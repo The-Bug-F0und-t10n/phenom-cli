@@ -1,0 +1,42 @@
+{
+  "sessionId": "d57581e25fcd25bf",
+  "createdAt": 1778353657473,
+  "updatedAt": 1778353952379,
+  "userRequest": "analize o diretorio e diga o que esse projeto implementa",
+  "notes": [
+    {
+      "id": "47cd8e07",
+      "type": "user_request",
+      "content": "ola",
+      "timestamp": 1778353659640
+    },
+    {
+      "id": "3453cf78",
+      "type": "progress",
+      "content": "Started processing request",
+      "timestamp": 1778353659640
+    },
+    {
+      "id": "229f7e70",
+      "type": "user_request",
+      "content": "analize o diretorio e diga o que esse projeto implementa",
+      "timestamp": 1778353681628
+    },
+    {
+      "id": "2b80e34d",
+      "type": "progress",
+      "content": "Started processing request",
+      "timestamp": 1778353681628
+    },
+    {
+      "id": "13887e73",
+      "type": "error",
+      "content": "Error: Ollama chat stream error: an error was encountered while running the model: ROCm error: an illegal memory access was encountered\n  current device: -1, in function ggml_backend_cuda_synchronize at /ml/backend/ggml/ggml/src/ggml-cuda/ggml-cuda.cu:2981\n  hipStreamSynchronize(cuda_ctx->stream())\n/ml/backend/ggml/ggml/src/ggml-cuda/ggml-cuda.cu:94: ROCm error",
+      "timestamp": 1778353952379
+    }
+  ],
+  "createdFiles": [],
+  "failedOperations": [],
+  "insights": [],
+  "pendingTasks": []
+}

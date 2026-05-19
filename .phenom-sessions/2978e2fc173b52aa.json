@@ -1,0 +1,41 @@
+{
+  "sessionId": "2978e2fc173b52aa",
+  "createdAt": 1778867289465,
+  "updatedAt": 1778867301306,
+  "userRequest": "Say hello in one word. Respond ONLY the greeting word, no extra text.",
+  "notes": [
+    {
+      "id": "3edb3ac3",
+      "type": "user_request",
+      "content": "Say hello in one word. Respond ONLY the greeting word, no extra text.",
+      "timestamp": 1778867289466
+    },
+    {
+      "id": "2a6eccf7",
+      "type": "progress",
+      "content": "Started processing request",
+      "timestamp": 1778867289466
+    }
+  ],
+  "createdFiles": [],
+  "failedOperations": [],
+  "insights": [],
+  "pendingTasks": [],
+  "messages": [
+    {
+      "role": "user",
+      "content": "Say hello in one word. Respond ONLY the greeting word, no extra text.",
+      "timestamp": 1778867289466
+    },
+    {
+      "role": "assistant",
+      "content": "hello",
+      "timestamp": 1778867301306
+    },
+    {
+      "role": "assistant",
+      "content": "hello",
+      "timestamp": 1778867301306
+    }
+  ]
+}

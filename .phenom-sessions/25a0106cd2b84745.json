@@ -1,0 +1,24 @@
+{
+  "sessionId": "25a0106cd2b84745",
+  "createdAt": 1779150417932,
+  "updatedAt": 1779150461589,
+  "userRequest": "Say hello in one word. Respond ONLY the greeting word, no extra text.",
+  "notes": [],
+  "createdFiles": [],
+  "failedOperations": [],
+  "insights": [],
+  "pendingTasks": [],
+  "planSteps": [],
+  "messages": [
+    {
+      "role": "user",
+      "content": "Say hello in one word. Respond ONLY the greeting word, no extra text.",
+      "timestamp": 1779150417932
+    },
+    {
+      "role": "assistant",
+      "content": "Hi",
+      "timestamp": 1779150461589
+    }
+  ]
+}

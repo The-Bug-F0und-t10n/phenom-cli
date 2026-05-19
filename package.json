@@ -1,0 +1,60 @@
+{
+  "name": "phenom-cli",
+  "version": "1.1.0",
+  "description": "Agente conversacional com API padronizada OpenAI/Ollama",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "tui": "tsx src/tui-main.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "tsx src/test.ts",
+    "test:core": "tsx src/test-multistep.ts && tsx src/test-agent-multistep.ts && tsx src/test-tools-fix.ts && tsx src/test-event-bus.ts && tsx src/test-cli-renderer.ts && tsx src/test-plan.ts && tsx src/test-tool-call-parser.ts && tsx src/test-model-capabilities.ts && tsx src/test-qwen-ollama-fixtures.ts && tsx src/test-agent-tool-loop.ts && tsx src/test-tool-loop-io-sequence.ts && tsx src/test-api-stream.ts && tsx src/test-use-cases.ts && tsx src/test-tool-execution-policy.ts && tsx src/test-tool-registrars.ts",
+    "test:all": "tsx src/test.ts && tsx src/test-multistep.ts && tsx src/test-agent-multistep.ts && tsx src/test-tools-fix.ts && tsx src/test-event-bus.ts && tsx src/test-cli-renderer.ts && tsx src/test-plan.ts && tsx src/test-tool-call-parser.ts && tsx src/test-model-capabilities.ts && tsx src/test-qwen-ollama-fixtures.ts && tsx src/test-use-cases.ts && tsx src/test-tool-loop-io-sequence.ts && tsx src/test-tool-execution-policy.ts && tsx src/test-tool-registrars.ts",
+    "test:plan": "tsx src/test-plan.ts",
+    "test:cli-renderer": "tsx src/test-cli-renderer.ts",
+    "test:api-stream": "tsx src/test-api-stream.ts",
+    "test:agent-loop": "tsx src/test-agent-tool-loop.ts",
+    "test:toolcall-parser": "tsx src/test-tool-call-parser.ts",
+    "test:model-capabilities": "tsx src/test-model-capabilities.ts",
+    "test:qwen-fixtures": "tsx src/test-qwen-ollama-fixtures.ts",
+    "test:tool-loop-io": "tsx src/test-tool-loop-io-sequence.ts",
+    "test:use-cases": "tsx src/test-use-cases.ts",
+    "test:tool-policy": "tsx src/test-tool-execution-policy.ts",
+    "test:tool-registrars": "tsx src/test-tool-registrars.ts",
+    "test:e2e:practical": "tsx src/test-practical-e2e.ts",
+    "test:real": "OLLAMA_ADAPTIVE_CTX=false tsx src/test-real-inference.ts",
+    "test:offline": "npm run test:core",
+    "test:online": "npm run test:real",
+    "test:real:simple": "OLLAMA_ADAPTIVE_CTX=false tsx src/test.ts && OLLAMA_ADAPTIVE_CTX=false tsx src/test-multistep.ts && OLLAMA_ADAPTIVE_CTX=false tsx src/test-agent-multistep.ts && OLLAMA_ADAPTIVE_CTX=false tsx src/test-plan.ts",
+    "example": "tsx src/examples.ts",
+    "example:advanced": "tsx src/examples-advanced.ts"
+  },
+  "keywords": [
+    "ollama",
+    "openai",
+    "agent",
+    "cli",
+    "ai"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "ansi-styles": "^6.2.1",
+    "chalk": "^5.6.2",
+    "commander": "^12.0.0",
+    "dotenv": "^16.4.5",
+    "marked": "^12.0.0",
+    "marked-terminal": "^7.0.0",
+    "simple-git": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/blessed": "^0.1.27",
+    "@types/diff": "^7.0.2",
+    "@types/marked-terminal": "^6.1.1",
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}

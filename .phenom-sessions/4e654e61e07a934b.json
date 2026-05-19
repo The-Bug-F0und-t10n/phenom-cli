@@ -1,0 +1,122 @@
+{
+  "sessionId": "4e654e61e07a934b",
+  "createdAt": 1778861301108,
+  "updatedAt": 1778861827493,
+  "userRequest": "say hello in one word",
+  "notes": [
+    {
+      "id": "9a5be422",
+      "type": "user_request",
+      "content": "Say hello in one word. Respond ONLY the greeting word, no extra text.",
+      "timestamp": 1778861301108
+    },
+    {
+      "id": "bdb43ade",
+      "type": "progress",
+      "content": "Started processing request",
+      "timestamp": 1778861301108
+    },
+    {
+      "id": "403d5168",
+      "type": "user_request",
+      "content": "ola",
+      "timestamp": 1778861646603
+    },
+    {
+      "id": "1631368c",
+      "type": "progress",
+      "content": "Started processing request",
+      "timestamp": 1778861646603
+    },
+    {
+      "id": "294f955a",
+      "type": "user_request",
+      "content": "como voce esta ?",
+      "timestamp": 1778861658604
+    },
+    {
+      "id": "fb39e8c8",
+      "type": "progress",
+      "content": "Started processing request",
+      "timestamp": 1778861658604
+    },
+    {
+      "id": "72333a16",
+      "type": "user_request",
+      "content": "say hello in one word",
+      "timestamp": 1778861823011
+    },
+    {
+      "id": "968688aa",
+      "type": "progress",
+      "content": "Started processing request",
+      "timestamp": 1778861823011
+    }
+  ],
+  "createdFiles": [],
+  "failedOperations": [],
+  "insights": [],
+  "pendingTasks": [],
+  "messages": [
+    {
+      "role": "user",
+      "content": "Say hello in one word. Respond ONLY the greeting word, no extra text.",
+      "timestamp": 1778861301108
+    },
+    {
+      "role": "assistant",
+      "content": "Hello",
+      "timestamp": 1778861308782
+    },
+    {
+      "role": "assistant",
+      "content": "Hello",
+      "timestamp": 1778861308782
+    },
+    {
+      "role": "user",
+      "content": "ola",
+      "timestamp": 1778861646603
+    },
+    {
+      "role": "assistant",
+      "content": "Olá",
+      "timestamp": 1778861650748
+    },
+    {
+      "role": "assistant",
+      "content": "Olá",
+      "timestamp": 1778861650748
+    },
+    {
+      "role": "user",
+      "content": "como voce esta ?",
+      "timestamp": 1778861658604
+    },
+    {
+      "role": "assistant",
+      "content": "Estou bem, obrigado! Como posso ajudar você hoje?",
+      "timestamp": 1778861663957
+    },
+    {
+      "role": "assistant",
+      "content": "Estou bem, obrigado! Como posso ajudar você hoje?",
+      "timestamp": 1778861663957
+    },
+    {
+      "role": "user",
+      "content": "say hello in one word",
+      "timestamp": 1778861823010
+    },
+    {
+      "role": "assistant",
+      "content": "Hello",
+      "timestamp": 1778861827493
+    },
+    {
+      "role": "assistant",
+      "content": "Hello",
+      "timestamp": 1778861827493
+    }
+  ]
+}

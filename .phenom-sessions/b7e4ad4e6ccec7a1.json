@@ -1,0 +1,24 @@
+{
+  "sessionId": "b7e4ad4e6ccec7a1",
+  "createdAt": 1778844080297,
+  "updatedAt": 1778844089229,
+  "userRequest": "ola",
+  "notes": [
+    {
+      "id": "64494c95",
+      "type": "user_request",
+      "content": "ola",
+      "timestamp": 1778844081841
+    },
+    {
+      "id": "e2d72eb7",
+      "type": "progress",
+      "content": "Started processing request",
+      "timestamp": 1778844081841
+    }
+  ],
+  "createdFiles": [],
+  "failedOperations": [],
+  "insights": [],
+  "pendingTasks": []
+}

@@ -1,0 +1,38 @@
+{
+  "sessionId": "baeccadb34fd6bde",
+  "createdAt": 1779114223991,
+  "updatedAt": 1779114404000,
+  "userRequest": "list the files in the current directory",
+  "notes": [
+    {
+      "id": "7a775723",
+      "type": "user_request",
+      "content": "list the files in the current directory",
+      "timestamp": 1779114223992
+    },
+    {
+      "id": "9e3daed0",
+      "type": "progress",
+      "content": "Started processing request",
+      "timestamp": 1779114223992
+    },
+    {
+      "id": "e41ef87c",
+      "type": "error",
+      "content": "Error: This operation was aborted",
+      "timestamp": 1779114404000
+    }
+  ],
+  "createdFiles": [],
+  "failedOperations": [],
+  "insights": [],
+  "pendingTasks": [],
+  "planSteps": [],
+  "messages": [
+    {
+      "role": "user",
+      "content": "list the files in the current directory",
+      "timestamp": 1779114223992
+    }
+  ]
+}

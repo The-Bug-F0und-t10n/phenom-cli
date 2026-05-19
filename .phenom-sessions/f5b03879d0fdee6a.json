@@ -1,0 +1,24 @@
+{
+  "sessionId": "f5b03879d0fdee6a",
+  "createdAt": 1778841669976,
+  "updatedAt": 1778841687937,
+  "userRequest": "Liste os arquivos da pasta src/",
+  "notes": [
+    {
+      "id": "e5673c2f",
+      "type": "user_request",
+      "content": "Liste os arquivos da pasta src/",
+      "timestamp": 1778841669977
+    },
+    {
+      "id": "027975e2",
+      "type": "progress",
+      "content": "Started processing request",
+      "timestamp": 1778841669977
+    }
+  ],
+  "createdFiles": [],
+  "failedOperations": [],
+  "insights": [],
+  "pendingTasks": []
+}

@@ -1,0 +1,12 @@
+{
+  "name": "math-utils",
+  "version": "1.0.0",
+  "description": "Biblioteca simples de operações matemáticas básicas",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node index.html"
+  },
+  "keywords": ["math", "calculator", "utilities"],
+  "author": "",
+  "license": "MIT"
+}

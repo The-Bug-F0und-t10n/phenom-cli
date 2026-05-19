@@ -1,0 +1,24 @@
+{
+  "sessionId": "571ad479b94c0f13",
+  "createdAt": 1778844460980,
+  "updatedAt": 1778844479986,
+  "userRequest": "ola",
+  "notes": [
+    {
+      "id": "844dfcdf",
+      "type": "user_request",
+      "content": "ola",
+      "timestamp": 1778844461658
+    },
+    {
+      "id": "0132408e",
+      "type": "progress",
+      "content": "Started processing request",
+      "timestamp": 1778844461658
+    }
+  ],
+  "createdFiles": [],
+  "failedOperations": [],
+  "insights": [],
+  "pendingTasks": []
+}

@@ -1,0 +1,151 @@
+import { extractBalancedJson, safeJsonParse } from './json-utils.js';
+import { ToolLoopParseResult, ToolLoopResponse } from './domain-contracts.js';
+
+export function parseToolCallOrFinal(raw: string): ToolLoopResponse | null {
+  return parseToolCallOrFinalDetailed(raw).response;
+}
+
+export function parseToolCallOrFinalDetailed(raw: string): ToolLoopParseResult {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return { response: null, strategy: 'empty' };
+
+  const tagged = parseTaggedToolCall(trimmed);
+  if (tagged) return { response: tagged, strategy: 'tagged_tool_call' };
+
+  const primary = parsePrimaryJsonBlock(trimmed);
+  if (primary) {
+    // If the first parse is a "final" answer but a valid tool call also exists in
+    // embedded JSON blocks, prefer the tool path to avoid false completion.
+    if (primary.type === 'final') {
+      const scanned = parseEmbeddedJsonBlocks(trimmed);
+      if (scanned?.type === 'tool') {
+        return { response: scanned, strategy: 'embedded_json_scan' };
+      }
+    }
+    return { response: primary, strategy: 'primary_json' };
+  }
+
+  const scanned = parseEmbeddedJsonBlocks(trimmed);
+  if (scanned) return { response: scanned, strategy: 'embedded_json_scan' };
+
+  const cleaned = stripRendererArtifacts(trimmed);
+  if (cleaned && cleaned !== trimmed) {
+    const reparsed = parseToolCallOrFinalDetailed(cleaned);
+    if (reparsed.response) return { ...reparsed, strategy: 'cleaned_retry' };
+  }
+
+  if (looksLikeBrokenToolJson(trimmed)) {
+    return { response: null, strategy: 'invalid_broken_tool_json' };
+  }
+  if (trimmed.length > 5) {
+    return { response: { type: 'final', content: trimmed }, strategy: 'plain_text_final' };
+  }
+  return { response: null, strategy: 'empty' };
+}
+
+function parseTaggedToolCall(raw: string): ToolLoopResponse | null {
+  const match = raw.match(/<tool_call>([\s\S]*?)<\/tool_call>/i);
+  if (!match) return null;
+
+  const parsed = safeJsonParse<Record<string, unknown>>(match[1].trim());
+  if (!parsed) return null;
+
+  const fn = toObject(parsed.function);
+  const name = String(parsed.name || parsed.toolName || fn.name || '').trim();
+  if (!name) return null;
+
+  return {
+    type: 'tool',
+    toolName: name,
+    args: toArgsRecord(parsed.arguments ?? parsed.args ?? parsed.parameters ?? {}),
+  };
+}
+
+function parsePrimaryJsonBlock(raw: string): ToolLoopResponse | null {
+  const extracted = extractBalancedJson(raw);
+  const parsed = safeJsonParse<Record<string, unknown>>(extracted);
+  if (!parsed || typeof parsed !== 'object') return null;
+
+  if (parsed.type === 'tool' && typeof parsed.toolName === 'string' && parsed.toolName.trim()) {
+    return { type: 'tool', toolName: parsed.toolName.trim(), args: toArgsRecord(parsed.args || {}) };
+  }
+
+  if (parsed.type === 'final' && typeof parsed.content === 'string') {
+    return { type: 'final', content: parsed.content };
+  }
+
+  // OpenAI-like function object: {"name":"...", "arguments":{...}}
+  if (
+    typeof parsed.name === 'string' &&
+    parsed.name.trim() &&
+    (parsed.arguments !== undefined || parsed.args !== undefined || parsed.parameters !== undefined)
+  ) {
+    return {
+      type: 'tool',
+      toolName: parsed.name.trim(),
+      args: toArgsRecord(parsed.arguments ?? parsed.args ?? parsed.parameters ?? {}),
+    };
+  }
+
+  return null;
+}
+
+function parseEmbeddedJsonBlocks(raw: string): ToolLoopResponse | null {
+  const toolCandidates: ToolLoopResponse[] = [];
+  const finalCandidates: ToolLoopResponse[] = [];
+  let pos = 0;
+
+  while (pos < raw.length) {
+    const idx = raw.indexOf('{', pos);
+    if (idx === -1) break;
+
+    const block = extractBalancedJson(raw.slice(idx));
+    if (block && block.startsWith('{')) {
+      const parsed = safeJsonParse<Record<string, unknown>>(block);
+      if (parsed?.type === 'tool' && typeof parsed.toolName === 'string' && parsed.toolName.trim()) {
+        toolCandidates.push({ type: 'tool', toolName: parsed.toolName, args: toArgsRecord(parsed.args || {}) });
+      } else if (parsed?.type === 'final' && typeof parsed.content === 'string' && parsed.content.trim()) {
+        finalCandidates.push({ type: 'final', content: parsed.content });
+      }
+      pos = idx + block.length;
+      continue;
+    }
+
+    pos = idx + 1;
+  }
+
+  if (toolCandidates.length > 0) return toolCandidates[0];
+  if (finalCandidates.length > 0) return finalCandidates[0];
+  return null;
+}
+
+function stripRendererArtifacts(raw: string): string {
+  return raw
+    .replace(/^\[assistant\]\s*/gi, '')
+    .replace(/^\[reasoning\]\s*/gi, '')
+    .replace(/^#.*\n*/gm, '')
+    .replace(/```json\s*/gi, '')
+    .replace(/```\s*/g, '')
+    .trim();
+}
+
+function looksLikeBrokenToolJson(raw: string): boolean {
+  return raw.includes('{"type"') || raw.includes('"toolName"') || raw.includes('"tool_call"');
+}
+
+function toObject(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return {};
+}
+
+function toArgsRecord(value: unknown): Record<string, unknown> {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return {};
+    const parsed = safeJsonParse<unknown>(trimmed);
+    return toObject(parsed);
+  }
+  return toObject(value);
+}

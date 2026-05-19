@@ -1,0 +1,8 @@
+{
+  "id": "plan-1778346605931",
+  "originalRequest": "Crie 3 arquivos em uma pasta \"projeto\": index.html com HTML básico, src/App.tsx com componente React, e src/styles.css com estilo body { background: #fff }. Use write_file para cada um, um por vez, verificando com list_dir depois de cada criação.",
+  "steps": [],
+  "completedSteps": [],
+  "createdAt": 1778346605931,
+  "updatedAt": 1778346605931
+}
