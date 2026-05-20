@@ -145,6 +145,9 @@ program
         const history = historyLines.reverse().join('\n');
         await fs.writeFile(historyPath, history, 'utf-8');
       } catch {}
+      // Leave the alt-screen BEFORE printing the farewell so the message lands
+      // on the user's main terminal rather than getting wiped with alt-screen.
+      renderer.detach();
       console.log('Session saved. Use phenom chat to continue.');
       process.exit(0);
     });

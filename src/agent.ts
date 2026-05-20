@@ -313,10 +313,12 @@ export class Agent {
       if (hasActivePlan) {
         contextParts.push(`## Active Plan\n${brain.getPlanSummary()}`);
       }
-      const created = brain.getCreatedFiles();
-      if (created.length > 0) {
-        contextParts.push(`## Files Modified This Session\n${created.join('\n')}`);
-      }
+      // "## Files Modified This Session" was removed from the system prompt:
+      // restoring a session re-injected every prior write/patch path, which
+      // turned past sibling/variant outputs into pseudo-examples the model
+      // treated as canonical. The brain still tracks created files for audit
+      // (list_session_files exposes them on demand) — only the auto-inject
+      // is filtered.
     }
     const sessionContext = contextParts.length > 0 ? `\n${contextParts.join('\n\n')}\n` : '';
 

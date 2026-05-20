@@ -102,13 +102,10 @@ export async function runToolLoopUseCase(
   let limitExtended = false;
   const messages = await deps.buildInitialMessages(userInput, inputParts);
   let consecutiveAllFailures = 0;
-  let totalToolExecutions = 0;
-  let noToolRecoveryAttempts = 0;
   let stagnantIterations = 0;
   let repeatedToolPlanIterations = 0;
   let previousToolPlanSignature = '';
   let previousOutcomeSignature = '';
-  const requiresDiskIOTools = isDiskIOTask(userInput);
   const contextThresholdTokens = Math.max(1024, Math.floor(deps.maxContextTokens * 0.9));
 
   for (let iteration = 0; iteration < maxToolIterations; iteration++) {
@@ -175,24 +172,8 @@ export async function runToolLoopUseCase(
           ? parsed.response.content
           : accumulatedContent)?.trim() || 'Concluded.';
 
-        if (requiresDiskIOTools && totalToolExecutions === 0 && noToolRecoveryAttempts < 2) {
-          noToolRecoveryAttempts++;
-          const recoveryPrompt = buildNoToolRecoveryPrompt(userInput, finalContent, noToolRecoveryAttempts);
-          deps.emitAssistantMessage('[guard] No tool call detected. Retrying with explicit tool-call instructions.');
-          messages.push({ role: 'user', content: recoveryPrompt });
-          eventBus.emit(EventType.PROGRESS_UPDATE, {
-            message: `Retrying with explicit tool-call requirement (${noToolRecoveryAttempts}/2)`,
-            intentType: 'general'
-          });
-          continue;
-        }
-
-        if (requiresDiskIOTools && totalToolExecutions === 0) {
-          const failMessage = 'Task requires file I/O tool execution, but model ended without any tool call.';
-          deps.emitAssistantMessage(failMessage);
-          return failMessage;
-        }
-
+        // No keyword-based "task requires disk I/O" heuristic. The model
+        // decides whether to use tools. If it answered with text, accept it.
         if (finalContent && finalContent !== 'Concluded.') {
           deps.emitAssistantMessage(finalContent);
         }
@@ -262,7 +243,6 @@ export async function runToolLoopUseCase(
       const rawArgs: Record<string, unknown> = normalizedToolCalls[i].args;
 
       const toolResult = await deps.executeToolWithEvents(toolName, rawArgs);
-      totalToolExecutions++;
       if (toolResult.success) {
         allFailed = false;
         hadSuccessfulTool = true;
@@ -395,26 +375,6 @@ function estimateLoopTokens(messages: InferenceMessage[]): number {
     }
   }
   return total;
-}
-
-function isDiskIOTask(userInput: string): boolean {
-  const text = String(userInput || '').toLowerCase();
-  if (!text) return false;
-
-  const hasFileRef = /\b[\w./-]+\.[a-z0-9]{1,10}\b/.test(text) || /\barquivo|file|diret[oó]rio|directory|pasta|folder\b/.test(text);
-  const hasEditIntent = /\b(refactor|refatore|editar|edite|alterar|altere|modificar|modifique|criar|create|write|patch|corrigir|fix)\b/.test(text);
-  return hasFileRef && hasEditIntent;
-}
-
-function buildNoToolRecoveryPrompt(userInput: string, lastAssistantOutput: string, attempt: number): string {
-  return [
-    'SYSTEM_GUARD: The previous assistant turn ended without executing any tool call.',
-    `Original task: ${userInput}`,
-    `Previous output: ${lastAssistantOutput || '[empty]'}`,
-    `Attempt: ${attempt}/2`,
-    'Now execute the task by calling the required tool(s) first (read_file/write_file/apply_patch/etc).',
-    'Do not reply with only a promise text like "I will do it".'
-  ].join('\n');
 }
 
 function stableStringify(value: unknown): string {

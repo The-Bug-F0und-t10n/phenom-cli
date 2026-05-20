@@ -12,7 +12,7 @@ export function registerFilesystemTools(deps: RegisterFilesystemToolsDeps): void
 
   register({
     name: 'read_file',
-    description: 'Read a file. Supports optional line-range and maxChars to avoid context overload.',
+    description: 'Read a slice of a file. Default behavior is MICRO-CONTEXT: at most 200 lines per call. Use grep_file or find_function FIRST to locate the relevant lines, then call read_file with startLine/endLine for the targeted range. Reading entire large files wastes context — only do that for short files (<200 lines) or when whole-file reasoning is genuinely required (pass wholeFile=true).',
     parameters: {
       type: 'object',
       properties: {
@@ -22,19 +22,23 @@ export function registerFilesystemTools(deps: RegisterFilesystemToolsDeps): void
         },
         startLine: {
           type: 'number',
-          description: 'Linha inicial (1-based, opcional)'
+          description: 'Linha inicial (1-based, opcional). Default: 1.'
         },
         endLine: {
           type: 'number',
-          description: 'Linha final (1-based, opcional, inclusiva)'
+          description: 'Linha final (1-based, inclusiva). Default: min(startLine + 199, total). Limite máximo de 200 linhas por leitura sem wholeFile=true.'
+        },
+        wholeFile: {
+          type: 'boolean',
+          description: 'Force reading the entire file regardless of size. Use sparingly — only for files <500 lines or when whole-file analysis is genuinely needed.'
         },
         maxChars: {
           type: 'number',
-          description: 'Limite de caracteres retornados (padrão 40000)'
+          description: 'Hard char cap (default 40000). Independent from line cap.'
         },
         numberLines: {
           type: 'boolean',
-          description: 'Se true, prefixa linhas com número'
+          description: 'Se true, prefixa linhas com número (útil pra apply_patch posterior)'
         }
       },
       required: ['path']
@@ -57,11 +61,24 @@ export function registerFilesystemTools(deps: RegisterFilesystemToolsDeps): void
         const totalLines = lines.length;
         const totalBytes = Buffer.byteLength(content, 'utf-8');
 
+        const MICRO_LINE_CAP = 200;
+        const wholeFile = Boolean(args.wholeFile);
         const startRaw = Number(args.startLine);
         const endRaw = Number(args.endLine);
-        const hasRange = Number.isFinite(startRaw) || Number.isFinite(endRaw);
-        const rangeStart = Number.isFinite(startRaw) ? Math.max(1, Math.floor(startRaw)) : 1;
-        const rangeEnd = Number.isFinite(endRaw) ? Math.max(rangeStart, Math.floor(endRaw)) : totalLines;
+        const hasStartLine = Number.isFinite(startRaw);
+        const hasEndLine = Number.isFinite(endRaw);
+        const hasRange = hasStartLine || hasEndLine;
+
+        let rangeStart = hasStartLine ? Math.max(1, Math.floor(startRaw)) : 1;
+        let rangeEnd: number;
+        if (hasEndLine) {
+          rangeEnd = Math.max(rangeStart, Math.floor(endRaw));
+        } else if (wholeFile) {
+          rangeEnd = totalLines;
+        } else {
+          // Micro-context default: cap window at MICRO_LINE_CAP lines from start.
+          rangeEnd = Math.min(totalLines, rangeStart + MICRO_LINE_CAP - 1);
+        }
 
         if (hasRange && (rangeStart > totalLines || rangeEnd > totalLines)) {
           return {
@@ -69,6 +86,13 @@ export function registerFilesystemTools(deps: RegisterFilesystemToolsDeps): void
             output: '',
             error: `Faixa inválida: ${rangeStart}-${rangeEnd}. Total de linhas: ${totalLines}`
           };
+        }
+
+        // Soft enforcement of MICRO_LINE_CAP unless wholeFile.
+        let rangeClipped = false;
+        if (!wholeFile && (rangeEnd - rangeStart + 1) > MICRO_LINE_CAP) {
+          rangeEnd = rangeStart + MICRO_LINE_CAP - 1;
+          rangeClipped = true;
         }
 
         const selectedLines = lines.slice(rangeStart - 1, rangeEnd);
@@ -90,6 +114,15 @@ export function registerFilesystemTools(deps: RegisterFilesystemToolsDeps): void
           ? numbered.slice(0, maxChars) + `\n...[truncated: ${numbered.length - maxChars} chars omitted]`
           : numbered;
 
+        const remainingLines = totalLines - rangeEnd;
+        const hints: string[] = [];
+        if (rangeClipped) {
+          hints.push(`hint: requested range exceeded ${MICRO_LINE_CAP}-line micro-context cap; clipped to ${rangeStart}-${rangeEnd}. Use grep_file/find_function to target the section you need.`);
+        }
+        if (remainingLines > 0) {
+          hints.push(`hint: ${remainingLines} more lines available (${rangeEnd + 1}..${totalLines}). Call read_file again with startLine=${rangeEnd + 1} for the next window, OR grep_file to jump to a specific region.`);
+        }
+
         const meta = [
           '[READ_FILE]',
           `path: ${readPath}`,
@@ -99,6 +132,9 @@ export function registerFilesystemTools(deps: RegisterFilesystemToolsDeps): void
           `numbered: ${numberLines ? 'true' : 'false'}`,
           `truncated: ${truncated ? 'true' : 'false'}`
         ];
+        if (hints.length > 0) {
+          for (const h of hints) meta.push(h);
+        }
 
         return {
           success: true,
@@ -155,7 +191,7 @@ export function registerFilesystemTools(deps: RegisterFilesystemToolsDeps): void
 
   register({
     name: 'write_file',
-    description: 'Write content to a file. Overwrites existing files by default (the model should verify context before writing). If content is identical, reports success without writing. Use overwrite=false to create a .bak backup.',
+    description: 'Write the FULL content of a file. Replaces the file entirely if it exists. Appropriate when (a) the file does not exist and the task is to create it, or (b) the change rewrites the whole file. For partial edits to an existing file, use apply_patch — it preserves untouched lines and is the correct tool for refactor/edit/change requests on existing content. If content is identical, reports success without writing. Use overwrite=false to create a .bak backup.',
     parameters: {
       type: 'object',
       properties: {
@@ -189,12 +225,15 @@ export function registerFilesystemTools(deps: RegisterFilesystemToolsDeps): void
       const dryRun = Boolean(args.dryRun);
 
       try {
-        if (!writePath) {
-          return { success: false, output: '', error: 'Caminho do arquivo não fornecido' };
-        }
-
-        if (content === undefined || content === null) {
-          return { success: false, output: '', error: 'Conteúdo não fornecido' };
+        const missingPath = !writePath;
+        const missingContent = content === undefined || content === null;
+        if (missingPath || missingContent) {
+          const missing = [missingPath && 'path', missingContent && 'content'].filter(Boolean).join(', ');
+          return {
+            success: false,
+            output: '',
+            error: `write_file requer "path" e "content" na MESMA chamada. Faltando: ${missing}. Schema: {"path":"<caminho do arquivo>","content":"<conteudo completo do arquivo>"}. Reenvie a chamada com ambos os campos preenchidos.`
+          };
         }
 
         const dangerousExtensions = [
@@ -303,7 +342,7 @@ export function registerFilesystemTools(deps: RegisterFilesystemToolsDeps): void
 
   register({
     name: 'create_file',
-    description: 'Create a new file with complete content. Overwrites by default (verify context before use). Use overwrite=false to create a .bak backup.',
+    description: 'Create a NEW file with complete content. Verify the file does not exist (path_exists) before calling. If the file already exists this call will replace it — for partial edits to an existing file, use apply_patch instead. Use overwrite=false to create a .bak backup before replacement.',
     parameters: {
       type: 'object',
       properties: {
@@ -329,11 +368,15 @@ export function registerFilesystemTools(deps: RegisterFilesystemToolsDeps): void
       const overwrite = 'overwrite' in args ? Boolean(args.overwrite) : true;
 
       try {
-        if (!writePath) {
-          return { success: false, output: '', error: 'File path not provided' };
-        }
-        if (!content && content !== '') {
-          return { success: false, output: '', error: 'Content not provided' };
+        const missingPath = !writePath;
+        const missingContent = !content && content !== '';
+        if (missingPath || missingContent) {
+          const missing = [missingPath && 'path', missingContent && 'content'].filter(Boolean).join(', ');
+          return {
+            success: false,
+            output: '',
+            error: `create_file requer "path" e "content" na MESMA chamada. Faltando: ${missing}. Schema: {"path":"<caminho do arquivo>","content":"<conteudo completo do arquivo>"}. Reenvie com ambos os campos preenchidos.`
+          };
         }
 
         const dangerousExtensions = ['.exe', '.dll', '.so', '.dylib', '.bin', '.jar', '.war', '.ear'];

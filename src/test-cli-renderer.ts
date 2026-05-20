@@ -200,7 +200,11 @@ test('attach is idempotent (no duplicated handlers)', () => {
   assert(userLines.length === 1, `user output should appear once, got ${userLines.length}`);
 });
 
-test('FILE_DIFF events are consolidated and rendered once per file at THINK_END', () => {
+test('FILE_DIFF events render inline in real time (no buffer to THINK_END)', () => {
+  // Semantics changed: diffs no longer wait for THINK_END. Each FILE_DIFF
+  // renders immediately so multi-step mutations are visible while the agent
+  // is still working. Two sequential writes to the same path now produce two
+  // distinct diff blocks in the order they happened.
   eventBus.clear();
   const renderer: any = new CliRenderer();
   renderer.plain = true;
@@ -242,9 +246,9 @@ test('FILE_DIFF events are consolidated and rendered once per file at THINK_END'
 
   const joined = logs.join('\n');
   const fileHeaderCount = (joined.match(/\[file\] hello-world\.html/g) || []).length;
-  assert(fileHeaderCount === 1, `expected single consolidated file header, got ${fileHeaderCount}`);
-  assert(joined.includes('1 ~ │ new'), 'expected decorated diff line with ~ marker');
-  assert(!joined.includes('1 ~ │ old'), 'expected latest diff content only');
+  assert(fileHeaderCount === 2, `expected two real-time diff blocks (one per FILE_DIFF), got ${fileHeaderCount}`);
+  assert(joined.includes('1 ~ │ new'), 'expected decorated diff line for second write');
+  assert(joined.includes('1 ~ │ old'), 'expected first write to be visible too (no consolidation)');
 });
 
 async function main() {

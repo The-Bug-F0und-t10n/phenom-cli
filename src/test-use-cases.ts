@@ -130,7 +130,11 @@ test('runToolLoopUseCase executes fallback JSON tool then returns final JSON con
   assert(assistantOutputs.includes('done'), 'expected final assistant output');
 });
 
-test('runToolLoopUseCase retries when disk IO task ends without tool call and then executes tool', async () => {
+test('runToolLoopUseCase accepts model text response without forcing tool retry', async () => {
+  // After the disk-IO heuristic was removed, a text-only response from the
+  // model is treated as the final answer. No SYSTEM_GUARD recovery prompt is
+  // injected, no failure is raised — the model decides whether a tool is
+  // needed.
   const executed: Array<{ tool: string; args: Record<string, unknown> }> = [];
   const streamMessages: Array<Array<{ role: string; content: string | any[] }>> = [];
   const assistantOutputs: string[] = [];
@@ -142,13 +146,7 @@ test('runToolLoopUseCase retries when disk IO task ends without tool call and th
         chatStream: async (messages, onChunk) => {
           streamMessages.push(messages.map(m => ({ role: m.role, content: m.content })));
           streamCalls++;
-          if (streamCalls === 1) {
-            onChunk('Vou refatorar o arquivo para adicionar um background gradiente animado.');
-          } else if (streamCalls === 2) {
-            onChunk('{"type":"tool","toolName":"write_file","args":{"path":"hello-world.html","content":"<html>ok</html>"}}');
-          } else {
-            onChunk('{"type":"final","content":"arquivo atualizado"}');
-          }
+          onChunk('Vou refatorar o arquivo para adicionar um background gradiente animado.');
           return '';
         },
         chat: async () => ({ message: { content: 'no' } })
@@ -176,19 +174,15 @@ test('runToolLoopUseCase retries when disk IO task ends without tool call and th
     'refatore o hello-world.html para um background gradiente que muda de cor sozinho'
   );
 
-  assert(streamCalls === 3, `expected 3 stream calls (recovery + tool + final), got ${streamCalls}`);
-  assert(executed.length === 1, `expected 1 tool execution, got ${executed.length}`);
-  assert(executed[0].tool === 'write_file', `expected write_file, got ${executed[0].tool}`);
-  assert(result === 'arquivo atualizado', `expected final content, got ${result}`);
-
-  const secondCallMessages = streamMessages[1] || [];
-  const hasRecoveryPrompt = secondCallMessages.some(m =>
-    m.role === 'user' && typeof m.content === 'string' && m.content.includes('SYSTEM_GUARD')
-  );
-  assert(hasRecoveryPrompt, 'expected SYSTEM_GUARD recovery prompt before second stream call');
+  assert(streamCalls === 1, `expected single stream call (no forced retry), got ${streamCalls}`);
+  assert(executed.length === 0, `expected zero tool executions when model gives text, got ${executed.length}`);
   assert(
-    assistantOutputs.some(msg => msg.includes('[guard] No tool call detected')),
-    'expected explicit guard assistant message during retry'
+    result === 'Vou refatorar o arquivo para adicionar um background gradiente animado.',
+    `expected model text as final, got ${result}`
+  );
+  assert(
+    !assistantOutputs.some(msg => msg.includes('[guard]') || msg.includes('SYSTEM_GUARD')),
+    'no guard message should be emitted — guard was removed'
   );
 });
 

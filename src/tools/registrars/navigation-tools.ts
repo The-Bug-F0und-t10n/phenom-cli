@@ -11,7 +11,7 @@ export function registerNavigationTools(deps: RegisterNavigationToolsDeps): void
 
   register({
     name: 'find_function',
-    description: 'Find function/class/const definitions with full signature and body. Returns complete code blocks.',
+    description: 'FIRST-RESORT lookup for code symbols. Find function / class / interface / type / const definitions with full signature and body. Returns the complete block — no need for a follow-up read_file when this hits. Faster than grep_file for named symbols.',
     parameters: {
       type: 'object',
       properties: {

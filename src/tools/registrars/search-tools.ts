@@ -49,7 +49,7 @@ export function registerSearchTools(deps: RegisterSearchToolsDeps): void {
 
   register({
     name: 'grep_file',
-    description: 'Search within specific file using regex pattern. Use when you know the file path. Add context:N for surrounding lines.',
+    description: 'FIRST-RESORT search tool. Use BEFORE read_file whenever you want to locate something specific (a symbol, a function name, a string, an error message). Returns line numbers — feed those into read_file with startLine/endLine for a focused micro-read instead of reading entire files. Add context:N for surrounding lines.',
     parameters: {
       type: 'object',
       properties: {
