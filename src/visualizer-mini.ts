@@ -39,7 +39,10 @@ export type VisualizerMode =
   | 'responding';
 
 const STATES: Record<VisualizerMode, VisualizerState> = {
-  idle:       { energy: 0.00, density: 0.0, chaos: 0.00, spdFactor: 0.0 },
+  // idle has low but non-zero energy so the wave keeps moving as a "breathing"
+  // indicator that the CLI is alive — matches the user's request to always
+  // have a visible animation at the right edge of the status bar.
+  idle:       { energy: 0.14, density: 1.0, chaos: 0.00, spdFactor: 2.5 },
   listening:  { energy: 0.22, density: 1.6, chaos: 0.00, spdFactor: 10.0 },
   thinking:   { energy: 0.52, density: 2.6, chaos: 0.03, spdFactor: 8.0 },
   working:    { energy: 0.63, density: 3.0, chaos: 0.04, spdFactor: 9.0 },
@@ -121,9 +124,8 @@ export class MiniVisualizer {
   }
 
   /**
-   * Convenience: map an agent op-label string into a visualizer mode.
-   * Used by cli-renderer to keep the visualizer in sync with what the agent
-   * is doing without a separate state machine.
+   * Map an agent op-label string into a visualizer mode (called from
+   * THINK_START / PROGRESS_UPDATE handlers).
    */
   static modeFromOpLabel(label: string): VisualizerMode {
     const l = String(label || '').toLowerCase();
@@ -133,5 +135,32 @@ export class MiniVisualizer {
     if (l.includes('reading') || l.includes('searching') || l.includes('exploring')) return 'listening';
     if (l.includes('running') || l.includes('testing') || l.includes('validating')) return 'working';
     return 'responding';
+  }
+
+  /**
+   * Map a tool name into a visualizer mode. Called from the TOOL_START
+   * handler so the wave responds to what the agent is *actually doing*
+   * (writing vs reading vs running) instead of stuck on the generic
+   * "thinking" derived from the agent's progress messages.
+   */
+  static modeFromToolName(toolName: string): VisualizerMode {
+    const n = String(toolName || '').toLowerCase();
+    if (!n) return 'thinking';
+    // Mutations / execution → working
+    if (n === 'write_file' || n === 'create_file' || n === 'apply_patch' ||
+        n === 'patch_file' || n === 'delete_file' || n === 'delete_dir' ||
+        n === 'run_code' || n === 'run_tests' || n === 'validate_syntax' ||
+        n === 'set_plan' || n === 'complete_step' || n === 'update_memory' ||
+        n === 'record_skill') {
+      return 'working';
+    }
+    // Read-only inspection → listening
+    if (n === 'read_file' || n === 'grep_file' || n === 'find_function' ||
+        n === 'path_exists' || n === 'list_dir' || n === 'list_session_files' ||
+        n === 'glob' || n === 'extract_block' || n === 'search_code' ||
+        n === 'web_search' || n.startsWith('git_')) {
+      return 'listening';
+    }
+    return 'working';
   }
 }

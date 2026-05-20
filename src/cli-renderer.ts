@@ -220,6 +220,9 @@ export class CliRenderer {
           this.streamMode = 'content';
           // Header was written — stream owns the visual display now.
           this.assistantStreamedDisplayed = true;
+          // Switch wave to "responding" the first time content chunks arrive
+          // (model is actively producing the answer, not just thinking).
+          this.visualizer.setMode('responding');
         }
         const rendered = this.streamMarkdown.processChunk(chunk);
         if (rendered) this.output.write(rendered);
@@ -231,6 +234,8 @@ export class CliRenderer {
     this.unsubscribers.push(eventBus.on(EventType.TOOL_START, (event) => {
       const { name, args } = event.payload;
       this.currentToolName = name || '';
+      // Sync wave with what the tool is actually doing (write/read/run).
+      this.visualizer.setMode(MiniVisualizer.modeFromToolName(name));
       const label = this.toolLabel(name);
       let detail = '';
       if (name === 'run_code' && args.command) {
@@ -245,6 +250,9 @@ export class CliRenderer {
 
     this.unsubscribers.push(eventBus.on(EventType.TOOL_RESULT, (event) => {
       const { result } = event.payload;
+      // Tool finished — model is back to thinking on its result before the
+      // next action.
+      if (this.thinkStarted) this.visualizer.setMode('thinking');
       if (this.SILENT_TOOLS.has(this.currentToolName)) return;
       if (this.currentToolName === 'run_code' && result?.success) {
         const output = result.output
@@ -258,6 +266,7 @@ export class CliRenderer {
     }));
 
     this.unsubscribers.push(eventBus.on(EventType.TOOL_ERROR, (event) => {
+      if (this.thinkStarted) this.visualizer.setMode('thinking');
       this.writeBlock('  ' + chalk.red('->') + ' ' + (event.payload.error || event.payload.message || 'failed'));
     }));
 
@@ -656,14 +665,10 @@ export class CliRenderer {
   }
 
   private showStatusLine(): void {
-    if (this.statusInterval) clearInterval(this.statusInterval);
+    // Animation interval is permanent (started in enterAltScreen).
+    // showStatusLine now only flips the "show prose" flag and triggers an
+    // immediate paint so the prose appears without waiting for the next tick.
     this.statusVisible = true;
-    // 33ms = 30 FPS — matches visualizer.py's FPS=30. Smooth wave animation.
-    // Paint is cheap (~150 bytes of ANSI per redraw via save-restore cursor),
-    // so this is well under measurable CPU impact even during long inferences.
-    // Interval runs ONLY when a status is active (started in showStatusLine,
-    // cleared in clearStatusLine), so idle has zero overhead.
-    this.statusInterval = setInterval(() => this.refreshStatus(), 33);
     this.refreshStatus();
   }
 
@@ -687,33 +692,63 @@ export class CliRenderer {
     this.lastStatusLine = '';
     this.thinkStarted = false;
     this.visualizer.setMode('idle');
-    if (this.statusInterval) {
-      clearInterval(this.statusInterval);
-      this.statusInterval = null;
-    }
-    // Wipe status row text left by drawFixedPrompt so it doesn't linger.
-    if (!this.plain && this.rl) {
-      const rows = this.output.rows || process.stdout.rows;
-      if (rows && rows >= 2) {
-        this.output.write('\x1b7' + `\x1b[${rows - 1};1H\x1b[K` + '\x1b8');
-      }
-    }
+    // Animation interval keeps running (idle wave continues at right edge).
+    // refreshStatus will repaint the row with prose dropped, so no manual
+    // row-wipe is needed.
+    this.refreshStatus();
   }
 
+  /**
+   * Compose the bottom status row. Two parts:
+   *   - Left: prose status (label + counters) — present only during active
+   *     inference (statusVisible + thinkStarted).
+   *   - Right: visualizer wave — always painted, even at idle. Width adapts
+   *     to whatever space is left on the row, so on terminal resize the wave
+   *     grows or shrinks to fill the remaining edge.
+   *
+   * Returns `null` only when there is literally nothing to paint (alt-screen
+   * not active OR cols unknown). drawFixedPrompt handles the null case.
+   */
   private getStatusLine(): string | null {
-    if (!this.statusVisible || !this.thinkStarted) return null;
-    const elapsed = this.formatDuration(Date.now() - this.actionStartTime);
-    const arrow = this.tokenDirection === 'down' ? '↓' : '↑';
-    const deltaTokens = Math.max(0, this.tokenTotal - this.startTokens);
-    const tokenStr = ' ' + arrow + ' ' + this.formatTokenCount(deltaTokens) + ' tokens';
-    const tpsStr = this.tokensPerSecond && this.tokensPerSecond > 0
-      ? ' · ' + this.formatTokensPerSecond(this.tokensPerSecond)
-      : '';
-    const label = this.opLabel || 'Thinking';
-    // Mini visualizer prefix (10 cols of wave glyphs). Colourised cyan so it
-    // reads as "active" but doesn't compete with the prose status info.
+    if (this.plain) return null;
+    const cols = this.output.columns || process.stdout.columns || 80;
+    if (cols < 12) return null;
+
+    // Compose the prose section (visible only during active inference).
+    let prose = '';
+    let proseVisibleLen = 0;
+    if (this.statusVisible && this.thinkStarted) {
+      const elapsed = this.formatDuration(Date.now() - this.actionStartTime);
+      const arrow = this.tokenDirection === 'down' ? '↓' : '↑';
+      const deltaTokens = Math.max(0, this.tokenTotal - this.startTokens);
+      const tokenStr = ' ' + arrow + ' ' + this.formatTokenCount(deltaTokens) + ' tokens';
+      const tpsStr = this.tokensPerSecond && this.tokensPerSecond > 0
+        ? ' · ' + this.formatTokensPerSecond(this.tokensPerSecond)
+        : '';
+      const label = this.opLabel || 'Thinking';
+      prose = chalk.gray(label + ' (' + elapsed + tokenStr + tpsStr + ' · esc to interrupt)');
+      proseVisibleLen = this.stripAnsi(prose).length;
+    }
+
+    // Compute visualizer width = whatever space is left on the row after the
+    // prose, minus a 1-col margin. Resizing the terminal automatically
+    // changes `cols`, so the wave grows/shrinks on every paint.
+    const margin = 1;
+    const available = cols - proseVisibleLen - margin;
+    if (available < 4) {
+      // Terminal too narrow for the wave AND the prose: drop the wave so the
+      // prose stays legible.
+      return prose || null;
+    }
+    this.visualizer.setWidth(available);
     const wave = chalk.cyan(this.visualizer.render());
-    return wave + ' ' + label + ' (' + elapsed + tokenStr + tpsStr + ' · esc to interrupt)';
+
+    // Left-pad with the prose and a single space, then right-align the wave.
+    if (proseVisibleLen === 0) {
+      // Idle: only the wave, right-aligned.
+      return ' '.repeat(margin) + wave;
+    }
+    return prose + ' '.repeat(margin) + wave;
   }
 
   private getSpinnerFrame(): string {
@@ -847,10 +882,11 @@ export class CliRenderer {
     const cols = this.output.columns || process.stdout.columns || 80;
     const preserveCursor = opts?.preserveCursor === true;
 
-    const statusLine = (this.statusVisible && this.thinkStarted) ? this.getStatusLine() : null;
-    const statusPainted = statusLine
-      ? chalk.gray(this.clampToWidth(statusLine, cols))
-      : '';
+    // Always call getStatusLine — even at idle it returns the breathing wave
+    // at the right edge. Internal coloring is set inside getStatusLine; no
+    // outer wrap here (chalk.gray would corrupt the cyan wave ANSI).
+    const statusLine = this.getStatusLine();
+    const statusPainted = statusLine ? this.clampToWidth(statusLine, cols) : '';
 
     let out = '';
     if (preserveCursor) out += '\x1b7';
@@ -886,18 +922,18 @@ export class CliRenderer {
     if (this.plain || this.altScreenActive) return;
     // \x1b[?1049h  enter alt-screen + save cursor + clear it
     // \x1b[H        cursor home (1,1)
-    // \x1b[?1007h  alternate scroll mode: in alt-screen, mouse wheel emits
-    //              up/down arrow keys. Combined with the terminal's native
-    //              alt-screen scrollback (most modern terminals: kitty,
-    //              alacritty, iTerm2, GNOME Terminal, WezTerm) this gives
-    //              wheel-based scrollback inside the CLI.
-    //              For terminals without native alt-screen scrollback, the
-    //              user can still scroll via Shift+PgUp/PgDn.
+    // \x1b[?1007h  alternate scroll mode (mouse wheel → arrows in alt-screen)
     this.output.write('\x1b[?1049h\x1b[H\x1b[?1007h');
     this.altScreenActive = true;
-    // Activate DECSTBM region 1..rows-2 once, here. The bottom two rows are
-    // now permanently reserved for the pinned status + prompt.
     this.enterStreamScrollRegion();
+
+    // Permanent 30 FPS animation tick. Runs the whole alt-screen lifetime so
+    // the wave at the right edge of the status bar never stops "breathing".
+    // refreshStatus chooses preserveCursor based on whether a stream is open,
+    // so it's safe to fire during typing AND during streaming.
+    if (!this.statusInterval) {
+      this.statusInterval = setInterval(() => this.refreshStatus(), 33);
+    }
 
     process.on('exit', this.cleanupAltScreen);
     process.on('SIGINT', this.cleanupAltScreen);
@@ -912,9 +948,12 @@ export class CliRenderer {
 
   private exitAltScreen(): void {
     if (!this.altScreenActive) return;
+    if (this.statusInterval) {
+      clearInterval(this.statusInterval);
+      this.statusInterval = null;
+    }
     this.exitStreamScrollRegion();
-    // \x1b[?1007l   disable alternate scroll mode (so wheel goes back to
-    //               terminal scrollback on main screen)
+    // \x1b[?1007l   disable alternate scroll mode
     // \x1b[?1049l   leave alt-screen + restore prior main-screen contents
     this.output.write('\x1b[?1007l\x1b[?1049l');
     this.altScreenActive = false;
