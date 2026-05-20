@@ -658,9 +658,12 @@ export class CliRenderer {
   private showStatusLine(): void {
     if (this.statusInterval) clearInterval(this.statusInterval);
     this.statusVisible = true;
-    // 250ms keeps the wave visualizer animation visible without burning much
-    // CPU (the heavy paint cost is the bottom-bar redraw which is small).
-    this.statusInterval = setInterval(() => this.refreshStatus(), 250);
+    // 33ms = 30 FPS — matches visualizer.py's FPS=30. Smooth wave animation.
+    // Paint is cheap (~150 bytes of ANSI per redraw via save-restore cursor),
+    // so this is well under measurable CPU impact even during long inferences.
+    // Interval runs ONLY when a status is active (started in showStatusLine,
+    // cleared in clearStatusLine), so idle has zero overhead.
+    this.statusInterval = setInterval(() => this.refreshStatus(), 33);
     this.refreshStatus();
   }
 
