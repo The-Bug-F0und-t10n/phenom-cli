@@ -2,6 +2,7 @@ import chalk from 'chalk';
 import readline from 'readline';
 import { eventBus, EventType } from './tui/event-bus.js';
 import { StreamMarkdownRenderer } from './stream-markdown-renderer.js';
+import { MiniVisualizer } from './visualizer-mini.js';
 
 interface PendingFileDiff {
   path: string;
@@ -82,6 +83,14 @@ export class CliRenderer {
   private altScreenActive: boolean = false;
   /** Bound cleanup handler, registered on multiple process signals. */
   private readonly cleanupAltScreen = () => this.exitAltScreen();
+
+  /**
+   * Mini wave visualizer rendered as a prefix in the status line. State
+   * (idle/thinking/working/...) is updated on THINK_START / PROGRESS_UPDATE
+   * / THINK_END so the wave matches what the agent is doing.
+   * Default 10 columns — minimum size that still shows a meaningful wave.
+   */
+  private visualizer = new MiniVisualizer(10);
 
   /**
    * Number of terminal lines the dynamic area occupies (content ABOVE the prompt).
@@ -405,6 +414,7 @@ export class CliRenderer {
         this.actionStartTime = Date.now();
       }
       this.opLabel = this.deriveOpLabel(this.currentAction, this.opLabel);
+      this.visualizer.setMode(MiniVisualizer.modeFromOpLabel(this.opLabel));
       this.showStatusLine();
     }));
 
@@ -639,6 +649,7 @@ export class CliRenderer {
     this.streamMode = 'none';
     this.reasoningStreamed = false;
     this.opLabel = this.deriveOpLabel(this.currentAction, '');
+    this.visualizer.setMode(MiniVisualizer.modeFromOpLabel(this.opLabel));
     this.thinkStarted = true;
     this.statusVisible = false;
     this.scheduleRender();
@@ -647,7 +658,9 @@ export class CliRenderer {
   private showStatusLine(): void {
     if (this.statusInterval) clearInterval(this.statusInterval);
     this.statusVisible = true;
-    this.statusInterval = setInterval(() => this.refreshStatus(), 1000);
+    // 250ms keeps the wave visualizer animation visible without burning much
+    // CPU (the heavy paint cost is the bottom-bar redraw which is small).
+    this.statusInterval = setInterval(() => this.refreshStatus(), 250);
     this.refreshStatus();
   }
 
@@ -670,6 +683,7 @@ export class CliRenderer {
     this.statusVisible = false;
     this.lastStatusLine = '';
     this.thinkStarted = false;
+    this.visualizer.setMode('idle');
     if (this.statusInterval) {
       clearInterval(this.statusInterval);
       this.statusInterval = null;
@@ -693,8 +707,10 @@ export class CliRenderer {
       ? ' · ' + this.formatTokensPerSecond(this.tokensPerSecond)
       : '';
     const label = this.opLabel || 'Thinking';
-    const spinner = this.getSpinnerFrame();
-    return label + ' ' + spinner + ' (' + elapsed + tokenStr + tpsStr + ' · esc to interrupt)';
+    // Mini visualizer prefix (10 cols of wave glyphs). Colourised cyan so it
+    // reads as "active" but doesn't compete with the prose status info.
+    const wave = chalk.cyan(this.visualizer.render());
+    return wave + ' ' + label + ' (' + elapsed + tokenStr + tpsStr + ' · esc to interrupt)';
   }
 
   private getSpinnerFrame(): string {
@@ -865,7 +881,16 @@ export class CliRenderer {
 
   private enterAltScreen(): void {
     if (this.plain || this.altScreenActive) return;
-    this.output.write('\x1b[?1049h\x1b[H');
+    // \x1b[?1049h  enter alt-screen + save cursor + clear it
+    // \x1b[H        cursor home (1,1)
+    // \x1b[?1007h  alternate scroll mode: in alt-screen, mouse wheel emits
+    //              up/down arrow keys. Combined with the terminal's native
+    //              alt-screen scrollback (most modern terminals: kitty,
+    //              alacritty, iTerm2, GNOME Terminal, WezTerm) this gives
+    //              wheel-based scrollback inside the CLI.
+    //              For terminals without native alt-screen scrollback, the
+    //              user can still scroll via Shift+PgUp/PgDn.
+    this.output.write('\x1b[?1049h\x1b[H\x1b[?1007h');
     this.altScreenActive = true;
     // Activate DECSTBM region 1..rows-2 once, here. The bottom two rows are
     // now permanently reserved for the pinned status + prompt.
@@ -885,7 +910,10 @@ export class CliRenderer {
   private exitAltScreen(): void {
     if (!this.altScreenActive) return;
     this.exitStreamScrollRegion();
-    this.output.write('\x1b[?1049l');
+    // \x1b[?1007l   disable alternate scroll mode (so wheel goes back to
+    //               terminal scrollback on main screen)
+    // \x1b[?1049l   leave alt-screen + restore prior main-screen contents
+    this.output.write('\x1b[?1007l\x1b[?1049l');
     this.altScreenActive = false;
   }
 
