@@ -1,0 +1,24 @@
+{
+  "sessionId": "78464e3073a4faec",
+  "createdAt": 1779316749371,
+  "updatedAt": 1779316778018,
+  "userRequest": "ola",
+  "notes": [],
+  "createdFiles": [],
+  "failedOperations": [],
+  "insights": [],
+  "pendingTasks": [],
+  "planSteps": [],
+  "messages": [
+    {
+      "role": "user",
+      "content": "ola",
+      "timestamp": 1779316752954
+    },
+    {
+      "role": "assistant",
+      "content": "Olá! 👋\n\nSou o Phenom, seu assistente de codificação. Estou pronto para ajudar com:\n\n- 📝 **Edição de código** - adicionar, modificar ou remover código\n- 🔍 **Busca de símbolos** - encontrar funções, classes, variáveis\n- 🧪 **Execução de código** - rodar comandos shell, testar scripts\n- 📊 **Análise de projeto** - explorar estrutura, entender o código\n- 🐛 **Depuração** - ajudar a encontrar e corrigir bugs\n- 📦 **Gestão de Git** - commits, diffs, status\n\nEstou trabalhando no projeto: `/home/ashirak/Projects/person/ai/cli-ai/phenom-cli-ts`\n\nEm que posso ajudar você hoje?",
+      "timestamp": 1779316778018
+    }
+  ]
+}
