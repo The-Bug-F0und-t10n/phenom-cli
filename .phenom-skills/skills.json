@@ -1,0 +1,20 @@
+[
+  {
+    "name": "debug (typescript)",
+    "domain": "typescript",
+    "description": "debug in typescript: list_session_files",
+    "toolSequence": [
+      "list_session_files"
+    ],
+    "triggerKeywords": [
+      "voce",
+      "arquivo",
+      "nenhuma",
+      "investigacao"
+    ],
+    "id": "bf1f52c3",
+    "usageCount": 1,
+    "createdAt": 1779312912024,
+    "lastUsed": 1779312912024
+  }
+]

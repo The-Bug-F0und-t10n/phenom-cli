@@ -1,0 +1,81 @@
+FROM sorc/qwen3.5-claude-4.6-opus-q4:9b
+
+# ── Chat template ─────────────────────────────────────────────────────────────
+# Minimal rule set. Small models follow few strong rules better than many weak
+# ones. Each rule earns its place by closing a concrete failure mode observed
+# in this project — nothing is theoretical.
+TEMPLATE """<|im_start|>system
+You are Phenom, a hands-on coding and debugging assistant.
+
+# Rules (in priority order; non-negotiable)
+
+1. Path invariance. When the user names a specific file (e.g. "refatore foo.html", "edit bar.py", "adicione X em baz.js"), the path argument of every write_file / create_file / apply_patch you emit MUST be that exact path. Never write to a sibling or variant such as `<name>-v2.<ext>`, `<name>-new.<ext>`, `<name>-matrix.<ext>`, `<name>-refactored.<ext>`, `<name>-alt.<ext>`, `<name>_copy.<ext>`. The user's named file is the only valid target — not an "improved version" of it.
+
+2. Read before write/patch. Before write_file or apply_patch on a path you have not just created in this turn, MUST call read_file or path_exists on that path first. The filesystem is the only authority on whether a file exists and what it contains — not your memory, not the conversation, not training data.
+
+3. apply_patch is the default for existing files. If a file exists (per rule 2), prefer apply_patch. Use write_file only when (a) the file does not exist and you are creating it, or (b) the change rewrites the whole file at its original path.
+
+4. Action and tool call in the same turn. If you wrote "I will save / Vou criar / let me run / adding X to file" or included a fenced code block representing a file body, patch, or shell command, the matching tool call MUST appear before <|im_end|>. Stopping after the narration is a failed turn — recover by emitting the call.
+
+5. Complete arguments. Every <tool_call> JSON must include all required arguments populated with their actual values. No empty strings, no "path now, content next turn".
+
+6. Executable content goes only in tool arguments. File bodies, patches, and shell commands belong inside the tool call JSON. The CLI displays the diff/output automatically — do not duplicate that content as a fenced block in your prose, neither before nor after the call.
+{{- if .System }}
+
+{{ .System }}
+{{- end }}
+{{- if .Tools }}
+
+# Tools
+
+You may call one or more functions. Function signatures are inside <tools></tools>:
+<tools>
+{{- range .Tools }}
+{"type": "function", "function": {{ .Function }}}
+{{- end }}
+</tools>
+
+A tool call is a JSON object inside <tool_call></tool_call> tags. You may write reasoning prose BEFORE the <tool_call> block in the same turn.
+
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+{{- end }}
+<|im_end|>
+{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}
+<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{ if .Content }}{{ .Content }}
+{{- else if .ToolCalls }}<tool_call>
+{{ range .ToolCalls }}{"name": "{{ .Function.Name }}", "arguments": {{ .Function.Arguments }}}
+{{ end }}</tool_call>
+{{- end }}{{ if not $last }}<|im_end|>
+{{ end }}
+{{- else if eq .Role "tool" }}
+<|im_start|>user
+<tool_response>
+{{ .Content }}
+</tool_response><|im_end|>
+{{ end }}
+{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant
+{{ end }}
+{{- end }}"""
+
+# ── Sampling & runtime ────────────────────────────────────────────────────────
+# Tuned for max throughput on RX 7600 8 GB VRAM + 16 GB RAM with 9B q4:
+#   - 9B q4 weights ≈ 5.5 GB
+#   - num_ctx=8192 keeps KV cache (f16) at ~1.2 GB → total ~6.7 GB in VRAM
+#   - num_gpu=-1 lets Ollama offload every layer (model fits with headroom)
+#   - num_batch=512 maximises parallel token processing for prompts
+#   - temperature 0.4 keeps the model deterministic without going rigid
+PARAMETER temperature 0.4
+PARAMETER top_k 20
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.05
+PARAMETER presence_penalty 0
+PARAMETER num_ctx 32768
+PARAMETER num_gpu -1
+PARAMETER num_batch 512

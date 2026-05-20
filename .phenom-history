@@ -1,43 +1,3 @@
-crie um index.html que mostre um hello word.
-sim 
-refatore o arquivo index.html para um background gradiente que muda de cor 
-sim
-refatore o arquivo index.html para um background gradiente que muda de cor 
-prossiga
-refatore o arquivo index.html para um background que tenha um efeito matrix
-n
->
-Iteration 2/20 ..  (6s · ↑ 4.0k tokens · esc to interrupt)
-✔ done (total: 4.0k tokens · tempo: 7s)
->
-ola
-refatore o arquivo index.html para um background que tenha um efeito matrix
-ola
-refatore o arquivo index.html para um background que tenha um efeito matrix
-ola
-refatore o arquivo index.html para um background que tenha um efeito matrix
-    7.9 MB    7.2 GB     7.4 GB  N/A     |
-ola
-como voce esta ?
-ola
-refatore o arquivo index.html para um background que tenha um efeito matrix
-> phenom-cli@1.1.0 dev
-> tsx src/index.ts chat
-Session restored (d69e9a18...)
-refatore o arquivo index.html para um background que tenha um efeito matrix
-[user] refatore o arquivo index.html para um background que tenha um efeito matrix
-[assistant] I'll help you refactor the `index.html` file to add a Matrix effect background. Let me first read the current content of the file.
-[tool: read_file] /home/ashirak/Projects/person/ai/cli-ai/phenom-cli-ts/index.html
-  -> <!DOCTYPE html>
-[assistant] I need to read the complete content of index.html to understand what's currently there before making any changes.
-<read_file:file:///home/ashirak/Projects/person/ai/cli-ai/phenom-cli-ts/index.html>
-[done]
->
-ola
-dado um arquivo index.html  no projeto refatore ele para um visual de terminal interativo com efeitos cyberpunk 
-ok leia e refatore
-ola
-dado um arquivo index.html  no projeto refatore ele para um visual de terminal interativo com efeitos cyberpunk 
 agora refatore o arquivo index.html em disco com o que voce gerou o output anterior
 Convert this to a multi-file structure
 Convert this to a multi-file structure, index.html 
@@ -70,3 +30,71 @@ qual o nome deste projeto?
 ola
 /reset
 qual o nome deste projeto?
+ola
+qual o nome deste projeto?
+esse projeto tem git ?
+liste os comits do projeto
+ola
+o que o projeto implementa?
+ola
+crie um hello world em html
+seu hello world tem um bug ele cria 2 "hello world" ao invez de apagar e escrever novamente como um efeito de escrita constante
+ainda nao foi corrijada 
+seu hello world tem um bug ele cria 2 "hello world" ao invez de apagar e escrever novamente como um efeito de escrita constante
+corrija o erro no arquivo hello-word.html na escita do " hello world"
+a animacao do "hello world" esta duplicando o "hello world"
+typewriter effect, esta bugado, nao renderizando o texto correntamente
+solucione o problema use ferramentas para solucionar o codigo 
+corrija o erro no arquivo hello-word.html na escita do " hello world" typewrite
+/reset
+typewriter effect, esta bugado, nao renderizando o texto corretamente duplicando o texto
+ola
+o que esse projeto implementa ?
+por que voce parou ?
+/reset 
+crie um bot para o telegram para fazer um exportacao de um canal para outro 
+export all midias without admin access 
+ajuste o telegram exports para um export de um canal para outro, nao e para baixar localmente e para fazer um export de conteudo de um canal no telegram para outro canal no telegram
+/reset
+ola
+ccrie um arquivo html com um hello world
+ola
+qual o seu nome ?
+ola
+crie um hello world em php
+agora refatore o hello world em php para um pagina simples em html que moste um hello world 
+refatore o hello world em html e adicione um bakcground que muda de cor sozinho.
+crie um hello world em html
+refatore o hello world para um background animado e que mude de cor sozinho
+refatore o hello-world.html e adicione um bakground estilo matrix
+ola
+refatore o hello word em html para ter um background colorido que muda de cor sozinho.
+agora refatore para um design de matrix terminal 
+./llama-server \
+    -m ~/models/phenom-9b-q4.gguf \
+    -c 8192 -ngl -1 -b 512 \
+    --temp 0.4 --top-k 20 --top-p 0.9 --repeat-penalty 1.05 \
+    --port 8080 --host 0.0.0.0
+ola
+analize o hello world em html e diga o que ele implementa 
+ola
+analize o projeto e mostre o que ele implementa 
+analize o visualizer.py e me explique como eu posso integralo ao phenom cli
+ola
+analize o visualizer.py e me explique como eu posso integralo ao phenom cli
+continue
+ola
+analize sua ultima sessao e me diga o que voce falhou
+voce escreveu um codigo sem acao, isso esta nas suas regras para nao fazer por que fez?
+voce usa markdown ao inez de usar ferramentas e diz que executou e criou algo, mas na verdade so escreveu um markdown
+vooce nao testou o projeto e nao verificou se suas modificacoes sao validas
+syntaxError identifier execAsync has already been declared visualizer-wrapper.js:17 
+visualizeWrapper is not defined cli-renderer.ts 
+me diga phenom por que voce recebeu este nome voce sabe ?
+phenom voce deve respeitar todas as regras impostas, nunca assume o caminho facil, obedeca as regras
+por que esta falando comigo em engle ?
+voce tem regras phenom, todas as regras que voce tem eu fui claro, nao se faca de esperto 
+phenom suas regras operacionais quais sao ? o que o usuario espera de voce quando solicitado uma task ?
+voce nao consegue usar patch, sempre que voce usa, o conteudo nao e econtrado, somente me diga o por que, nao escreva na de codigo
+voce nao leu o arquivo e nao fez nenhuma investigacao do bug 
+session files nao funciona liga a investigacao usando comandos em shell
