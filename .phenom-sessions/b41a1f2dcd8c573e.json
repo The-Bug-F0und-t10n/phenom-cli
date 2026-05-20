@@ -1,8 +1,0 @@
-{
-  "id": "plan-1778346508899",
-  "originalRequest": "Crie apenas o arquivo test.txt com conteudo \"Hello World\" usando write_file",
-  "steps": [],
-  "completedSteps": [],
-  "createdAt": 1778346508899,
-  "updatedAt": 1778346508899
-}

@@ -1,8 +1,0 @@
-{
-  "id": "plan-1778346805303",
-  "originalRequest": "Crie 3 arquivos: index.html (HTML básico), src/App.tsx (componente React), src/styles.css (estilo body). Use write_file para cada um, um por vez, verificando depois de cada um.",
-  "steps": [],
-  "completedSteps": [],
-  "createdAt": 1778346805303,
-  "updatedAt": 1778346805303
-}

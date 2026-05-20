@@ -71,7 +71,11 @@ const REASONING_MODELS = [
   'r1',
   'deepseek-r1',
   'qwq',
-  'deepseekr1'
+  'deepseekr1',
+  // phenom (Qwen3-Next base) emits chain-of-thought natively via Ollama.
+  // Marking it as reasoning-capable makes the agent forward the `think`
+  // parameter and the renderer expect [thinking] chunks.
+  'phenom'
 ];
 
 const NATIVE_TOOLS_FAMILIES = [
@@ -83,7 +87,12 @@ const NATIVE_TOOLS_FAMILIES = [
   'command',
   'deepseek',
   'gemma4',
-  'gemma-4'
+  'gemma-4',
+  // 'phenom' is the local Ollama tag derived from a Qwen3-Next base. Without
+  // this entry, detectModelCapabilities returns supportsNativeTools=false for
+  // 'phenom:latest', which silently falls back to the legacy phenom JSON
+  // tool-call protocol and the model never receives the tools schema.
+  'phenom'
 ];
 
 const OPENAI_FORMAT_FAMILIES = [
@@ -96,7 +105,11 @@ const OPENAI_FORMAT_FAMILIES = [
 
 function detectModelFamily(modelName: string): string {
   const lower = modelName.toLowerCase();
-  
+
+  // phenom is a custom Ollama tag built FROM a qwen3.5 base (see Modelfile).
+  // Map it to 'qwen' so family-keyed capability checks (vision, reasoning,
+  // etc.) apply to it like to any other Qwen variant.
+  if (lower.includes('phenom')) return 'qwen';
   if (lower.includes('qwen')) return 'qwen';
   if (lower.includes('llama')) return 'llama';
   if (lower.includes('phi')) return 'phi';
@@ -105,7 +118,7 @@ function detectModelFamily(modelName: string): string {
   if (lower.includes('command')) return 'cohere';
   if (lower.includes('deepseek')) return 'deepseek';
   if (lower.includes('gemma')) return 'gemma';
-  
+
   return 'unknown';
 }
 

@@ -174,6 +174,12 @@ export class ApiClient {
   private activeModel: string;
   private timeoutMs: number;
   private runtimeOptions: RuntimeOptions;
+  /**
+   * Ollama's `think` parameter. null/undefined omits the field entirely
+   * (compatible with older Ollama versions and non-thinking models). The Agent
+   * sets this based on model capability + OLLAMA_THINK env.
+   */
+  private thinkValue: boolean | string | null = null;
 
   constructor() {
     this.baseUrl = this.normalizeHost(String(config.ollama.host || 'http://127.0.0.1:11434'));
@@ -193,6 +199,11 @@ export class ApiClient {
     return this.activeModel;
   }
 
+  /** Set the `think` field sent in chat requests. null = omit. */
+  setThink(value: boolean | string | null): void {
+    this.thinkValue = value;
+  }
+
   async chat(
     messages: ApiChatMessage[],
     tools?: ApiToolDef[]
@@ -208,6 +219,7 @@ export class ApiClient {
       body.tools = tools;
       body.tool_choice = 'auto';
     }
+    if (this.thinkValue !== null) body.think = this.thinkValue;
 
     let res = await this.fetchWithTimeout(url, body);
     let json: OpenAICompatResponse;
@@ -258,6 +270,7 @@ export class ApiClient {
       body.tools = tools;
       body.tool_choice = 'auto';
     }
+    if (this.thinkValue !== null) body.think = this.thinkValue;
 
     let res = await this.fetchWithTimeout(url, body);
     if (!res.ok) {
@@ -589,6 +602,7 @@ export class ApiClient {
     if (tools && tools.length > 0) {
       body.tools = tools;
     }
+    if (this.thinkValue !== null) body.think = this.thinkValue;
     return body;
   }
 

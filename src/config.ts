@@ -40,6 +40,22 @@ const parseKeepAlive = (value: string | undefined): string | number => {
   return raw;
 };
 
+/**
+ * Raw OLLAMA_THINK value, kept as-is for the Agent to resolve at runtime
+ * (it needs supportsReasoning to compute the "auto" default). Accepted:
+ *   undefined / "" / "auto"  → auto-on for reasoning-capable models
+ *   "true" | "1" | "yes"     → force on
+ *   "false" | "0" | "no"     → force off
+ *   "low" | "medium" | "high" → graded level (forwarded as string)
+ */
+const parseThinkMode = (value: string | undefined): string | undefined => {
+  if (value === undefined) return undefined;
+  const raw = value.trim().toLowerCase();
+  if (!raw || raw === 'auto') return 'auto';
+  const allowed = new Set(['true', '1', 'yes', 'false', '0', 'no', 'low', 'medium', 'high']);
+  return allowed.has(raw) ? raw : 'auto';
+};
+
 const modelHint = (process.env.OLLAMA_MODEL || '').toLowerCase();
 const isSmallModel = modelHint.includes('2b') || modelHint.includes('4b');
 const is14bModel = modelHint.includes('9b');
@@ -56,6 +72,7 @@ export const config = {
     model: process.env.OLLAMA_CODER_MODEL || process.env.OLLAMA_MODEL,
     keepAlive: parseKeepAlive(process.env.OLLAMA_KEEP_ALIVE),
     requestTimeoutMs: parseInteger(process.env.OLLAMA_REQUEST_TIMEOUT_MS, 600000),
+    thinkMode: parseThinkMode(process.env.OLLAMA_THINK),
     adaptiveContext: {
       enabled: process.env.OLLAMA_ADAPTIVE_CTX === 'true' ? true : false,
       minCtx: ollamaMinCtx,

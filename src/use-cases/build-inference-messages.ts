@@ -9,6 +9,15 @@ interface BuildInferenceMessagesDeps {
   currentUserContent?: ApiContentPart[];
   maxContextTokens: number;
   summarizeConversation(messages: InferenceMessage[]): Promise<string>;
+  /**
+   * Optional session id — was used by a context-store integration that is
+   * currently not wired (deferred from the minimal-recovery scope). Accepted
+   * here so callers/tests can still pass it without a type error; ignored by
+   * the implementation until the context-store path is restored.
+   */
+  sessionId?: string;
+  /** Same rationale as sessionId — accepted but unused in this minimal build. */
+  contextStore?: unknown;
 }
 
 export async function buildInferenceMessagesUseCase(

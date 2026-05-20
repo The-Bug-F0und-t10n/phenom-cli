@@ -54,6 +54,11 @@ export class Agent {
   async initialize(existingSessionId?: string): Promise<string> {
     await this.sessionManager.init();
 
+    // Wire the brain getter so session-scoped tools (list_session_files, etc.)
+    // observe the current brain through this provider, surviving session
+    // restores without needing tool re-registration.
+    this.toolSystem.setBrainProvider(() => this.brain);
+
     if (existingSessionId && existingSessionId.length === 16) {
       this.brain = await this.sessionManager.loadSession(existingSessionId);
       if (this.brain) {
@@ -550,10 +555,42 @@ Keep the summary under 400 tokens. Do not add commentary.`;
     if (!targetModel) return;
 
     const currentModel = this.llm.getActiveModel();
-    if (currentModel === targetModel) return;
+    if (currentModel === targetModel) {
+      // Even on no-op model swap, re-apply think setting (covers first-time setup).
+      this.applyThinkSetting();
+      return;
+    }
 
     this.llm.setActiveModel(targetModel);
     // Sync capabilities to the new model so native-tools routing stays correct.
     this.modelCapabilities = detectModelCapabilities(targetModel);
+    this.applyThinkSetting();
+  }
+
+  /**
+   * Resolve OLLAMA_THINK env override + supportsReasoning into a concrete
+   * `think` value and push it to the LLM client.
+   *
+   * Resolution rules:
+   *   - env "auto" or unset → think=true when supportsReasoning, else null
+   *   - env "true"/"1"/"yes" → think=true
+   *   - env "false"/"0"/"no" → think=false (sent explicitly)
+   *   - env "low"/"medium"/"high" → forward the level string
+   */
+  private applyThinkSetting(): void {
+    const mode = config.ollama.thinkMode;
+    let resolved: boolean | string | null;
+    if (!mode || mode === 'auto') {
+      resolved = this.modelCapabilities.supportsReasoning ? true : null;
+    } else if (mode === 'true' || mode === '1' || mode === 'yes') {
+      resolved = true;
+    } else if (mode === 'false' || mode === '0' || mode === 'no') {
+      resolved = false;
+    } else if (mode === 'low' || mode === 'medium' || mode === 'high') {
+      resolved = mode;
+    } else {
+      resolved = this.modelCapabilities.supportsReasoning ? true : null;
+    }
+    this.llm.setThink(resolved);
   }
 }

@@ -9,6 +9,9 @@ import { registerGitTools } from './tools/registrars/git-tools.js';
 import { registerNavigationTools } from './tools/registrars/navigation-tools.js';
 import { registerSearchTools } from './tools/registrars/search-tools.js';
 import { registerUtilityTools } from './tools/registrars/utility-tools.js';
+import { registerSessionTools } from './tools/registrars/session-tools.js';
+import { registerWorkflowTools } from './tools/registrars/workflow-tools.js';
+import type { SessionBrain } from './session-brain.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -28,6 +31,12 @@ export class ToolSystem {
   private git: SimpleGit;
   private search: SemanticSearch;
   private syntaxValidator: SyntaxValidator;
+  /**
+   * Late-bound brain getter. Set by Agent after SessionBrain initialises so
+   * session-scoped tools (list_session_files, set_plan, etc.) observe the
+   * current brain on every call.
+   */
+  private brainProvider: (() => SessionBrain | null) = () => null;
 
   constructor() {
     this.tools = new Map();
@@ -35,6 +44,15 @@ export class ToolSystem {
     this.search = new SemanticSearch();
     this.syntaxValidator = new SyntaxValidator();
     this.registerTools();
+  }
+
+  /**
+   * Called by Agent.initialize once the SessionBrain is available. Session
+   * tools see the brain via this getter so it stays current across session
+   * restores.
+   */
+  setBrainProvider(provider: () => SessionBrain | null): void {
+    this.brainProvider = provider;
   }
 
   private async validateSyntax(filePath: string): Promise<{ valid: boolean; output: string; error: string | null }> {
@@ -72,6 +90,18 @@ export class ToolSystem {
     registerUtilityTools({
       register: this.register.bind(this),
       openBrowser: this.openBrowser.bind(this)
+    });
+
+    registerSessionTools({
+      register: this.register.bind(this),
+      brainProvider: () => this.brainProvider()
+    });
+
+    registerWorkflowTools({
+      register: this.register.bind(this),
+      brainProvider: () => this.brainProvider(),
+      syntaxValidator: this.syntaxValidator,
+      execFileAsync
     });
   }
   private openBrowser(url: string, devtools: boolean): void {

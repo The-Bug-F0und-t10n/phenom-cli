@@ -83,6 +83,11 @@ export class OllamaClient {
     return this.api.getActiveModel();
   }
 
+  /** Forward the `think` parameter to the underlying ApiClient. */
+  setThink(value: boolean | string | null): void {
+    this.api.setThink(value);
+  }
+
   async generate(prompt: string, system?: string): Promise<string> {
     for (let attempt = 1; attempt <= this.maxRetries + 1; attempt++) {
       try {

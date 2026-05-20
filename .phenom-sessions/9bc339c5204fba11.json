@@ -1,8 +1,0 @@
-{
-  "id": "plan-1778346470689",
-  "originalRequest": "Crie o arquivo src/components/Footer.tsx com um componente funcional que retorna um footer com copyright do ano atual. Use write_file.",
-  "steps": [],
-  "completedSteps": [],
-  "createdAt": 1778346470689,
-  "updatedAt": 1778346470689
-}
