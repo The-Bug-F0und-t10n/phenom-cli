@@ -2,32 +2,64 @@ import { promises as fs } from 'fs';
 import { readFileSync, existsSync } from 'fs';
 import path from 'path';
 
+/**
+ * Auto-recorded entry per completed task (machine-managed).
+ */
 export interface MemoryEntry {
   request: string;
-  files: string[];        // files touched this session
+  files: string[];        // files touched this session (kept for audit, not injected)
   insights: string[];     // insights from SessionBrain
   timestamp: number;
 }
 
+/**
+ * Model-managed sections that the LLM writes into via the update_memory tool.
+ * These hold semantic knowledge about the project that survives across
+ * sessions: how the codebase is structured, what conventions to respect, what
+ * rules the user has stated. The model builds this over time as it learns.
+ */
+export type ModelMemorySection = 'context' | 'conventions' | 'rules' | 'insights';
+
 const MAX_TASKS    = 10;
-const MAX_INSIGHTS = 15;
+const MAX_INSIGHTS = 20;
 const MAX_FILES    = 15;
+const SECTION_HARD_CAP_CHARS = 4000;
 const PRESERVE_TAG = '<!-- phenom:preserve -->';
+
+const SECTION_HEADERS: Record<ModelMemorySection, string> = {
+  context:     '## Project context',
+  conventions: '## Conventions',
+  rules:       '## Custom rules',
+  insights:    '## Insights'
+};
 
 interface ParsedMemory {
   taskCount: number;
-  tasks:    Array<{ date: string; request: string; files: string[] }>;
-  insights: string[];
-  files:    Map<string, number>;
+  tasks:     Array<{ date: string; request: string; files: string[] }>;
+  // Model-managed sections, stored as raw markdown content (each one is whatever
+  // the model wrote — usually a bulleted list, sometimes prose).
+  modelSections: Record<ModelMemorySection, string>;
+  // Auto-recorded file-touch counts (kept on disk for audit, NOT injected).
+  files:     Map<string, number>;
   preserved: string;
 }
 
 /**
  * Reads and writes .MEMORY.md in the project root.
  *
- * The file has machine-managed sections (tasks, insights, files) and an
- * optional human-editable block after <!-- phenom:preserve --> that is
- * preserved verbatim across every regeneration.
+ * The file has THREE kinds of content:
+ *   1. Machine-managed task log + file counts (auto-recorded after every task).
+ *   2. Model-managed sections — Project context, Conventions, Custom rules,
+ *      Insights — that the LLM writes into via update_memory(). These hold
+ *      durable knowledge about the project; they ARE injected into the system
+ *      prompt on subsequent inferences.
+ *   3. An optional human-editable preserve block (everything after the
+ *      <!-- phenom:preserve --> marker) — never touched by regeneration.
+ *
+ * Why model-managed sections matter: a 9B model loses context fast in long
+ * sessions. By having the model deposit durable observations ("the agent uses
+ * X pattern", "the user prefers Y") into stable sections, subsequent
+ * inferences carry that knowledge forward without re-deriving it from code.
  */
 export class MemoryWriter {
   private memPath: string;
@@ -36,24 +68,30 @@ export class MemoryWriter {
     this.memPath = path.join(cwd, '.MEMORY.md');
   }
 
+  /**
+   * Auto-record a completed task: append to "Recent tasks" + accumulate
+   * insights and file-touch counts. Called by the LearningLoop after every
+   * task completion (regardless of model action).
+   */
   async update(entry: MemoryEntry, taskCount: number): Promise<void> {
     const mem = this.parse();
     mem.taskCount = taskCount;
 
-    // Prepend new task entry
     const date = new Date(entry.timestamp).toISOString().slice(0, 16).replace('T', ' ');
     const shortReq = entry.request.replace(/\n/g, ' ').slice(0, 80);
-    const topFiles = entry.files.slice(0, 3);
-    mem.tasks.unshift({ date, request: shortReq, files: topFiles });
+    mem.tasks.unshift({ date, request: shortReq, files: [] });
     if (mem.tasks.length > MAX_TASKS) mem.tasks = mem.tasks.slice(0, MAX_TASKS);
 
-    // Merge insights (deduplicated)
+    // Insights from brain — deduped, capped.
+    const existing = new Set(this.parseInsightLines(mem.modelSections.insights));
     for (const ins of entry.insights) {
-      if (!mem.insights.includes(ins)) mem.insights.push(ins);
+      if (!existing.has(ins)) {
+        existing.add(ins);
+      }
     }
-    if (mem.insights.length > MAX_INSIGHTS) mem.insights = mem.insights.slice(-MAX_INSIGHTS);
+    const merged = Array.from(existing).slice(-MAX_INSIGHTS);
+    mem.modelSections.insights = merged.map(l => `- ${l}`).join('\n');
 
-    // Accumulate file touch counts
     for (const f of entry.files) {
       mem.files.set(f, (mem.files.get(f) ?? 0) + 1);
     }
@@ -62,27 +100,59 @@ export class MemoryWriter {
   }
 
   /**
-   * Returns a compact excerpt of .MEMORY.md suitable for injection into
-   * the system prompt (max ~600 chars). Empty string if the file doesn't exist.
+   * Model-driven section update. Called via the update_memory tool. The
+   * model passes a section name + content + mode ('append' | 'replace').
    *
-   * The "## Modified files" section is intentionally EXCLUDED from the
-   * injection. The file count list (e.g. "hello-world-matrix.html (1x)") was
-   * surfacing past-output paths as if they were canonical project artifacts,
-   * priming the model to reproduce sibling/variant naming. The section still
-   * exists on disk for human audit — only the injection is filtered.
+   * Append mode: new content is added below the existing section content
+   * (good for accumulating insights, rules, conventions as the project grows).
+   *
+   * Replace mode: section is overwritten entirely (good for re-architecting
+   * the project context section when the model has a better understanding).
+   *
+   * Returns the resulting section body length so the caller (the tool) can
+   * confirm the write to the model.
    */
-  readCompact(maxChars = 600): string {
+  async updateSection(
+    section: ModelMemorySection,
+    content: string,
+    mode: 'append' | 'replace' = 'append'
+  ): Promise<number> {
+    const mem = this.parse();
+    const incoming = String(content || '').trim();
+    if (!incoming) return mem.modelSections[section].length;
+
+    const existing = mem.modelSections[section] || '';
+    let next: string;
+    if (mode === 'replace' || !existing) {
+      next = incoming;
+    } else {
+      next = (existing.trim() + '\n' + incoming).trim();
+    }
+    if (next.length > SECTION_HARD_CAP_CHARS) {
+      next = next.slice(-SECTION_HARD_CAP_CHARS);
+    }
+    mem.modelSections[section] = next;
+    await fs.writeFile(this.memPath, this.render(mem), 'utf-8');
+    return next.length;
+  }
+
+  /**
+   * Compact excerpt for system-prompt injection. Includes the model-managed
+   * sections (Project context, Conventions, Custom rules, Insights) plus the
+   * Recent tasks log. The "## Modified files" file-count list is intentionally
+   * EXCLUDED: it leaks past output paths as pseudo-examples and biases the
+   * model toward reproducing those exact paths.
+   */
+  readCompact(maxChars = 1500): string {
     if (!existsSync(this.memPath)) return '';
     try {
       const raw = readFileSync(this.memPath, 'utf-8');
-      // Strip preserve block and horizontal rule — keep only machine sections
       const idx = raw.indexOf(PRESERVE_TAG);
       let trimmed = (idx === -1 ? raw : raw.slice(0, idx))
         .replace(/^---\s*$/m, '')
         .trim();
 
-      // Drop the "## Modified files" section entirely (and anything after it,
-      // up to the next top-level section or end of the machine block).
+      // Drop "## Modified files" from the injected excerpt.
       const filesIdx = trimmed.indexOf('## Modified files');
       if (filesIdx !== -1) {
         const after = trimmed.indexOf('\n## ', filesIdx + 1);
@@ -93,7 +163,6 @@ export class MemoryWriter {
       }
 
       if (trimmed.length <= maxChars) return trimmed;
-      // Truncate at last complete line within limit
       const cut = trimmed.lastIndexOf('\n', maxChars);
       return trimmed.slice(0, cut > 0 ? cut : maxChars) + '\n…';
     } catch {
@@ -103,30 +172,34 @@ export class MemoryWriter {
 
   // ── Private ─────────────────────────────────────────────────────────
 
-  private parse(): ParsedMemory {
-    const empty: ParsedMemory = {
+  private emptyMem(): ParsedMemory {
+    return {
       taskCount: 0,
       tasks: [],
-      insights: [],
+      modelSections: {
+        context: '',
+        conventions: '',
+        rules: '',
+        insights: ''
+      },
       files: new Map(),
       preserved: ''
     };
+  }
 
-    if (!existsSync(this.memPath)) return empty;
+  private parse(): ParsedMemory {
+    const mem = this.emptyMem();
+    if (!existsSync(this.memPath)) return mem;
 
     try {
       const raw = readFileSync(this.memPath, 'utf-8');
-      const mem: ParsedMemory = { ...empty, files: new Map() };
 
-      // Preserve block
       const pi = raw.indexOf(PRESERVE_TAG);
       if (pi !== -1) mem.preserved = raw.slice(pi + PRESERVE_TAG.length).trim();
 
-      // Task count from header
       const cm = raw.match(/Tasks:\s*(\d+)/);
       if (cm) mem.taskCount = parseInt(cm[1], 10);
 
-      // Tasks section
       const tasksSec = extractSection(raw, '## Recent tasks');
       for (const line of tasksSec.split('\n')) {
         const m = line.match(/^-\s+\[([^\]]+)\]\s+(.+?)(?:\s+\(([^)]+)\))?$/);
@@ -139,14 +212,13 @@ export class MemoryWriter {
         }
       }
 
-      // Insights section
-      const insSec = extractSection(raw, '## Insights');
-      for (const line of insSec.split('\n')) {
-        const m = line.match(/^-\s+(.+)$/);
-        if (m) mem.insights.push(m[1]);
+      for (const key of Object.keys(SECTION_HEADERS) as ModelMemorySection[]) {
+        const body = extractSection(raw, SECTION_HEADERS[key]);
+        if (body && body !== '_none yet_') {
+          mem.modelSections[key] = body;
+        }
       }
 
-      // Files section
       const filesSec = extractSection(raw, '## Modified files');
       for (const line of filesSec.split('\n')) {
         const m = line.match(/^-\s+(.+?)\s+\((\d+)x\)$/);
@@ -155,24 +227,28 @@ export class MemoryWriter {
 
       return mem;
     } catch {
-      return empty;
+      return this.emptyMem();
     }
+  }
+
+  private parseInsightLines(body: string): string[] {
+    if (!body) return [];
+    return body
+      .split('\n')
+      .map(l => l.replace(/^-\s+/, '').trim())
+      .filter(l => l.length > 0 && l !== '_none yet_');
+  }
+
+  private renderSection(key: ModelMemorySection, body: string): string {
+    const trimmed = (body || '').trim();
+    return [SECTION_HEADERS[key], trimmed || '_none yet_'].join('\n');
   }
 
   private render(mem: ParsedMemory): string {
     const today = new Date().toISOString().slice(0, 10);
 
-    // The file list per task was removed from the rendered line because it was
-    // leaking output patterns from past failures back into the system prompt as
-    // pseudo-examples. The agent would then pattern-match its own past mistakes
-    // (e.g. "refatore X.html (X-matrix.html)") as the canonical project style.
-    // The file counts in "## Modified files" still exist for human audit.
     const taskLines = mem.tasks.length
       ? mem.tasks.map(t => `- [${t.date}] ${t.request}`).join('\n')
-      : '_none yet_';
-
-    const insightLines = mem.insights.length
-      ? mem.insights.map(i => `- ${i}`).join('\n')
       : '_none yet_';
 
     const sortedFiles = Array.from(mem.files.entries())
@@ -181,26 +257,29 @@ export class MemoryWriter {
       .map(([f, n]) => `- ${f} (${n}x)`)
       .join('\n') || '_none yet_';
 
-    const preservedSection = mem.preserved
-      ? `\n${mem.preserved}\n`
-      : '';
+    const preservedSection = mem.preserved ? `\n${mem.preserved}\n` : '';
 
     return [
       `# Phenom Memory`,
       `> Updated: ${today} | Tasks: ${mem.taskCount}`,
       ``,
+      this.renderSection('context', mem.modelSections.context),
+      ``,
+      this.renderSection('conventions', mem.modelSections.conventions),
+      ``,
+      this.renderSection('rules', mem.modelSections.rules),
+      ``,
+      this.renderSection('insights', mem.modelSections.insights),
+      ``,
       `## Recent tasks`,
       taskLines,
-      ``,
-      `## Insights`,
-      insightLines,
       ``,
       `## Modified files`,
       sortedFiles,
       ``,
       `---`,
       PRESERVE_TAG,
-      preservedSection,
+      preservedSection
     ].join('\n');
   }
 }

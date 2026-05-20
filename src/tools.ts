@@ -11,6 +11,7 @@ import { registerSearchTools } from './tools/registrars/search-tools.js';
 import { registerUtilityTools } from './tools/registrars/utility-tools.js';
 import { registerSessionTools } from './tools/registrars/session-tools.js';
 import { registerWorkflowTools } from './tools/registrars/workflow-tools.js';
+import { registerMemoryTools } from './tools/registrars/memory-tools.js';
 import type { SessionBrain } from './session-brain.js';
 
 const execFileAsync = promisify(execFile);
@@ -102,6 +103,10 @@ export class ToolSystem {
       brainProvider: () => this.brainProvider(),
       syntaxValidator: this.syntaxValidator,
       execFileAsync
+    });
+
+    registerMemoryTools({
+      register: this.register.bind(this)
     });
   }
   private openBrowser(url: string, devtools: boolean): void {
