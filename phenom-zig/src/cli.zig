@@ -23,6 +23,7 @@ pub const Config = struct {
     command: Command = .help,
     session: []const u8 = "default",
     prompt: []const u8 = "",
+    prompt_provided: bool = false,
     host: []const u8 = "127.0.0.1:11434",
     model: []const u8 = "llama3.2",
     backend: Backend = .ollama,
@@ -65,6 +66,7 @@ pub fn parseArgs(args: []const []const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingPrompt;
             cfg.prompt = args[i];
+            cfg.prompt_provided = true;
         } else if (std.mem.eql(u8, arg, "--host")) {
             i += 1;
             if (i >= args.len) return error.MissingHost;
@@ -122,7 +124,7 @@ pub fn printUsage(writer: anytype) !void {
         \\phenom-zig spike
         \\
         \\commands:
-        \\  chat --prompt TEXT [--session ID] [--offline]
+        \\  chat [--prompt TEXT] [--session ID] [--offline]
         \\  chat --backend ollama|llamacpp --host HOST:PORT --model MODEL --prompt TEXT
         \\  probe --backend ollama|llamacpp --host HOST:PORT
         \\  snapshot
@@ -154,10 +156,20 @@ test "parse chat args" {
     try std.testing.expectEqual(Command.chat, cfg.command);
     try std.testing.expect(std.mem.eql(u8, cfg.session, "s1"));
     try std.testing.expect(std.mem.eql(u8, cfg.prompt, "ola"));
+    try std.testing.expect(cfg.prompt_provided);
     try std.testing.expectEqual(Backend.llamacpp, cfg.backend);
     try std.testing.expectEqual(@as(u16, 32), cfg.max_tokens);
     try std.testing.expectEqual(ThinkingMode.on, cfg.thinking);
     try std.testing.expect(cfg.no_color);
+}
+
+test "parse chat without prompt enables interactive mode" {
+    const args = &.{ "phenom", "chat", "--offline" };
+    const cfg = try parseArgs(args);
+    try std.testing.expectEqual(Command.chat, cfg.command);
+    try std.testing.expect(cfg.offline);
+    try std.testing.expect(!cfg.prompt_provided);
+    try std.testing.expectEqualStrings("", cfg.prompt);
 }
 
 test "parse expected visible output assertion" {

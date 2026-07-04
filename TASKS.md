@@ -5034,3 +5034,87 @@ O que ainda falta fora desta task:
 - Markdown renderer incremental com tabelas/code blocks/highlight equivalente ao TS.
 - Diff renderer com line numbers reais, header info (`lines/bytes/op`) e paleta final anti-ofuscamento.
 - Eventos de renderer completos (`USER_MESSAGE`, `THINK_START`, `TOOL_START`, `TOOL_RESULT`, `FILE_DIFF`, `THINK_END`) em vez de chamadas diretas parciais.
+
+## T230 - Completar TUI interativa Zig com prompt fixo, statusbar, visualizer e prova real
+
+Status: implemented-verified-real.
+
+Cumprimento: 100% para os elementos de CLI exigidos nesta etapa: `chat` sem `--prompt` agora abre TUI raw-mode, pinta prompt fixo com a mesma paleta do `phenom-cli-ts`, reserva scroll region para output append-only, mostra statusbar com visualizer, preserva cursor, aceita historico, setas, backspace UTF-8, bracketed paste basico, Ctrl-D para sair e Ctrl-C para cancelar. Tambem corrige a validacao anterior: `chat --prompt --offline` nao e mais usado como prova de backend; backend real e provado por `real-smoke` e por teste PTY com permissao de rede.
+
+Evidencia:
+
+- `../phenom-cli-ts/src/cli-renderer.ts:333-760` implementa raw stdin, bracketed paste, historico, setas, Ctrl-C/Ctrl-D e prompt ownership.
+- `../phenom-cli-ts/src/cli-renderer.ts:2860-3310` implementa bottom bar com prompt fixo, `USER_BG/USER_FG`, scroll region e cursor parking.
+- `../phenom-cli-ts/src/cli-renderer.ts:2488-2575` implementa statusbar com prose de inferencia e visualizer a direita.
+- `../phenom-cli-ts/src/visualizer-mini.ts` define modos `idle/listening/thinking/working/responding`.
+- `phenom-zig/src/main.zig` antes so executava `chat` com `--prompt`; sem prompt nao havia TUI real equivalente ao fluxo `npm run dev -- chat`.
+- A validacao anterior com `--offline` imprimia `ok`, mas isso era resposta fake local, nao inferencia do modelo.
+
+Impacto:
+
+- `./phenom chat` passa a ser usavel como CLI interativa, nao apenas comando one-shot.
+- Output do modelo continua append-only e copiavel, enquanto prompt/statusbar ficam reservados no rodape.
+- Statusbar sinaliza inferencia com `Thinking (0s · esc to interrupt)` e visualizer em glyphs de bloco.
+- Tool output ganhou glyph `▸` no anuncio, alinhando o sample de tools ao visual Codex-like/TS.
+- `--prompt` continua sendo caminho deterministico para automacao e testes reais.
+- A diferenca entre falha de modelo e falha de infraestrutura fica visivel: teste sem permissao de rede em TTY retornou `SocketCreateFailed`; teste com permissao de rede provou backend.
+
+Teste primeiro:
+
+- Parser: `chat --offline` sem `--prompt` ativa modo interativo.
+- Editor: submit preserva UTF-8 em backspace.
+- Editor: historico com setas sobe/desce.
+- Editor: bytes depois de Enter sao preservados para a proxima leitura (`ola\r\x04`).
+- Prompt view: wrap respeita largura e mantem cursor em janela visivel.
+- Bottom bar: snapshot com status, prompt e visualizer.
+- Visualizer: frames e mapping por label deterministicos.
+- Renderer: tool sample mostra glyph `▸`.
+
+Implementacao:
+
+- `phenom-zig/src/tui.zig`: criar `InputEditor`, `TerminalUi`, `renderBottomBar`, `computePromptView`, `visualizerFrame` e helpers de largura UTF-8.
+- `phenom-zig/src/cli.zig`: adicionar `prompt_provided` para separar one-shot de interativo.
+- `phenom-zig/src/main.zig`: rotear `chat` sem `--prompt` para TUI interativa; extrair `runChatTurnWithUi`; pulsar visualizer durante deltas visiveis/thinking.
+- `phenom-zig/src/render.zig`: adicionar glyph `▸` no sample de tools.
+
+Passos de implementacao:
+
+1. Criar editor puro testavel antes de mexer no terminal.
+2. Adicionar raw mode com `termios`, bracketed paste e restore garantido em `deinit`.
+3. Pintar bottom bar em scroll region DECSTBM sem alternate screen.
+4. Reservar linhas de prompt/status para output append-only nao colidir.
+5. Integrar TUI somente quando `chat` nao recebe `--prompt`.
+6. Manter caminho `--prompt` estavel para automacao.
+7. Pulsar visualizer em eventos de streaming sem thread concorrente.
+8. Validar offline, release, real-smoke e PTY real.
+
+Revisao baixo nivel antes do commit:
+
+- Ownership/lifetime: `InputEditor.submit` devolve linha owned; callers liberam com `allocator.free`. Historico duplica entradas e libera em `deinit`.
+- `deinit`: `TerminalUi.deinit` sempre chama `detach`; `InputEditor.deinit` libera buffer, pending, draft e entradas de historico.
+- C interop: `termios` e `tcsetattr` restauram raw mode; `read` trata `0` como EOF e `<0` como erro; `ioctl(TIOCGWINSZ)` tem fallback 80x24.
+- Bounds/overflow: prompt wrapping usa floors, saturating subtraction e max rows; pending preserva bytes apos submit sem ler fora do slice.
+- UTF-8: backspace/delete andam por boundary de codepoint; statusbar nao corta UTF-8 no meio.
+- Terminal: DECSTBM e bracketed paste sao desativados em detach; teste PTY confirmou cleanup.
+- Concorrencia: visualizer nao usa timer/thread; avanca apenas em chamadas do loop, evitando interleaving com output do modelo.
+- Erro/comportamento: `chat` sem prompt em non-TTY imprime usage e falha como `MissingPrompt`; `--prompt` nao entra na TUI.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- `real-smoke` com `--prompt` prova backend real e nao usa `ok` offline.
+- PTY offline com `ola\r\x04` executa turno, mostra statusbar/visualizer, imprime output e restaura terminal.
+- PTY real com permissao de rede executa turno, backend responde `PHENOM_REAL_7319`, statusbar pulsa e terminal restaura.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest` -> passou; backend retornou `PHENOM_REAL_7319`.
+- PTY offline `./zig-out/bin/phenom chat --offline --no-color`, input `ola\r\x04` -> passou; exibiu statusbar, visualizer, user bubble, `ok`, `[done]` e restaurou terminal.
+- PTY real com rede liberada `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 96 --thinking off --expect-contains PHENOM_REAL_7319 --show-expect-status`, input `Complete: PHENOM_REAL_7319\r\x04` -> passou; backend retornou `PHENOM_REAL_7319`, status de sucesso e `[done]`.
+
+Observacao operacional:
+
+- O teste PTY real sem permissao de rede falhou com `SocketCreateFailed`; isso foi classificado como infraestrutura/sandbox e repetido com permissao elevada. O teste elevado passou.

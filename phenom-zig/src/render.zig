@@ -112,6 +112,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             try self.blockGap(.tool);
             self.tool_seq += 1;
             try self.writeContentGutter();
+            try self.writeCyanBold("▸ ");
             try self.writer.print("{}. ", .{self.tool_seq});
             try self.writeCyanBold(toolLabel(name));
             try self.writer.writeAll(toolDetail(name));
@@ -473,7 +474,7 @@ test "tool sample uses phenom cli ts tool announcement and output gutter" {
     try renderer.toolSample("read_file_range", "a\nb\nc\n");
 
     const expected =
-        \\ 1. Reading file range
+        \\ ▸ 1. Reading file range
         \\     │ a
         \\     │ b
         \\     └─ (1 more line truncated)

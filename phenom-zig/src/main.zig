@@ -12,6 +12,7 @@ const render = @import("render.zig");
 const tool_call = @import("tool_call.zig");
 const tool_loop = @import("tool_loop.zig");
 const tools = @import("tools.zig");
+const tui = @import("tui.zig");
 
 const c = @cImport({
     @cInclude("sys/stat.h");
@@ -88,17 +89,58 @@ fn backendName(backend: cli.Backend) []const u8 {
 
 fn runChat(allocator: std.mem.Allocator, config: cli.Config) !void {
     const stdout = fd_writer.FdWriter{ .fd = 1 };
-    var renderer = render.AppendOnlyRenderer(@TypeOf(stdout)).init(stdout, .{ .color = !config.no_color });
+    if (!config.prompt_provided) return runInteractiveChat(allocator, config, stdout);
+    try runChatTurn(allocator, config, stdout, config.prompt);
+}
+
+fn runInteractiveChat(allocator: std.mem.Allocator, config: cli.Config, stdout: fd_writer.FdWriter) !void {
+    var ui = tui.TerminalUi(@TypeOf(stdout)).init(allocator, stdout, !config.no_color);
+    defer ui.deinit();
+
+    ui.attach() catch |err| switch (err) {
+        error.NotATty => {
+            try cli.printUsage(fd_writer.FdWriter{ .fd = 2 });
+            return error.MissingPrompt;
+        },
+        else => return err,
+    };
+
+    while (true) {
+        const line = ui.readLine() catch |err| switch (err) {
+            error.Cancelled => return,
+            else => return err,
+        };
+        const prompt = line orelse return;
+        defer allocator.free(prompt);
+        if (std.mem.trim(u8, prompt, " \t\r\n").len == 0) {
+            try ui.showPrompt();
+            continue;
+        }
+
+        try ui.showStatus("Thinking (0s · esc to interrupt)");
+        try ui.positionContent();
+        try runChatTurnWithUi(allocator, config, stdout, prompt, &ui);
+        try ui.showDone();
+    }
+}
+
+fn runChatTurn(allocator: std.mem.Allocator, config: cli.Config, stdout: fd_writer.FdWriter, prompt: []const u8) !void {
+    try runChatTurnWithUi(allocator, config, stdout, prompt, null);
+}
+
+fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: fd_writer.FdWriter, prompt: []const u8, ui: anytype) !void {
+    const size = tui.terminalSize();
+    var renderer = render.AppendOnlyRenderer(@TypeOf(stdout)).init(stdout, .{ .color = !config.no_color, .terminal_columns = size.cols });
 
     try makeDirIfMissing(".phenom-zig");
     var db = try audit.AuditDb.open(allocator, ".phenom-zig/phenom.db");
     defer db.close();
 
-    try db.recordEvent(config.session, "turn_start", config.prompt);
-    try renderer.user(config.prompt);
+    try db.recordEvent(config.session, "turn_start", prompt);
+    try renderer.user(prompt);
 
     if (config.demo_read_file) |path| {
-        const allowed = gate.isAllowed("read_file_range", &.{ "read_file_range" });
+        const allowed = gate.isAllowed("read_file_range", &.{"read_file_range"});
         if (!allowed) return error.ToolDenied;
         const range = try tools.readFileRange(allocator, path, 1, 12, 16 * 1024);
         defer range.deinit(allocator);
@@ -131,13 +173,14 @@ fn runChat(allocator: std.mem.Allocator, config: cli.Config) !void {
             .renderer = &renderer,
             .db = &db,
             .session = config.session,
-            .filter = reasoning_filter.ReasoningFilter.init(allocator, http.resolveThinking(config.thinking, config.prompt) == .on),
+            .ui = ui,
+            .filter = reasoning_filter.ReasoningFilter.init(allocator, http.resolveThinking(config.thinking, prompt) == .on),
             .visible = std.ArrayList(u8).empty,
             .visible_bytes = 0,
             .thinking_bytes = 0,
         };
         defer sink.deinit();
-        client.streamChat(config.prompt, &sink) catch |err| {
+        client.streamChat(prompt, &sink) catch |err| {
             const endpoint = client.endpointSummary(allocator) catch "unknown-endpoint";
             defer if (!std.mem.eql(u8, endpoint, "unknown-endpoint")) allocator.free(endpoint);
             const message = try std.fmt.allocPrint(
@@ -193,6 +236,7 @@ fn StreamSink(comptime RendererPtr: type) type {
         renderer: RendererPtr,
         db: *audit.AuditDb,
         session: []const u8,
+        ui: ?*tui.TerminalUi(fd_writer.FdWriter),
         filter: reasoning_filter.ReasoningFilter,
         visible: std.ArrayList(u8),
         visible_bytes: usize,
@@ -215,12 +259,14 @@ fn StreamSink(comptime RendererPtr: type) type {
             ctx.visible_bytes += visible.len;
             try ctx.visible.appendSlice(ctx.allocator, visible);
             try ctx.renderer.assistantDelta(visible);
+            if (ctx.ui) |ui| try ui.pulseStatus();
             try ctx.db.recordEvent(ctx.session, "assistant_delta", visible);
         }
 
         pub fn writeThinking(ctx: *@This(), thinking: []const u8) !void {
             ctx.thinking_bytes += thinking.len;
             try ctx.renderer.thinkingDelta(thinking);
+            if (ctx.ui) |ui| try ui.pulseStatus();
             try ctx.db.recordEvent(ctx.session, "assistant_thinking_delta", thinking);
         }
 
@@ -265,4 +311,5 @@ test {
     _ = tool_call;
     _ = tool_loop;
     _ = tools;
+    _ = tui;
 }
