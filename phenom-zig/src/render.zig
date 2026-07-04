@@ -108,14 +108,22 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         }
 
         pub fn toolSample(self: *Self, name: []const u8, sample: []const u8) !void {
+            try self.toolSampleWithDetail(name, "", sample);
+        }
+
+        pub fn toolSampleWithDetail(self: *Self, name: []const u8, detail: []const u8, sample: []const u8) !void {
             try self.closeOpenBlocks();
             try self.blockGap(.tool);
             self.tool_seq += 1;
             try self.writeContentGutter();
             try self.writeCyanBold("▸ ");
-            try self.writer.print("{}. ", .{self.tool_seq});
             try self.writeCyanBold(toolLabel(name));
-            try self.writer.writeAll(toolDetail(name));
+            if (detail.len > 0) {
+                try self.writeDim(": ");
+                try self.writer.writeAll(detail);
+            } else {
+                try self.writer.writeAll(toolDetail(name));
+            }
             try self.writer.writeAll("\n");
             try self.writeToolOutput(sample);
             self.last_block = .tool;
@@ -474,9 +482,26 @@ test "tool sample uses phenom cli ts tool announcement and output gutter" {
     try renderer.toolSample("read_file_range", "a\nb\nc\n");
 
     const expected =
-        \\ ▸ 1. Reading file range
+        \\ ▸ Reading file range
         \\     │ a
         \\     │ b
+        \\     └─ (1 more line truncated)
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, buffer.items);
+}
+
+test "tool sample renders command detail like phenom cli ts" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .max_tool_sample_lines = 1 });
+    try renderer.toolSampleWithDetail("run_code", "ls -la ~/.config/nvim", "$ ls -la ~/.config/nvim    [cwd=. exit 0 3ms]\nfile\n");
+
+    const expected =
+        \\ ▸ Running: ls -la ~/.config/nvim
+        \\     │ $ ls -la ~/.config/nvim    [cwd=. exit 0 3ms]
         \\     └─ (1 more line truncated)
         \\
     ;

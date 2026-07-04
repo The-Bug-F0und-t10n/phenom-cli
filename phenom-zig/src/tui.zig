@@ -24,6 +24,8 @@ pub const BottomBarState = struct {
     cols: usize = 80,
     status: ?[]const u8 = null,
     visualizer: ?[]const u8 = null,
+    visualizer_mode: ?VisualizerMode = null,
+    visualizer_tick: usize = 0,
     prompt: []const u8 = "",
     cursor: usize = 0,
     show_prompt: bool = true,
@@ -60,6 +62,16 @@ pub fn visualizerFrame(mode: VisualizerMode, tick: usize) []const u8 {
     };
 }
 
+pub fn writeVisualizerFrame(writer: anytype, mode: VisualizerMode, tick: usize, width: usize) !void {
+    const frame = visualizerFrame(mode, tick);
+    if (width == 0) return;
+    var i: usize = 0;
+    while (i < width) : (i += 1) {
+        const glyph_index = i % utf8Columns(frame);
+        try writeUtf8GlyphAt(writer, frame, glyph_index);
+    }
+}
+
 pub fn modeFromLabel(label: []const u8) VisualizerMode {
     if (containsIgnoreCase(label, "read") or containsIgnoreCase(label, "search") or containsIgnoreCase(label, "explor")) return .listening;
     if (containsIgnoreCase(label, "write") or containsIgnoreCase(label, "patch") or containsIgnoreCase(label, "run") or containsIgnoreCase(label, "test")) return .working;
@@ -77,7 +89,11 @@ pub fn renderBottomBar(writer: anytype, state: BottomBarState) !usize {
     var rows_written: usize = 0;
 
     if (state.status) |status| {
-        try writeStatus(writer, state.color, status, state.visualizer, paint_cols);
+        if (state.visualizer_mode) |mode| {
+            try writeStatusDynamic(writer, state.color, status, mode, state.visualizer_tick, paint_cols);
+        } else {
+            try writeStatus(writer, state.color, status, state.visualizer, paint_cols);
+        }
     } else {
         try writeSpaces(writer, paint_cols);
     }
@@ -399,6 +415,17 @@ pub const InputEditor = struct {
         try self.buffer.appendSlice(self.allocator, text);
         self.cursor = self.buffer.items.len;
     }
+
+    pub fn loadHistoryNewestFirst(self: *InputEditor, lines: []const []const u8) !void {
+        for (self.history.items) |item| self.allocator.free(item);
+        self.history.clearRetainingCapacity();
+        var i: usize = 0;
+        while (i < lines.len and i < 200) : (i += 1) {
+            const trimmed = std.mem.trim(u8, lines[i], " \t\r\n");
+            if (trimmed.len == 0) continue;
+            try self.history.append(self.allocator, try self.allocator.dupe(u8, trimmed));
+        }
+    }
 };
 
 pub fn TerminalUi(comptime Writer: type) type {
@@ -536,12 +563,12 @@ pub fn TerminalUi(comptime Writer: type) type {
             const bw = fd_writer.BufferWriter{ .allocator = self.allocator, .list = &out };
             if (opts.preserve_cursor) try bw.writeAll("\x1b7");
             try bw.print("\x1b[{};1H", .{status_row});
-            const frame = if (opts.status != null and self.visualizer_mode != .idle) visualizerFrame(self.visualizer_mode, self.visualizer_tick) else null;
             _ = try renderBottomBar(bw, .{
                 .color = self.color,
                 .cols = size.cols,
                 .status = opts.status,
-                .visualizer = frame,
+                .visualizer_mode = if (opts.status != null and self.visualizer_mode != .idle) self.visualizer_mode else null,
+                .visualizer_tick = self.visualizer_tick,
                 .prompt = self.editor.buffer.items,
                 .cursor = self.editor.cursor,
                 .show_prompt = opts.show_prompt,
@@ -600,6 +627,25 @@ fn writeStatus(writer: anytype, color: bool, status: []const u8, visualizer: ?[]
         try writeSpaces(writer, width - clipped_cols - visual_cols);
         if (color) try writer.writeAll(cyan);
         try writer.writeAll(visual);
+        if (color) try writer.writeAll(reset);
+    } else if (clipped_cols < width) {
+        try writeSpaces(writer, width - clipped_cols);
+    }
+}
+
+fn writeStatusDynamic(writer: anytype, color: bool, status: []const u8, mode: VisualizerMode, tick: usize, width: usize) !void {
+    const min_visual_cols: usize = 4;
+    const status_cols = @min(utf8Columns(status), width);
+    const visual_cols = if (width > status_cols + 1 + min_visual_cols) width - status_cols - 1 else 0;
+    const clipped = status[0..utf8PrefixBytes(status, width -| (visual_cols + if (visual_cols > 0) @as(usize, 1) else 0))];
+    const clipped_cols = utf8Columns(clipped);
+    if (color) try writer.writeAll(dim);
+    try writer.writeAll(clipped);
+    if (color) try writer.writeAll(reset);
+    if (visual_cols > 0) {
+        try writeSpaces(writer, width - clipped_cols - visual_cols);
+        if (color) try writer.writeAll(cyan);
+        try writeVisualizerFrame(writer, mode, tick, visual_cols);
         if (color) try writer.writeAll(reset);
     } else if (clipped_cols < width) {
         try writeSpaces(writer, width - clipped_cols);
@@ -676,6 +722,21 @@ fn utf8PrefixBytes(bytes: []const u8, max_cols: usize) usize {
         cols += 1;
     }
     return i;
+}
+
+fn writeUtf8GlyphAt(writer: anytype, bytes: []const u8, glyph_index: usize) !void {
+    var idx: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const start = i;
+        i += 1;
+        while (i < bytes.len and (bytes[i] & 0b1100_0000) == 0b1000_0000) : (i += 1) {}
+        if (idx == glyph_index) {
+            try writer.writeAll(bytes[start..i]);
+            return;
+        }
+        idx += 1;
+    }
 }
 
 test "input editor submits and keeps utf8 backspace intact" {

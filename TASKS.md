@@ -5118,3 +5118,57 @@ Validacao executada:
 Observacao operacional:
 
 - O teste PTY real sem permissao de rede falhou com `SocketCreateFailed`; isso foi classificado como infraestrutura/sandbox e repetido com permissao elevada. O teste elevado passou.
+
+## T231 - Corrigir paridade do fluxo `phenom chat` com `phenom-cli-ts`
+
+Status: implemented-verified-real.
+
+Motivacao: a implementacao T230 criou uma TUI funcional, mas ainda nao copiava a ordem operacional real do `phenom-cli-ts`. O fluxo correto observado em `../phenom-cli-ts/src/index.ts` e: criar `Agent`, criar `CliRenderer`, `renderer.attach()`, inicializar sessao, entrar em pipe mode quando `--prompt`/stdin pipe, senao carregar `.phenom-history`, chamar `renderer.bindInput`, em `onLine` emitir `USER_MESSAGE`, executar comando slash ou `agent.processInput`, chamar `renderer.renderPrompt`, salvar transcript/historico em `onClose`.
+
+Evidencia:
+
+- `../phenom-cli-ts/src/index.ts:50-52`: cria `Agent`, `CliRenderer` e chama `renderer.attach()`.
+- `../phenom-cli-ts/src/index.ts:128-161`: pipe mode em `!stdin.isTTY || options.prompt`; emite `USER_MESSAGE`, chama `agent.processInput`, faz cleanup e sai.
+- `../phenom-cli-ts/src/index.ts:179-263`: interactive mode carrega `.phenom-history`, define `onLine`, `onClose`, `onFatalError`, chama `renderer.bindInput` e `renderer.renderPrompt`.
+- `../phenom-cli-ts/src/cli-renderer.ts:753-768`: user bubble usa `> [${userLabel}]`.
+- `../phenom-cli-ts/src/cli-renderer.ts:1320-1355`: tool start renderiza label + detail via `nextToolAnnouncement`, sem numeracao visivel no print real.
+- Print real do usuario mostra `[ashirak]`, `│ thinking`, `▸ Running: ...`, output sample com gutter, statusbar com visualizer largo e prompt permanente.
+
+Impacto esperado:
+
+- `phenom-zig chat` deve preservar historico entre execucoes em `.phenom-history`.
+- Ctrl-D e `/exit` devem salvar historico, restaurar terminal e imprimir `Session saved. Use phenom chat to continue.`.
+- User bubble deve usar `$USER` como label (`[ashirak]`) em vez de `[user]`.
+- Tool announcements devem seguir `▸ Running: comando`, nao `▸ 1. Running`.
+- Statusbar deve usar visualizer dinamico no espaco disponivel, nao um frame fixo pequeno.
+
+Implementacao em andamento:
+
+- `phenom-zig/src/main.zig`: adicionar `loadHistory`, `saveHistory`, `userLabel`, `/exit`, `/reset` e label real no renderer.
+- `phenom-zig/src/tui.zig`: adicionar carga de historico no editor e visualizer largo.
+- `phenom-zig/src/render.zig`: adicionar `toolSampleWithDetail` e remover numeracao visivel do tool announcement.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Snapshot de tool announcement prova `▸ Running: ls -la ~/.config/nvim`.
+- PTY com `/exit` salva/restaura e imprime mensagem de sessao.
+- PTY com prompt real mostra label de usuario vindo de `$USER`.
+- `real-smoke` continua provando backend real.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Verificar ownership de linhas carregadas/salvas no historico.
+- Verificar cleanup de raw mode/DECSTBM em Ctrl-D, `/exit` e erro.
+- Verificar que label de usuario e slice de env usado somente durante render sincrono.
+- Verificar que visualizer largo nao corta UTF-8 no meio.
+- Verificar que `--prompt` nao entra em TUI interativa e nao usa output fake offline como prova de backend.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- PTY `/exit` em `./zig-out/bin/phenom chat --offline --no-color` -> restaurou DECSTBM/bracketed paste e imprimiu `Session saved. Use phenom chat to continue.`
+- `./zig-out/bin/phenom chat --offline --no-color --prompt "ola"` -> exibiu `> [ashirak] ola`, provando label por `$USER`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest` -> passou; backend retornou `PHENOM_REAL_7319`, nao `ok` offline.
