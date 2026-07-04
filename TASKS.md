@@ -4883,3 +4883,58 @@ O que ainda falta fora desta task:
 - Sandbox configuravel por diretorio raiz em vez de cwd fixo.
 - Hash full-file streaming quando stale check exigir garantia alem dos primeiros 64 KiB.
 - Audit/replay registrando rejeicoes de path sensivel com erro tipado.
+
+## T228 - Concluir ownership de `EvidenceEntry`
+
+Status: implemented-verified-offline.
+
+Cumprimento: 100% para o objetivo pequeno desta task. A mudanca pendente em `evidence.zig` corrigia a direcao principal, mas faltava fechar cleanup em falha parcial de alocacao e provar ownership por teste.
+
+Evidencia:
+
+- `EvidenceEntry.deinit` original liberava apenas `range` e `excerpt`, mas `source` e `kind` podiam ser owned.
+- `fromFileRange` original devolvia `source = range.path` e `kind = "file_range"` emprestados.
+- A mudanca pendente ja duplicava `source`, `kind` e `excerpt`, mas fazia alocacoes diretamente no return literal. Se uma alocacao posterior falhasse, alocacoes anteriores poderiam vazar.
+- `EvidencePacket.add` assumia ownership na pratica, mas se `append` falhasse o entry passado nao era limpo.
+
+Impacto:
+
+- `EvidenceEntry` agora tem ownership uniforme de `source`, `kind`, `range` e `excerpt`.
+- `fromFileRange` limpa alocacoes parciais com `errdefer`.
+- `EvidencePacket.add` limpa o entry se a transferencia de ownership falhar no append.
+- Evidence gerada a partir de `FileRange` continua valida mesmo se o range original for mutado/liberado depois.
+
+Teste primeiro:
+
+- Adicionar teste que cria `FileRange` com buffers mutaveis, chama `fromFileRange`, muta os buffers originais e verifica que `EvidenceEntry` preserva `source`, `kind`, `range` e `excerpt`.
+
+Implementacao:
+
+- `phenom-zig/src/evidence.zig`: completar `fromFileRange` com variaveis locais owned e `errdefer`.
+- `phenom-zig/src/evidence.zig`: adicionar `errdefer entry.deinit` em `EvidencePacket.add`.
+- `phenom-zig/src/evidence.zig`: manter teste existente ajustado para campos owned e adicionar teste de ownership.
+
+Passos de implementacao:
+
+1. Confirmar se a mudanca pendente resolvia ownership funcional.
+2. Identificar vazamento em alocacao parcial.
+3. Adicionar cleanup com `errdefer`.
+4. Cobrir ownership com teste offline.
+5. Rodar suite offline e release build.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Teste prova que `EvidenceEntry` nao depende do buffer original de `FileRange`.
+- `fromFileRange` nao deixa alocacoes anteriores sem cleanup quando uma etapa posterior falha.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+
+O que ainda falta fora desta task:
+
+- Teste com allocator falhante para provar cleanup em cada ponto de falha de forma granular.
+- Audit/replay completo para ownership de evidence persistida em SQLite.
