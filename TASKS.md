@@ -4938,3 +4938,99 @@ O que ainda falta fora desta task:
 
 - Teste com allocator falhante para provar cleanup em cada ponto de falha de forma granular.
 - Audit/replay completo para ownership de evidence persistida em SQLite.
+
+## T229 - Portar superficie visual do CLI `phenom-cli-ts` para o renderer Zig
+
+Status: implemented-verified-offline.
+
+Cumprimento: parcial deliberado para o pedido amplo de CLI final. Esta task porta a superficie visivel append-only ja suportada pelo spike Zig: user query, assistant stream, thinking em baixo destaque, sample de tool, diff preview, status textual, `[done]`, prompt row e status row. Nao implementa ainda o event loop interativo raw-mode completo do `phenom-cli-ts`, nem visualizer animado, resize/reflow, scroll region DECSTBM, historico de input, bracketed paste ou markdown renderer completo.
+
+Evidencia:
+
+- `../phenom-cli-ts/src/cli-renderer.ts:753-768` define `formatUserMessageBubble`/`formatUserMessageBlock` com `USER_BG = \x1b[48;5;236m`, `USER_FG = \x1b[38;5;252m`, gutter de conteudo e bloco com separadores.
+- `../phenom-cli-ts/src/cli-renderer.ts:1038-1041` define thinking como `│ thinking` e linhas com `│ ` em tom baixo.
+- `../phenom-cli-ts/src/cli-renderer.ts:1320-1392` mostra tool start/result como anuncio numerado e amostra de output com gutter `    │`.
+- `../phenom-cli-ts/src/cli-renderer.ts:1588-1652` finaliza inferencia com `[done]` discreto.
+- `../phenom-cli-ts/src/cli-renderer.ts:2488-2575` define status row ativa como `Thinking (elapsed · esc to interrupt)` com visualizer opcional.
+- `../phenom-cli-ts/src/cli-renderer.ts:2880-3310` define prompt/statusbar com prefixo `> `, background `USER_BG/USER_FG`, largura `cols - 1` e sem pintar a ultima coluna.
+- `phenom-zig/src/render.zig` anterior ainda tinha labels antigos (`> user`, `assistant`, `done`) no baseline commit e depois snapshots pendentes que nao passavam.
+
+Impacto:
+
+- O transcript do spike deixa de parecer debug output e passa a seguir a linguagem visual do `phenom-cli-ts`.
+- O user prompt e o prompt row usam a mesma paleta ANSI fixa do TS.
+- Assistant/status/done/tool/diff recebem gutter de conteudo de uma coluna, preservando copia em terminal/tmux.
+- Thinking fica separado e de baixo destaque, sem vazar colado ao output final.
+- A implementacao continua append-only e testavel por snapshots; nao introduz alternate screen nem cursor control nesta etapa.
+
+Teste primeiro:
+
+- Snapshot de thinking com gutter `│ thinking`, conteudo em baixo destaque e separacao do output final.
+- Snapshot end-to-end append-only: user bubble, assistant delta e `[done]`.
+- Snapshot de status apos assistant delta para provar que status nao cola no texto do modelo.
+- Snapshot de tool sample com anuncio numerado e output truncado.
+- Snapshot de diff preview com markers suaves e truncamento.
+- Snapshot ANSI da paleta do user bubble igual ao `phenom-cli-ts`.
+- Snapshot ANSI do prompt row com `> ` e mesma paleta.
+- Snapshot plain do status row com shape ativo do `phenom-cli-ts`.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: substituir labels antigos por blocos append-only com gutter e separadores.
+- `phenom-zig/src/render.zig`: implementar wrap hard do user bubble por largura, preservando quebras de linha.
+- `phenom-zig/src/render.zig`: adicionar `promptRow` e `statusRow` puros para contrato visual da statusbar/prompt.
+- `phenom-zig/src/render.zig`: manter color=false removendo ANSI, para snapshots deterministas.
+- `phenom-zig/src/render.zig`: manter ANSI color=true com as constantes exatas do TS para user/prompt.
+
+Passos de implementacao:
+
+1. Comparar `phenom-zig/src/render.zig` com `../phenom-cli-ts/src/cli-renderer.ts`.
+2. Identificar elementos visuais ja suportados pelo spike e os que exigem engine interativa.
+3. Corrigir user bubble para usar gutter, palette e wrap do TS.
+4. Corrigir assistant stream para prefixar gutter por linha.
+5. Corrigir thinking/tool/status/done/diff para blocos separados e copiaveis.
+6. Adicionar contrato puro de prompt row/status row.
+7. Adicionar snapshots pequenos cobrindo cada elemento.
+8. Rodar teste offline, release build e chat offline real do binario.
+
+Revisao baixo nivel antes do commit:
+
+- Ownership/lifetime: renderer nao armazena slices recebidos; escreve tudo sincronicamente no writer.
+- `deinit`/allocacao: nao ha novas alocacoes dinamicas no renderer; wrap do user bubble opera por slices e buffers fixos.
+- C interop: nenhuma nova chamada C nesta task.
+- Bounds/overflow: largura usa saturating subtraction (`-|`) e floors (`@max`) para evitar underflow em terminais estreitos; wrap do user bubble avanca por posicao virtual e evita loop infinito quando label excede largura.
+- Escrita parcial: continua usando `writer.writeAll`, herdando retry/append do writer existente.
+- ANSI: `color=false` nao escreve escapes; `color=true` usa constantes fixas testadas.
+- Erro/comportamento: renderer propaga erro de writer; nao engole falhas de IO.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Chat offline real mostra user bubble, assistant output e `[done]` no formato novo.
+- TASKS deixa claro que esta task nao e a CLI/TUI final completa; e a base visual append-only + contratos puros de prompt/status.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest` -> passou; o modelo respondeu `PHENOM_REAL_7319` e o renderer mostrou status de sucesso + `[done]`.
+- `./zig-out/bin/phenom chat --offline --no-color --session renderer-check --prompt "ola"` -> passou e exibiu:
+
+```text
+
+ > [user] ola
+
+ ok
+
+ [done]
+```
+
+O que ainda falta fora desta task:
+
+- Engine interativa raw-mode equivalente ao `phenom-cli-ts`: leitura de teclas, cursor, historico, multiline, paste, interrupt e renderizacao incremental do prompt.
+- Statusbar animada com `MiniVisualizer`, resize/reflow e isolamento de cursor.
+- Scroll region DECSTBM/append-mode completo para impedir overlap entre stream, status e prompt em TTY real.
+- Markdown renderer incremental com tabelas/code blocks/highlight equivalente ao TS.
+- Diff renderer com line numbers reais, header info (`lines/bytes/op`) e paleta final anti-ofuscamento.
+- Eventos de renderer completos (`USER_MESSAGE`, `THINK_START`, `TOOL_START`, `TOOL_RESULT`, `FILE_DIFF`, `THINK_END`) em vez de chamadas diretas parciais.
