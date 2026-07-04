@@ -4808,3 +4808,78 @@ O que ainda falta fora desta task:
 - Probe para varios enderecos retornados por DNS.
 - Probe real para Ollama `/api/tags`.
 - Harness real estruturado com latencia, modelo, tokens e backend.
+
+## T227 - Corrigir hardening de `read_file_range`, ownership de tool call e allocators
+
+Status: implemented-verified-offline.
+
+Cumprimento: 100% para o objetivo pequeno desta task. Corrige os bugs reportados em `tools.zig`, `tool_call.zig` e o uso de allocator no flush HTTP. Nao corrige `parseHost` com validacao forte nem restricao de familia DNS, por decisao explicita do usuario (#8 e #9 ficam fora desta etapa).
+
+Evidencia:
+
+- `tools.zig` rejeitava qualquer path contendo `..`, bloqueando falsos positivos como `foo..txt`.
+- `tools.zig` usava `mode.ptr` de slice para `fopen`; isso dependia de detalhe da string literal.
+- `tools.zig` devolvia `FileRange.path` emprestado e liberava apenas `text`.
+- O hash era calculado sobre o buffer limitado por `max_bytes`, entao o mesmo arquivo podia gerar hashes diferentes conforme a janela visivel.
+- `tool_call.zig` devolvia `ToolCall.name` e `ToolCall.path` como slices do output original.
+- `http.zig` usava `std.heap.page_allocator` no flush final de linha.
+- `start_line=0` era aceito por acidente embora a API seja 1-based.
+
+Impacto:
+
+- Paths com `..` dentro de nome de arquivo deixam de ser falsamente classificados como traversal.
+- Traversal por componente (`../x`, `foo/../../bar`) continua bloqueado.
+- Leitura de arquivos sensiveis/ocultos do cwd fica bloqueada para o modelo (`.env`, `.git/*`, `credentials.json`, `secret`, `token`, chaves privadas comuns).
+- Symlinks que escapam do cwd sao bloqueados por `realpath`.
+- `FileRange` e `ToolCall` passam a ter ownership explicito.
+- Hash de stale context fica estavel entre janelas visiveis diferentes, usando uma janela fixa inicial de 64 KiB.
+
+Teste primeiro:
+
+- Teste de traversal por componente.
+- Teste de falso positivo `foo..txt` e `valid..path`.
+- Teste de paths ocultos/sensiveis.
+- Teste de `start_line=0`.
+- Teste de ownership de `FileRange.path`.
+- Teste de hash estavel com `max_bytes` diferente.
+- Teste de ownership de `ToolCall.name` e `ToolCall.path`.
+
+Implementacao:
+
+- `phenom-zig/src/tools.zig`: adicionar `validateModelPath`, `realPathInsideCwd`, denylist simples de paths sensiveis, `start_line` 1-based, `FileRange.path` owned, hash fixo de 64 KiB e `fopen` com `[*:0]const u8`.
+- `phenom-zig/src/tool_call.zig`: trocar parser para `parseFirst(allocator, output) !?ToolCall` e adicionar `ToolCall.deinit`.
+- `phenom-zig/src/tool_loop.zig`: adaptar para parser owned e `defer call.deinit`.
+- `phenom-zig/src/http.zig`: passar allocator para `flushLine` e tornar `ParsedHost.host` owned com `deinit`, sem alterar politica de validacao de host.
+
+Passos de implementacao:
+
+1. Corrigir validação lexical de path por componente, nao por substring.
+2. Adicionar denylist pragmatica para arquivos ocultos e nomes sensiveis.
+3. Resolver realpath e garantir que o alvo fica dentro do cwd.
+4. Estabilizar hash em janela fixa independente do `max_bytes` visivel.
+5. Tornar ownership de retornos explicito.
+6. Atualizar callers.
+7. Rodar testes offline e release build.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Testes provam que `foo..txt` nao vira traversal, mas `foo/../../bar` vira.
+- Testes provam que `.env` e `config/credentials.json` sao bloqueados.
+- Testes provam que `FileRange.path` e `ToolCall` nao dependem do buffer original.
+- Testes provam hash estavel entre janelas de leitura.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lsqlite3 -lc` -> 36/36 testes passaram.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+
+O que ainda falta fora desta task:
+
+- Validacao forte de `parseHost` (#8) quando a politica de rede do produto for definida.
+- Restricao de familia/endereco em `getaddrinfo` (#9) quando a politica de rede do produto for definida.
+- Sandbox configuravel por diretorio raiz em vez de cwd fixo.
+- Hash full-file streaming quando stale check exigir garantia alem dos primeiros 64 KiB.
+- Audit/replay registrando rejeicoes de path sensivel com erro tipado.

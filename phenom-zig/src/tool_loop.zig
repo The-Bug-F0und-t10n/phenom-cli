@@ -22,10 +22,11 @@ pub fn runOnce(
     model_output: []const u8,
     allowed_tools: []const []const u8,
 ) !ToolLoopResult {
-    const call = tool_call.parseFirst(model_output) orelse return .{
+    const call = (try tool_call.parseFirst(allocator, model_output)) orelse return .{
         .executed = false,
         .rejected = false,
     };
+    defer call.deinit(allocator);
 
     if (!gate.isAllowed(call.name, allowed_tools)) {
         return .{ .executed = false, .rejected = true };

@@ -5,9 +5,14 @@ pub const ToolCall = struct {
     path: ?[]const u8 = null,
     start_line: usize = 1,
     max_lines: usize = 12,
+
+    pub fn deinit(self: ToolCall, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        if (self.path) |path| allocator.free(path);
+    }
 };
 
-pub fn parseFirst(output: []const u8) ?ToolCall {
+pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
     const call_start = std.mem.indexOf(u8, output, "<tool_call>") orelse return null;
     const call_end = std.mem.indexOf(u8, output[call_start..], "</tool_call>") orelse return null;
     const body = output[call_start + "<tool_call>".len .. call_start + call_end];
@@ -19,8 +24,8 @@ pub fn parseFirst(output: []const u8) ?ToolCall {
     const name = std.mem.trim(u8, body[name_start .. name_start + name_end], " \r\n\t");
 
     return .{
-        .name = name,
-        .path = parseParameter(body, "path"),
+        .name = try allocator.dupe(u8, name),
+        .path = if (parseParameter(body, "path")) |path| try allocator.dupe(u8, path) else null,
         .start_line = parseIntParameter(body, "start_line") orelse 1,
         .max_lines = parseIntParameter(body, "max_lines") orelse 12,
     };
@@ -57,7 +62,8 @@ test "parses qwopus xml tool call" {
         \\</function>
         \\</tool_call>
     ;
-    const call = parseFirst(output) orelse return error.NoToolCall;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("read_file_range", call.name);
     try std.testing.expectEqualStrings("README.md", call.path.?);
     try std.testing.expectEqual(@as(usize, 2), call.start_line);
@@ -65,5 +71,21 @@ test "parses qwopus xml tool call" {
 }
 
 test "plain text is not a tool call" {
-    try std.testing.expect(parseFirst("ola") == null);
+    try std.testing.expect((try parseFirst(std.testing.allocator, "ola")) == null);
+}
+
+test "parsed tool call owns name and path" {
+    var output = try std.testing.allocator.dupe(u8,
+        \\<tool_call>
+        \\<function=read_file_range>
+        \\<parameter=path>README.md</parameter>
+        \\</function>
+        \\</tool_call>
+    );
+    defer std.testing.allocator.free(output);
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    output[16] = 'X';
+    try std.testing.expectEqualStrings("read_file_range", call.name);
+    try std.testing.expectEqualStrings("README.md", call.path.?);
 }

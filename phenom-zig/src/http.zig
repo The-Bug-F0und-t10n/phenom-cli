@@ -26,7 +26,8 @@ pub const LocalModelClient = struct {
     }
 
     pub fn endpointSummary(self: *LocalModelClient, allocator: std.mem.Allocator) ![]u8 {
-        const parsed = try parseHost(self.host, self.backend);
+        const parsed = try parseHost(allocator, self.host, self.backend);
+        defer parsed.deinit(allocator);
         return std.fmt.allocPrint(
             allocator,
             "http://{s}:{}{s}",
@@ -39,7 +40,8 @@ pub const LocalModelClient = struct {
         prompt: []const u8,
         sink: anytype,
     ) !void {
-        const parsed = try parseHost(self.host, self.backend);
+        const parsed = try parseHost(self.allocator, self.host, self.backend);
+        defer parsed.deinit(self.allocator);
 
         const fd = try tcpConnect(self.allocator, parsed.host, parsed.port);
         defer _ = c.close(fd);
@@ -94,7 +96,7 @@ pub const LocalModelClient = struct {
             }
         }
 
-        _ = try flushLine(&line_buffer, sink);
+        _ = try flushLine(self.allocator, &line_buffer, sink);
     }
 
     fn buildBody(self: *LocalModelClient, prompt: []const u8) ![]u8 {
@@ -148,7 +150,7 @@ pub const ProbeResult = struct {
 };
 
 pub fn probeBackend(allocator: std.mem.Allocator, host: []const u8, backend: cli.Backend) ProbeResult {
-    const parsed = parseHost(host, backend) catch |err| {
+    const parsed = parseHost(allocator, host, backend) catch |err| {
         return .{
             .endpoint = std.fmt.allocPrint(allocator, "invalid-host:{s}", .{host}) catch unreachable,
             .tcp_ok = false,
@@ -158,6 +160,7 @@ pub fn probeBackend(allocator: std.mem.Allocator, host: []const u8, backend: cli
             .error_name = @errorName(err),
         };
     };
+    defer parsed.deinit(allocator);
     const path = probePathForBackend(backend);
     const endpoint = std.fmt.allocPrint(allocator, "http://{s}:{}{s}", .{ parsed.host, parsed.port, path }) catch unreachable;
 
@@ -301,9 +304,13 @@ fn looksComplex(prompt: []const u8) bool {
 const ParsedHost = struct {
     host: []const u8,
     port: u16,
+
+    fn deinit(self: ParsedHost, allocator: std.mem.Allocator) void {
+        allocator.free(self.host);
+    }
 };
 
-fn parseHost(host: []const u8, backend: cli.Backend) !ParsedHost {
+fn parseHost(allocator: std.mem.Allocator, host: []const u8, backend: cli.Backend) !ParsedHost {
     var normalized = host;
     if (std.mem.startsWith(u8, normalized, "http://")) {
         normalized = normalized["http://".len..];
@@ -313,11 +320,11 @@ fn parseHost(host: []const u8, backend: cli.Backend) !ParsedHost {
     }
     if (std.mem.indexOfScalar(u8, normalized, ':')) |idx| {
         return .{
-            .host = normalized[0..idx],
+            .host = try allocator.dupe(u8, normalized[0..idx]),
             .port = try std.fmt.parseInt(u16, normalized[idx + 1 ..], 10),
         };
     }
-    return .{ .host = normalized, .port = LocalModelClient.defaultPort(backend) };
+    return .{ .host = try allocator.dupe(u8, normalized), .port = LocalModelClient.defaultPort(backend) };
 }
 
 fn tcpConnect(allocator: std.mem.Allocator, host: []const u8, port: u16) !c_int {
@@ -458,9 +465,9 @@ fn feedLines(
     return false;
 }
 
-fn flushLine(line_buffer: *std.ArrayList(u8), sink: anytype) !bool {
+fn flushLine(allocator: std.mem.Allocator, line_buffer: *std.ArrayList(u8), sink: anytype) !bool {
     if (line_buffer.items.len == 0) return false;
-    const done = try processModelLine(std.heap.page_allocator, line_buffer.items, sink);
+    const done = try processModelLine(allocator, line_buffer.items, sink);
     line_buffer.clearRetainingCapacity();
     return done;
 }
@@ -593,7 +600,7 @@ test "extract llama cpp sse content field" {
     var line_buffer = std.ArrayList(u8).empty;
     defer line_buffer.deinit(std.testing.allocator);
     try std.testing.expect(!try feedLines(std.testing.allocator, &line_buffer, line, &ctx));
-    try std.testing.expect(!try flushLine(&line_buffer, &ctx));
+    try std.testing.expect(!try flushLine(std.testing.allocator, &line_buffer, &ctx));
     try std.testing.expectEqual(@as(usize, 1), calls);
 }
 
