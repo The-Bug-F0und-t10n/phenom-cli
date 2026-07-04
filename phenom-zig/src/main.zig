@@ -18,7 +18,6 @@ const c = @cImport({
     @cInclude("sys/stat.h");
     @cInclude("errno.h");
     @cInclude("stdlib.h");
-    @cInclude("stdio.h");
 });
 
 pub fn main(init: std.process.Init) !void {
@@ -108,7 +107,10 @@ fn runInteractiveChat(allocator: std.mem.Allocator, config: cli.Config, stdout: 
         else => return err,
     };
     attached = true;
-    try loadHistory(allocator, &ui);
+    try makeDirIfMissing(".phenom-zig");
+    var db = try audit.AuditDb.open(allocator, ".phenom-zig/phenom.db");
+    defer db.close();
+    try loadHistoryFromDb(allocator, &db, &ui);
 
     while (true) {
         const line = ui.readLine() catch |err| switch (err) {
@@ -116,7 +118,6 @@ fn runInteractiveChat(allocator: std.mem.Allocator, config: cli.Config, stdout: 
             else => return err,
         };
         const prompt = line orelse {
-            try saveHistory(&ui);
             ui.deinit();
             attached = false;
             try stdout.writeAll("Session saved. Use phenom chat to continue.\n");
@@ -128,8 +129,8 @@ fn runInteractiveChat(allocator: std.mem.Allocator, config: cli.Config, stdout: 
             continue;
         }
         const input = std.mem.trim(u8, prompt, " \t\r\n");
+        try db.recordInputHistory(input);
         if (std.mem.eql(u8, input, "/exit")) {
-            try saveHistory(&ui);
             ui.deinit();
             attached = false;
             try stdout.writeAll("Session saved. Use phenom chat to continue.\n");
@@ -261,44 +262,10 @@ fn userLabel() []const u8 {
     return "user";
 }
 
-fn loadHistory(allocator: std.mem.Allocator, ui: anytype) !void {
-    const file = c.fopen(".phenom-history", "rb") orelse return;
-    defer _ = c.fclose(file);
-    if (c.fseek(file, 0, c.SEEK_END) != 0) return;
-    const len_raw = c.ftell(file);
-    if (len_raw <= 0 or len_raw > 1024 * 1024) return;
-    if (c.fseek(file, 0, c.SEEK_SET) != 0) return;
-    const len: usize = @intCast(len_raw);
-    const raw = try allocator.alloc(u8, len);
-    defer allocator.free(raw);
-    const read = c.fread(raw.ptr, 1, raw.len, file);
-    const data = raw[0..read];
-
-    var lines = std.ArrayList([]const u8).empty;
-    defer lines.deinit(allocator);
-    var start: usize = 0;
-    while (start <= data.len) {
-        const rel = std.mem.indexOfScalar(u8, data[start..], '\n');
-        const end = if (rel) |idx| start + idx else data.len;
-        const line = std.mem.trim(u8, data[start..end], " \t\r\n");
-        if (line.len > 0) try lines.append(allocator, line);
-        if (rel == null) break;
-        start = end + 1;
-    }
-    std.mem.reverse([]const u8, lines.items);
+fn loadHistoryFromDb(allocator: std.mem.Allocator, db: *audit.AuditDb, ui: anytype) !void {
+    var lines = try db.loadInputHistoryNewestFirst(allocator, 200);
+    defer audit.freeHistoryLines(allocator, &lines);
     try ui.editor.loadHistoryNewestFirst(lines.items);
-}
-
-fn saveHistory(ui: anytype) !void {
-    const file = c.fopen(".phenom-history", "wb") orelse return error.HistoryOpenFailed;
-    defer _ = c.fclose(file);
-    var i = ui.editor.history.items.len;
-    while (i > 0) {
-        i -= 1;
-        const item = ui.editor.history.items[i];
-        if (item.len > 0 and c.fwrite(item.ptr, 1, item.len, file) != item.len) return error.HistoryWriteFailed;
-        if (c.fwrite("\n", 1, 1, file) != 1) return error.HistoryWriteFailed;
-    }
 }
 
 fn StreamSink(comptime RendererPtr: type) type {

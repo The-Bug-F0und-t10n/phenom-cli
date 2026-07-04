@@ -5123,7 +5123,7 @@ Observacao operacional:
 
 Status: implemented-verified-real.
 
-Motivacao: a implementacao T230 criou uma TUI funcional, mas ainda nao copiava a ordem operacional real do `phenom-cli-ts`. O fluxo correto observado em `../phenom-cli-ts/src/index.ts` e: criar `Agent`, criar `CliRenderer`, `renderer.attach()`, inicializar sessao, entrar em pipe mode quando `--prompt`/stdin pipe, senao carregar `.phenom-history`, chamar `renderer.bindInput`, em `onLine` emitir `USER_MESSAGE`, executar comando slash ou `agent.processInput`, chamar `renderer.renderPrompt`, salvar transcript/historico em `onClose`.
+Motivacao: a implementacao T230 criou uma TUI funcional, mas ainda nao copiava a ordem operacional real do `phenom-cli-ts`. O fluxo correto observado em `../phenom-cli-ts/src/index.ts` e: criar `Agent`, criar `CliRenderer`, `renderer.attach()`, inicializar sessao, entrar em pipe mode quando `--prompt`/stdin pipe, chamar `renderer.bindInput`, em `onLine` emitir `USER_MESSAGE`, executar comando slash ou `agent.processInput`, chamar `renderer.renderPrompt`, salvar transcript/historico em `onClose`. A referencia TS usa `.phenom-history`, mas no Zig final isso e uma evidencia de comportamento visual/operacional, nao uma decisao de storage.
 
 Evidencia:
 
@@ -5136,7 +5136,7 @@ Evidencia:
 
 Impacto esperado:
 
-- `phenom-zig chat` deve preservar historico entre execucoes em `.phenom-history`.
+- `phenom-zig chat` deve preservar historico entre execucoes via SQLite operacional, nao `.phenom-history`.
 - Ctrl-D e `/exit` devem salvar historico, restaurar terminal e imprimir `Session saved. Use phenom chat to continue.`.
 - User bubble deve usar `$USER` como label (`[ashirak]`) em vez de `[user]`.
 - Tool announcements devem seguir `▸ Running: comando`, nao `▸ 1. Running`.
@@ -5144,7 +5144,7 @@ Impacto esperado:
 
 Implementacao em andamento:
 
-- `phenom-zig/src/main.zig`: adicionar `loadHistory`, `saveHistory`, `userLabel`, `/exit`, `/reset` e label real no renderer.
+- `phenom-zig/src/main.zig`: adicionar carga/persistencia de historico, `userLabel`, `/exit`, `/reset` e label real no renderer.
 - `phenom-zig/src/tui.zig`: adicionar carga de historico no editor e visualizer largo.
 - `phenom-zig/src/render.zig`: adicionar `toolSampleWithDetail` e remover numeracao visivel do tool announcement.
 
@@ -5172,3 +5172,78 @@ Validacao executada:
 - PTY `/exit` em `./zig-out/bin/phenom chat --offline --no-color` -> restaurou DECSTBM/bracketed paste e imprimiu `Session saved. Use phenom chat to continue.`
 - `./zig-out/bin/phenom chat --offline --no-color --prompt "ola"` -> exibiu `> [ashirak] ola`, provando label por `$USER`.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest` -> passou; backend retornou `PHENOM_REAL_7319`, nao `ok` offline.
+
+## T232 - Migrar historico interativo do arquivo para SQLite
+
+Status: implemented-verified-real.
+
+Motivacao: a T231 portou o comportamento visual do `phenom-cli-ts`, mas tambem trouxe o detalhe errado de storage `.phenom-history`. Para o Phenom Zig, o historico deve usar o SQLite operacional em `.phenom-zig/phenom.db`, porque o projeto ja decidiu reduzir arquivos soltos e separar storage operacional de contexto do modelo. O editor pode manter um cache em memoria para navegacao com setas, mas a fonte persistente nao pode ser arquivo texto paralelo.
+
+Evidencia:
+
+- `phenom-zig/src/audit.zig`: antes desta task so criava tabela `events`; nao havia tabela de historico de input.
+- `phenom-zig/src/main.zig:111`: `runInteractiveChat` chamava `loadHistory` antes do loop.
+- `phenom-zig/src/main.zig:264-301`: `loadHistory`/`saveHistory` liam e gravavam `.phenom-history` via C stdio.
+- `phenom-zig/src/tui.zig:227-426`: `InputEditor.history` e apenas estrutura de navegacao em memoria; ele nao precisa saber qual storage persistente alimenta suas entradas.
+- Regra operacional do projeto: `MEMORY.md`/`SKILLS.md` sao contexto persistente do projeto; historico de CLI e audit sao storage operacional e devem ficar fora do prompt do modelo.
+
+Impacto esperado:
+
+- `phenom-zig chat` carrega historico interativo de `.phenom-zig/phenom.db`.
+- Cada input nao vazio submetido no modo interativo e persistido em `input_history`.
+- Navegacao com seta continua usando `InputEditor.history`, alimentado por linhas newest-first vindas do SQLite.
+- `.phenom-history` deixa de ser criado ou atualizado pelo binario Zig.
+- Historico e deduplicado na leitura: repetir uma linha move essa linha para o topo.
+- Banco limita o historico operacional aos 200 inputs distintos mais recentes para evitar crescimento sem controle.
+
+Teste primeiro:
+
+- `audit.zig`: inserir `primeiro`, `segundo`, `primeiro`; leitura deve retornar `primeiro`, `segundo`.
+- `audit.zig`: inserir 205 linhas distintas; leitura deve retornar 200, de `line-204` ate `line-5`.
+- Validacao PTY em diretorio temporario: sair com `/exit` nao deve criar `.phenom-history`.
+
+Implementacao:
+
+- `phenom-zig/src/audit.zig`: adicionar tabela `input_history`, indice `(line, id)`, `recordInputHistory`, `loadInputHistoryNewestFirst` e `freeHistoryLines`.
+- `phenom-zig/src/main.zig`: abrir `.phenom-zig/phenom.db` no modo interativo, carregar history do banco e gravar cada input nao vazio com `recordInputHistory`.
+- `phenom-zig/src/main.zig`: remover `loadHistory`/`saveHistory` baseados em `.phenom-history`.
+
+Passos de implementacao:
+
+1. Criar schema SQLite antes de alterar o loop interativo.
+2. Escrever testes unitarios do banco provando ordem, dedupe e limite.
+3. Substituir chamadas de arquivo em `runInteractiveChat` por chamadas de `AuditDb`.
+4. Remover dependencia de C stdio do `main.zig`.
+5. Rodar testes unitarios e release.
+6. Rodar PTY em diretorio temporario para provar que `.phenom-history` nao nasce.
+7. Comitar somente `phenom-zig/src/audit.zig`, `phenom-zig/src/main.zig` e `TASKS.md`.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Ownership/lifetime: linhas retornadas de SQLite sao duplicadas para o allocator chamador e liberadas por `freeHistoryLines`; o editor duplica novamente para seu proprio cache.
+- `deinit`: `sqlite3_stmt` sempre finaliza; linhas alocadas em falha sao limpas por `errdefer`.
+- C interop: SQL e input sao `dupeZ`; `sqlite3_column_text` e copiado antes de `sqlite3_step` avancar/finalizar.
+- Bounds/overflow: `limit` valida `c_int`; trimming ignora input vazio; trim de storage fica limitado a 200 linhas distintas.
+- Erro/comportamento: falha de SQLite deve abortar o fluxo interativo porque historico/audit operacional e parte da confiabilidade do CLI.
+- Escopo: nao resolver validacao de host/DNS nesta task; isso pertence ao modulo HTTP.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- PTY `/exit` em diretorio temporario nao cria `.phenom-history`.
+- `real-smoke` continua provando backend real.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- PTY em `/tmp` com `/home/ashirak/Projects/person/ai/cli-ai/phenom-cli/phenom-zig/zig-out/bin/phenom chat --offline --no-color`, input `/exit\r` -> restaurou terminal e imprimiu `Session saved. Use phenom chat to continue.`
+- Verificacao de arquivos apos PTY: `/tmp/.phenom-zig/phenom.db` existe; `/tmp/.phenom-history` nao existe.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest` -> passou; backend retornou `PHENOM_REAL_7319`.
+
+Revisao baixo nivel executada:
+
+- Corrigido possivel leak em `loadInputHistoryNewestFirst`: `dupe` da linha agora e separado do `append`, com `errdefer` para liberar se o append falhar.
+- `recordInputHistory` valida tamanho antes de passar length para `sqlite3_bind_text` como `c_int`.
+- `main.zig` nao importa mais `stdio.h`; persistencia por arquivo foi removida do caminho interativo.
