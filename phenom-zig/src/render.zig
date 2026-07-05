@@ -141,7 +141,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 try self.writer.writeAll(toolDetail(name));
             }
             try self.writer.writeAll("\n");
-            try self.writeToolOutput(sample);
+            if (sample.len > 0) try self.writeToolOutput(sample);
             self.last_block = .tool;
         }
 
@@ -616,6 +616,18 @@ test "tool sample renders command detail like phenom cli ts" {
         \\
     ;
     try std.testing.expectEqualStrings(expected, buffer.items);
+}
+
+test "tool start announcement does not fake empty result" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false });
+    try renderer.toolSampleWithDetail("read_file_range", "README.md", "");
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Reading: README.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "no output") == null);
 }
 
 test "diff preview uses soft markers and truncation" {

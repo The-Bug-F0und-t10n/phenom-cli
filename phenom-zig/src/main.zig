@@ -116,6 +116,9 @@ fn runInteractiveChat(allocator: std.mem.Allocator, config: cli.Config, stdout: 
     var db = try audit.AuditDb.open(allocator, ".phenom-zig/phenom.db");
     defer db.close();
     try loadHistoryFromDb(allocator, &db, &ui);
+    try ui.positionContent();
+    const restored = try renderRestoredSession(allocator, &db, config.session, stdout, !config.no_color, tui.terminalSize().cols, true, ui.mutex());
+    if (restored > 0) try ui.showPrompt();
 
     while (true) {
         const line = ui.readLine() catch |err| switch (err) {
@@ -182,6 +185,9 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
     if (config.demo_read_file) |path| {
         const allowed = gate.isAllowed("read_file_range", &.{"read_file_range"});
         if (!allowed) return error.ToolDenied;
+        const tool_start = try std.fmt.allocPrint(allocator, "read_file_range\t{s}", .{path});
+        defer allocator.free(tool_start);
+        try db.recordEvent(config.session, "tool_start", tool_start);
         try events.emit(.{ .tool_start = .{ .name = "read_file_range", .detail = path } });
         const range = try tools.readFileRange(allocator, path, 1, 12, 16 * 1024);
         defer range.deinit(allocator);
@@ -269,6 +275,89 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
 
     try events.emit(.{ .think_end = {} });
     try db.recordEvent(config.session, "turn_done", "ok");
+}
+
+fn renderRestoredSession(
+    allocator: std.mem.Allocator,
+    db: *audit.AuditDb,
+    session: []const u8,
+    writer: anytype,
+    color: bool,
+    columns: usize,
+    crlf: bool,
+    write_mutex: ?*std.atomic.Mutex,
+) !usize {
+    var events = try db.loadSessionEvents(allocator, session, 5000);
+    defer audit.freeAuditEvents(allocator, &events);
+    if (events.items.len == 0) return 0;
+
+    var transcript_writer = fd_writer.NewlineWriter(@TypeOf(writer)){ .inner = writer, .crlf = crlf };
+    var renderer = render.AppendOnlyRenderer(@TypeOf(&transcript_writer)).init(&transcript_writer, .{
+        .color = color,
+        .terminal_columns = columns,
+        .user_label = userLabel(),
+    });
+    var bus = ui_events.EventBus.init(allocator);
+    defer bus.deinit();
+    var render_sink = ui_events.RendererEventSink(@TypeOf(&renderer)){
+        .renderer = &renderer,
+        .write_mutex = write_mutex,
+        .terminal_columns = if (write_mutex != null) currentTerminalColumns else null,
+    };
+    try bus.on(&render_sink, @TypeOf(render_sink).handleOpaque);
+
+    var restored_turn_open = false;
+    for (events.items) |event| {
+        if (std.mem.eql(u8, event.kind, "turn_start")) {
+            if (restored_turn_open) try bus.emit(.{ .think_end = {} });
+            try bus.emit(.{ .user_message = event.body });
+            try bus.emit(.{ .think_start = "Thinking" });
+            restored_turn_open = true;
+        } else if (std.mem.eql(u8, event.kind, "assistant_thinking_delta")) {
+            try bus.emit(.{ .reasoning_chunk = event.body });
+            restored_turn_open = true;
+        } else if (std.mem.eql(u8, event.kind, "assistant_delta") or std.mem.eql(u8, event.kind, "assistant_offline_stub")) {
+            try bus.emit(.{ .message_chunk = event.body });
+            restored_turn_open = true;
+        } else if (std.mem.eql(u8, event.kind, "tool_start")) {
+            const parsed = parseRestoredToolStart(event.body);
+            try bus.emit(.{ .tool_start = .{ .name = parsed.name, .detail = parsed.detail } });
+            restored_turn_open = true;
+        } else if (std.mem.eql(u8, event.kind, "evidence")) {
+            try bus.emit(.{ .tool_result = .{ .name = "read_file_range", .output = event.body } });
+            restored_turn_open = true;
+        } else if (std.mem.eql(u8, event.kind, "model_error")) {
+            try bus.emit(.{ .progress_update = event.body });
+            try bus.emit(.{ .think_end = {} });
+            restored_turn_open = false;
+        } else if (std.mem.eql(u8, event.kind, "empty_visible_answer")) {
+            try bus.emit(.{ .progress_update = "model emitted no visible final answer; reasoning was suppressed or generation ended inside <think>" });
+            restored_turn_open = true;
+        } else if (std.mem.eql(u8, event.kind, "expectation_failed")) {
+            try bus.emit(.{ .progress_update = event.body });
+            try bus.emit(.{ .think_end = {} });
+            restored_turn_open = false;
+        } else if (std.mem.eql(u8, event.kind, "expectation_passed")) {
+            restored_turn_open = true;
+        } else if (std.mem.eql(u8, event.kind, "turn_done")) {
+            try bus.emit(.{ .think_end = {} });
+            restored_turn_open = false;
+        }
+    }
+    if (restored_turn_open) try bus.emit(.{ .think_end = {} });
+    return events.items.len;
+}
+
+const RestoredToolStart = struct {
+    name: []const u8,
+    detail: []const u8,
+};
+
+fn parseRestoredToolStart(body: []const u8) RestoredToolStart {
+    if (std.mem.indexOfScalar(u8, body, '\t')) |idx| {
+        return .{ .name = body[0..idx], .detail = body[idx + 1 ..] };
+    }
+    return .{ .name = body, .detail = "" };
 }
 
 fn offlineStubResponse() []const u8 {
@@ -406,4 +495,32 @@ test "visible output trims only leading whitespace after thinking" {
     try std.testing.expect(active);
     try std.testing.expectEqualStrings("final", trimLeadingWhitespaceAfterThinking("final", &active));
     try std.testing.expect(!active);
+}
+
+test "restored sqlite session is rendered through styled transcript events" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordEvent("restore", "turn_start", "analise");
+    try db.recordEvent("restore", "assistant_thinking_delta", "vou ler");
+    try db.recordEvent("restore", "tool_start", "read_file_range\tREADME.md");
+    try db.recordEvent("restore", "evidence", "[EVIDENCE]\nREADME.md:1\n");
+    try db.recordEvent("restore", "assistant_delta", "resposta");
+    try db.recordEvent("restore", "turn_done", "ok");
+
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+
+    const count = try renderRestoredSession(std.testing.allocator, &db, "restore", writer, false, 80, false, null);
+    try std.testing.expectEqual(@as(usize, 6), count);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "> [") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "analise") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "thinking") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "vou ler") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Reading") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "README.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "[EVIDENCE]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "resposta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "[done]") != null);
 }

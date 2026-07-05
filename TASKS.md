@@ -5591,3 +5591,77 @@ Validacao executada:
 - PTY real pequeno `stty cols 36 rows 12; ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 120 --thinking on --no-color`, input `ola` + `/exit` -> passou; thinking quebrou com gutter nas continuacoes e resposta ficou separada por gap controlado.
 - PTY grande `stty cols 140 rows 40; ./zig-out/bin/phenom chat --offline --no-color`, input `ola em terminal grande` + `/exit` -> passou; statusbar, prompt e transcript ficaram alinhados.
 - Smoke real limpo `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 120 --thinking on --prompt ola --no-color` -> passou; thinking enquadrado e resposta final sem whitespace inicial.
+
+## T238 - Restaurar sessao SQLite com estilos e portar visualizer.py para Zig
+
+Status: implemented-verified.
+
+Motivacao: o chat Zig ja persistia eventos operacionais em SQLite, mas ao abrir uma sessao nao reconstruia o transcript visivel. Isso deixava o SQLite como audit passivo, nao como fonte de recuperacao da sessao. Alem disso, a statusbar usava uma onda estatica simples, enquanto o `phenom-cli-ts` executa um visualizer baseado no `visualizer.py` com estados, noise e transicao em cascata.
+
+Evidencia:
+
+- `phenom-zig/src/audit.zig`: havia `events(session, kind, body)`, mas so existia leitura para `input_history`.
+- `phenom-zig/src/main.zig`: `runInteractiveChat` carregava historico de input, mas nao reemitia eventos da sessao para o renderer.
+- `phenom-zig/src/main.zig`: `tool_start` era exibido ao vivo mas nao era persistido, entao uma recuperacao futura perderia o anuncio da tool.
+- `../phenom-cli-ts/src/cli-renderer.ts:951-1030`: `restoreConversation` reconstrui user, thinking, tools e assistant a partir de dados logicos, nao de texto bruto stale.
+- `../phenom-cli-ts/src/visualizer-mini.ts`: porta do `visualizer.py` com estados `idle/listening/thinking/working/responding`, noise deterministico e cascade left-to-right.
+- `../phenom-cli-ts/visualizer.py`: referencia original de blocos, estados e cascata visual.
+
+Impacto esperado:
+
+- Ao abrir `phenom chat --session ID`, eventos existentes no SQLite sao reemitidos como transcript estilizado.
+- User messages, thinking, tool start, evidence/tool result, assistant output, status/error e done usam o renderer atual.
+- O replay nao usa texto renderizado antigo; largura, cores e wrapping sao recalculados no momento da restauracao.
+- `tool_start` passa a ser persistido para novas sessoes.
+- Statusbar passa a usar visualizer stateful com energia/densidade/caos e transicao em cascata, alinhado ao `phenom-cli-ts`.
+
+Teste primeiro:
+
+- SQLite in-memory com eventos `turn_start`, `assistant_thinking_delta`, `tool_start`, `evidence`, `assistant_delta`, `turn_done` deve renderizar transcript contendo user bubble, `thinking`, `Reading`, evidence, assistant e `[done]`.
+- Audit store deve carregar eventos por sessao em ordem de insercao.
+- Visualizer deve renderizar largura correta em idle/active e sobreviver a resize.
+- PTY deve restaurar uma sessao real offline a partir de `.phenom-zig/phenom.db`.
+
+Implementacao:
+
+- `phenom-zig/src/audit.zig`: adicionar `AuditEvent`, `loadSessionEvents` e `freeAuditEvents`.
+- `phenom-zig/src/main.zig`: adicionar `renderRestoredSession`, chamado no boot interativo apos abrir SQLite e antes do prompt.
+- `phenom-zig/src/main.zig`: mapear eventos SQLite para `EventBus`: `turn_start`, `assistant_thinking_delta`, `tool_start`, `evidence`, `assistant_delta`, `assistant_offline_stub`, erros/status e `turn_done`.
+- `phenom-zig/src/main.zig`: persistir `tool_start` como `name\tdetail`.
+- `phenom-zig/src/render.zig`: `tool_start` com sample vazio nao imprime mais falso `no output`.
+- `phenom-zig/src/tui.zig`: adicionar `MiniVisualizer` stateful com formulas do `visualizer-mini.ts`/`visualizer.py`, resize de largura e tick de 33ms.
+- `phenom-zig/src/tui.zig`: statusbar usa frame renderizado pelo `MiniVisualizer` em vez de frame estatico.
+
+Passos de implementacao:
+
+1. Criar leitura tipada dos eventos SQLite.
+2. Criar replay de sessao usando renderer/event bus existente.
+3. Persistir `tool_start` para novas sessoes.
+4. Corrigir anuncio de tool sem resultado falso.
+5. Portar mini visualizer para Zig sem alocacao.
+6. Conectar visualizer ao ticker/statusbar.
+7. Rodar unitarios, release e PTY de restauracao.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria/lifetime: `loadSessionEvents` duplica `kind/body` e `freeAuditEvents` libera todos; `renderRestoredSession` usa `defer`.
+- SQLite: statements sao finalizados; bind usa tamanhos explicitos; limite de eventos evita replay sem teto.
+- Terminal: replay escreve via `NewlineWriter` com CRLF quando esta em TUI raw.
+- Concorrencia: replay usa o mesmo mutex da TUI no `RendererEventSink`.
+- Visualizer: sem heap; buffer maximo fixo `max_visualizer_cols * 4`; `setWidth` clampa largura.
+- Limite deliberado: replay usa eventos disponiveis no SQLite atual; sessoes antigas sem `tool_start` ainda restauram evidence/assistant/done, mas nao podem inventar detalhe de tool que nao foi salvo.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Sessao offline criada com `--session restore-smoke --demo-read-file src/main.zig` restaura transcript estilizado ao abrir a mesma sessao.
+- Visualizer aparece na statusbar com frame gerado pelo port stateful, nao por tabela estatica.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- PTY `./zig-out/bin/phenom chat --session restore-smoke --offline --no-color --demo-read-file src/main.zig`, input `analise com ferramenta` + `/exit` -> gravou user/tool/evidence/assistant/done no SQLite.
+- PTY abrindo a mesma sessao -> restaurou user bubble, `▸ Reading: src/main.zig`, bloco evidence com gutter, assistant offline e `[done]` antes do prompt.
+- Visualizer no smoke PTY exibiu onda gerada durante `Thinking`, com ticker de 33ms.

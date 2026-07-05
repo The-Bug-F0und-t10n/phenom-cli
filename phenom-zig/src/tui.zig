@@ -49,6 +49,140 @@ pub const VisualizerMode = enum {
     responding,
 };
 
+const VisualizerState = struct {
+    energy: f64,
+    density: f64,
+    chaos: f64,
+    spd_factor: f64,
+};
+
+const visualizer_blocks = [_][]const u8{ " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
+const noise_norm = 0.8110;
+const flat_threshold = 0.05;
+const cascade_sec = 1.0;
+const ease_sec = 0.85;
+const max_visualizer_cols = 512;
+
+pub const MiniVisualizer = struct {
+    width: usize = 20,
+    mode: VisualizerMode = .idle,
+    target: VisualizerState = visualizerState(.idle),
+    snap: [max_visualizer_cols]VisualizerState = [_]VisualizerState{visualizerState(.idle)} ** max_visualizer_cols,
+    transition_start_ms: i64 = 0,
+    start_ms: i64 = 0,
+
+    pub fn init(width: usize) MiniVisualizer {
+        const now = monotonicMs();
+        return .{
+            .width = @max(@as(usize, 4), @min(max_visualizer_cols, width)),
+            .transition_start_ms = now - @as(i64, @intFromFloat((cascade_sec + ease_sec) * 1000.0)),
+            .start_ms = now,
+        };
+    }
+
+    pub fn setMode(self: *MiniVisualizer, mode: VisualizerMode, now_ms: i64) void {
+        if (mode == self.mode) return;
+        var i: usize = 0;
+        while (i < self.width) : (i += 1) {
+            self.snap[i] = self.effectiveStateFor(i, now_ms);
+        }
+        self.mode = mode;
+        self.target = visualizerState(mode);
+        self.transition_start_ms = now_ms;
+    }
+
+    pub fn setWidth(self: *MiniVisualizer, width: usize) void {
+        const next = @max(@as(usize, 4), @min(max_visualizer_cols, width));
+        if (next == self.width) return;
+        if (next > self.width) {
+            var i = self.width;
+            while (i < next) : (i += 1) self.snap[i] = self.target;
+        }
+        self.width = next;
+    }
+
+    pub fn render(self: *MiniVisualizer, out: []u8, now_ms: i64) ![]const u8 {
+        var pos: usize = 0;
+        const t_anim = @as(f64, @floatFromInt(now_ms - self.start_ms)) / 1000.0;
+        var x: usize = 0;
+        while (x < self.width) : (x += 1) {
+            const state = self.effectiveStateFor(x, now_ms);
+            if (state.energy < flat_threshold) {
+                try appendGlyph(out, &pos, if (state.energy < 0.000001) " " else "▁");
+                continue;
+            }
+            const xf = @as(f64, @floatFromInt(x));
+            const spd = 0.4 + state.energy * state.spd_factor;
+            const nx1 = xf * 0.07 * state.density + t_anim * spd;
+            const nx2 = xf * 0.12 * state.density + t_anim * spd * 1.2;
+            const raw = rawNoise(nx1, nx2);
+            const gamma = 0.25 + 4.5 * std.math.pow(f64, 1.0 - state.energy, 2.0);
+            const jitter = if (state.chaos == 0.0)
+                0.0
+            else
+                (std.math.sin(t_anim * 7.3 + xf * 1.7) + std.math.sin(t_anim * 4.1 + xf * 2.9)) * 0.25 * state.chaos;
+            const value = clamp01(std.math.pow(f64, raw, gamma) + jitter);
+            const idx: usize = @intFromFloat(@floor(value * @as(f64, @floatFromInt(visualizer_blocks.len - 1))));
+            try appendGlyph(out, &pos, visualizer_blocks[idx]);
+        }
+        return out[0..pos];
+    }
+
+    fn effectiveStateFor(self: *MiniVisualizer, i: usize, now_ms: i64) VisualizerState {
+        const denom = @max(self.width -| 1, 1);
+        const delay = (@as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(denom))) * cascade_sec;
+        const elapsed = @as(f64, @floatFromInt(now_ms - self.transition_start_ms)) / 1000.0;
+        const blend = easeSmooth((elapsed - delay) / ease_sec);
+        return lerpState(self.snap[i], self.target, blend);
+    }
+};
+
+fn visualizerState(mode: VisualizerMode) VisualizerState {
+    return switch (mode) {
+        .idle => .{ .energy = 0.02, .density = 1.0, .chaos = 0.00, .spd_factor = 0.0 },
+        .listening => .{ .energy = 0.32, .density = 2.2, .chaos = 0.00, .spd_factor = 12.0 },
+        .thinking => .{ .energy = 0.58, .density = 3.0, .chaos = 0.04, .spd_factor = 5.5 },
+        .working => .{ .energy = 0.72, .density = 4.0, .chaos = 0.08, .spd_factor = 11.0 },
+        .responding => .{ .energy = 0.95, .density = 4.8, .chaos = 0.01, .spd_factor = 8.5 },
+    };
+}
+
+fn n1(x: f64) f64 {
+    return std.math.sin(x * 0.35) * 0.60 + std.math.sin(x * 0.90) * 0.25 + std.math.sin(x * 1.70) * 0.15;
+}
+
+fn n2(x: f64) f64 {
+    return std.math.sin(x * 0.55) * 0.50 + std.math.sin(x * 1.30) * 0.35 + std.math.sin(x * 2.10) * 0.15;
+}
+
+fn rawNoise(nx1: f64, nx2: f64) f64 {
+    return @min((@abs(n1(nx1)) * 0.65 + @abs(n2(nx2)) * 0.35) / noise_norm, 1.0);
+}
+
+fn easeSmooth(p: f64) f64 {
+    const t = clamp01(p);
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+fn lerpState(a: VisualizerState, b: VisualizerState, t: f64) VisualizerState {
+    return .{
+        .energy = a.energy * (1.0 - t) + b.energy * t,
+        .density = a.density * (1.0 - t) + b.density * t,
+        .chaos = a.chaos * (1.0 - t) + b.chaos * t,
+        .spd_factor = a.spd_factor * (1.0 - t) + b.spd_factor * t,
+    };
+}
+
+fn clamp01(value: f64) f64 {
+    return @max(0.0, @min(1.0, value));
+}
+
+fn appendGlyph(out: []u8, pos: *usize, glyph: []const u8) !void {
+    if (pos.* + glyph.len > out.len) return error.VisualizerBufferTooSmall;
+    @memcpy(out[pos.* .. pos.* + glyph.len], glyph);
+    pos.* += glyph.len;
+}
+
 pub fn lockTerminal(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) {
         std.Thread.yield() catch {};
@@ -459,6 +593,7 @@ pub fn TerminalUi(comptime Writer: type) type {
         status_started_ms: i64 = 0,
         visualizer_mode: VisualizerMode = .idle,
         visualizer_tick: usize = 0,
+        visualizer: MiniVisualizer,
         show_prompt: bool = true,
         status_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         status_thread: ?std.Thread = null,
@@ -473,6 +608,7 @@ pub fn TerminalUi(comptime Writer: type) type {
                 .writer = writer,
                 .color = color,
                 .editor = InputEditor.init(allocator),
+                .visualizer = MiniVisualizer.init(20),
             };
         }
 
@@ -549,6 +685,7 @@ pub fn TerminalUi(comptime Writer: type) type {
         pub fn showStatus(self: *Self, status: []const u8) !void {
             self.last_status = status;
             self.visualizer_mode = modeFromLabel(status);
+            self.visualizer.setMode(self.visualizer_mode, monotonicMs());
             self.visualizer_tick +%= 1;
             self.show_prompt = false;
             try self.startStatusTicker();
@@ -566,6 +703,7 @@ pub fn TerminalUi(comptime Writer: type) type {
             self.stopStatusTicker();
             self.last_status = "[done]";
             self.visualizer_mode = .idle;
+            self.visualizer.setMode(.idle, monotonicMs());
             self.show_prompt = true;
             try self.draw(.{ .status = "[done]", .show_prompt = true, .preserve_cursor = false });
         }
@@ -574,6 +712,7 @@ pub fn TerminalUi(comptime Writer: type) type {
             self.stopStatusTicker();
             self.last_status = null;
             self.visualizer_mode = .idle;
+            self.visualizer.setMode(.idle, monotonicMs());
             self.show_prompt = true;
             try self.draw(.{ .status = null, .show_prompt = true, .preserve_cursor = false });
         }
@@ -594,7 +733,7 @@ pub fn TerminalUi(comptime Writer: type) type {
 
         fn statusThreadMain(self: *Self) void {
             while (self.status_running.load(.acquire)) {
-                _ = c.usleep(80 * 1000);
+                _ = c.usleep(33 * 1000);
                 if (!self.status_running.load(.acquire)) break;
                 self.pulseStatus() catch {};
             }
@@ -630,13 +769,25 @@ pub fn TerminalUi(comptime Writer: type) type {
             const bw = fd_writer.BufferWriter{ .allocator = self.allocator, .list = &out };
             var status_buf: [96]u8 = undefined;
             const status_text = if (opts.status) |status| self.formatStatus(status, &status_buf) else null;
+            var visualizer_buf: [max_visualizer_cols * 4]u8 = undefined;
+            var visualizer_text: ?[]const u8 = null;
+            if (status_text) |text| {
+                if (opts.status != null and self.visualizer_mode != .idle) {
+                    const visual_cols = visualizerWidth(text, paint_cols);
+                    if (visual_cols > 0) {
+                        self.visualizer.setWidth(visual_cols);
+                        visualizer_text = try self.visualizer.render(&visualizer_buf, monotonicMs());
+                    }
+                }
+            }
             if (opts.preserve_cursor) try bw.writeAll("\x1b7");
             try bw.print("\x1b[{};1H", .{status_row});
             _ = try renderBottomBar(bw, .{
                 .color = self.color,
                 .cols = size.cols,
                 .status = status_text,
-                .visualizer_mode = if (opts.status != null and self.visualizer_mode != .idle) self.visualizer_mode else null,
+                .visualizer = visualizer_text,
+                .visualizer_mode = null,
                 .visualizer_tick = self.visualizer_tick,
                 .prompt = self.editor.buffer.items,
                 .cursor = self.editor.cursor,
@@ -746,6 +897,13 @@ fn writeStatusDynamic(writer: anytype, color: bool, status: []const u8, mode: Vi
     } else if (clipped_cols < width) {
         try writeSpaces(writer, width - clipped_cols);
     }
+}
+
+fn visualizerWidth(status: []const u8, width: usize) usize {
+    const min_visual_cols: usize = 4;
+    const status_cols = @min(utf8Columns(status), width);
+    if (width > status_cols + 1 + min_visual_cols) return width - status_cols - 1;
+    return 0;
 }
 
 fn paintInputRow(writer: anytype, color: bool, prefix: []const u8, content: []const u8, width: usize) !void {
@@ -929,4 +1087,26 @@ test "visualizer frame and mode mapping are deterministic" {
     try std.testing.expectEqualStrings("▁▂▃▄▅▄▃▂▁▂", visualizerFrame(.thinking, 0));
     try std.testing.expectEqual(VisualizerMode.working, modeFromLabel("Patching files"));
     try std.testing.expectEqual(VisualizerMode.listening, modeFromLabel("Reading context"));
+}
+
+test "mini visualizer renders baseline idle and active wave" {
+    var visualizer = MiniVisualizer.init(8);
+    var buf: [128]u8 = undefined;
+    const now = monotonicMs();
+    const idle = try visualizer.render(&buf, now);
+    try std.testing.expectEqual(@as(usize, 8), utf8Columns(idle));
+    try std.testing.expect(std.mem.indexOf(u8, idle, "▁") != null);
+
+    visualizer.setMode(.responding, now);
+    const active = try visualizer.render(&buf, now + 3000);
+    try std.testing.expectEqual(@as(usize, 8), utf8Columns(active));
+    try std.testing.expect(active.len > 0);
+}
+
+test "mini visualizer resizes without stale width" {
+    var visualizer = MiniVisualizer.init(6);
+    visualizer.setWidth(12);
+    var buf: [256]u8 = undefined;
+    const frame = try visualizer.render(&buf, monotonicMs());
+    try std.testing.expectEqual(@as(usize, 12), utf8Columns(frame));
 }

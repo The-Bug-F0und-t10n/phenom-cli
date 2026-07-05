@@ -4,6 +4,16 @@ const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
+pub const AuditEvent = struct {
+    kind: []u8,
+    body: []u8,
+
+    pub fn deinit(self: *AuditEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.kind);
+        allocator.free(self.body);
+    }
+};
+
 pub const AuditDb = struct {
     allocator: std.mem.Allocator,
     db: ?*c.sqlite3,
@@ -154,11 +164,65 @@ pub const AuditDb = struct {
 
         return lines;
     }
+
+    pub fn loadSessionEvents(self: *AuditDb, allocator: std.mem.Allocator, session: []const u8, limit: usize) !std.ArrayList(AuditEvent) {
+        if (limit > std.math.maxInt(c_int)) return error.EventLimitTooLarge;
+
+        const sql =
+            \\select kind, body
+            \\from events
+            \\where session = ?1
+            \\order by id asc
+            \\limit ?2
+        ;
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        const z_session = try self.allocator.dupeZ(u8, session);
+        defer self.allocator.free(z_session);
+
+        if (c.sqlite3_bind_text(stmt, 1, z_session.ptr, @as(c_int, @intCast(session.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_int(stmt, 2, @as(c_int, @intCast(limit))) != c.SQLITE_OK) return error.SqliteBindFailed;
+
+        var events = std.ArrayList(AuditEvent).empty;
+        errdefer freeAuditEvents(allocator, &events);
+
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStepFailed;
+
+            const kind = try dupeColumnText(allocator, stmt, 0);
+            errdefer allocator.free(kind);
+            const body = try dupeColumnText(allocator, stmt, 1);
+            errdefer allocator.free(body);
+            try events.append(allocator, .{ .kind = kind, .body = body });
+        }
+
+        return events;
+    }
 };
 
 pub fn freeHistoryLines(allocator: std.mem.Allocator, lines: *std.ArrayList([]u8)) void {
     for (lines.items) |line| allocator.free(line);
     lines.deinit(allocator);
+}
+
+pub fn freeAuditEvents(allocator: std.mem.Allocator, events: *std.ArrayList(AuditEvent)) void {
+    for (events.items) |*event| event.deinit(allocator);
+    events.deinit(allocator);
+}
+
+fn dupeColumnText(allocator: std.mem.Allocator, stmt: ?*c.sqlite3_stmt, column: c_int) ![]u8 {
+    const ptr = c.sqlite3_column_text(stmt, column) orelse return error.SqliteColumnFailed;
+    const len_raw = c.sqlite3_column_bytes(stmt, column);
+    if (len_raw < 0) return error.SqliteColumnFailed;
+    const bytes = @as([*]const u8, @ptrCast(ptr))[0..@as(usize, @intCast(len_raw))];
+    return allocator.dupe(u8, bytes);
 }
 
 test "input history loads newest distinct sqlite lines" {
@@ -175,6 +239,24 @@ test "input history loads newest distinct sqlite lines" {
     try std.testing.expectEqual(@as(usize, 2), lines.items.len);
     try std.testing.expectEqualStrings("primeiro", lines.items[0]);
     try std.testing.expectEqualStrings("segundo", lines.items[1]);
+}
+
+test "session events load in insertion order" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordEvent("s1", "turn_start", "ola");
+    try db.recordEvent("s2", "turn_start", "ignore");
+    try db.recordEvent("s1", "assistant_delta", "ok");
+
+    var events = try db.loadSessionEvents(std.testing.allocator, "s1", 20);
+    defer freeAuditEvents(std.testing.allocator, &events);
+
+    try std.testing.expectEqual(@as(usize, 2), events.items.len);
+    try std.testing.expectEqualStrings("turn_start", events.items[0].kind);
+    try std.testing.expectEqualStrings("ola", events.items[0].body);
+    try std.testing.expectEqualStrings("assistant_delta", events.items[1].kind);
+    try std.testing.expectEqualStrings("ok", events.items[1].body);
 }
 
 test "input history trims to newest 200 distinct lines" {
