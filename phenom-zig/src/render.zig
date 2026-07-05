@@ -93,6 +93,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             var start: usize = 0;
             while (start < text.len) {
                 if (text[start] == '\n') {
+                    if (self.thinking_needs_gutter) try self.writeThinkingBlankLine();
                     try self.writeDim("\n");
                     self.thinking_needs_gutter = true;
                     self.thinking_col = 0;
@@ -295,6 +296,11 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 self.thinking_col += cols;
                 start = end;
             }
+        }
+
+        fn writeThinkingBlankLine(self: *Self) !void {
+            try self.writeContentGutter();
+            try self.writeCyan("│");
         }
 
         fn writeToolOutput(self: *Self, sample: []const u8) !void {
@@ -508,6 +514,30 @@ test "thinking streamed by token keeps one gutter per logical line" {
         \\ │ thinking
         \\ │ O usuario esta
         \\ │ ok
+        \\
+        \\ final
+    ;
+    try std.testing.expectEqualStrings(expected, buffer.items);
+}
+
+test "thinking blank lines stay inside guttered component" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false });
+    try renderer.thinkingDelta("primeiro\n\nsegundo\n\nterceiro");
+    try renderer.thinkingEnd();
+    try renderer.assistantDelta("final");
+
+    const expected =
+        \\
+        \\ │ thinking
+        \\ │ primeiro
+        \\ │
+        \\ │ segundo
+        \\ │
+        \\ │ terceiro
         \\
         \\ final
     ;

@@ -5665,3 +5665,57 @@ Validacao executada:
 - PTY `./zig-out/bin/phenom chat --session restore-smoke --offline --no-color --demo-read-file src/main.zig`, input `analise com ferramenta` + `/exit` -> gravou user/tool/evidence/assistant/done no SQLite.
 - PTY abrindo a mesma sessao -> restaurou user bubble, `▸ Reading: src/main.zig`, bloco evidence com gutter, assistant offline e `[done]` antes do prompt.
 - Visualizer no smoke PTY exibiu onda gerada durante `Thinking`, com ticker de 33ms.
+
+## T239 - Manter linhas vazias internas dentro do componente thinking
+
+Status: implemented-verified-real.
+
+Motivacao: o modelo pode emitir raciocinio em paragrafos separados por linhas vazias. O renderer preservava essas quebras como linhas totalmente vazias, sem gutter, fazendo o bloco `thinking` parecer varios componentes soltos. O visual esperado e um unico componente vertical: todas as linhas internas, inclusive separadores de paragrafo, precisam continuar marcadas pelo gutter `│`.
+
+Evidencia:
+
+- Log reportado: `thinking` aparece com uma linha vazia crua entre `Preciso responder...`, `Da Vinci se refere...` e `Vou fornecer...`.
+- `phenom-zig/src/render.zig`: em `thinkingDelta`, quando o byte atual era `\n`, o renderer escrevia apenas newline e marcava `thinking_needs_gutter = true`; em `\n\n`, a segunda quebra virava linha vazia sem `│`.
+- `../phenom-cli-ts/src/cli-renderer.ts`: `formatThinkingBlock` renderiza linha vazia interna como marker do thinking, mantendo o bloco unido.
+
+Impacto esperado:
+
+- Paragrafos dentro de `thinking` ficam em um unico bloco visual.
+- Linhas vazias internas aparecem como `│`, nao como buracos no transcript.
+- Wrapping, UTF-8 e gap entre `thinking` e resposta final permanecem inalterados.
+
+Teste primeiro:
+
+- Renderer com `primeiro\n\nsegundo\n\nterceiro` deve produzir `│ primeiro`, `│`, `│ segundo`, `│`, `│ terceiro`.
+- Smoke real com `--thinking on` deve mostrar parágrafos internos do thinking com gutter continuo.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: adicionar `writeThinkingBlankLine`.
+- `phenom-zig/src/render.zig`: quando `thinkingDelta` recebe newline enquanto `thinking_needs_gutter` ja esta ativo, escrever uma linha vazia com gutter antes do newline.
+
+Passos de implementacao:
+
+1. Reproduzir causa pela leitura do estado `thinking_needs_gutter`.
+2. Adicionar helper minimo para blank line guttered.
+3. Cobrir com teste de snapshot do renderer.
+4. Rodar unitarios, release e smoke real.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria/lifetime: nenhum estado ou buffer novo owned; helper escreve direto no writer.
+- UTF-8: mudanca so intercepta byte newline; texto multibyte continua pelo caminho existente.
+- Terminal: em TUI raw, newline continua passando pelo `NewlineWriter`; gutter blank line recebe CRLF como o resto do transcript.
+- Escopo: nao altera parser de thinking, protocolo HTTP, replay SQLite ou statusbar.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real `--thinking on --prompt "quem foi davinci"` mostra blank lines internas como `│`.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 180 --thinking on --prompt "quem foi davinci" --no-color` -> passou; paragrafos internos do thinking apareceram com linhas `│`.
