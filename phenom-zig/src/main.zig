@@ -522,5 +522,5 @@ test "restored sqlite session is rendered through styled transcript events" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "README.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "[EVIDENCE]") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "resposta") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "[done]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Worked for") != null);
 }

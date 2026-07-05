@@ -5784,3 +5784,71 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 120 --thinking on --prompt ola --no-color` -> passou; user, thinking, resposta e `[done]` apareceram em sequencia linear sem gaps duplicados.
+
+## T241 - Trocar marcador final por footer Codex-like com duracao real
+
+Status: implemented-verified-real.
+
+Motivacao: o usuario pediu para substituir o marcador final `[done]` por uma divisoria no estilo Codex: `─ Worked for 7m 17s ─...`. O objetivo e manter o transcript append-only copiavel, mas tornar a finalizacao mais informativa e visualmente alinhada com a referencia do Codex, sem poluir o output do modelo nem depender de texto bruto salvo no historico.
+
+Evidencia:
+
+- `phenom-zig/src/render.zig`: `done()` escrevia finalizacao curta e os snapshots ainda validavam o marcador antigo.
+- `phenom-zig/src/ui_events.zig`: o event sink ja recebe `user_message`, `think_start` e `think_end`, portanto consegue medir a duracao real do turno sem criar estado global.
+- `phenom-zig/src/main.zig`: replay SQLite e turno real passam pelo mesmo `RendererEventSink`, entao a mudanca precisa ser feita no renderer/event sink, nao em cada fluxo de chat.
+- Smoke real anterior mostrava o fim do turno como marcador literal, sem duracao.
+
+Impacto esperado:
+
+- Todo turno renderizado por `RendererEventSink` termina com `Worked for Ns` ou `Worked for Mm Ss`.
+- `renderer.done()` continua disponivel para snapshots/caminhos sem temporizador e usa `0s`.
+- A divisoria respeita largura do terminal e nao corta caractere UTF-8.
+- O historico SQLite continua armazenando eventos logicos; a estetica do footer e recalculada no replay.
+
+Teste primeiro:
+
+- Snapshot append-only simples deve trocar o marcador final pela linha `Worked for`.
+- Snapshot de status + finalizacao deve provar que o footer entra em bloco separado.
+- Snapshot completo Codex-like deve terminar com a divisoria nova.
+- Teste do `RendererEventSink` e do restore SQLite devem procurar `Worked for`, nao `[done]`.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: adicionar `doneWithElapsed(elapsed)` e manter `done()` como wrapper para `0s`.
+- `phenom-zig/src/render.zig`: adicionar writer de divisoria que preenche ate `paintCols()`.
+- `phenom-zig/src/render.zig`: escrever prefixo UTF-8 por colunas, nao por bytes, para evitar corte invalido do caractere `─`.
+- `phenom-zig/src/ui_events.zig`: iniciar cronometro em `user_message` quando necessario e em `think_start` no fluxo normal.
+- `phenom-zig/src/ui_events.zig`: formatar duracao no `think_end`, chamar `doneWithElapsed` e zerar estado do turno.
+- `phenom-zig/src/tui.zig`: trocar status residual `showDone()` para `Worked for 0s` e manter colorizacao discreta.
+- `phenom-zig/src/main.zig`: atualizar teste de restore SQLite para o footer novo.
+
+Passos de implementacao:
+
+1. Trocar snapshots para expressar o footer esperado.
+2. Implementar API minima `doneWithElapsed`.
+3. Medir duracao no event sink com `clock_gettime(CLOCK_MONOTONIC)`.
+4. Corrigir corte UTF-8 da divisoria por largura de coluna.
+5. Atualizar TUI/status residual.
+6. Rodar unitarios, release e smoke real.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria/lifetime: nenhum heap novo; buffers de formatacao ficam na stack e sao escritos antes de sair do escopo.
+- UTF-8: `writeDimColumns` percorre codepoints pelo tamanho UTF-8 e nunca fatia o caractere `─` no meio.
+- Tempo: `CLOCK_MONOTONIC` evita regressao por ajuste de relogio do sistema; fallback retorna `0s`.
+- Concorrencia: cronometro e renderer continuam dentro do mesmo `RendererEventSink`; quando ha TUI, o mutex existente protege a escrita.
+- Terminal: footer usa `paintCols()` e respeita resize para novos blocos; nao tenta reflowar transcript antigo.
+- Escopo: nao adiciona tokens/throughput ainda porque o event sink atual ignora `token_update`; deve entrar quando estatisticas reais estiverem conectadas.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real com backend local mostra resposta do modelo e footer `Worked for`.
+- Nenhum caminho visual novo em `phenom-zig/src` deve depender do literal `[done]`.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 80 --thinking on --prompt ola --no-color` -> passou; backend respondeu, thinking/output ficaram alinhados e o footer mostrou `Worked for 2s`.

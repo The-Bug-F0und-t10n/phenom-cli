@@ -176,10 +176,13 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         }
 
         pub fn done(self: *Self) !void {
+            try self.doneWithElapsed("0s");
+        }
+
+        pub fn doneWithElapsed(self: *Self, elapsed: []const u8) !void {
             try self.closeOpenBlocks();
             try self.blockGap(.done);
-            try self.writeContentGutter();
-            try self.writeGreen("[done]");
+            try self.writeWorkedLine(elapsed);
             try self.writer.writeAll("\n");
             self.last_block = .done;
         }
@@ -395,6 +398,28 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             }
         }
 
+        fn writeWorkedLine(self: *Self, elapsed: []const u8) !void {
+            const paint_cols = self.paintCols();
+            var prefix_buf: [96]u8 = undefined;
+            const prefix = try std.fmt.bufPrint(&prefix_buf, "─ Worked for {s} ", .{elapsed});
+            const shown_cols = try self.writeDimColumns(prefix, paint_cols);
+            var i: usize = shown_cols;
+            while (i < paint_cols) : (i += 1) try self.writeDim("─");
+        }
+
+        fn writeDimColumns(self: *Self, text: []const u8, max_cols: usize) !usize {
+            var cols: usize = 0;
+            var i: usize = 0;
+            while (i < text.len and cols < max_cols) {
+                const len = utf8ByteLen(text[i]);
+                const end = @min(text.len, i + len);
+                try self.writeDim(text[i..end]);
+                i = end;
+                cols += 1;
+            }
+            return cols;
+        }
+
         fn writeSpaces(self: *Self, count: usize) !void {
             var i: usize = 0;
             while (i < count) : (i += 1) try self.writer.writeAll(" ");
@@ -598,7 +623,7 @@ test "append only snapshot matches phenom cli ts plain surface" {
     try renderer.assistantDelta("ok");
     try renderer.done();
 
-    const expected = "\n > [user] ola    \n\n ok\n\n [done]\n";
+    const expected = "\n > [user] ola    \n\n ok\n\n─ Worked for 0s ─\n";
     try std.testing.expectEqualStrings(expected, buffer.items);
 }
 
@@ -618,7 +643,7 @@ test "status after assistant delta starts on separate block" {
         \\
         \\ success expected visible text found: PHENOM_REAL_7319
         \\
-        \\ [done]
+        \\─ Worked for 0s ───────────────────────────────────────────────────────────────
         \\
     ;
     try std.testing.expectEqualStrings(expected, buffer.items);
@@ -740,7 +765,7 @@ test "codex style append only turn snapshot covers core blocks" {
         "\n" ++
         " Corrigido.\n" ++
         "\n" ++
-        " [done]\n";
+        "─ Worked for 0s ─────────────────────────\n";
     try std.testing.expectEqualStrings(expected, buffer.items);
 }
 

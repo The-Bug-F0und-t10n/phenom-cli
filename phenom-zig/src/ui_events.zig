@@ -1,5 +1,9 @@
 const std = @import("std");
 
+const c = @cImport({
+    @cInclude("time.h");
+});
+
 pub const EventType = enum {
     user_message,
     agent_message,
@@ -101,6 +105,7 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
         write_mutex: ?*std.atomic.Mutex = null,
         terminal_columns: ?*const fn () usize = null,
         assistant_started: bool = false,
+        turn_started_ms: i64 = 0,
 
         const Self = @This();
 
@@ -116,9 +121,13 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
             }
             if (self.terminal_columns) |columns| self.renderer.setTerminalColumns(columns());
             switch (event) {
-                .user_message => |text| try self.renderer.user(text),
+                .user_message => |text| {
+                    if (self.turn_started_ms == 0) self.turn_started_ms = monotonicMs();
+                    try self.renderer.user(text);
+                },
                 .think_start => {
                     self.assistant_started = false;
+                    self.turn_started_ms = monotonicMs();
                 },
                 .message_chunk, .agent_message => |text| {
                     try self.ensureAssistantStarted();
@@ -140,8 +149,11 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
                 .token_update => {},
                 .clear_streaming => {},
                 .think_end => {
-                    try self.renderer.done();
+                    var elapsed_buf: [32]u8 = undefined;
+                    const elapsed = formatElapsed(&elapsed_buf, elapsedMillis(self.turn_started_ms));
+                    try self.renderer.doneWithElapsed(elapsed);
                     self.assistant_started = false;
+                    self.turn_started_ms = 0;
                 },
             }
         }
@@ -152,6 +164,29 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
             self.assistant_started = true;
         }
     };
+}
+
+fn elapsedMillis(start_ms: i64) u64 {
+    if (start_ms <= 0) return 0;
+    const now = monotonicMs();
+    if (now <= start_ms) return 0;
+    return @intCast(now - start_ms);
+}
+
+fn monotonicMs() i64 {
+    var ts: c.struct_timespec = undefined;
+    if (c.clock_gettime(c.CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
+}
+
+fn formatElapsed(buf: *[32]u8, elapsed_ms: u64) []const u8 {
+    const total_seconds = elapsed_ms / 1000;
+    const minutes = total_seconds / 60;
+    const seconds = total_seconds % 60;
+    if (minutes > 0) {
+        return std.fmt.bufPrint(buf, "{}m {}s", .{ minutes, seconds }) catch "0s";
+    }
+    return std.fmt.bufPrint(buf, "{}s", .{seconds}) catch "0s";
 }
 
 fn lockTerminal(mutex: *std.atomic.Mutex) void {
@@ -203,5 +238,5 @@ test "renderer sink maps chat events to transcript" {
 
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "> [user] ola") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "resposta") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "[done]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Worked for") != null);
 }

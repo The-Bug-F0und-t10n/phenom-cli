@@ -701,11 +701,11 @@ pub fn TerminalUi(comptime Writer: type) type {
 
         pub fn showDone(self: *Self) !void {
             self.stopStatusTicker();
-            self.last_status = "[done]";
+            self.last_status = "Worked for 0s";
             self.visualizer_mode = .idle;
             self.visualizer.setMode(.idle, monotonicMs());
             self.show_prompt = true;
-            try self.draw(.{ .status = "[done]", .show_prompt = true, .preserve_cursor = false });
+            try self.draw(.{ .status = "Worked for 0s", .show_prompt = true, .preserve_cursor = false });
         }
 
         pub fn showPrompt(self: *Self) !void {
@@ -807,7 +807,7 @@ pub fn TerminalUi(comptime Writer: type) type {
 
         fn formatStatus(self: *Self, status: []const u8, buf: *[96]u8) []const u8 {
             if (!self.status_running.load(.acquire)) return status;
-            if (std.mem.eql(u8, status, "[done]")) return status;
+            if (std.mem.startsWith(u8, status, "Worked for")) return status;
             if (std.mem.indexOfScalar(u8, status, '(') != null) return status;
             const now = monotonicMs();
             const elapsed_ms: u64 = if (now > self.status_started_ms) @intCast(now - self.status_started_ms) else 0;
@@ -866,7 +866,7 @@ fn writeStatus(writer: anytype, color: bool, status: []const u8, visualizer: ?[]
     const clipped = status[0..utf8PrefixBytes(status, status_width)];
     const clipped_cols = utf8Columns(clipped);
     if (color) {
-        if (std.mem.eql(u8, status, "[done]")) try writer.writeAll(green) else try writer.writeAll(dim);
+        if (std.mem.startsWith(u8, status, "Worked for")) try writer.writeAll(green) else try writer.writeAll(dim);
     }
     try writer.writeAll(clipped);
     if (color) try writer.writeAll(reset);
