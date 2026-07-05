@@ -14,6 +14,7 @@ pub const EventType = enum {
     tool_error,
     think_start,
     think_end,
+    turn_done,
     token_update,
     file_diff,
     inference_cancel,
@@ -51,6 +52,10 @@ pub const TokenUpdate = struct {
     tokens_per_second: ?f64 = null,
 };
 
+pub const TurnDone = struct {
+    elapsed_ms: ?u64 = null,
+};
+
 pub const Event = union(EventType) {
     user_message: []const u8,
     agent_message: []const u8,
@@ -61,6 +66,7 @@ pub const Event = union(EventType) {
     tool_error: ToolError,
     think_start: []const u8,
     think_end: void,
+    turn_done: TurnDone,
     token_update: TokenUpdate,
     file_diff: FileDiff,
     inference_cancel: []const u8,
@@ -122,12 +128,12 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
             if (self.terminal_columns) |columns| self.renderer.setTerminalColumns(columns());
             switch (event) {
                 .user_message => |text| {
-                    if (self.turn_started_ms == 0) self.turn_started_ms = monotonicMs();
+                    if (self.turn_started_ms == 0) self.turn_started_ms = monotonicMillis();
                     try self.renderer.user(text);
                 },
                 .think_start => {
                     self.assistant_started = false;
-                    self.turn_started_ms = monotonicMs();
+                    self.turn_started_ms = monotonicMillis();
                 },
                 .message_chunk, .agent_message => |text| {
                     try self.ensureAssistantStarted();
@@ -149,11 +155,10 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
                 .token_update => {},
                 .clear_streaming => {},
                 .think_end => {
-                    var elapsed_buf: [32]u8 = undefined;
-                    const elapsed = formatElapsed(&elapsed_buf, elapsedMillis(self.turn_started_ms));
-                    try self.renderer.doneWithElapsed(elapsed);
-                    self.assistant_started = false;
-                    self.turn_started_ms = 0;
+                    try self.finish(null);
+                },
+                .turn_done => |done| {
+                    try self.finish(done.elapsed_ms);
                 },
             }
         }
@@ -163,23 +168,32 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
             try self.renderer.assistantStart();
             self.assistant_started = true;
         }
+
+        fn finish(self: *Self, stored_elapsed_ms: ?u64) !void {
+            var elapsed_buf: [32]u8 = undefined;
+            const elapsed_ms = stored_elapsed_ms orelse elapsedMillisSince(self.turn_started_ms);
+            const elapsed = formatElapsedMillis(&elapsed_buf, elapsed_ms);
+            try self.renderer.doneWithElapsed(elapsed);
+            self.assistant_started = false;
+            self.turn_started_ms = 0;
+        }
     };
 }
 
-fn elapsedMillis(start_ms: i64) u64 {
+pub fn elapsedMillisSince(start_ms: i64) u64 {
     if (start_ms <= 0) return 0;
-    const now = monotonicMs();
+    const now = monotonicMillis();
     if (now <= start_ms) return 0;
     return @intCast(now - start_ms);
 }
 
-fn monotonicMs() i64 {
+pub fn monotonicMillis() i64 {
     var ts: c.struct_timespec = undefined;
     if (c.clock_gettime(c.CLOCK_MONOTONIC, &ts) != 0) return 0;
     return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
 }
 
-fn formatElapsed(buf: *[32]u8, elapsed_ms: u64) []const u8 {
+pub fn formatElapsedMillis(buf: *[32]u8, elapsed_ms: u64) []const u8 {
     const total_seconds = elapsed_ms / 1000;
     const minutes = total_seconds / 60;
     const seconds = total_seconds % 60;

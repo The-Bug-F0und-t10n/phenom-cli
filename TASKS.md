@@ -5929,3 +5929,73 @@ Validacao executada:
 - Smoke runtime em `/tmp/phenom-config-smoke/config.toml` com `offline = true`, sem flag `--offline`: `/home/ashirak/Projects/person/ai/cli-ai/phenom-cli/phenom-zig/zig-out/bin/phenom chat --prompt oi` -> passou; exibiu `[offline stub] model not called`.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou `/home/ashirak/.local/bin/phenom` e `/home/ashirak/.config/phenom/config.toml`.
 - `/home/ashirak/.local/bin/phenom version` -> passou; exibiu `phenom-zig spike 0.1.0`.
+
+## T243 - Persistir estatisticas de inferencia no replay SQLite
+
+Status: implemented-verified.
+
+Motivacao: depois da troca para footer `Worked for {time}`, o turno ao vivo mostrava a duracao correta, mas a recuperacao da sessao reconstruia o fim do turno sem o tempo original. Isso fazia o replay perder um dado operacional pertinente ao uso do agente e degradava a confiabilidade auditavel da sessao.
+
+Evidencia:
+
+- `phenom-zig/src/main.zig`: `runChatTurnWithUi` gravava `turn_done` com corpo fixo `ok`, sem `elapsed_ms`.
+- `phenom-zig/src/main.zig`: `renderRestoredSession` recebia `turn_done` e emitia `think_end`, forçando o `RendererEventSink` a calcular tempo novo durante replay.
+- `phenom-zig/src/ui_events.zig`: `RendererEventSink` ja sabia formatar `Worked for`, mas nao aceitava metadado persistido.
+- Smoke SQLite antes da mudanca teria apenas `turn_done|ok`, insuficiente para reproduzir duracao do turno.
+
+Impacto esperado:
+
+- Cada turno novo grava `turn_done` como `status=<status> elapsed_ms=<N>`.
+- Replay usa `elapsed_ms` persistido para renderizar `Worked for` com o mesmo tempo logico do turno original.
+- Sessoes antigas com `turn_done = ok` continuam restaurando; nesse caso o footer cai no comportamento legado sem metadado.
+- Erros de modelo e falhas de expectativa tambem fecham o turno com `turn_done` e duracao, em vez de depender de fechamento visual sem stats.
+
+Teste primeiro:
+
+- Teste de restore SQLite deve gravar `turn_done` com `elapsed_ms=1234` e exigir `Worked for 1s` no transcript.
+- Parser de `elapsed_ms` deve aceitar corpo novo e retornar `null` para corpo legado `ok`.
+- Smoke runtime deve mostrar `turn_done|status=ok elapsed_ms=N` no SQLite.
+- Replay TTY com `elapsed_ms=1234` deve renderizar `Worked for 1s`.
+
+Implementacao:
+
+- `phenom-zig/src/ui_events.zig`: adicionar evento de dominio `turn_done` com `elapsed_ms` opcional.
+- `phenom-zig/src/ui_events.zig`: manter `think_end` para compatibilidade, mas concentrar o fechamento em `finish`.
+- `phenom-zig/src/ui_events.zig`: expor `monotonicMillis`, `elapsedMillisSince` e `formatElapsedMillis`.
+- `phenom-zig/src/main.zig`: medir inicio do turno em `runChatTurnWithUi`.
+- `phenom-zig/src/main.zig`: adicionar `recordAndEmitTurnDone`, gravando `status` e `elapsed_ms` antes de emitir o fechamento.
+- `phenom-zig/src/main.zig`: trocar sucesso, erro de modelo e falha de expectativa para `recordAndEmitTurnDone`.
+- `phenom-zig/src/main.zig`: parsear `elapsed_ms` no replay e emitir `turn_done` com o valor persistido.
+
+Passos de implementacao:
+
+1. Adicionar evento `turn_done` no event bus.
+2. Fazer renderer sink aceitar elapsed persistido.
+3. Gravar `elapsed_ms` no SQLite no fim do turno.
+4. Atualizar replay para consumir `elapsed_ms`.
+5. Preservar compatibilidade com sessoes antigas.
+6. Rodar unitarios, release e smoke SQLite/replay.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria/lifetime: `recordAndEmitTurnDone` aloca apenas o corpo do evento na stack do turno via allocator e libera com `defer`.
+- SQLite: schema nao muda; `turn_done` continua evento logico, agora com corpo chave-valor.
+- Compatibilidade: `parseElapsedMs("ok")` retorna `null`; sessoes antigas nao quebram.
+- Tempo: usa `CLOCK_MONOTONIC` via helper existente; `elapsed_ms` e gravado como inteiro decimal.
+- Replay: `model_error` e `expectation_failed` deixam o turno aberto ate `turn_done`; sessoes antigas sem `turn_done` fecham no fallback de fim do replay.
+- Escopo: ainda nao persiste tokens/throughput porque `token_update` nao esta conectado ao backend real.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- SQLite de uma sessao nova contem `turn_done|status=ok elapsed_ms=N`.
+- Replay de sessao com `elapsed_ms=1234` mostra `Worked for 1s`.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `/home/ashirak/Projects/person/ai/cli-ai/phenom-cli/phenom-zig/zig-out/bin/phenom chat --session elapsed-smoke --offline --no-color --prompt oi` em `/tmp/phenom-elapsed-smoke` -> passou; gravou sessao offline.
+- `sqlite3 .phenom-zig/phenom.db "select kind, body from events where session='elapsed-smoke' order by id;"` -> mostrou `turn_done|status=ok elapsed_ms=1`.
+- Replay TTY da sessao com `turn_done` alterado para `status=ok elapsed_ms=1234` -> passou; transcript restaurado mostrou `Worked for 1s`.

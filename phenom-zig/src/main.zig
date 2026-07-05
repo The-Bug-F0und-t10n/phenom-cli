@@ -181,6 +181,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
     var db = try audit.AuditDb.open(allocator, ".phenom-zig/phenom.db");
     defer db.close();
 
+    const turn_started_ms = ui_events.monotonicMillis();
     try db.recordEvent(config.session, "turn_start", prompt);
     try events.emit(.{ .user_message = prompt });
     try events.emit(.{ .think_start = "Thinking" });
@@ -241,7 +242,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
             defer allocator.free(message);
             try events.emit(.{ .progress_update = message });
             try db.recordEvent(config.session, "model_error", @errorName(err));
-            try events.emit(.{ .think_end = {} });
+            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "model_error");
             if (config.fail_on_model_error) return err;
             return;
         };
@@ -260,7 +261,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
                 defer allocator.free(message);
                 try events.emit(.{ .progress_update = message });
                 try db.recordEvent(config.session, "expectation_failed", expected);
-                try events.emit(.{ .think_end = {} });
+                try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "expectation_failed");
                 return error.ExpectedVisibleOutputMissing;
             }
             try db.recordEvent(config.session, "expectation_passed", expected);
@@ -276,8 +277,22 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
         }
     }
 
-    try events.emit(.{ .think_end = {} });
-    try db.recordEvent(config.session, "turn_done", "ok");
+    try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok");
+}
+
+fn recordAndEmitTurnDone(
+    allocator: std.mem.Allocator,
+    db: *audit.AuditDb,
+    session: []const u8,
+    events: *ui_events.EventBus,
+    turn_started_ms: i64,
+    status: []const u8,
+) !void {
+    const elapsed_ms = ui_events.elapsedMillisSince(turn_started_ms);
+    const body = try std.fmt.allocPrint(allocator, "status={s} elapsed_ms={}", .{ status, elapsed_ms });
+    defer allocator.free(body);
+    try db.recordEvent(session, "turn_done", body);
+    try events.emit(.{ .turn_done = .{ .elapsed_ms = elapsed_ms } });
 }
 
 fn renderRestoredSession(
@@ -331,19 +346,17 @@ fn renderRestoredSession(
             restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "model_error")) {
             try bus.emit(.{ .progress_update = event.body });
-            try bus.emit(.{ .think_end = {} });
-            restored_turn_open = false;
+            restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "empty_visible_answer")) {
             try bus.emit(.{ .progress_update = "model emitted no visible final answer; reasoning was suppressed or generation ended inside <think>" });
             restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "expectation_failed")) {
             try bus.emit(.{ .progress_update = event.body });
-            try bus.emit(.{ .think_end = {} });
-            restored_turn_open = false;
+            restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "expectation_passed")) {
             restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "turn_done")) {
-            try bus.emit(.{ .think_end = {} });
+            try bus.emit(.{ .turn_done = .{ .elapsed_ms = parseElapsedMs(event.body) } });
             restored_turn_open = false;
         }
     }
@@ -361,6 +374,15 @@ fn parseRestoredToolStart(body: []const u8) RestoredToolStart {
         return .{ .name = body[0..idx], .detail = body[idx + 1 ..] };
     }
     return .{ .name = body, .detail = "" };
+}
+
+fn parseElapsedMs(body: []const u8) ?u64 {
+    const needle = "elapsed_ms=";
+    const start = std.mem.indexOf(u8, body, needle) orelse return null;
+    var end = start + needle.len;
+    while (end < body.len and body[end] >= '0' and body[end] <= '9') : (end += 1) {}
+    if (end == start + needle.len) return null;
+    return std.fmt.parseInt(u64, body[start + needle.len .. end], 10) catch null;
 }
 
 fn offlineStubResponse() []const u8 {
@@ -509,7 +531,7 @@ test "restored sqlite session is rendered through styled transcript events" {
     try db.recordEvent("restore", "tool_start", "read_file_range\tREADME.md");
     try db.recordEvent("restore", "evidence", "[EVIDENCE]\nREADME.md:1\n");
     try db.recordEvent("restore", "assistant_delta", "resposta");
-    try db.recordEvent("restore", "turn_done", "ok");
+    try db.recordEvent("restore", "turn_done", "status=ok elapsed_ms=1234");
 
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
@@ -525,5 +547,7 @@ test "restored sqlite session is rendered through styled transcript events" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "README.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "[EVIDENCE]") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "resposta") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Worked for") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Worked for 1s") != null);
+    try std.testing.expectEqual(@as(?u64, 1234), parseElapsedMs("status=ok elapsed_ms=1234"));
+    try std.testing.expectEqual(@as(?u64, null), parseElapsedMs("ok"));
 }
