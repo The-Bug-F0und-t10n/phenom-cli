@@ -38,3 +38,55 @@ pub const BufferWriter = struct {
         try self.writeAll(text);
     }
 };
+
+pub fn NewlineWriter(comptime Inner: type) type {
+    return struct {
+        inner: Inner,
+        crlf: bool = false,
+        prev_cr: bool = false,
+
+        const Self = @This();
+
+        pub fn writeAll(self: *Self, bytes: []const u8) !void {
+            if (!self.crlf) {
+                try self.inner.writeAll(bytes);
+                if (bytes.len > 0) self.prev_cr = bytes[bytes.len - 1] == '\r';
+                return;
+            }
+
+            var start: usize = 0;
+            var i: usize = 0;
+            while (i < bytes.len) : (i += 1) {
+                if (bytes[i] != '\n') continue;
+                if (i > start) try self.inner.writeAll(bytes[start..i]);
+                const has_cr = if (i > 0) bytes[i - 1] == '\r' else self.prev_cr;
+                if (!has_cr) try self.inner.writeAll("\r");
+                try self.inner.writeAll("\n");
+                self.prev_cr = false;
+                start = i + 1;
+            }
+            if (start < bytes.len) {
+                try self.inner.writeAll(bytes[start..]);
+                self.prev_cr = bytes[bytes.len - 1] == '\r';
+            }
+        }
+
+        pub fn print(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+            var buf: [4096]u8 = undefined;
+            const text = try std.fmt.bufPrint(&buf, fmt, args);
+            try self.writeAll(text);
+        }
+    };
+}
+
+test "newline writer translates lf for raw terminal transcript" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const inner = BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var writer = NewlineWriter(@TypeOf(inner)){ .inner = inner, .crlf = true };
+    try writer.writeAll("a\nb");
+    try writer.writeAll("\r\nc\n");
+
+    try std.testing.expectEqualStrings("a\r\nb\r\nc\r\n", buffer.items);
+}

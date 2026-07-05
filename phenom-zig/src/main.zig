@@ -155,8 +155,9 @@ fn runChatTurn(allocator: std.mem.Allocator, config: cli.Config, stdout: fd_writ
 
 fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: fd_writer.FdWriter, prompt: []const u8, ui: anytype) !void {
     const size = tui.terminalSize();
-    var renderer = render.AppendOnlyRenderer(@TypeOf(stdout)).init(stdout, .{ .color = !config.no_color, .terminal_columns = size.cols, .user_label = userLabel() });
     const ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter) = ui;
+    var transcript_writer = fd_writer.NewlineWriter(fd_writer.FdWriter){ .inner = stdout, .crlf = ui_ptr != null };
+    var renderer = render.AppendOnlyRenderer(@TypeOf(&transcript_writer)).init(&transcript_writer, .{ .color = !config.no_color, .terminal_columns = size.cols, .user_label = userLabel() });
     var events = ui_events.EventBus.init(allocator);
     defer events.deinit();
     var render_sink = ui_events.RendererEventSink(@TypeOf(&renderer)){

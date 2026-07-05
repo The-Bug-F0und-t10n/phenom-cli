@@ -5457,3 +5457,64 @@ Validacao executada:
 - Smoke real sem permissao de rede no sandbox -> falhou antes de conectar com `SocketCreateFailed`, validando que nao era falha do renderer.
 - Smoke real com permissao de rede `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 80 --prompt ola --no-color` -> passou; backend respondeu `Ola! Como posso ajudar?` e `[done]` apareceu uma vez.
 - Smoke real com thinking `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 140 --thinking on --prompt ola --no-color` -> passou; bloco `thinking` saiu com texto continuo em portugues, sem gutter entre tokens.
+
+## T236 - Corrigir alinhamento do transcript append-only em terminal raw
+
+Status: implemented-verified-real.
+
+Motivacao: apos T235, o gutter do `thinking` parou de repetir por token, mas o log interativo ainda mostrou os blocos deslocados para a direita. A causa nao era o renderer de thinking: em raw mode, `cfmakeraw` desativa a traducao de output do terminal, entao `\n` desce linha sem retornar para coluna 1. O footer ja usava CRLF; faltava normalizar o transcript append-only quando a TUI esta ativa.
+
+Evidencia:
+
+- Log reportado pelo usuario: user bubble inicia correto, mas `│ thinking`, resposta final e `[done]` aparecem com grandes espacos antes do conteudo.
+- `phenom-zig/src/tui.zig`: `attach` usa `cfmakeraw`, que remove processamento de output.
+- `phenom-zig/src/render.zig`: o transcript append-only emite `\n` em varios pontos por design, correto para stdout normal, mas insuficiente quando stdout esta sob TUI raw.
+- PTY offline antes da correcao: depois de uma linha preenchida ate o fim, linhas seguintes podiam herdar coluna errada.
+
+Impacto esperado:
+
+- Transcript interativo volta para coluna 1 em cada newline.
+- Modo `--prompt` nao interativo preserva LF normal.
+- Nao e necessario alterar todos os blocos do renderer nem ligar `OPOST` globalmente no terminal.
+- Footer/statusbar continua usando sua propria renderizacao CRLF.
+
+Teste primeiro:
+
+- Unitario do writer: `a\nb`, `\r\n`, `c\n` devem virar `a\r\nb\r\nc\r\n` sem duplicar CR.
+- PTY offline interativo deve mostrar user bubble, resposta e `[done]` alinhados na margem.
+- PTY real com `--thinking on` deve mostrar `│ thinking`, resposta e `[done]` alinhados na margem.
+
+Implementacao:
+
+- `phenom-zig/src/fd_writer.zig`: adicionar `NewlineWriter(Inner)` com modo `crlf`.
+- `phenom-zig/src/fd_writer.zig`: preservar estado `prev_cr` para nao transformar `\r\n` em `\r\r\n`.
+- `phenom-zig/src/main.zig`: usar `NewlineWriter(fd_writer.FdWriter)` no renderer do turno; `crlf = true` somente quando ha `TerminalUi` ativa.
+
+Passos de implementacao:
+
+1. Identificar que o deslocamento vem de LF em raw mode, nao de padding do renderer.
+2. Criar writer pequeno com traducao LF -> CRLF.
+3. Ativar o writer apenas no transcript do chat interativo.
+4. Rodar unitarios, release, PTY offline e PTY real com thinking.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria/lifetime: `NewlineWriter` nao aloca; guarda apenas `inner`, `crlf` e `prev_cr` no stack do turno.
+- C interop: nenhuma mudanca em `termios`; evita efeitos colaterais de reativar `OPOST/ONLCR` globalmente.
+- UTF-8: writer so inspeciona bytes `\r` e `\n`; nao reescreve bytes multibyte.
+- Concorrencia: renderer continua protegido pelo mutex da TUI via `RendererEventSink`; writer vive ate o fim de `runChatTurnWithUi`.
+- Escopo: nao altera visualizer/statusbar; corrige apenas newline do transcript append-only em raw mode.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- PTY offline `ola\r/exit\r` mostra blocos alinhados na margem.
+- PTY real `--thinking on`, input `ola`, mostra `│ thinking`, resposta e `[done]` alinhados na margem.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- PTY offline `./zig-out/bin/phenom chat --offline --no-color`, input `ola\r/exit\r` -> passou; user bubble, resposta offline e `[done]` iniciaram alinhados na margem.
+- PTY real `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 140 --thinking on --no-color`, input `ola\r/exit\r` -> passou; `│ thinking`, resposta final e `[done]` iniciaram alinhados na margem.
