@@ -189,6 +189,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
     if (config.demo_read_file) |path| {
         const allowed = gate.isAllowed("read_file_range", &.{"read_file_range"});
         if (!allowed) return error.ToolDenied;
+        if (ui_ptr) |active_ui| try active_ui.showStatus("Reading");
         const tool_start = try std.fmt.allocPrint(allocator, "read_file_range\t{s}", .{path});
         defer allocator.free(tool_start);
         try db.recordEvent(config.session, "tool_start", tool_start);
@@ -203,6 +204,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
         defer allocator.free(rendered);
         try db.recordEvent(config.session, "evidence", rendered);
         try events.emit(.{ .tool_result = .{ .name = "read_file_range", .output = rendered } });
+        if (ui_ptr) |active_ui| try active_ui.showStatus("Thinking");
     }
 
     if (config.offline) {
@@ -559,8 +561,20 @@ test "restored sqlite session is rendered through styled transcript events" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "[EVIDENCE]") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "resposta") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Worked for 1s") != null);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(buffer.items, "▸ Reading"));
     try std.testing.expectEqual(@as(?u64, 1234), parseElapsedMs("status=ok elapsed_ms=1234"));
     try std.testing.expectEqual(@as(?u64, null), parseElapsedMs("ok"));
     try std.testing.expectEqual(@as(?u64, 2000), restoredElapsedMs("ok", 100, 102));
     try std.testing.expectEqual(@as(?u64, null), restoredElapsedMs("ok", 102, 100));
+}
+
+fn countNeedle(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0) return 0;
+    var count: usize = 0;
+    var start: usize = 0;
+    while (std.mem.indexOf(u8, haystack[start..], needle)) |idx| {
+        count += 1;
+        start += idx + needle.len;
+    }
+    return count;
 }

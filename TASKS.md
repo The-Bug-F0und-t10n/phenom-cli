@@ -6135,3 +6135,78 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
 - `/home/ashirak/.config/phenom/config.toml` apos install manteve `host = "inference.local"` e `thinking = "on"`.
+
+## T246 - Fechar contrato Codex-like do terminal Zig
+
+Status: implemented-verified.
+
+Motivacao: as tasks Codex-like anteriores tinham implementado blocos essenciais, mas ainda nao estavam 100% como contrato operacional. O desvio mais visivel era o ciclo de tools: `TOOL_START` anunciava a tool e `TOOL_RESULT` reimprimia outro anuncio antes do resultado. Isso deixava o transcript menos parecido com Codex/phenom-cli-ts, poluia replay SQLite e quebrava a leitura append-only.
+
+Evidencia:
+
+- `phenom-zig/src/ui_events.zig`: `tool_result` chamava `toolSampleWithDetail(result.name, "", result.output)`, duplicando `▸ Reading`/`▸ Running`.
+- `phenom-zig/src/render.zig`: so havia API publica combinada `toolSampleWithDetail`; nao existia contrato separado para start, output e failure.
+- `phenom-zig/src/main.zig`: demo tool nao mudava a statusbar para `Reading`, apesar do TS mudar o op label conforme tool ativa.
+- T240 ja tinha snapshot amplo, mas nao provava lifecycle start/result sem duplicacao.
+
+Impacto esperado:
+
+- Tool lifecycle fica Codex-like: um anuncio `▸ Running/Reading/Patching`, depois stdout/evidence/erro no mesmo bloco.
+- `TOOL_RESULT` nao duplica o anuncio.
+- Erro de tool aparece como `✗ resumo`, com primeira linha truncada para evitar despejo bruto.
+- Statusbar TUI passa por `Thinking -> Reading -> Thinking/Responding` no fluxo de tool atual.
+- Replay SQLite herda o mesmo contrato porque reemite `tool_start` e `tool_result`.
+
+Teste primeiro:
+
+- Snapshot de `toolStart + toolOutput` deve conter um unico `▸ Running`.
+- Snapshot de `toolFailure` deve renderizar `✗ compile failed`.
+- Snapshot completo Codex-like deve usar start/result separados.
+- Teste de restore SQLite deve garantir `▸ Reading` uma vez.
+- PTY com `--demo-read-file` deve mostrar statusbar `Reading` e transcript sem duplicar tool.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: adicionar `toolStart`, `toolOutput` e `toolFailure`.
+- `phenom-zig/src/render.zig`: manter `toolSampleWithDetail` como wrapper de compatibilidade.
+- `phenom-zig/src/render.zig`: adicionar helper `firstLine` para erro curto e `countNeedle` para teste.
+- `phenom-zig/src/ui_events.zig`: mapear `tool_start` para `toolStart`.
+- `phenom-zig/src/ui_events.zig`: mapear `tool_result` para `toolOutput` ou `toolFailure`.
+- `phenom-zig/src/ui_events.zig`: mapear `tool_error` para start opcional + failure.
+- `phenom-zig/src/main.zig`: durante `demo_read_file`, statusbar muda para `Reading` enquanto a tool executa e volta para `Thinking`.
+- `phenom-zig/src/main.zig`: restore test passa a validar que `▸ Reading` aparece uma vez.
+
+Passos de implementacao:
+
+1. Separar API de tool start/result/failure no renderer.
+2. Atualizar event sink para usar lifecycle separado.
+3. Atualizar snapshot Codex-like completo.
+4. Adicionar snapshots de lifecycle e erro.
+5. Conectar statusbar `Reading` no fluxo de tool atual.
+6. Validar replay SQLite sem tool duplicada.
+7. Rodar unitarios, release e smoke PTY.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria/lifetime: nenhuma alocacao nova no renderer/event sink; helpers operam sobre slices existentes.
+- Bounds: `firstLine` limita erro a 200 bytes e corta somente por indice de linha; erro UTF-8 muito longo pode truncar por byte no limite, aceitavel para resumo de falha atual.
+- Terminal: tool output continua usando gutter append-only e `NewlineWriter` no TUI raw.
+- Concorrencia: statusbar usa os metodos TUI existentes e mutex interno; renderer segue protegido pelo `RendererEventSink`.
+- Compatibilidade: `toolSampleWithDetail` permanece para testes/callers antigos.
+- Limite deliberado: markdown renderer rico ainda nao entra; o contrato fechado aqui e o Codex-like operacional de transcript, tools, diff, prompt, statusbar e replay.
+
+Criterio de aceite:
+
+- `zig test src/render.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke `--demo-read-file` mostra um unico `▸ Reading`.
+- PTY interativo mostra statusbar `Thinking -> Reading -> Thinking` e prompt permanente.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/render.zig -lc` -> passou; 19 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --offline --no-color --prompt 'analise' --demo-read-file src/main.zig --session codex-like-smoke` -> passou; transcript exibiu um unico `▸ Reading: src/main.zig` e evidence no mesmo bloco.
+- PTY `./zig-out/bin/phenom chat --offline --no-color --demo-read-file src/main.zig --session codex-like-pty`, input `analise` + `/exit` -> passou; statusbar mostrou `Thinking`, depois `Reading`, depois `Thinking`, transcript permaneceu alinhado e prompt foi restaurado.

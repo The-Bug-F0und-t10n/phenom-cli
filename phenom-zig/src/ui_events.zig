@@ -140,14 +140,18 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
                     try self.renderer.assistantDelta(text);
                 },
                 .reasoning_chunk => |text| try self.renderer.thinkingDelta(text),
-                .tool_start => |tool| try self.renderer.toolSampleWithDetail(tool.name, tool.detail, ""),
+                .tool_start => |tool| try self.renderer.toolStart(tool.name, tool.detail),
                 .tool_result => |result| {
-                    if (!result.success) return;
-                    if (result.output.len > 0) try self.renderer.toolSampleWithDetail(result.name, "", result.output);
+                    if (!result.success) {
+                        try self.renderer.toolFailure(if (result.output.len > 0) result.output else "failed");
+                        return;
+                    }
+                    try self.renderer.toolOutput(result.output);
                 },
                 .tool_error => |tool| {
                     const message = if (tool.output.len > 0) tool.output else tool.message;
-                    try self.renderer.toolSampleWithDetail(tool.name, tool.message, message);
+                    if (tool.message.len > 0) try self.renderer.toolStart(tool.name, tool.message);
+                    try self.renderer.toolFailure(message);
                 },
                 .file_diff => |diff| try self.renderer.diff(diff.path, diff.action, diff.content),
                 .inference_cancel => |reason| try self.renderer.status(reason),

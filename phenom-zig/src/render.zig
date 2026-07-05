@@ -135,6 +135,11 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         }
 
         pub fn toolSampleWithDetail(self: *Self, name: []const u8, detail: []const u8, sample: []const u8) !void {
+            try self.toolStart(name, detail);
+            if (sample.len > 0) try self.toolOutput(sample);
+        }
+
+        pub fn toolStart(self: *Self, name: []const u8, detail: []const u8) !void {
             try self.closeOpenBlocks();
             try self.blockGap(.tool);
             self.tool_seq += 1;
@@ -148,7 +153,27 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 try self.writer.writeAll(toolDetail(name));
             }
             try self.writer.writeAll("\n");
-            if (sample.len > 0) try self.writeToolOutput(sample);
+            self.last_block = .tool;
+        }
+
+        pub fn toolOutput(self: *Self, sample: []const u8) !void {
+            if (self.last_block != .tool) {
+                try self.closeOpenBlocks();
+                try self.blockGap(.tool);
+            }
+            try self.writeToolOutput(sample);
+            self.last_block = .tool;
+        }
+
+        pub fn toolFailure(self: *Self, message: []const u8) !void {
+            if (self.last_block != .tool) {
+                try self.closeOpenBlocks();
+                try self.blockGap(.tool);
+            }
+            try self.writeContentGutter();
+            try self.writeRed("  ✗ ");
+            try self.writer.writeAll(firstLine(message));
+            try self.writer.writeAll("\n");
             self.last_block = .tool;
         }
 
@@ -511,6 +536,22 @@ fn toolDetail(name: []const u8) []const u8 {
     return "";
 }
 
+fn firstLine(text: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    return text[0..@min(end, 200)];
+}
+
+fn countNeedle(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0) return 0;
+    var count: usize = 0;
+    var start: usize = 0;
+    while (std.mem.indexOf(u8, haystack[start..], needle)) |idx| {
+        count += 1;
+        start += idx + needle.len;
+    }
+    return count;
+}
+
 test "thinking renders cyan gutter and separates final output" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
@@ -690,10 +731,46 @@ test "tool start announcement does not fake empty result" {
 
     const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
     var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false });
-    try renderer.toolSampleWithDetail("read_file_range", "README.md", "");
+    try renderer.toolStart("read_file_range", "README.md");
 
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Reading: README.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "no output") == null);
+}
+
+test "tool lifecycle appends result without duplicating announcement" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false });
+    try renderer.toolStart("run_code", "zig build test");
+    try renderer.toolOutput("$ zig build test    [cwd=. exit 0 3ms]\nok\n");
+
+    const expected =
+        \\ ▸ Running: zig build test
+        \\     │ $ zig build test    [cwd=. exit 0 3ms]
+        \\     │ ok
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, buffer.items);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(buffer.items, "▸ Running"));
+}
+
+test "tool failure renders codex style failure line" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false });
+    try renderer.toolStart("run_code", "zig build test");
+    try renderer.toolFailure("compile failed\nfull trace");
+
+    const expected =
+        \\ ▸ Running: zig build test
+        \\   ✗ compile failed
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, buffer.items);
 }
 
 test "diff preview uses soft markers and truncation" {
@@ -738,7 +815,8 @@ test "codex style append only turn snapshot covers core blocks" {
     try renderer.user("corrija o bug");
     try renderer.thinkingDelta("vou inspecionar\n\naplicar patch");
     try renderer.thinkingEnd();
-    try renderer.toolSampleWithDetail("run_code", "zig build test", "$ zig build test\nok\n");
+    try renderer.toolStart("run_code", "zig build test");
+    try renderer.toolOutput("$ zig build test\nok\n");
     try renderer.diff("src/app.zig", "patched", "@@ -1 +1 @@\n-old\n+new\n context\n");
     try renderer.assistantStart();
     try renderer.assistantDelta("Corrigido.");
