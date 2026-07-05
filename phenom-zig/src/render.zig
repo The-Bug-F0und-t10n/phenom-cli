@@ -16,6 +16,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         assistant_open: bool = false,
         thinking_open: bool = false,
         stream_needs_gutter: bool = true,
+        thinking_needs_gutter: bool = true,
         last_block: BlockKind = .none,
         tool_seq: usize = 0,
 
@@ -79,28 +80,35 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 try self.writeCyanBold("thinking");
                 try self.writer.writeAll("\n");
                 self.thinking_open = true;
+                self.thinking_needs_gutter = true;
                 self.last_block = .thinking;
             }
 
             var start: usize = 0;
-            while (start <= text.len) {
-                const rel = std.mem.indexOfScalar(u8, text[start..], '\n');
-                const end = if (rel) |idx| start + idx else text.len;
-                if (end > start) {
+            while (start < text.len) {
+                if (text[start] == '\n') {
+                    try self.writeDim("\n");
+                    self.thinking_needs_gutter = true;
+                    start += 1;
+                    continue;
+                }
+                if (self.thinking_needs_gutter) {
                     try self.writeContentGutter();
                     try self.writeCyan("│ ");
-                    try self.writeDim(text[start..end]);
+                    self.thinking_needs_gutter = false;
                 }
-                if (rel == null) break;
-                try self.writer.writeAll("\n");
-                start = end + 1;
+                const rel = std.mem.indexOfScalar(u8, text[start..], '\n');
+                const end = if (rel) |idx| start + idx else text.len;
+                try self.writeDim(text[start..end]);
+                start = end;
             }
         }
 
         pub fn thinkingEnd(self: *Self) !void {
             if (!self.thinking_open) return;
-            try self.writer.writeAll("\n");
+            if (!self.thinking_needs_gutter) try self.writer.writeAll("\n");
             self.thinking_open = false;
+            self.thinking_needs_gutter = true;
             try self.writer.writeAll("\n");
             self.assistant_open = true;
             self.stream_needs_gutter = true;
@@ -434,6 +442,41 @@ test "thinking renders cyan gutter and separates final output" {
         \\ final
     ;
     try std.testing.expectEqualStrings(expected, buffer.items);
+}
+
+test "thinking streamed by token keeps one gutter per logical line" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false });
+    try renderer.assistantStart();
+    try renderer.thinkingDelta("O");
+    try renderer.thinkingDelta(" usuario");
+    try renderer.thinkingDelta(" esta\nok");
+    try renderer.thinkingEnd();
+    try renderer.assistantDelta("final");
+
+    const expected =
+        \\
+        \\ │ thinking
+        \\ │ O usuario esta
+        \\ │ ok
+        \\
+        \\ final
+    ;
+    try std.testing.expectEqualStrings(expected, buffer.items);
+}
+
+test "thinking stream preserves utf8 text inside styled chunks" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = true });
+    try renderer.thinkingDelta("usuário em português");
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "usuário em português") != null);
 }
 
 test "append only snapshot matches phenom cli ts plain surface" {

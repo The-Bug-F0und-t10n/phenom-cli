@@ -5391,3 +5391,69 @@ Validacao executada:
 - PTY offline `./zig-out/bin/phenom chat --offline --no-color`, input parcial `abc` -> output mostrou `> abc` antes do Enter.
 - PTY offline `abc\r/exit\r` -> mostrou statusbar, resposta offline explicita, `[done]`, restaurou terminal.
 - PTY real `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 96 --thinking off --expect-contains PHENOM_REAL_7319 --show-expect-status`, input `Complete: PHENOM_REAL_7319\r` -> statusbar repintou wave, mudou `Thinking` para `Responding`, backend retornou `PHENOM_REAL_7319`, terminal restaurou em `/exit`.
+
+## T235 - Corrigir streaming do bloco thinking e finalizacao duplicada no chat Zig
+
+Status: implemented-verified-real.
+
+Motivacao: o log real mostrou o bloco `thinking` ilegivel, com gutter `│` inserido entre tokens (`O │ usuario │ esta...`), e o fim do turno apareceu com `[done]` duplicado/prompt corrompido. Isso quebra a paridade visual com o `phenom-cli-ts`, atrapalha copia do terminal e mascara a separacao entre raciocinio de baixo destaque e resposta final.
+
+Evidencia:
+
+- Log reportado pelo usuario: `│ thinking` seguido de `│ O │ usuário │ está...`, resposta final desalinhada, dois `[done]` e prompt final `n>`.
+- `phenom-zig/src/render.zig`: `thinkingDelta` escrevia `│ ` para cada chunk recebido. Como o backend streama tokens, cada token virava uma falsa linha visual.
+- `phenom-zig/src/main.zig`: `runChatTurnWithUi` ja finalizava o transcript via evento `think_end`/`renderer.done()`, e `runInteractiveChat` chamava `ui.showDone()` logo depois, criando segunda finalizacao no footer.
+- `../phenom-cli-ts/src/cli-renderer.ts`: o thinking e renderizado como bloco append-only com gutter por linha, nao por token.
+
+Impacto esperado:
+
+- `thinking` streamado por token fica legivel, com um unico `│` no inicio de cada linha logica.
+- Texto UTF-8 em portugues permanece contiguo dentro de chunks coloridos.
+- `[done]` aparece uma vez no transcript do turno.
+- Apos o turno interativo, o footer volta para prompt limpo em vez de imprimir outro estado final.
+
+Teste primeiro:
+
+- Unitario do renderer com chunks `"O"`, `" usuario"`, `" esta\nok"` deve produzir `│ O usuario esta` e `│ ok`, sem gutter entre tokens.
+- Unitario com ANSI ligado deve preservar substring UTF-8 `usuario em portugues` com acentos.
+- PTY offline deve mostrar um unico `[done]` e prompt limpo depois do turno.
+- Smoke real com `--thinking on` deve mostrar bloco thinking sem `│` entre tokens.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: adicionar `thinking_needs_gutter` ao `AppendOnlyRenderer`.
+- `phenom-zig/src/render.zig`: mudar `thinkingDelta` para escrever gutter apenas no inicio de linha logica e preservar fatias UTF-8 entre `\n`.
+- `phenom-zig/src/render.zig`: ajustar `thinkingEnd` para nao forcar linha extra quando o bloco ja terminou em newline.
+- `phenom-zig/src/main.zig`: trocar `ui.showDone()` por `ui.showPrompt()` no loop interativo; o `[done]` do transcript continua sendo responsabilidade do evento `think_end`.
+
+Passos de implementacao:
+
+1. Reproduzir causa no renderer por leitura do codigo e teste de chunks.
+2. Adicionar estado minimo para gutter do thinking.
+3. Preservar escrita por slice para nao quebrar UTF-8.
+4. Remover duplicacao visual de done no loop interativo.
+5. Rodar unitarios, build release, PTY offline e smoke real com backend.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria/lifetime: nenhum buffer owned novo; `thinking_needs_gutter` e estado escalar dentro do renderer.
+- UTF-8: escrita do thinking usa fatias entre newlines, nao byte a byte, evitando ANSI no meio de codepoint.
+- Concorrencia: mantido o lock existente do `RendererEventSink` quando ha TUI; a mudanca nao adiciona thread nem ponteiro novo.
+- Terminal cleanup: `ui.showPrompt()` para ticker via `stopStatusTicker` e redesenha footer; `renderer.done()` permanece append-only no transcript.
+- Escopo: nao altera parsing de reasoning nem protocolo HTTP; corrige apenas render/finalizacao.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- PTY offline `ola\r/exit\r` mostra um unico `[done]` e restaura terminal.
+- Smoke real `--thinking on --prompt ola` mostra `│ thinking` com texto continuo e resposta final separada.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- PTY offline `./zig-out/bin/phenom chat --offline --no-color`, input `ola\r/exit\r` -> mostrou `[offline stub] model not called`, um unico `[done]`, prompt limpo e mensagem de sessao salva.
+- Smoke real sem permissao de rede no sandbox -> falhou antes de conectar com `SocketCreateFailed`, validando que nao era falha do renderer.
+- Smoke real com permissao de rede `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 80 --prompt ola --no-color` -> passou; backend respondeu `Ola! Como posso ajudar?` e `[done]` apareceu uma vez.
+- Smoke real com thinking `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 140 --thinking on --prompt ola --no-color` -> passou; bloco `thinking` saiu com texto continuo em portugues, sem gutter entre tokens.

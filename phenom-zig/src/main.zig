@@ -145,7 +145,7 @@ fn runInteractiveChat(allocator: std.mem.Allocator, config: cli.Config, stdout: 
         try ui.showStatus("Thinking");
         try ui.positionContent();
         try runChatTurnWithUi(allocator, config, stdout, prompt, &ui);
-        try ui.showDone();
+        try ui.showPrompt();
     }
 }
 
