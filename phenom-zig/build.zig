@@ -27,6 +27,15 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run phenom");
     run_step.dependOn(&run_cmd.step);
 
+    const install_local_step = b.step("install-local", "Install phenom to ~/.local/bin and config to ~/.config/phenom.");
+    const install_local_cmd = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        "test -n \"$HOME\" && install -Dm755 zig-out/bin/phenom \"$HOME/.local/bin/phenom\" && install -Dm644 ../config.toml \"$HOME/.config/phenom/config.toml\"",
+    });
+    install_local_cmd.step.dependOn(b.getInstallStep());
+    install_local_step.dependOn(&install_local_cmd.step);
+
     const real_backend = b.option([]const u8, "real-backend", "Real backend for smoke test: ollama or llamacpp") orelse "llamacpp";
     const real_host = b.option([]const u8, "real-host", "Real backend host:port for smoke test") orelse "127.0.0.1:11434";
     const real_model = b.option([]const u8, "real-model", "Real model name for smoke test") orelse "phenom:latest";

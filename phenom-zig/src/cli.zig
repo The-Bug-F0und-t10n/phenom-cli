@@ -38,7 +38,11 @@ pub const Config = struct {
 };
 
 pub fn parseArgs(args: []const []const u8) !Config {
-    var cfg = Config{};
+    return parseArgsWithBase(Config{}, args);
+}
+
+pub fn parseArgsWithBase(base: Config, args: []const []const u8) !Config {
+    var cfg = base;
     if (args.len <= 1) return cfg;
 
     if (std.mem.eql(u8, args[1], "chat")) {
@@ -139,7 +143,32 @@ pub fn printUsage(writer: anytype) !void {
         \\  --show-expect-status
         \\  --demo-read-file PATH
         \\
+        \\config:
+        \\  reads ./config.toml, then ~/.config/phenom/config.toml when local config is absent
+        \\  flags override config values
+        \\  keys: backend, host, port, server, model, thinking, max_tokens, no_color,
+        \\        offline, fail_on_model_error, expect_contains, show_expect_status,
+        \\        demo_read_file, session
+        \\
     );
+}
+
+test "parse args preserves config defaults and lets flags override" {
+    const base = Config{
+        .host = "192.168.1.122:11434",
+        .model = "phenom:latest",
+        .backend = .llamacpp,
+        .thinking = .on,
+        .max_tokens = 128,
+    };
+    const args = &.{ "phenom", "chat", "--thinking", "off" };
+    const cfg = try parseArgsWithBase(base, args);
+    try std.testing.expectEqual(Command.chat, cfg.command);
+    try std.testing.expectEqualStrings("192.168.1.122:11434", cfg.host);
+    try std.testing.expectEqualStrings("phenom:latest", cfg.model);
+    try std.testing.expectEqual(Backend.llamacpp, cfg.backend);
+    try std.testing.expectEqual(ThinkingMode.off, cfg.thinking);
+    try std.testing.expectEqual(@as(u16, 128), cfg.max_tokens);
 }
 
 test "parse probe args" {

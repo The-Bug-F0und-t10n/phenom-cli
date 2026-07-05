@@ -5852,3 +5852,80 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 80 --thinking on --prompt ola --no-color` -> passou; backend respondeu, thinking/output ficaram alinhados e o footer mostrou `Worked for 2s`.
+
+## T242 - Adicionar config.toml para defaults do Phenom Zig
+
+Status: implemented-verified.
+
+Motivacao: o CLI Zig estava exigindo flags repetidas para `backend`, `host`, `port`, `model`, `thinking` e demais opcoes operacionais. Para uso real instalado em `~/.local/bin`, isso precisa virar configuracao persistente em `~/.config/phenom/config.toml`, mantendo flags como override explicito por turno.
+
+Evidencia:
+
+- `phenom-zig/src/cli.zig`: `parseArgs` partia sempre de defaults internos (`127.0.0.1:11434`, `llama3.2`, `ollama`, `thinking=auto`).
+- `phenom-zig/src/main.zig`: `main` chamava `cli.parseArgs` direto; nao havia camada de config antes das flags.
+- `phenom-zig/build.zig`: havia build/install padrao, mas nenhum step para publicar binario em `~/.local/bin` e config em `~/.config/phenom`.
+- Uso real reportado pelo usuario alterna backend/host/model/thinking com frequencia; repetir isso em flags aumenta erro operacional.
+
+Impacto esperado:
+
+- `config.toml` na raiz do repo serve como default de desenvolvimento.
+- Runtime instalado le `~/.config/phenom/config.toml` quando nao existe `./config.toml` no diretorio atual.
+- Ordem de precedencia fica clara: defaults internos < config file < flags.
+- `host` e `port` podem ser separados; `server` continua existindo como alias completo para `HOST:PORT` ou URL com `http://`.
+- O prompt nao entra no config para nao transformar `phenom chat` interativo em prompt fixo acidental.
+- `zig build install-local` copia `zig-out/bin/phenom` para `~/.local/bin/phenom` e `../config.toml` para `~/.config/phenom/config.toml`.
+
+Teste primeiro:
+
+- Parser deve aplicar `backend`, `host`, `port`, `model`, `thinking`, `max_tokens` e `no_color`.
+- Flags devem sobrescrever valores vindos do config.
+- `server` deve funcionar como alias de endpoint completo.
+- Smoke runtime com config temporario `offline = true` deve executar sem tentar rede, mesmo sem flag `--offline`.
+
+Implementacao:
+
+- `phenom-zig/src/cli.zig`: adicionar `parseArgsWithBase(base, args)` e manter `parseArgs` como wrapper.
+- `phenom-zig/src/config_file.zig`: criar loader de `./config.toml` com fallback para `~/.config/phenom/config.toml`.
+- `phenom-zig/src/config_file.zig`: implementar parser TOML subset para `key = value`, strings, bools, ints, comentarios e secoes ignoradas.
+- `phenom-zig/src/config_file.zig`: manter buffer do arquivo vivo enquanto `cli.Config` usa slices dele.
+- `phenom-zig/src/main.zig`: trocar `cli.parseArgs` por `config_file.load`.
+- `config.toml`: adicionar template operacional na raiz do repo.
+- `phenom-zig/build.zig`: adicionar step `install-local`.
+- `phenom-zig/src/cli.zig`: documentar lookup e chaves aceitas no help.
+
+Passos de implementacao:
+
+1. Separar parsing CLI puro de parsing com defaults.
+2. Criar loader owned para o arquivo de config.
+3. Parsear chaves simples e validar enum/bool/int.
+4. Compor `host:port` quando `port` for informado.
+5. Conectar loader no `main`.
+6. Adicionar template `config.toml`.
+7. Adicionar step de instalacao local.
+8. Rodar unitarios, release e smoke offline por config.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria/lifetime: `LoadedConfig` libera `text` e `owned_host`; `cli.Config` nao sobrevive ao `deinit`.
+- Heap: apenas o texto do config e o `host:port` composto sao alocados; sem storage global.
+- I/O: leitura usa libc sincrona, limite de 64 KiB, falha em arquivo grande e nao ignora arquivo existente que nao pode ser aberto.
+- Erros: OOM ao montar caminho de `HOME` nao e mascarado; `HOME` ausente apenas desativa fallback de usuario.
+- Install: `install-local` valida `HOME` antes de copiar e falha antes de tocar paths fora do usuario se `HOME` estiver ausente.
+- Compatibilidade: flags continuam tendo precedencia e `parseArgs` antigo permanece para testes/caminhos existentes.
+- Limite deliberado: parser nao implementa TOML completo; aceita somente o subset operacional do config atual. Expandir quando surgir necessidade real de tabelas/listas.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- `phenom chat --prompt oi` com config temporario `offline = true` deve retornar stub offline sem tocar rede.
+- Help lista origem do config e chaves aceitas.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/config_file.zig -lc` -> passou; 8 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- Smoke runtime em `/tmp/phenom-config-smoke/config.toml` com `offline = true`, sem flag `--offline`: `/home/ashirak/Projects/person/ai/cli-ai/phenom-cli/phenom-zig/zig-out/bin/phenom chat --prompt oi` -> passou; exibiu `[offline stub] model not called`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou `/home/ashirak/.local/bin/phenom` e `/home/ashirak/.config/phenom/config.toml`.
+- `/home/ashirak/.local/bin/phenom version` -> passou; exibiu `phenom-zig spike 0.1.0`.

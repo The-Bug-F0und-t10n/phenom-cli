@@ -2,6 +2,7 @@ const std = @import("std");
 
 const audit = @import("audit.zig");
 const cli = @import("cli.zig");
+const config_file = @import("config_file.zig");
 const evidence = @import("evidence.zig");
 const fd_writer = @import("fd_writer.zig");
 const gate = @import("gate.zig");
@@ -33,10 +34,12 @@ pub fn main(init: std.process.Init) !void {
         try args_list.append(allocator, arg);
     }
 
-    const config = cli.parseArgs(args_list.items) catch |err| {
+    var loaded_config = config_file.load(allocator, args_list.items) catch |err| {
         try cli.printUsage(fd_writer.FdWriter{ .fd = 2 });
         return err;
     };
+    defer loaded_config.deinit(allocator);
+    const config = loaded_config.config;
 
     switch (config.command) {
         .help => try cli.printUsage(fd_writer.FdWriter{ .fd = 1 }),
