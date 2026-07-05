@@ -325,12 +325,14 @@ fn renderRestoredSession(
     try bus.on(&render_sink, @TypeOf(render_sink).handleOpaque);
 
     var restored_turn_open = false;
+    var restored_turn_started_s: ?i64 = null;
     for (events.items) |event| {
         if (std.mem.eql(u8, event.kind, "turn_start")) {
             if (restored_turn_open) try bus.emit(.{ .think_end = {} });
             try bus.emit(.{ .user_message = event.body });
             try bus.emit(.{ .think_start = "Thinking" });
             restored_turn_open = true;
+            restored_turn_started_s = event.created_at_unix_s;
         } else if (std.mem.eql(u8, event.kind, "assistant_thinking_delta")) {
             try bus.emit(.{ .reasoning_chunk = event.body });
             restored_turn_open = true;
@@ -356,8 +358,9 @@ fn renderRestoredSession(
         } else if (std.mem.eql(u8, event.kind, "expectation_passed")) {
             restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "turn_done")) {
-            try bus.emit(.{ .turn_done = .{ .elapsed_ms = parseElapsedMs(event.body) } });
+            try bus.emit(.{ .turn_done = .{ .elapsed_ms = restoredElapsedMs(event.body, restored_turn_started_s, event.created_at_unix_s) } });
             restored_turn_open = false;
+            restored_turn_started_s = null;
         }
     }
     if (restored_turn_open) try bus.emit(.{ .think_end = {} });
@@ -383,6 +386,14 @@ fn parseElapsedMs(body: []const u8) ?u64 {
     while (end < body.len and body[end] >= '0' and body[end] <= '9') : (end += 1) {}
     if (end == start + needle.len) return null;
     return std.fmt.parseInt(u64, body[start + needle.len .. end], 10) catch null;
+}
+
+fn restoredElapsedMs(body: []const u8, started_s: ?i64, done_s: ?i64) ?u64 {
+    if (parseElapsedMs(body)) |elapsed_ms| return elapsed_ms;
+    const start = started_s orelse return null;
+    const done = done_s orelse return null;
+    if (done < start) return null;
+    return @as(u64, @intCast(done - start)) * 1000;
 }
 
 fn offlineStubResponse() []const u8 {
@@ -550,4 +561,6 @@ test "restored sqlite session is rendered through styled transcript events" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Worked for 1s") != null);
     try std.testing.expectEqual(@as(?u64, 1234), parseElapsedMs("status=ok elapsed_ms=1234"));
     try std.testing.expectEqual(@as(?u64, null), parseElapsedMs("ok"));
+    try std.testing.expectEqual(@as(?u64, 2000), restoredElapsedMs("ok", 100, 102));
+    try std.testing.expectEqual(@as(?u64, null), restoredElapsedMs("ok", 102, 100));
 }

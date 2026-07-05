@@ -7,6 +7,7 @@ const c = @cImport({
 pub const AuditEvent = struct {
     kind: []u8,
     body: []u8,
+    created_at_unix_s: ?i64 = null,
 
     pub fn deinit(self: *AuditEvent, allocator: std.mem.Allocator) void {
         allocator.free(self.kind);
@@ -169,7 +170,7 @@ pub const AuditDb = struct {
         if (limit > std.math.maxInt(c_int)) return error.EventLimitTooLarge;
 
         const sql =
-            \\select kind, body
+            \\select kind, body, cast(strftime('%s', created_at) as integer)
             \\from events
             \\where session = ?1
             \\order by id asc
@@ -200,7 +201,8 @@ pub const AuditDb = struct {
             errdefer allocator.free(kind);
             const body = try dupeColumnText(allocator, stmt, 1);
             errdefer allocator.free(body);
-            try events.append(allocator, .{ .kind = kind, .body = body });
+            const created_at_unix_s = if (c.sqlite3_column_type(stmt, 2) == c.SQLITE_NULL) null else @as(i64, @intCast(c.sqlite3_column_int64(stmt, 2)));
+            try events.append(allocator, .{ .kind = kind, .body = body, .created_at_unix_s = created_at_unix_s });
         }
 
         return events;

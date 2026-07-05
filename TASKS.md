@@ -5999,3 +5999,68 @@ Validacao executada:
 - `/home/ashirak/Projects/person/ai/cli-ai/phenom-cli/phenom-zig/zig-out/bin/phenom chat --session elapsed-smoke --offline --no-color --prompt oi` em `/tmp/phenom-elapsed-smoke` -> passou; gravou sessao offline.
 - `sqlite3 .phenom-zig/phenom.db "select kind, body from events where session='elapsed-smoke' order by id;"` -> mostrou `turn_done|status=ok elapsed_ms=1`.
 - Replay TTY da sessao com `turn_done` alterado para `status=ok elapsed_ms=1234` -> passou; transcript restaurado mostrou `Worked for 1s`.
+
+## T244 - Recuperar Worked for em sessao alvo legada
+
+Status: implemented-verified.
+
+Motivacao: a persistencia de `elapsed_ms` resolvia sessoes novas, mas uma sessao alvo criada antes da T243 ainda tinha `turn_done=ok`. Ao recuperar esse historico, o replay nao tinha o metadado novo e renderizava `Worked for 0s`, mesmo havendo `created_at` suficiente no SQLite para derivar a duracao aproximada do turno.
+
+Evidencia:
+
+- `phenom-zig/src/audit.zig`: `loadSessionEvents` carregava apenas `kind` e `body`; descartava `created_at`.
+- `phenom-zig/src/main.zig`: `parseElapsedMs("ok")` retorna `null`; sem fallback, o `RendererEventSink` calcula duracao no momento do replay.
+- Smoke de sessao alvo legada com `turn_start` em `14:00:00` e `turn_done=ok` em `14:00:02` inicialmente restaurou `Worked for 0s` com binario anterior ao fallback.
+
+Impacto esperado:
+
+- Sessoes novas continuam usando `elapsed_ms` persistido em `turn_done`.
+- Sessoes legadas sem `elapsed_ms` passam a derivar duracao por `created_at` de `turn_start` e `turn_done`.
+- Se timestamps estiverem ausentes ou inconsistentes, o replay cai para comportamento anterior sem quebrar a sessao.
+- O replay continua renderizando texto atual, nao salva footer bruto.
+
+Teste primeiro:
+
+- Helper `restoredElapsedMs("ok", 100, 102)` deve retornar `2000`.
+- Helper deve retornar `null` se `turn_done` vier antes de `turn_start`.
+- Smoke TTY com SQLite legado controlado deve restaurar `Worked for 2s`.
+
+Implementacao:
+
+- `phenom-zig/src/audit.zig`: adicionar `created_at_unix_s` em `AuditEvent`.
+- `phenom-zig/src/audit.zig`: `loadSessionEvents` passa a selecionar `cast(strftime('%s', created_at) as integer)`.
+- `phenom-zig/src/main.zig`: guardar timestamp do `turn_start` durante replay.
+- `phenom-zig/src/main.zig`: adicionar `restoredElapsedMs`, com precedencia para `elapsed_ms` real e fallback para diferenca de timestamps.
+- `phenom-zig/src/main.zig`: usar `restoredElapsedMs` ao emitir `turn_done` restaurado.
+
+Passos de implementacao:
+
+1. Carregar timestamp junto dos eventos SQLite.
+2. Propagar timestamp sem alterar schema.
+3. Criar fallback por diferenca `turn_done.created_at - turn_start.created_at`.
+4. Cobrir helper com teste.
+5. Validar sessao legada real em TTY.
+6. Reinstalar binario em `~/.local/bin`.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria/lifetime: `created_at_unix_s` e escalar; nao adiciona alocacao nem libera extra.
+- SQLite: schema permanece intacto; query usa `strftime` sobre coluna existente.
+- Compatibilidade: `elapsed_ms` no corpo do `turn_done` tem precedencia sobre timestamp derivado.
+- Precisao: fallback legado tem precisao de segundos porque `created_at` antigo usa `current_timestamp`; aceitavel para recuperar sessoes alvo antigas.
+- Erros: timestamp ausente, nulo ou invertido retorna `null`, sem crash e sem duracao falsa negativa.
+- Escopo: nao tenta reescrever eventos antigos no banco; apenas melhora o replay.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Sessao legada com `turn_done=ok` e timestamps diferentes restaura `Worked for Ns`.
+- Binario instalado em `~/.local/bin/phenom` recebe a correcao.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- SQLite legado em `/tmp/phenom-legacy-elapsed/.phenom-zig/phenom.db` com `turn_start` `2026-07-05 14:00:00`, `turn_done=ok` `2026-07-05 14:00:02` -> replay TTY mostrou `Worked for 2s`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; reinstalou `/home/ashirak/.local/bin/phenom`.
