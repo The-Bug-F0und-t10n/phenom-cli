@@ -6210,3 +6210,89 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --offline --no-color --prompt 'analise' --demo-read-file src/main.zig --session codex-like-smoke` -> passou; transcript exibiu um unico `▸ Reading: src/main.zig` e evidence no mesmo bloco.
 - PTY `./zig-out/bin/phenom chat --offline --no-color --demo-read-file src/main.zig --session codex-like-pty`, input `analise` + `/exit` -> passou; statusbar mostrou `Thinking`, depois `Reading`, depois `Thinking`, transcript permaneceu alinhado e prompt foi restaurado.
+
+## T247 - Renderizar Markdown completo para output de agente de codigo no Zig
+
+Status: implemented-verified.
+
+Motivacao: o contrato Codex-like ainda estava incompleto porque `assistantDelta` escrevia texto bruto. Isso deixava respostas reais com Markdown visivelmente inferiores ao `phenom-cli-ts`: headings, listas, links, tabelas, fences de codigo e diffs apareciam como texto cru ou sem enquadramento. Para um agente focado em codigo, o renderer precisa transformar Markdown em transcript terminal legivel, copiavel e append-only.
+
+Evidencia:
+
+- `../phenom-cli-ts/src/stream-markdown-renderer.ts` implementa renderer incremental com linhas pendentes, fences, diff, tabelas, heading/lista/blockquote/hr, inline markdown e highlight por linguagem.
+- `../phenom-cli-ts/src/cli-renderer.ts:800-804` renderiza conteudo restaurado pelo `StreamMarkdownRenderer`, entao historico tambem recebe o mesmo visual.
+- `phenom-zig/src/render.zig` antes desta task chamava `writeContentStream` em `assistantDelta`, portanto nao havia parse Markdown no caminho principal do chat nem no replay que reemite `message_chunk`.
+- Smoke real com prompt pedindo Markdown exigia que o caminho HTTP -> `assistantDelta` renderizasse `#`, bullets e fence `zig`, nao que o modelo entregasse texto ja estilizado.
+
+Impacto esperado:
+
+- Output do assistant passa a renderizar Markdown operacional completo para codigo: headings, bullets, listas numeradas, blockquotes, horizontal rules, links, inline code, bold, fenced code, fenced diff/patch, tabelas e highlight lexical basico.
+- Fences de codigo usam gutter `│`, preservando blocos copiaveis e alinhados.
+- Diffs dentro de Markdown usam cor/marker suave e nao usam background red/green saturado.
+- Tabelas Markdown sao bufferizadas e emitidas como caixas terminal compactas.
+- Streaming simples continua aparecendo imediatamente; chunks plain text nao ficam presos ate `[done]`.
+- Chunks Markdown incompletos ficam pendentes ate newline ou fechamento do bloco, evitando vazar `**`, crases e tabelas quebradas.
+- Replay SQLite que reemite `message_chunk` recebe o mesmo renderer, sem precisar salvar output ja formatado.
+
+Teste primeiro:
+
+- Snapshot de heading/lista/link/fence `zig` prova que marcadores Markdown nao vazam como texto cru.
+- Snapshot de fence `diff` prova `@@`, `-old`, `+new` e ausencia de backgrounds saturados.
+- Snapshot de tabela prova bordas `┌`, `├`, `└` e celulas alinhadas.
+- Snapshot de streaming split prova que texto plain aparece imediatamente e Markdown incompleto so aparece formatado no flush.
+- Snapshot de newline plain prova que streaming imediato nao adiciona gutter fantasma no fim da linha.
+- Suite antiga de thinking/tool/diff/statusbar continua passando, provando que a mudanca nao quebrou o contrato Codex-like anterior.
+- Smoke real com llama.cpp/Ollama compativel prova o caminho modelo -> renderer.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: `assistantDelta` passa a chamar `writeMarkdownStream`.
+- `render.zig`: adicionar buffer fixo de linha Markdown (`8192` bytes), estado de fence, linguagem do fence e buffer fixo de tabela (`8192` bytes).
+- `render.zig`: implementar parser incremental por linhas completas, com flush em `closeOpenBlocks`.
+- `render.zig`: streaming plain text sem marcadores Markdown continua usando `writeContentStream` para nao congelar respostas simples.
+- `render.zig`: implementar heading/lista/blockquote/hr/diff solto/prosa inline.
+- `render.zig`: implementar inline `**bold**`, `` `code` `` e `[label](url)` sem deixar marcadores no transcript.
+- `render.zig`: implementar fences genericos com gutter `│` e highlight lexical simples para keywords, strings, numeros, comentarios e chamadas de funcao.
+- `render.zig`: implementar fence `diff`/`patch` com cores por linha `+`, `-`, `@@` e sem background saturado.
+- `render.zig`: implementar tabela Markdown com deteccao de linhas `|`, separador `---`, calculo de largura visivel e bordas terminal.
+- `render.zig`: corrigir ciclo de inferencia Zig entre `writeInlineMarkdown` e `writeBoldInlineMarkdown` usando error set explicito.
+- `render.zig`: adicionar helper `trimLeft` porque Zig 0.16 nao expoe `std.mem.trimLeft`.
+
+Passos de implementacao:
+
+1. Comparar o comportamento esperado com `StreamMarkdownRenderer` do TS.
+2. Trocar somente a entrada de assistant output para Markdown stream.
+3. Adicionar buffers fixos e estados de Markdown no renderer append-only.
+4. Implementar renderizacao estrutural antes de inline.
+5. Implementar fences de codigo e diff.
+6. Implementar tabelas bufferizadas.
+7. Restaurar streaming imediato para plain text.
+8. Adicionar snapshots de Markdown de codigo.
+9. Rodar render isolado, build completo e smoke real.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: buffers sao arrays fixos dentro do renderer; nao ha alocacao dinamica no caminho Markdown.
+- Bounds: todo append verifica capacidade antes de copiar; linhas maiores que o buffer caem para render bruto/gutter em vez de overflow.
+- Lifetime: slices de tabela/linha sao usados antes de limpar buffers; nada e armazenado fora do renderer.
+- UTF-8: avanco visual usa `utf8ByteLen`; nao tenta validar Unicode completo, mas evita quebrar bytes ASCII por indice em loops principais.
+- Error set: recursao inline/bold usa `anyerror!void` para impedir `dependency loop` no Zig.
+- Terminal: renderer segue append-only; nao entra em alternate screen e nao faz repaint.
+- Compatibilidade: APIs publicas anteriores (`assistantDelta`, `done`, `tool*`) nao mudaram.
+- Limite deliberado: nao e um parser CommonMark academico; cobre o Markdown necessario para output real de agente de codigo. Extensoes futuras devem entrar com snapshot antes de feature.
+
+Criterio de aceite:
+
+- `zig test src/render.zig -lc` passa com snapshots Markdown.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real renderiza titulo, lista e bloco `zig` sem deixar `#`, `-` e fence como ruido bruto.
+- Nenhum background ANSI red/green saturado aparece em diff Markdown.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/render.zig -lc` -> passou; 24 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --no-color --max-tokens 160 --prompt 'responda em markdown curto com: um titulo, uma lista e um bloco de codigo zig com const ok = true'` -> passou; transcript renderizou heading, bullets `•` e fence `zig` com gutter `│`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o renderer atualizado em `~/.local/bin/phenom`.
