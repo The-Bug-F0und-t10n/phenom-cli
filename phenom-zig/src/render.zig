@@ -17,6 +17,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         thinking_open: bool = false,
         stream_needs_gutter: bool = true,
         thinking_needs_gutter: bool = true,
+        thinking_col: usize = 0,
         last_block: BlockKind = .none,
         tool_seq: usize = 0,
 
@@ -40,6 +41,10 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
 
         pub fn init(writer: Writer, options: RenderOptions) Self {
             return .{ .writer = writer, .options = options };
+        }
+
+        pub fn setTerminalColumns(self: *Self, columns: usize) void {
+            self.options.terminal_columns = @max(@as(usize, 1), columns);
         }
 
         pub fn user(self: *Self, text: []const u8) !void {
@@ -81,6 +86,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 try self.writer.writeAll("\n");
                 self.thinking_open = true;
                 self.thinking_needs_gutter = true;
+                self.thinking_col = 0;
                 self.last_block = .thinking;
             }
 
@@ -89,6 +95,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 if (text[start] == '\n') {
                     try self.writeDim("\n");
                     self.thinking_needs_gutter = true;
+                    self.thinking_col = 0;
                     start += 1;
                     continue;
                 }
@@ -99,7 +106,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 }
                 const rel = std.mem.indexOfScalar(u8, text[start..], '\n');
                 const end = if (rel) |idx| start + idx else text.len;
-                try self.writeDim(text[start..end]);
+                try self.writeWrappedThinkingText(text[start..end]);
                 start = end;
             }
         }
@@ -109,6 +116,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             if (!self.thinking_needs_gutter) try self.writer.writeAll("\n");
             self.thinking_open = false;
             self.thinking_needs_gutter = true;
+            self.thinking_col = 0;
             try self.writer.writeAll("\n");
             self.assistant_open = true;
             self.stream_needs_gutter = true;
@@ -263,6 +271,32 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             }
         }
 
+        fn writeWrappedThinkingText(self: *Self, text: []const u8) !void {
+            const width = self.thinkingTextWidth();
+            var start: usize = 0;
+            while (start < text.len) {
+                if (self.thinking_col >= width) {
+                    try self.writeDim("\n");
+                    self.thinking_needs_gutter = true;
+                    self.thinking_col = 0;
+                }
+                if (self.thinking_needs_gutter) {
+                    try self.writeContentGutter();
+                    try self.writeCyan("│ ");
+                    self.thinking_needs_gutter = false;
+                }
+                const remaining_cols = width - self.thinking_col;
+                var end = start;
+                var cols: usize = 0;
+                while (end < text.len and cols < remaining_cols) : (cols += 1) {
+                    end = @min(text.len, end + utf8ByteLen(text[end]));
+                }
+                try self.writeDim(text[start..end]);
+                self.thinking_col += cols;
+                start = end;
+            }
+        }
+
         fn writeToolOutput(self: *Self, sample: []const u8) !void {
             if (sample.len == 0) {
                 try self.writeDim("    └─ (no output, exit 0)");
@@ -361,6 +395,10 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             return @max(@as(usize, 1), self.paintCols() -| content_gutter_cols);
         }
 
+        fn thinkingTextWidth(self: *Self) usize {
+            return @max(@as(usize, 1), self.contentWrapWidth() -| 2);
+        }
+
         fn userInnerWidth(self: *Self) usize {
             return @max(@as(usize, 8), @max(@as(usize, 12), self.contentWrapWidth()) - 1);
         }
@@ -408,6 +446,14 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             try self.writeAnsi("\x1b[33;1m", text);
         }
     };
+}
+
+fn utf8ByteLen(first: u8) usize {
+    if (first < 0x80) return 1;
+    if ((first & 0xe0) == 0xc0) return 2;
+    if ((first & 0xf0) == 0xe0) return 3;
+    if ((first & 0xf8) == 0xf0) return 4;
+    return 1;
 }
 
 fn toolLabel(name: []const u8) []const u8 {
@@ -477,6 +523,27 @@ test "thinking stream preserves utf8 text inside styled chunks" {
     try renderer.thinkingDelta("usuário em português");
 
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "usuário em português") != null);
+}
+
+test "thinking wraps inside narrow terminal with gutter on continuation" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 12 });
+    try renderer.thinkingDelta("abcdefghi");
+    try renderer.thinkingEnd();
+    try renderer.assistantDelta("final");
+
+    const expected =
+        \\
+        \\ │ thinking
+        \\ │ abcdefgh
+        \\ │ i
+        \\
+        \\ final
+    ;
+    try std.testing.expectEqualStrings(expected, buffer.items);
 }
 
 test "append only snapshot matches phenom cli ts plain surface" {

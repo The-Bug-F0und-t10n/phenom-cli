@@ -5518,3 +5518,76 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - PTY offline `./zig-out/bin/phenom chat --offline --no-color`, input `ola\r/exit\r` -> passou; user bubble, resposta offline e `[done]` iniciaram alinhados na margem.
 - PTY real `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 140 --thinking on --no-color`, input `ola\r/exit\r` -> passou; `│ thinking`, resposta final e `[done]` iniciaram alinhados na margem.
+
+## T237 - Ajustar wrapping do thinking e resiliencia do TUI a resize
+
+Status: implemented-verified-real.
+
+Motivacao: o layout estava quase correto, mas ainda faltava enquadrar o texto longo do `thinking` dentro do componente e reduzir o espaco variavel entre fim do thinking e output. Tambem havia risco em resize: o footer recalculava largura em cada draw, mas a scroll region so era ressincronizada quando a quantidade de linhas do prompt mudava, nao quando o terminal mudava `rows/cols`.
+
+Evidencia:
+
+- Log reportado: `thinking` com linha longa sem enquadramento visual no componente.
+- `phenom-zig/src/render.zig`: `thinkingDelta` preservava gutter por linha, mas nao tinha largura interna para quebrar linhas longas.
+- `phenom-zig/src/main.zig`: depois de `</think>`, o output visivel podia chegar com `\n\n` ou espaco inicial do template/modelo, inflando o gap antes da resposta.
+- `phenom-zig/src/tui.zig`: `drawUnlocked` chamava `terminalSize()`, mas `resyncScrollRegion()` so era acionado por mudanca de `bottom_rows`.
+
+Impacto esperado:
+
+- `thinking` passa a quebrar dentro da largura disponivel e cada continuacao recebe gutter `│`.
+- A resposta final apos thinking remove whitespace inicial vindo da transicao `</think>`, deixando o gap visual controlado pelo renderer.
+- Renderer interativo atualiza `terminal_columns` antes de cada evento, entao novos chunks respeitam a largura atual depois de resize.
+- TUI ressincroniza scroll region quando `rows` ou `cols` mudam.
+- Footer limita linhas de prompt conforme altura disponivel para reduzir quebra em terminais pequenos.
+
+Teste primeiro:
+
+- Unitario do renderer: terminal estreito deve quebrar `abcdefghi` em `│ abcdefgh` + `│ i`.
+- Unitario do stream: transicao pos-thinking deve aparar `\r\n\t ` antes da resposta final.
+- Unitario do prompt view: limite de linhas pequeno deve mostrar somente as ultimas linhas visiveis.
+- PTY pequeno deve manter footer dentro da area reservada.
+- PTY grande deve manter statusbar/prompt alinhados.
+- Smoke real com `--thinking on` deve mostrar thinking enquadrado e gap controlado antes da resposta.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: adicionar `thinking_col`, `setTerminalColumns` e `writeWrappedThinkingText`.
+- `phenom-zig/src/render.zig`: contar codepoints UTF-8 como uma coluna pratica e escrever fatias, nao byte a byte, preservando ANSI e texto UTF-8.
+- `phenom-zig/src/ui_events.zig`: adicionar callback opcional `terminal_columns` no `RendererEventSink`.
+- `phenom-zig/src/main.zig`: ligar `currentTerminalColumns` quando ha TUI ativa.
+- `phenom-zig/src/main.zig`: aparar whitespace inicial apenas na primeira resposta visivel apos `endThinking`.
+- `phenom-zig/src/tui.zig`: guardar ultimo `terminal_rows/terminal_cols`, ressincronizar scroll region em resize e limitar linhas do prompt no footer.
+
+Passos de implementacao:
+
+1. Adicionar wrapping interno do thinking sem quebrar UTF-8.
+2. Atualizar largura dinamica antes de cada evento renderizado.
+3. Normalizar whitespace inicial depois de `</think>`.
+4. Ressincronizar scroll region em mudanca de tamanho.
+5. Limitar prompt footer pela altura disponivel.
+6. Rodar unitarios, release e smokes PTY pequeno/grande/real.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria/lifetime: nenhum buffer owned novo no renderer/event sink; novos campos sao escalares e callback de funcao estatica.
+- UTF-8: wrapping usa fatias por codepoint; nao injeta ANSI dentro de codepoint e nao corta bytes deliberadamente.
+- Concorrencia: callback de coluna roda dentro do mesmo lock do renderer quando ha TUI; nao cria thread nova.
+- Terminal: resize chama `resyncScrollRegionFor(size)` com tamanho capturado no draw atual; footer limita linhas para nao desenhar area maior que o terminal.
+- Limite deliberado: transcript append-only nao reflowa texto antigo depois de resize; apenas novos chunks e footer passam a usar a largura atual.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- PTY estreito nao quebra footer nem deixa thinking sair do componente.
+- PTY grande mantem statusbar/prompt alinhados.
+- Smoke real `--thinking on` mostra thinking wrapped e resposta separada por gap controlado.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- PTY pequeno `stty cols 32 rows 10; ./zig-out/bin/phenom chat --offline --no-color`, input longo + `/exit` -> passou; footer ficou na area reservada e transcript alinhou.
+- PTY real pequeno `stty cols 36 rows 12; ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 120 --thinking on --no-color`, input `ola` + `/exit` -> passou; thinking quebrou com gutter nas continuacoes e resposta ficou separada por gap controlado.
+- PTY grande `stty cols 140 rows 40; ./zig-out/bin/phenom chat --offline --no-color`, input `ola em terminal grande` + `/exit` -> passou; statusbar, prompt e transcript ficaram alinhados.
+- Smoke real limpo `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 120 --thinking on --prompt ola --no-color` -> passou; thinking enquadrado e resposta final sem whitespace inicial.

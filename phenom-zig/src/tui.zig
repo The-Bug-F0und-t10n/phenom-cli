@@ -30,6 +30,7 @@ pub const BottomBarState = struct {
     prompt: []const u8 = "",
     cursor: usize = 0,
     show_prompt: bool = true,
+    prompt_line_limit: usize = max_prompt_rows,
 };
 
 const user_bg = "\x1b[48;5;236m";
@@ -111,7 +112,7 @@ pub fn renderBottomBar(writer: anytype, state: BottomBarState) !usize {
     rows_written += 1;
 
     if (state.show_prompt) {
-        const view = computePromptView(state.prompt, state.cursor, paint_cols);
+        const view = computePromptViewLimited(state.prompt, state.cursor, paint_cols, state.prompt_line_limit);
         var i: usize = 0;
         while (i < view.line_count) : (i += 1) {
             try writer.writeAll("\r\n");
@@ -144,6 +145,10 @@ pub const PromptView = struct {
 };
 
 pub fn computePromptView(prompt: []const u8, cursor: usize, paint_cols: usize) PromptView {
+    return computePromptViewLimited(prompt, cursor, paint_cols, max_prompt_rows);
+}
+
+pub fn computePromptViewLimited(prompt: []const u8, cursor: usize, paint_cols: usize, line_limit: usize) PromptView {
     const content_width = @max(@as(usize, 1), paint_cols -| 2);
     var view = PromptView{};
     var wrapped: [256]struct { start: usize, end: usize, logical_row: usize, col_start: usize } = undefined;
@@ -209,10 +214,11 @@ pub fn computePromptView(prompt: []const u8, cursor: usize, paint_cols: usize) P
     }
     if (!found_cursor) cursor_wrapped_row = wrapped_len - 1;
 
-    const visible_count = @min(max_prompt_rows, wrapped_len);
+    const safe_limit = @max(@as(usize, 1), @min(max_prompt_rows, line_limit));
+    const visible_count = @min(safe_limit, wrapped_len);
     var first_visible: usize = 0;
-    if (wrapped_len > max_prompt_rows) {
-        first_visible = @min(wrapped_len - max_prompt_rows, cursor_wrapped_row);
+    if (wrapped_len > safe_limit) {
+        first_visible = @min(wrapped_len - safe_limit, cursor_wrapped_row);
     }
     view.first_visible = first_visible;
     view.line_count = visible_count;
@@ -446,6 +452,8 @@ pub fn TerminalUi(comptime Writer: type) type {
         original_termios: c.termios = undefined,
         bottom_rows: usize = 0,
         prompt_rows: usize = 1,
+        terminal_rows: usize = 0,
+        terminal_cols: usize = 0,
         attached: bool = false,
         last_status: ?[]const u8 = null,
         status_started_ms: i64 = 0,
@@ -603,15 +611,20 @@ pub fn TerminalUi(comptime Writer: type) type {
             const size = terminalSize();
             const paint_cols = @max(@as(usize, 1), size.cols -| 1);
             const view = computePromptView(self.editor.buffer.items, self.editor.cursor, paint_cols);
-            const active_prompt_lines = if (opts.show_prompt) view.line_count else 1;
-            const rows = bottomBarRows(active_prompt_lines);
-            if (rows != self.bottom_rows) {
+            const max_footer_rows = @max(@as(usize, 1), size.rows -| 1);
+            const max_prompt_lines = @max(@as(usize, 1), max_footer_rows -| 3);
+            const active_prompt_lines = if (opts.show_prompt) @min(view.line_count, max_prompt_lines) else 1;
+            const rows = @min(bottomBarRows(active_prompt_lines), max_footer_rows);
+            const size_changed = size.rows != self.terminal_rows or size.cols != self.terminal_cols;
+            if (rows != self.bottom_rows or size_changed) {
                 self.prompt_rows = view.line_count;
                 self.bottom_rows = rows;
-                try self.resyncScrollRegion();
+                self.terminal_rows = size.rows;
+                self.terminal_cols = size.cols;
+                try self.resyncScrollRegionFor(size);
             }
 
-            const status_row = @max(@as(usize, 1), size.rows -| (1 + active_prompt_lines + 1));
+            const status_row = @max(@as(usize, 1), (size.rows -| self.bottom_rows) + 1);
             var out = std.ArrayList(u8).empty;
             defer out.deinit(self.allocator);
             const bw = fd_writer.BufferWriter{ .allocator = self.allocator, .list = &out };
@@ -628,13 +641,15 @@ pub fn TerminalUi(comptime Writer: type) type {
                 .prompt = self.editor.buffer.items,
                 .cursor = self.editor.cursor,
                 .show_prompt = opts.show_prompt,
+                .prompt_line_limit = active_prompt_lines,
             });
             if (opts.preserve_cursor) {
                 try bw.writeAll("\x1b8");
             } else if (opts.show_prompt) {
                 const prompt_first_row = status_row + 2;
                 const screen_col = @min(size.cols, @as(usize, 3) + view.cursor_col);
-                try bw.print("\x1b[{};{}H", .{ prompt_first_row + view.cursor_row, screen_col });
+                const screen_row = @min(size.rows, prompt_first_row + view.cursor_row);
+                try bw.print("\x1b[{};{}H", .{ screen_row, screen_col });
             }
             try self.writer.writeAll(out.items);
         }
@@ -656,6 +671,12 @@ pub fn TerminalUi(comptime Writer: type) type {
             if (!self.attached) return;
             const size = terminalSize();
             if (self.bottom_rows == 0) self.bottom_rows = bottomBarRows(self.prompt_rows);
+            self.terminal_rows = size.rows;
+            self.terminal_cols = size.cols;
+            try self.resyncScrollRegionFor(size);
+        }
+
+        fn resyncScrollRegionFor(self: *Self, size: TerminalSize) !void {
             const last = @max(@as(usize, 1), size.rows -| self.bottom_rows);
             try self.writer.print("\x1b7\x1b[1;{}r\x1b8", .{last});
         }
@@ -895,6 +916,13 @@ test "prompt view wraps and keeps cursor in visible window" {
     try std.testing.expectEqualStrings("i", view.storage[2]);
     try std.testing.expectEqual(@as(usize, 2), view.cursor_row);
     try std.testing.expectEqual(@as(usize, 1), view.cursor_col);
+}
+
+test "prompt view honors small terminal line limit" {
+    const view = computePromptViewLimited("abcdefghijkl", 12, 6, 2);
+    try std.testing.expectEqual(@as(usize, 2), view.line_count);
+    try std.testing.expectEqualStrings("efgh", view.storage[0]);
+    try std.testing.expectEqualStrings("ijkl", view.storage[1]);
 }
 
 test "visualizer frame and mode mapping are deterministic" {

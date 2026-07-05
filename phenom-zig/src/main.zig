@@ -89,6 +89,10 @@ fn backendName(backend: cli.Backend) []const u8 {
     };
 }
 
+fn currentTerminalColumns() usize {
+    return tui.terminalSize().cols;
+}
+
 fn runChat(allocator: std.mem.Allocator, config: cli.Config) !void {
     const stdout = fd_writer.FdWriter{ .fd = 1 };
     if (!config.prompt_provided) return runInteractiveChat(allocator, config, stdout);
@@ -163,6 +167,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
     var render_sink = ui_events.RendererEventSink(@TypeOf(&renderer)){
         .renderer = &renderer,
         .write_mutex = if (ui_ptr) |active_ui| active_ui.mutex() else null,
+        .terminal_columns = if (ui_ptr != null) currentTerminalColumns else null,
     };
     try events.on(&render_sink, @TypeOf(render_sink).handleOpaque);
 
@@ -213,6 +218,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
             .visible = std.ArrayList(u8).empty,
             .visible_bytes = 0,
             .thinking_bytes = 0,
+            .trim_visible_leading_whitespace = false,
         };
         defer sink.deinit();
         client.streamChat(prompt, &sink) catch |err| {
@@ -293,6 +299,7 @@ const StreamSink = struct {
     visible: std.ArrayList(u8),
     visible_bytes: usize,
     thinking_bytes: usize,
+    trim_visible_leading_whitespace: bool = false,
 
     pub fn deinit(ctx: *StreamSink) void {
         ctx.filter.deinit();
@@ -308,12 +315,14 @@ const StreamSink = struct {
     }
 
     pub fn writeVisible(ctx: *StreamSink, visible: []const u8) !void {
-        ctx.visible_bytes += visible.len;
-        try ctx.visible.appendSlice(ctx.allocator, visible);
+        const text = trimLeadingWhitespaceAfterThinking(visible, &ctx.trim_visible_leading_whitespace);
+        if (text.len == 0) return;
+        ctx.visible_bytes += text.len;
+        try ctx.visible.appendSlice(ctx.allocator, text);
         if (ctx.ui) |ui| try ui.showStatus("Responding");
-        try ctx.events.emit(.{ .message_chunk = visible });
+        try ctx.events.emit(.{ .message_chunk = text });
         if (ctx.ui) |ui| try ui.pulseStatus();
-        try ctx.db.recordEvent(ctx.session, "assistant_delta", visible);
+        try ctx.db.recordEvent(ctx.session, "assistant_delta", text);
     }
 
     pub fn writeThinking(ctx: *StreamSink, thinking: []const u8) !void {
@@ -325,9 +334,21 @@ const StreamSink = struct {
     }
 
     pub fn endThinking(ctx: *StreamSink) !void {
-        _ = ctx;
+        ctx.trim_visible_leading_whitespace = true;
     }
 };
+
+fn trimLeadingWhitespaceAfterThinking(text: []const u8, active: *bool) []const u8 {
+    if (!active.*) return text;
+    var start: usize = 0;
+    while (start < text.len and isAsciiSpace(text[start])) : (start += 1) {}
+    if (start < text.len) active.* = false;
+    return text[start..];
+}
+
+fn isAsciiSpace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r';
+}
 
 fn runSnapshot() !void {
     var buffer = std.ArrayList(u8).empty;
@@ -373,4 +394,16 @@ test "offline stub is explicit and not ok" {
     try std.testing.expect(!std.mem.eql(u8, response, "ok"));
     try std.testing.expect(std.mem.indexOf(u8, response, "offline") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "model not called") != null);
+}
+
+test "visible output trims only leading whitespace after thinking" {
+    var active = true;
+    try std.testing.expectEqualStrings("Olá", trimLeadingWhitespaceAfterThinking("\n\n Olá", &active));
+    try std.testing.expect(!active);
+
+    active = true;
+    try std.testing.expectEqualStrings("", trimLeadingWhitespaceAfterThinking("\r\n\t ", &active));
+    try std.testing.expect(active);
+    try std.testing.expectEqualStrings("final", trimLeadingWhitespaceAfterThinking("final", &active));
+    try std.testing.expect(!active);
 }

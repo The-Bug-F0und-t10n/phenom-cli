@@ -99,6 +99,7 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
     return struct {
         renderer: RendererPtr,
         write_mutex: ?*std.atomic.Mutex = null,
+        terminal_columns: ?*const fn () usize = null,
         assistant_started: bool = false,
 
         const Self = @This();
@@ -113,6 +114,7 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
                 lockTerminal(mutex);
                 defer mutex.unlock();
             }
+            if (self.terminal_columns) |columns| self.renderer.setTerminalColumns(columns());
             switch (event) {
                 .user_message => |text| try self.renderer.user(text),
                 .think_start => {
