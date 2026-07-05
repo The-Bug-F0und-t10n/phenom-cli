@@ -14,6 +14,8 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         writer: Writer,
         options: RenderOptions,
         assistant_open: bool = false,
+        assistant_wrote_content: bool = false,
+        suppress_next_block_gap: bool = false,
         thinking_open: bool = false,
         stream_needs_gutter: bool = true,
         thinking_needs_gutter: bool = true,
@@ -63,11 +65,13 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             try self.closeOpenBlocks();
             try self.blockGap(.assistant);
             self.assistant_open = true;
+            self.assistant_wrote_content = false;
             self.stream_needs_gutter = true;
             self.last_block = .assistant;
         }
 
         pub fn assistantDelta(self: *Self, text: []const u8) !void {
+            if (text.len > 0) self.assistant_wrote_content = true;
             try self.writeContentStream(text);
         }
 
@@ -79,7 +83,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                     self.assistant_open = false;
                     wrote_gap = true;
                 }
-                if (!wrote_gap) try self.writer.writeAll("\n");
+                if (!wrote_gap and self.last_block != .user) try self.writer.writeAll("\n");
                 try self.writeContentGutter();
                 try self.writeCyan("│ ");
                 try self.writeCyanBold("thinking");
@@ -120,6 +124,8 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             self.thinking_col = 0;
             try self.writer.writeAll("\n");
             self.assistant_open = true;
+            self.assistant_wrote_content = false;
+            self.suppress_next_block_gap = true;
             self.stream_needs_gutter = true;
             self.last_block = .assistant;
         }
@@ -197,12 +203,17 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 self.thinking_open = false;
             }
             if (self.assistant_open) {
-                try self.writer.writeAll("\n");
+                if (self.assistant_wrote_content) try self.writer.writeAll("\n");
                 self.assistant_open = false;
+                self.assistant_wrote_content = false;
             }
         }
 
         fn blockGap(self: *Self, next: BlockKind) !void {
+            if (self.suppress_next_block_gap) {
+                self.suppress_next_block_gap = false;
+                return;
+            }
             if (self.last_block == .none) return;
             if (self.last_block == .user) return;
             _ = next;
@@ -676,6 +687,60 @@ test "diff preview uses soft markers and truncation" {
         \\   ... 2 more lines hidden from preview
         \\
     ;
+    try std.testing.expectEqualStrings(expected, buffer.items);
+}
+
+test "ansi diff colors markers without saturated backgrounds" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = true, .max_diff_lines = 4 });
+    try renderer.diff("src/app.zig", "patched", "@@ -1 +1 @@\n-old value\n+new value\n context\n");
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[41") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[42") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[31m  - │ \x1b[0mold value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[32m  + │ \x1b[0mnew value") != null);
+}
+
+test "codex style append only turn snapshot covers core blocks" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 42, .max_tool_sample_lines = 2, .max_diff_lines = 3 });
+    try renderer.user("corrija o bug");
+    try renderer.thinkingDelta("vou inspecionar\n\naplicar patch");
+    try renderer.thinkingEnd();
+    try renderer.toolSampleWithDetail("run_code", "zig build test", "$ zig build test\nok\n");
+    try renderer.diff("src/app.zig", "patched", "@@ -1 +1 @@\n-old\n+new\n context\n");
+    try renderer.assistantStart();
+    try renderer.assistantDelta("Corrigido.");
+    try renderer.done();
+
+    const expected =
+        "\n" ++
+        " > [user] corrija o bug                  \n" ++
+        "\n" ++
+        " │ thinking\n" ++
+        " │ vou inspecionar\n" ++
+        " │\n" ++
+        " │ aplicar patch\n" ++
+        "\n" ++
+        " ▸ Running: zig build test\n" ++
+        "     │ $ zig build test\n" ++
+        "     │ ok\n" ++
+        "\n" ++
+        "   ◆ src/app.zig (patched)\n" ++
+        "   @@ -1 +1 @@\n" ++
+        "   - │ old\n" ++
+        "   + │ new\n" ++
+        "   ... 1 more line hidden from preview\n" ++
+        "\n" ++
+        " Corrigido.\n" ++
+        "\n" ++
+        " [done]\n";
     try std.testing.expectEqualStrings(expected, buffer.items);
 }
 

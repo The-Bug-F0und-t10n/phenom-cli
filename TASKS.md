@@ -5719,3 +5719,68 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 180 --thinking on --prompt "quem foi davinci" --no-color` -> passou; paragrafos internos do thinking apareceram com linhas `│`.
+
+## T240 - Concluir fase visual Codex/TUI com snapshots append-only
+
+Status: implemented-verified-real.
+
+Motivacao: depois das correcoes de TUI, restore SQLite, visualizer, resize e thinking, faltava fechar a conclusao operacional sobre Codex: o Phenom Zig deve seguir os principios de UX, nao copiar implementacao. A base agora precisa provar em snapshot que o turno append-only tem user query, thinking, tool sample, diff, resposta e `[done]` em sequencia copiavel, com espacamentos previsiveis e diff sem paleta ofuscante.
+
+Evidencia:
+
+- Fase 18 do devlog define Codex como referencia de comportamento: transcript append-only, blocos limpos, tool samples, finalizacao discreta e divisorias consistentes.
+- T229-T239 implementaram partes reais no Zig: user bubble, thinking, TUI raw, statusbar, resize, restore SQLite, visualizer e blank lines internas.
+- `phenom-zig/src/render.zig`: ainda nao havia snapshot unico cobrindo uma sequencia completa user -> thinking -> tool -> diff -> assistant -> done.
+- `phenom-zig/src/render.zig`: diff ja usava marker colorido e corpo neutro, mas nao havia teste provando ausencia de background saturado vermelho/verde.
+
+Impacto esperado:
+
+- A conclusao Codex fica codificada como contrato de renderer, nao apenas texto em task.
+- Regressao de espacamento entre user, thinking, tool, diff, resposta e done passa a falhar em teste.
+- Diff continua legivel: marker forte, corpo do codigo sem background saturado.
+- O motor permanece append-only, compatível com tmux/scrollback/copy.
+
+Teste primeiro:
+
+- Snapshot end-to-end de turno append-only com user query, thinking com blank line interna, tool sample, diff truncado, assistant e `[done]`.
+- Snapshot ANSI de diff garantindo que nao ha `\x1b[41`/`\x1b[42` e que apenas os markers `- │`/`+ │` recebem foreground red/green.
+- Smoke real `--thinking on` para verificar spacing user -> thinking -> resposta com backend.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: adicionar snapshot `codex style append only turn snapshot covers core blocks`.
+- `phenom-zig/src/render.zig`: adicionar teste `ansi diff colors markers without saturated backgrounds`.
+- `phenom-zig/src/render.zig`: adicionar `assistant_wrote_content` para nao fechar assistant vazio como linha extra.
+- `phenom-zig/src/render.zig`: adicionar `suppress_next_block_gap` para evitar gap duplicado quando `thinkingEnd` ja emitiu separador.
+- `phenom-zig/src/render.zig`: evitar newline extra na abertura de thinking logo apos user block.
+
+Passos de implementacao:
+
+1. Criar snapshot completo da sequencia visual Codex-like.
+2. Rodar teste e identificar gaps extras.
+3. Remover newline extra user -> thinking.
+4. Impedir que assistant vazio entre thinking/tool gere linha fantasma.
+5. Impedir que `blockGap` duplique separador pos-thinking.
+6. Criar teste ANSI de diff sem background saturado.
+7. Rodar unitarios, release e smoke real.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria/lifetime: novos campos sao booleanos escalares no renderer; sem alocacao.
+- Terminal: mudanca atua no transcript append-only; TUI raw continua usando `NewlineWriter`.
+- Concorrencia: renderer continua sincrono e protegido pelo mutex quando chamado via TUI.
+- ANSI: teste garante que diff nao usa background red/green saturado.
+- Escopo: nao implementa markdown renderer completo nem copia codigo do Codex; fecha principios visuais centrais ja suportados no Zig.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Snapshot completo do turno append-only passa.
+- Smoke real com `--thinking on --prompt ola` mostra spacing user -> thinking -> resposta sem gaps duplicados.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 120 --thinking on --prompt ola --no-color` -> passou; user, thinking, resposta e `[done]` apareceram em sequencia linear sem gaps duplicados.
