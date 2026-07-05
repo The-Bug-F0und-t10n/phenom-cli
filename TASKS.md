@@ -5247,3 +5247,78 @@ Revisao baixo nivel executada:
 - Corrigido possivel leak em `loadInputHistoryNewestFirst`: `dupe` da linha agora e separado do `append`, com `errdefer` para liberar se o append falhar.
 - `recordInputHistory` valida tamanho antes de passar length para `sqlite3_bind_text` como `c_int`.
 - `main.zig` nao importa mais `stdio.h`; persistencia por arquivo foi removida do caminho interativo.
+
+## T233 - Iniciar port do chat TS com contrato de eventos no Zig
+
+Status: implemented-verified-real.
+
+Motivacao: a analise do `phenom-cli-ts` mostrou que o chat real nao e apenas um renderer bonito. O fluxo e `index.ts` criando `Agent` + `CliRenderer`, emitindo eventos (`USER_MESSAGE`, `THINK_START`, `MESSAGE_CHUNK`, `REASONING_CHUNK`, `TOOL_START`, `TOOL_RESULT`, `FILE_DIFF`, `THINK_END`) e deixando o renderer decidir layout/status/stream. O Zig ainda chamava `renderer.user`, `renderer.assistantDelta`, `renderer.done` diretamente, o que impediria portar fielmente o motor do TS sem reescrever o controller de novo.
+
+Evidencia:
+
+- `../phenom-cli-ts/src/index.ts:49-52`: `Agent`, `CliRenderer` e `renderer.attach()` sao criados antes do chat.
+- `../phenom-cli-ts/src/index.ts:198-218`: `onLine` emite `USER_MESSAGE`, executa comando slash ou `agent.processInput`, depois renderiza prompt.
+- `../phenom-cli-ts/src/tui/event-bus.ts:5-56`: lista de eventos que define o contrato visual/operacional do chat.
+- `../phenom-cli-ts/src/cli-renderer.ts:1089-1845`: `CliRenderer` escuta eventos e decide user bubble, chunks, thinking, tools, diff, status, cancelamento e done.
+- `phenom-zig/src/main.zig` antes desta task chamava renderer diretamente e, em `--offline`, emitia `ok`, confundindo stub local com output de modelo.
+
+Impacto esperado:
+
+- `phenom-zig chat` passa a ter um contrato interno de eventos equivalente ao caminho TS.
+- O renderer atual vira apenas um subscriber/adaptador; futuras tasks podem trocar o motor visual sem mudar o controller.
+- `--offline` nao parece mais resposta real do modelo: output vira `[offline stub] model not called`.
+- Tool demo passa por `tool_start`/`tool_result`, preparando a paridade de tool UI do TS.
+- Streaming real passa por `message_chunk` e `reasoning_chunk`, preparando a supressao de envelopes/tool JSON no renderer.
+
+Teste primeiro:
+
+- `ui_events.zig`: EventBus entrega eventos em ordem de registro.
+- `ui_events.zig`: RendererEventSink transforma `user_message`, `think_start`, `message_chunk`, `think_end` em transcript com user bubble, resposta e `[done]`.
+- `main.zig`: offline stub deve conter `offline` e `model not called`, e nunca ser `ok`.
+
+Implementacao:
+
+- `phenom-zig/src/ui_events.zig`: adicionar `EventType`, `Event`, payloads pequenos, `EventBus` sincrono e `RendererEventSink`.
+- `phenom-zig/src/main.zig`: criar EventBus por turno, registrar renderer sink e trocar chamadas diretas por eventos.
+- `phenom-zig/src/main.zig`: trocar branch `--offline` de `ok` para `[offline stub] model not called`.
+- `phenom-zig/src/main.zig`: `StreamSink` passa a emitir `message_chunk` e `reasoning_chunk`.
+
+Passos de implementacao:
+
+1. Criar contrato de eventos independente do renderer.
+2. Cobrir ordem de dispatch com teste unitario.
+3. Cobrir adapter renderer com snapshot simples.
+4. Inserir bus no `runChatTurnWithUi`.
+5. Emitir eventos para user, think start, tool demo, chunks, errors, status e think end.
+6. Remover `ok` ambiguo do modo offline.
+7. Rodar teste, release, offline prompt e smoke real.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Ownership/lifetime: payloads sao slices validos durante `emit` sincrono; o bus nao armazena payload apos retorno.
+- Alocacao: `EventBus` so aloca lista de handlers; `deinit` libera a lista.
+- Erro/comportamento: erro em handler aborta o turno; isso e correto porque renderer/audit precisam falhar visivelmente, nao mascarar output quebrado.
+- Bounds/overflow: nenhuma aritmetica nova em terminal; esta task nao altera wrapping/statusbar.
+- Escopo: ainda nao porta o visualizer com noise/cascade, markdown streaming, mouse wheel, transcript restore completo ou suppressao de tool envelopes do TS.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- `./zig-out/bin/phenom chat --offline --no-color --prompt oi` mostra `[offline stub] model not called`, nao `ok`.
+- `real-smoke` continua provando que o caminho sem `--offline` chama backend real.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --offline --no-color --prompt oi` -> exibiu `[offline stub] model not called` e `[done]`, sem `ok`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest` -> passou; backend retornou `PHENOM_REAL_7319`.
+
+Revisao baixo nivel executada:
+
+- `EventBus.emit` e sincrono; nenhum payload fica armazenado depois do handler.
+- `RendererEventSink` nao possui buffers owned; so guarda ponteiro do renderer valido durante o turno.
+- `StreamSink.visible` continua owned e liberado em `deinit`.
+- `offlineStubResponse` retorna string literal estatica; nao exige free.
+- `real-smoke` provou que `--offline` nao interfere no caminho real.

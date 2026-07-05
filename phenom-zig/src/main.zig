@@ -13,6 +13,7 @@ const tool_call = @import("tool_call.zig");
 const tool_loop = @import("tool_loop.zig");
 const tools = @import("tools.zig");
 const tui = @import("tui.zig");
+const ui_events = @import("ui_events.zig");
 
 const c = @cImport({
     @cInclude("sys/stat.h");
@@ -155,17 +156,23 @@ fn runChatTurn(allocator: std.mem.Allocator, config: cli.Config, stdout: fd_writ
 fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: fd_writer.FdWriter, prompt: []const u8, ui: anytype) !void {
     const size = tui.terminalSize();
     var renderer = render.AppendOnlyRenderer(@TypeOf(stdout)).init(stdout, .{ .color = !config.no_color, .terminal_columns = size.cols, .user_label = userLabel() });
+    var events = ui_events.EventBus.init(allocator);
+    defer events.deinit();
+    var render_sink = ui_events.RendererEventSink(@TypeOf(&renderer)){ .renderer = &renderer };
+    try events.on(&render_sink, @TypeOf(render_sink).handleOpaque);
 
     try makeDirIfMissing(".phenom-zig");
     var db = try audit.AuditDb.open(allocator, ".phenom-zig/phenom.db");
     defer db.close();
 
     try db.recordEvent(config.session, "turn_start", prompt);
-    try renderer.user(prompt);
+    try events.emit(.{ .user_message = prompt });
+    try events.emit(.{ .think_start = "Thinking" });
 
     if (config.demo_read_file) |path| {
         const allowed = gate.isAllowed("read_file_range", &.{"read_file_range"});
         if (!allowed) return error.ToolDenied;
+        try events.emit(.{ .tool_start = .{ .name = "read_file_range", .detail = path } });
         const range = try tools.readFileRange(allocator, path, 1, 12, 16 * 1024);
         defer range.deinit(allocator);
         const entry = try evidence.fromFileRange(allocator, range);
@@ -175,14 +182,13 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
         const rendered = try packet.render(allocator);
         defer allocator.free(rendered);
         try db.recordEvent(config.session, "evidence", rendered);
-        try renderer.toolSample("read_file_range", rendered);
+        try events.emit(.{ .tool_result = .{ .name = "read_file_range", .output = rendered } });
     }
 
-    try renderer.assistantStart();
-
     if (config.offline) {
-        try renderer.assistantDelta("ok");
-        try db.recordEvent(config.session, "assistant", "ok");
+        const response = offlineStubResponse();
+        try events.emit(.{ .message_chunk = response });
+        try db.recordEvent(config.session, "assistant_offline_stub", response);
     } else {
         var client = http.LocalModelClient{
             .allocator = allocator,
@@ -192,9 +198,9 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
             .max_tokens = config.max_tokens,
             .thinking = config.thinking,
         };
-        var sink = StreamSink(@TypeOf(&renderer)){
+        var sink = StreamSink{
             .allocator = allocator,
-            .renderer = &renderer,
+            .events = &events,
             .db = &db,
             .session = config.session,
             .ui = ui,
@@ -213,15 +219,15 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
                 .{ @errorName(err), endpoint },
             );
             defer allocator.free(message);
-            try renderer.status(message);
+            try events.emit(.{ .progress_update = message });
             try db.recordEvent(config.session, "model_error", @errorName(err));
-            try renderer.done();
+            try events.emit(.{ .think_end = {} });
             if (config.fail_on_model_error) return err;
             return;
         };
         try sink.flush();
         if (sink.visible_bytes == 0) {
-            try renderer.status("model emitted no visible final answer; reasoning was suppressed or generation ended inside <think>");
+            try events.emit(.{ .progress_update = "model emitted no visible final answer; reasoning was suppressed or generation ended inside <think>" });
             try db.recordEvent(config.session, "empty_visible_answer", "reasoning_suppressed_or_unclosed");
         }
         if (config.expect_contains) |expected| {
@@ -232,9 +238,9 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
                     .{expected},
                 );
                 defer allocator.free(message);
-                try renderer.status(message);
+                try events.emit(.{ .progress_update = message });
                 try db.recordEvent(config.session, "expectation_failed", expected);
-                try renderer.done();
+                try events.emit(.{ .think_end = {} });
                 return error.ExpectedVisibleOutputMissing;
             }
             try db.recordEvent(config.session, "expectation_passed", expected);
@@ -245,13 +251,17 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
                     .{expected},
                 );
                 defer allocator.free(message);
-                try renderer.status(message);
+                try events.emit(.{ .progress_update = message });
             }
         }
     }
 
-    try renderer.done();
+    try events.emit(.{ .think_end = {} });
     try db.recordEvent(config.session, "turn_done", "ok");
+}
+
+fn offlineStubResponse() []const u8 {
+    return "[offline stub] model not called";
 }
 
 fn userLabel() []const u8 {
@@ -268,51 +278,49 @@ fn loadHistoryFromDb(allocator: std.mem.Allocator, db: *audit.AuditDb, ui: anyty
     try ui.editor.loadHistoryNewestFirst(lines.items);
 }
 
-fn StreamSink(comptime RendererPtr: type) type {
-    return struct {
-        allocator: std.mem.Allocator,
-        renderer: RendererPtr,
-        db: *audit.AuditDb,
-        session: []const u8,
-        ui: ?*tui.TerminalUi(fd_writer.FdWriter),
-        filter: reasoning_filter.ReasoningFilter,
-        visible: std.ArrayList(u8),
-        visible_bytes: usize,
-        thinking_bytes: usize,
+const StreamSink = struct {
+    allocator: std.mem.Allocator,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    session: []const u8,
+    ui: ?*tui.TerminalUi(fd_writer.FdWriter),
+    filter: reasoning_filter.ReasoningFilter,
+    visible: std.ArrayList(u8),
+    visible_bytes: usize,
+    thinking_bytes: usize,
 
-        pub fn deinit(ctx: *@This()) void {
-            ctx.filter.deinit();
-            ctx.visible.deinit(ctx.allocator);
-        }
+    pub fn deinit(ctx: *StreamSink) void {
+        ctx.filter.deinit();
+        ctx.visible.deinit(ctx.allocator);
+    }
 
-        pub fn onDelta(ctx: *@This(), delta: []const u8) !void {
-            try ctx.filter.feed(delta, ctx);
-        }
+    pub fn onDelta(ctx: *StreamSink, delta: []const u8) !void {
+        try ctx.filter.feed(delta, ctx);
+    }
 
-        pub fn flush(ctx: *@This()) !void {
-            try ctx.filter.flush(ctx);
-        }
+    pub fn flush(ctx: *StreamSink) !void {
+        try ctx.filter.flush(ctx);
+    }
 
-        pub fn writeVisible(ctx: *@This(), visible: []const u8) !void {
-            ctx.visible_bytes += visible.len;
-            try ctx.visible.appendSlice(ctx.allocator, visible);
-            try ctx.renderer.assistantDelta(visible);
-            if (ctx.ui) |ui| try ui.pulseStatus();
-            try ctx.db.recordEvent(ctx.session, "assistant_delta", visible);
-        }
+    pub fn writeVisible(ctx: *StreamSink, visible: []const u8) !void {
+        ctx.visible_bytes += visible.len;
+        try ctx.visible.appendSlice(ctx.allocator, visible);
+        try ctx.events.emit(.{ .message_chunk = visible });
+        if (ctx.ui) |ui| try ui.pulseStatus();
+        try ctx.db.recordEvent(ctx.session, "assistant_delta", visible);
+    }
 
-        pub fn writeThinking(ctx: *@This(), thinking: []const u8) !void {
-            ctx.thinking_bytes += thinking.len;
-            try ctx.renderer.thinkingDelta(thinking);
-            if (ctx.ui) |ui| try ui.pulseStatus();
-            try ctx.db.recordEvent(ctx.session, "assistant_thinking_delta", thinking);
-        }
+    pub fn writeThinking(ctx: *StreamSink, thinking: []const u8) !void {
+        ctx.thinking_bytes += thinking.len;
+        try ctx.events.emit(.{ .reasoning_chunk = thinking });
+        if (ctx.ui) |ui| try ui.pulseStatus();
+        try ctx.db.recordEvent(ctx.session, "assistant_thinking_delta", thinking);
+    }
 
-        pub fn endThinking(ctx: *@This()) !void {
-            try ctx.renderer.thinkingEnd();
-        }
-    };
-}
+    pub fn endThinking(ctx: *StreamSink) !void {
+        _ = ctx;
+    }
+};
 
 fn runSnapshot() !void {
     var buffer = std.ArrayList(u8).empty;
@@ -350,4 +358,12 @@ test {
     _ = tool_loop;
     _ = tools;
     _ = tui;
+    _ = ui_events;
+}
+
+test "offline stub is explicit and not ok" {
+    const response = offlineStubResponse();
+    try std.testing.expect(!std.mem.eql(u8, response, "ok"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "offline") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "model not called") != null);
 }
