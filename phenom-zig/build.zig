@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
     const install_local_cmd = b.addSystemCommand(&.{
         "sh",
         "-c",
-        "test -n \"$HOME\" && install -Dm755 zig-out/bin/phenom \"$HOME/.local/bin/phenom\" && install -Dm644 ../config.toml \"$HOME/.config/phenom/config.toml\"",
+        "test -n \"$HOME\" && install -Dm755 zig-out/bin/phenom \"$HOME/.local/bin/phenom\" && sh tools/merge_config.sh ../config.toml \"$HOME/.config/phenom/config.toml\"",
     });
     install_local_cmd.step.dependOn(b.getInstallStep());
     install_local_step.dependOn(&install_local_cmd.step);

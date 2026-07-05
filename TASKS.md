@@ -6064,3 +6064,74 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - SQLite legado em `/tmp/phenom-legacy-elapsed/.phenom-zig/phenom.db` com `turn_start` `2026-07-05 14:00:00`, `turn_done=ok` `2026-07-05 14:00:02` -> replay TTY mostrou `Worked for 2s`.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; reinstalou `/home/ashirak/.local/bin/phenom`.
+
+## T245 - Instalar config.toml sem sobrescrever valores do usuario
+
+Status: implemented-verified.
+
+Motivacao: `zig build install-local` copiava `../config.toml` diretamente para `~/.config/phenom/config.toml`. A cada atualizacao do binario, qualquer configuracao real do usuario era perdida. O fluxo correto e criar o config quando ele nao existe; quando existe, aplicar atualizacoes da base do template, como novos parametros e comentarios, preservando os valores ativos do usuario.
+
+Evidencia:
+
+- `phenom-zig/build.zig`: `install-local` executava `install -Dm644 ../config.toml "$HOME/.config/phenom/config.toml"`, sobrescrevendo o arquivo de destino.
+- Config instalado real continha customizacao (`host = "inference.local"`, `thinking = "on"`), que seria perdida em qualquer update simples por copia direta.
+- `config.toml`: template precisa continuar podendo evoluir com comentarios e chaves novas.
+
+Impacto esperado:
+
+- Primeira instalacao cria `~/.config/phenom/config.toml` a partir do template.
+- Instalacoes futuras usam o template atual como base estrutural e preservam valores ativos do usuario para chaves existentes.
+- Chaves novas do template entram no arquivo instalado.
+- Chaves customizadas do usuario que nao existem no template sao preservadas no fim do arquivo.
+- Se o merge gerar conteudo identico, o arquivo nao e regravado.
+
+Teste primeiro:
+
+- Merge em destino inexistente deve criar config igual ao template.
+- Merge em destino com `backend`, `host`, `port`, `model` customizados deve preservar esses valores.
+- Template novo com chave adicional deve inserir a chave adicional.
+- Chave customizada do usuario deve ser mantida em bloco final.
+- `install-local` real deve preservar `host = "inference.local"` e `thinking = "on"` no config instalado.
+
+Implementacao:
+
+- `phenom-zig/tools/merge_config.sh`: criar script POSIX shell/awk sem dependencia de gawk.
+- `merge_config.sh`: detectar linhas ativas `key = value`, ignorando comentarios e linhas vazias.
+- `merge_config.sh`: imprimir o template novo, substituindo valores das chaves que ja existem no arquivo do usuario.
+- `merge_config.sh`: anexar chaves ativas do usuario que nao existem no template sob um bloco de preservacao.
+- `merge_config.sh`: comparar temp e destino com `cmp -s` antes de mover, evitando rewrite desnecessario.
+- `phenom-zig/build.zig`: trocar copia direta de config por `sh tools/merge_config.sh ../config.toml "$HOME/.config/phenom/config.toml"`.
+
+Passos de implementacao:
+
+1. Criar script de merge pequeno e auditavel.
+2. Remover dependencia de `ARGIND` para compatibilidade com awk comum.
+3. Ligar script ao `install-local`.
+4. Testar criacao inicial em `/tmp`.
+5. Testar preservacao de valores e chave customizada em `/tmp`.
+6. Rodar build/test/release.
+7. Rodar `install-local` real e inspecionar config instalado.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- I/O: script escreve em arquivo temporario no mesmo diretorio e usa `mv` atomico dentro do filesystem.
+- Falhas: `set -eu` e `trap` removem temp em erro.
+- Compatibilidade: usa POSIX shell e awk basico; nao depende de gawk.
+- Preservacao: valores ativos do usuario vencem valores do template; comentarios/base do template vencem comentarios antigos.
+- Limite deliberado: comentarios customizados soltos do usuario nao sao preservados, porque nao ha marcador confiavel para diferenciar comentario antigo da base de comentario escrito pelo usuario.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Merge em `/tmp` preserva valores do usuario e adiciona chave nova do template.
+- `install-local` nao sobrescreve valores existentes no config real.
+
+Validacao executada:
+
+- `sh phenom-zig/tools/merge_config.sh /tmp/phenom-config-merge-test/template.toml /tmp/phenom-config-merge-test/config.toml` em destino inexistente -> criou config igual ao template.
+- Merge com destino contendo `backend = "ollama"`, `host = "192.168.1.122"`, `port = 11435`, `model = "custom:model"` e `custom_knob = "keep-me"` + template com `new_param = true` -> preservou valores do usuario, adicionou `new_param = true` e anexou `custom_knob`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
+- `/home/ashirak/.config/phenom/config.toml` apos install manteve `host = "inference.local"` e `thinking = "on"`.
