@@ -5322,3 +5322,72 @@ Revisao baixo nivel executada:
 - `StreamSink.visible` continua owned e liberado em `deinit`.
 - `offlineStubResponse` retorna string literal estatica; nao exige free.
 - `real-smoke` provou que `--offline` nao interfere no caminho real.
+
+## T234 - Corrigir prompt digitado e statusbar assincrona no chat Zig
+
+Status: implemented-verified-real.
+
+Motivacao: antes de continuar o port do chat TS, dois bugs bloqueavam uso real da TUI: o texto digitado no prompt nao aparecia de forma confiavel em raw mode, e a statusbar/visualizer so mudava quando o loop principal chamava `pulseStatus`, sem ticker proprio durante prefill/inferencia. No TS, `CliRenderer` usa footer fixo com repaint ativo durante inferencia e save/restore cursor; o Zig precisava do mesmo principio operacional.
+
+Evidencia:
+
+- `phenom-zig/src/tui.zig`: `cfmakeraw` desativa processamento de output do terminal; `renderBottomBar` usava `\n` puro entre linhas. Em raw mode, `\n` nao garante retorno para coluna 1, causando prompt pintado fora da posicao esperada.
+- `phenom-zig/src/tui.zig`: `pulseStatus` so rodava quando chamado pelo stream; durante prefill/model wait nao havia atualizacao assincrona.
+- `../phenom-cli-ts/src/cli-renderer.ts:2447-2455`: TS inicia timer de repaint durante inferencia.
+- `../phenom-cli-ts/src/cli-renderer.ts:2463-2484`: TS redesenha footer com save/restore cursor para nao misturar status com output do modelo.
+- `../phenom-cli-ts/src/cli-renderer.ts:2499-2556`: TS monta status com label, elapsed/tokens e visualizer dinamico.
+
+Impacto esperado:
+
+- Texto digitado aparece no prompt antes do Enter.
+- Statusbar atualiza de forma assincrona durante espera do modelo, nao apenas quando chega token.
+- Status muda de `Thinking` para `Responding` quando chegam chunks visiveis.
+- Renderer e footer compartilham lock simples para reduzir risco de escape sequences intercaladas.
+- `showDone`, `showPrompt` e `detach` param a thread e fazem join antes de limpar/restaurar terminal.
+
+Teste primeiro:
+
+- Snapshot do bottom bar passa a esperar CRLF (`\r\n`) entre linhas, cobrindo raw mode.
+- PTY offline: digitar `abc` sem Enter deve mostrar `> abc`.
+- PTY real: durante inferencia, statusbar deve repintar wave e mudar `Thinking` -> `Responding`.
+
+Implementacao:
+
+- `phenom-zig/src/tui.zig`: trocar separadores do bottom bar para `\r\n`.
+- `phenom-zig/src/tui.zig`: adicionar `status_running`, `status_thread`, `status_started_ms`, `write_mutex`, `startStatusTicker`, `stopStatusTicker` e ticker com `usleep(80ms)`.
+- `phenom-zig/src/tui.zig`: formatar status dinamico como `{label} ({elapsed}s · esc to interrupt)` usando `clock_gettime(CLOCK_MONOTONIC)`.
+- `phenom-zig/src/ui_events.zig`: adicionar lock opcional no `RendererEventSink`.
+- `phenom-zig/src/main.zig`: passar mutex da TUI para renderer sink e atualizar status para `Thinking`/`Responding` nos chunks.
+
+Passos de implementacao:
+
+1. Corrigir CRLF do footer para raw mode.
+2. Adicionar lock terminal compartilhado.
+3. Criar ticker assincrono de status durante inferencia.
+4. Garantir stop/join em done/prompt/detach.
+5. Atualizar labels do main para `Thinking`/`Responding`.
+6. Rodar unitarios e release.
+7. Validar PTY offline e PTY real.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Lifetime: thread recebe ponteiro para `TerminalUi`; `stopStatusTicker` faz join antes de `deinit` liberar editor/restaurar terminal.
+- Concorrencia: `RendererEventSink` e `TerminalUi.draw` usam o mesmo `std.atomic.Mutex`; writes do renderer e do footer nao rodam simultaneamente.
+- C interop: `usleep` e `clock_gettime(CLOCK_MONOTONIC)` usam headers libc ja declarados; falha de `clock_gettime` retorna elapsed 0.
+- Raw mode: CRLF evita depender de `OPOST/ONLCR`, que `cfmakeraw` desativa.
+- Escopo: ainda nao porta o visualizer noise/cascade completo do TS; esta task corrige funcionamento assincrono e visibilidade.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- PTY offline mostra texto digitado antes do Enter.
+- PTY real mostra statusbar atualizando durante inferencia e backend retorna token esperado.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- PTY offline `./zig-out/bin/phenom chat --offline --no-color`, input parcial `abc` -> output mostrou `> abc` antes do Enter.
+- PTY offline `abc\r/exit\r` -> mostrou statusbar, resposta offline explicita, `[done]`, restaurou terminal.
+- PTY real `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --max-tokens 96 --thinking off --expect-contains PHENOM_REAL_7319 --show-expect-status`, input `Complete: PHENOM_REAL_7319\r` -> statusbar repintou wave, mudou `Thinking` para `Responding`, backend retornou `PHENOM_REAL_7319`, terminal restaurou em `/exit`.

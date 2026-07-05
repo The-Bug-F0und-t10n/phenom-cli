@@ -98,6 +98,7 @@ pub const EventBus = struct {
 pub fn RendererEventSink(comptime RendererPtr: type) type {
     return struct {
         renderer: RendererPtr,
+        write_mutex: ?*std.atomic.Mutex = null,
         assistant_started: bool = false,
 
         const Self = @This();
@@ -108,6 +109,10 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
         }
 
         pub fn handle(self: *Self, event: Event) !void {
+            if (self.write_mutex) |mutex| {
+                lockTerminal(mutex);
+                defer mutex.unlock();
+            }
             switch (event) {
                 .user_message => |text| try self.renderer.user(text),
                 .think_start => {
@@ -145,6 +150,12 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
             self.assistant_started = true;
         }
     };
+}
+
+fn lockTerminal(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) {
+        std.Thread.yield() catch {};
+    }
 }
 
 test "event bus dispatches events in registration order" {

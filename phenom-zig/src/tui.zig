@@ -5,6 +5,7 @@ const c = @cImport({
     @cInclude("termios.h");
     @cInclude("unistd.h");
     @cInclude("sys/ioctl.h");
+    @cInclude("time.h");
 });
 
 pub const InputEvent = union(enum) {
@@ -46,6 +47,12 @@ pub const VisualizerMode = enum {
     working,
     responding,
 };
+
+pub fn lockTerminal(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) {
+        std.Thread.yield() catch {};
+    }
+}
 
 pub fn visualizerFrame(mode: VisualizerMode, tick: usize) []const u8 {
     const idle = [_][]const u8{ "▁▁▁▁▁▁▁▁▁▁", "▁▁▁▁▁▁▁▁▁▁" };
@@ -99,7 +106,7 @@ pub fn renderBottomBar(writer: anytype, state: BottomBarState) !usize {
     }
     rows_written += 1;
 
-    try writer.writeAll("\n");
+    try writer.writeAll("\r\n");
     try paintInputBlank(writer, state.color, paint_cols);
     rows_written += 1;
 
@@ -107,18 +114,18 @@ pub fn renderBottomBar(writer: anytype, state: BottomBarState) !usize {
         const view = computePromptView(state.prompt, state.cursor, paint_cols);
         var i: usize = 0;
         while (i < view.line_count) : (i += 1) {
-            try writer.writeAll("\n");
+            try writer.writeAll("\r\n");
             const prefix: []const u8 = if (i == 0 and view.first_visible == 0) "> " else "  ";
             try paintInputRow(writer, state.color, prefix, view.storage[i], paint_cols);
             rows_written += 1;
         }
     } else {
-        try writer.writeAll("\n");
+        try writer.writeAll("\r\n");
         try paintInputBlank(writer, state.color, paint_cols);
         rows_written += 1;
     }
 
-    try writer.writeAll("\n");
+    try writer.writeAll("\r\n");
     try paintInputBlank(writer, state.color, paint_cols);
     rows_written += 1;
     return rows_written;
@@ -441,11 +448,16 @@ pub fn TerminalUi(comptime Writer: type) type {
         prompt_rows: usize = 1,
         attached: bool = false,
         last_status: ?[]const u8 = null,
+        status_started_ms: i64 = 0,
         visualizer_mode: VisualizerMode = .idle,
         visualizer_tick: usize = 0,
         show_prompt: bool = true,
+        status_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        status_thread: ?std.Thread = null,
+        write_mutex: std.atomic.Mutex = .unlocked,
 
         const Self = @This();
+        const DrawOptions = struct { status: ?[]const u8, show_prompt: bool, preserve_cursor: bool };
 
         pub fn init(allocator: std.mem.Allocator, writer: Writer, color: bool) Self {
             return .{
@@ -461,6 +473,10 @@ pub fn TerminalUi(comptime Writer: type) type {
             self.editor.deinit();
         }
 
+        pub fn mutex(self: *Self) *std.atomic.Mutex {
+            return &self.write_mutex;
+        }
+
         pub fn attach(self: *Self) !void {
             if (self.attached) return;
             if (c.isatty(self.stdin_fd) != 1) return error.NotATty;
@@ -470,13 +486,18 @@ pub fn TerminalUi(comptime Writer: type) type {
             if (c.tcsetattr(self.stdin_fd, c.TCSAFLUSH, &raw) != 0) return error.TermiosSetFailed;
             self.raw_enabled = true;
             self.attached = true;
+            lockTerminal(&self.write_mutex);
+            defer self.write_mutex.unlock();
             try self.writer.writeAll("\x1b[?2004h");
             try self.resyncScrollRegion();
-            try self.draw(.{ .status = null, .show_prompt = true, .preserve_cursor = false });
+            try self.drawUnlocked(.{ .status = null, .show_prompt = true, .preserve_cursor = false });
         }
 
         pub fn detach(self: *Self) !void {
             if (!self.attached and !self.raw_enabled) return;
+            self.stopStatusTicker();
+            lockTerminal(&self.write_mutex);
+            defer self.write_mutex.unlock();
             try self.writer.writeAll("\x1b[r");
             try self.clearBottom();
             try self.writer.writeAll("\x1b[?2004l");
@@ -510,6 +531,8 @@ pub fn TerminalUi(comptime Writer: type) type {
 
         pub fn positionContent(self: *Self) !void {
             if (!self.attached) return;
+            lockTerminal(&self.write_mutex);
+            defer self.write_mutex.unlock();
             const size = terminalSize();
             const last = @max(@as(usize, 1), size.rows -| self.bottom_rows);
             try self.writer.print("\x1b[{};1H", .{last});
@@ -520,6 +543,7 @@ pub fn TerminalUi(comptime Writer: type) type {
             self.visualizer_mode = modeFromLabel(status);
             self.visualizer_tick +%= 1;
             self.show_prompt = false;
+            try self.startStatusTicker();
             try self.draw(.{ .status = status, .show_prompt = false, .preserve_cursor = true });
         }
 
@@ -531,6 +555,7 @@ pub fn TerminalUi(comptime Writer: type) type {
         }
 
         pub fn showDone(self: *Self) !void {
+            self.stopStatusTicker();
             self.last_status = "[done]";
             self.visualizer_mode = .idle;
             self.show_prompt = true;
@@ -538,13 +563,42 @@ pub fn TerminalUi(comptime Writer: type) type {
         }
 
         pub fn showPrompt(self: *Self) !void {
+            self.stopStatusTicker();
             self.last_status = null;
             self.visualizer_mode = .idle;
             self.show_prompt = true;
             try self.draw(.{ .status = null, .show_prompt = true, .preserve_cursor = false });
         }
 
-        fn draw(self: *Self, opts: struct { status: ?[]const u8, show_prompt: bool, preserve_cursor: bool }) !void {
+        fn startStatusTicker(self: *Self) !void {
+            if (self.status_running.swap(true, .acq_rel)) return;
+            self.status_started_ms = monotonicMs();
+            self.status_thread = try std.Thread.spawn(.{}, statusThreadMain, .{self});
+        }
+
+        fn stopStatusTicker(self: *Self) void {
+            if (!self.status_running.swap(false, .acq_rel)) return;
+            if (self.status_thread) |thread| {
+                thread.join();
+                self.status_thread = null;
+            }
+        }
+
+        fn statusThreadMain(self: *Self) void {
+            while (self.status_running.load(.acquire)) {
+                _ = c.usleep(80 * 1000);
+                if (!self.status_running.load(.acquire)) break;
+                self.pulseStatus() catch {};
+            }
+        }
+
+        fn draw(self: *Self, opts: DrawOptions) !void {
+            lockTerminal(&self.write_mutex);
+            defer self.write_mutex.unlock();
+            try self.drawUnlocked(opts);
+        }
+
+        fn drawUnlocked(self: *Self, opts: DrawOptions) !void {
             if (!self.attached) return;
             const size = terminalSize();
             const paint_cols = @max(@as(usize, 1), size.cols -| 1);
@@ -561,12 +615,14 @@ pub fn TerminalUi(comptime Writer: type) type {
             var out = std.ArrayList(u8).empty;
             defer out.deinit(self.allocator);
             const bw = fd_writer.BufferWriter{ .allocator = self.allocator, .list = &out };
+            var status_buf: [96]u8 = undefined;
+            const status_text = if (opts.status) |status| self.formatStatus(status, &status_buf) else null;
             if (opts.preserve_cursor) try bw.writeAll("\x1b7");
             try bw.print("\x1b[{};1H", .{status_row});
             _ = try renderBottomBar(bw, .{
                 .color = self.color,
                 .cols = size.cols,
-                .status = opts.status,
+                .status = status_text,
                 .visualizer_mode = if (opts.status != null and self.visualizer_mode != .idle) self.visualizer_mode else null,
                 .visualizer_tick = self.visualizer_tick,
                 .prompt = self.editor.buffer.items,
@@ -581,6 +637,19 @@ pub fn TerminalUi(comptime Writer: type) type {
                 try bw.print("\x1b[{};{}H", .{ prompt_first_row + view.cursor_row, screen_col });
             }
             try self.writer.writeAll(out.items);
+        }
+
+        fn formatStatus(self: *Self, status: []const u8, buf: *[96]u8) []const u8 {
+            if (!self.status_running.load(.acquire)) return status;
+            if (std.mem.eql(u8, status, "[done]")) return status;
+            if (std.mem.indexOfScalar(u8, status, '(') != null) return status;
+            const now = monotonicMs();
+            const elapsed_ms: u64 = if (now > self.status_started_ms) @intCast(now - self.status_started_ms) else 0;
+            const seconds = elapsed_ms / 1000;
+            if (seconds < 60) {
+                return std.fmt.bufPrint(buf, "{s} ({}s · esc to interrupt)", .{ status, seconds }) catch status;
+            }
+            return std.fmt.bufPrint(buf, "{s} ({}m {}s · esc to interrupt)", .{ status, seconds / 60, seconds % 60 }) catch status;
         }
 
         fn resyncScrollRegion(self: *Self) !void {
@@ -601,6 +670,12 @@ pub fn TerminalUi(comptime Writer: type) type {
             }
         }
     };
+}
+
+fn monotonicMs() i64 {
+    var ts: c.struct_timespec = undefined;
+    if (c.clock_gettime(c.CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
 }
 
 pub fn terminalSize() TerminalSize {
@@ -805,9 +880,9 @@ test "bottom bar snapshot matches prompt and status surface" {
     });
 
     const expected =
-        "Thinking (3s  ▁▂▃\n" ++
-        "                 \n" ++
-        "> ola            \n" ++
+        "Thinking (3s  ▁▂▃\r\n" ++
+        "                 \r\n" ++
+        "> ola            \r\n" ++
         "                 ";
     try std.testing.expectEqualStrings(expected, buffer.items);
 }

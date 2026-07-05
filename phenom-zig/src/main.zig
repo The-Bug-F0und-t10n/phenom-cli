@@ -142,7 +142,7 @@ fn runInteractiveChat(allocator: std.mem.Allocator, config: cli.Config, stdout: 
             continue;
         }
 
-        try ui.showStatus("Thinking (0s · esc to interrupt)");
+        try ui.showStatus("Thinking");
         try ui.positionContent();
         try runChatTurnWithUi(allocator, config, stdout, prompt, &ui);
         try ui.showDone();
@@ -156,9 +156,13 @@ fn runChatTurn(allocator: std.mem.Allocator, config: cli.Config, stdout: fd_writ
 fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: fd_writer.FdWriter, prompt: []const u8, ui: anytype) !void {
     const size = tui.terminalSize();
     var renderer = render.AppendOnlyRenderer(@TypeOf(stdout)).init(stdout, .{ .color = !config.no_color, .terminal_columns = size.cols, .user_label = userLabel() });
+    const ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter) = ui;
     var events = ui_events.EventBus.init(allocator);
     defer events.deinit();
-    var render_sink = ui_events.RendererEventSink(@TypeOf(&renderer)){ .renderer = &renderer };
+    var render_sink = ui_events.RendererEventSink(@TypeOf(&renderer)){
+        .renderer = &renderer,
+        .write_mutex = if (ui_ptr) |active_ui| active_ui.mutex() else null,
+    };
     try events.on(&render_sink, @TypeOf(render_sink).handleOpaque);
 
     try makeDirIfMissing(".phenom-zig");
@@ -203,7 +207,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
             .events = &events,
             .db = &db,
             .session = config.session,
-            .ui = ui,
+            .ui = ui_ptr,
             .filter = reasoning_filter.ReasoningFilter.init(allocator, http.resolveThinking(config.thinking, prompt) == .on),
             .visible = std.ArrayList(u8).empty,
             .visible_bytes = 0,
@@ -305,6 +309,7 @@ const StreamSink = struct {
     pub fn writeVisible(ctx: *StreamSink, visible: []const u8) !void {
         ctx.visible_bytes += visible.len;
         try ctx.visible.appendSlice(ctx.allocator, visible);
+        if (ctx.ui) |ui| try ui.showStatus("Responding");
         try ctx.events.emit(.{ .message_chunk = visible });
         if (ctx.ui) |ui| try ui.pulseStatus();
         try ctx.db.recordEvent(ctx.session, "assistant_delta", visible);
@@ -312,6 +317,7 @@ const StreamSink = struct {
 
     pub fn writeThinking(ctx: *StreamSink, thinking: []const u8) !void {
         ctx.thinking_bytes += thinking.len;
+        if (ctx.ui) |ui| try ui.showStatus("Thinking");
         try ctx.events.emit(.{ .reasoning_chunk = thinking });
         if (ctx.ui) |ui| try ui.pulseStatus();
         try ctx.db.recordEvent(ctx.session, "assistant_thinking_delta", thinking);
