@@ -9,6 +9,12 @@ pub const RenderOptions = struct {
     max_diff_lines: usize = 2000,
 };
 
+const Rgb = struct {
+    r: u8,
+    g: u8,
+    b: u8,
+};
+
 pub fn AppendOnlyRenderer(comptime Writer: type) type {
     return struct {
         writer: Writer,
@@ -47,6 +53,18 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         const user_bg = "\x1b[48;5;236m";
         const user_fg = "\x1b[38;5;252m";
         const reset = "\x1b[0m";
+        const tone_keyword = Rgb{ .r = 0xa4, .g = 0x8e, .b = 0xc7 };
+        const tone_string = Rgb{ .r = 0x7f, .g = 0xa9, .b = 0x8f };
+        const tone_number = Rgb{ .r = 0xcf, .g = 0xa0, .b = 0x6e };
+        const tone_fn = Rgb{ .r = 0x7a, .g = 0x9c, .b = 0xc6 };
+        const tone_type = Rgb{ .r = 0x7f, .g = 0xb2, .b = 0xc9 };
+        const tone_comment = Rgb{ .r = 0x5f, .g = 0x6a, .b = 0x72 };
+        const tone_text = Rgb{ .r = 0x9a, .g = 0xa6, .b = 0xb2 };
+        const tone_preproc = Rgb{ .r = 0xd4, .g = 0xb9, .b = 0x7a };
+        const diff_add_bg = Rgb{ .r = 0xed, .g = 0xf8, .b = 0xf0 };
+        const diff_add_fg = Rgb{ .r = 0x2f, .g = 0x6f, .b = 0x45 };
+        const diff_del_bg = Rgb{ .r = 0xff, .g = 0xf0, .b = 0xf0 };
+        const diff_del_fg = Rgb{ .r = 0x8a, .g = 0x30, .b = 0x30 };
         const content_gutter_cols: usize = 1;
 
         pub fn init(writer: Writer, options: RenderOptions) Self {
@@ -391,9 +409,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
 
         fn writeMarkdownLine(self: *Self, line: []const u8, newline: bool) !void {
             if (isFenceLine(line)) {
-                try self.writeContentGutter();
-                try self.writeCyan("│ ");
-                try self.writeYellowBold(line);
+                try self.writeFenceLine(line);
                 self.setMarkdownFence(line);
             } else if (self.markdown_in_code) {
                 try self.writeCodeLine(line);
@@ -422,22 +438,48 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             try self.writeContentGutter();
             if (isDiffLang(lang)) {
                 if (std.mem.startsWith(u8, line, "+")) {
-                    try self.writeGreen("│ ");
-                    try self.writeGreen(line);
+                    try self.writeRgbFgBg(diff_add_fg, diff_add_bg, "│ ");
+                    try self.writeRgbBg(diff_add_bg, line);
                 } else if (std.mem.startsWith(u8, line, "-")) {
-                    try self.writeRed("│ ");
-                    try self.writeRed(line);
+                    try self.writeRgbFgBg(diff_del_fg, diff_del_bg, "│ ");
+                    try self.writeRgbBg(diff_del_bg, line);
                 } else if (std.mem.startsWith(u8, line, "@@")) {
                     try self.writeCyan("│ ");
-                    try self.writeCyan(line);
+                    try self.writeRgb(tone_fn, line);
+                } else if (std.mem.startsWith(u8, line, "+++") or std.mem.startsWith(u8, line, "---")) {
+                    try self.writeDim("│ ");
+                    try self.writeRgb(tone_preproc, line);
                 } else {
                     try self.writeDim("│ ");
-                    try self.writeDim(line);
+                    try self.writeRgb(tone_text, line);
                 }
                 return;
             }
-            try self.writeCyan("│ ");
+            try self.writeCyanDim("│ ");
             try self.writeHighlightedCode(line, lang);
+        }
+
+        fn writeFenceLine(self: *Self, line: []const u8) !void {
+            const lang = fenceLang(line);
+            const outgoing = self.markdown_code_lang[0..self.markdown_code_lang_len];
+            const active_lang = if (!self.markdown_in_code) lang else outgoing;
+            try self.writeContentGutter();
+            if (isDiffLang(active_lang)) {
+                try self.writeCyan("│ ");
+            } else {
+                try self.writeCyanDim("│ ");
+            }
+            const ticks_len = fenceTicksLen(line);
+            try self.writeRgb(tone_preproc, line[0..ticks_len]);
+            if (lang.len > 0) {
+                const lang_start = fenceLangStart(line);
+                if (ticks_len < lang_start) try self.writeRgb(tone_text, line[ticks_len..lang_start]);
+                try self.writeRgb(tone_fn, lang);
+                const rest_start = lang_start + lang.len;
+                if (rest_start < line.len) try self.writeRgb(tone_text, line[rest_start..]);
+            } else if (ticks_len < line.len) {
+                try self.writeRgb(tone_text, line[ticks_len..]);
+            }
         }
 
         fn writeMarkdownProseLine(self: *Self, line: []const u8) !void {
@@ -565,7 +607,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         fn writeHighlightedCode(self: *Self, line: []const u8, lang: []const u8) !void {
             var i: usize = 0;
             while (i < line.len) {
-                if (line[i] == '"' or line[i] == '\'') {
+                if (line[i] == '"' or line[i] == '\'' or line[i] == '`') {
                     const quote = line[i];
                     var end = i + 1;
                     while (end < line.len) : (end += 1) {
@@ -574,12 +616,12 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                             break;
                         }
                     }
-                    try self.writeGreen(line[i..@min(end, line.len)]);
+                    try self.writeRgb(tone_string, line[i..@min(end, line.len)]);
                     i = @min(end, line.len);
                     continue;
                 }
-                if (std.mem.startsWith(u8, line[i..], "//") or line[i] == '#') {
-                    try self.writeDim(line[i..]);
+                if (std.mem.startsWith(u8, line[i..], "//") or std.mem.startsWith(u8, line[i..], "--") or line[i] == '#') {
+                    try self.writeRgb(tone_comment, line[i..]);
                     break;
                 }
                 if (isIdentStart(line[i])) {
@@ -587,11 +629,13 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                     while (end < line.len and isIdent(line[end])) : (end += 1) {}
                     const word = line[i..end];
                     if (isCodeKeyword(word, lang)) {
-                        try self.writeYellowBold(word);
+                        try self.writeRgb(tone_keyword, word);
+                    } else if (isTypeToken(word)) {
+                        try self.writeRgb(tone_type, word);
                     } else if (end < line.len and line[end] == '(') {
-                        try self.writeCyan(word);
+                        try self.writeRgb(tone_fn, word);
                     } else {
-                        try self.writer.writeAll(word);
+                        try self.writeRgb(tone_text, word);
                     }
                     i = end;
                     continue;
@@ -599,12 +643,12 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 if (line[i] >= '0' and line[i] <= '9') {
                     var end = i + 1;
                     while (end < line.len and ((line[end] >= '0' and line[end] <= '9') or line[end] == '.')) : (end += 1) {}
-                    try self.writeYellowBold(line[i..end]);
+                    try self.writeRgb(tone_number, line[i..end]);
                     i = end;
                     continue;
                 }
                 const len = utf8ByteLen(line[i]);
-                try self.writer.writeAll(line[i..@min(line.len, i + len)]);
+                try self.writeRgb(tone_text, line[i..@min(line.len, i + len)]);
                 i += len;
             }
         }
@@ -796,8 +840,36 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             try self.writer.writeAll(reset);
         }
 
+        fn writeRgb(self: *Self, rgb: Rgb, text: []const u8) !void {
+            if (!self.options.color) {
+                try self.writer.writeAll(text);
+                return;
+            }
+            try self.writer.print("\x1b[38;2;{};{};{}m{s}\x1b[0m", .{ rgb.r, rgb.g, rgb.b, text });
+        }
+
+        fn writeRgbBg(self: *Self, bg: Rgb, text: []const u8) !void {
+            if (!self.options.color) {
+                try self.writer.writeAll(text);
+                return;
+            }
+            try self.writer.print("\x1b[48;2;{};{};{}m{s}\x1b[0m", .{ bg.r, bg.g, bg.b, text });
+        }
+
+        fn writeRgbFgBg(self: *Self, fg: Rgb, bg: Rgb, text: []const u8) !void {
+            if (!self.options.color) {
+                try self.writer.writeAll(text);
+                return;
+            }
+            try self.writer.print("\x1b[38;2;{};{};{};48;2;{};{};{}m{s}\x1b[0m", .{ fg.r, fg.g, fg.b, bg.r, bg.g, bg.b, text });
+        }
+
         fn writeCyan(self: *Self, text: []const u8) !void {
             try self.writeAnsi("\x1b[36m", text);
+        }
+
+        fn writeCyanDim(self: *Self, text: []const u8) !void {
+            try self.writeAnsi("\x1b[36;2m", text);
         }
 
         fn writeCyanBold(self: *Self, text: []const u8) !void {
@@ -865,12 +937,22 @@ fn isFenceLine(line: []const u8) bool {
 
 fn fenceLang(line: []const u8) []const u8 {
     if (!isFenceLine(line)) return "";
-    var i: usize = 3;
-    while (i < line.len and line[i] == '`') : (i += 1) {}
-    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
-    const start = i;
+    const start = fenceLangStart(line);
+    var i = start;
     while (i < line.len and isIdent(line[i])) : (i += 1) {}
     return line[start..i];
+}
+
+fn fenceTicksLen(line: []const u8) usize {
+    var i: usize = 0;
+    while (i < line.len and line[i] == '`') : (i += 1) {}
+    return i;
+}
+
+fn fenceLangStart(line: []const u8) usize {
+    var i = fenceTicksLen(line);
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    return i;
 }
 
 fn isDiffLang(lang: []const u8) bool {
@@ -1012,6 +1094,10 @@ fn isIdentStart(ch: u8) bool {
 
 fn isIdent(ch: u8) bool {
     return isIdentStart(ch) or (ch >= '0' and ch <= '9') or ch == '$' or ch == '-';
+}
+
+fn isTypeToken(word: []const u8) bool {
+    return word.len > 0 and word[0] >= 'A' and word[0] <= 'Z';
 }
 
 fn isCodeKeyword(word: []const u8, lang: []const u8) bool {
@@ -1467,4 +1553,70 @@ test "assistant markdown plain newline does not add phantom gutter" {
 
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "primeira \n") == null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, " primeira\n segunda\n") != null);
+}
+
+test "assistant markdown code uses phenom cli ts 24 bit syntax palette" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = true });
+    try renderer.assistantStart();
+    try renderer.assistantDelta(
+        \\```ts
+        \\const value = "ok";
+        \\run(value);
+        \\```
+    );
+    try renderer.done();
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;212;185;122m```") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;122;156;198mts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;164;142;199mconst") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;127;169;143m\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;122;156;198mrun") != null);
+}
+
+test "assistant markdown diff uses phenom cli ts pastel backgrounds" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = true });
+    try renderer.assistantStart();
+    try renderer.assistantDelta(
+        \\```diff
+        \\--- a/file.zig
+        \\+++ b/file.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\```
+    );
+    try renderer.done();
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[48;2;237;248;240m+new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[48;2;255;240;240m-old") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;47;111;69;48;2;237;248;240m│ ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;138;48;48;48;2;255;240;240m│ ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[41") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[42") == null);
+}
+
+test "assistant markdown spaced fence language renders once" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false });
+    try renderer.assistantStart();
+    try renderer.assistantDelta(
+        \\``` ts
+        \\const ok = true;
+        \\```
+    );
+    try renderer.done();
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, " │ ``` ts\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "tss") == null);
 }

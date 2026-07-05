@@ -6296,3 +6296,74 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --no-color --max-tokens 160 --prompt 'responda em markdown curto com: um titulo, uma lista e um bloco de codigo zig com const ok = true'` -> passou; transcript renderizou heading, bullets `•` e fence `zig` com gutter `│`.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o renderer atualizado em `~/.local/bin/phenom`.
+
+## T248 - Portar paleta de codigo e diff do `phenom-cli-ts` para Markdown Zig
+
+Status: implemented-verified.
+
+Motivacao: a T247 renderizava a estrutura Markdown, mas o codigo e o diff ainda nao tinham a mesma coloracao do `phenom-cli-ts`. O Zig usava ANSI basico (`31/32/33/36`) e diff sem background pastel. Visualmente isso nao batia com o renderer TS, que usa paleta hex 24-bit derivada do tema do usuario e backgrounds suaves em diff fenced.
+
+Evidencia:
+
+- `../phenom-cli-ts/src/stream-markdown-renderer.ts`: define `C.keyword = #a48ec7`, `C.string = #7fa98f`, `C.number = #cfa06e`, `C.fn = #7a9cc6`, `C.type = #7fb2c9`, `C.comment = #5f6a72`, `C.text = #9aa6b2`, `C.preproc = #d4b97a`.
+- `../phenom-cli-ts/src/stream-markdown-renderer.ts`: diff fenced usa `#edf8f0` para adicoes e `#fff0f0` para remocoes, sem `bgGreen`/`bgRed` saturado.
+- `phenom-zig/src/render.zig`: antes desta task, fences e highlighter usavam `writeYellowBold`, `writeGreen`, `writeCyan` e `writeRed`, sem ANSI 24-bit.
+- Smoke real colorido mostrou que o caminho precisava emitir `38;2`/`48;2`, nao apenas render estrutural.
+
+Impacto esperado:
+
+- Fences de codigo passam a usar gutter cyan dim, backticks em `#d4b97a` e linguagem em `#7a9cc6`.
+- Keywords, strings, numeros, funcoes, tipos, comentarios e texto base usam a mesma familia visual do TS.
+- Diff fenced passa a usar background pastel em adicoes/remocoes e foreground especifico no gutter.
+- Continua proibido background saturado ANSI `41/42`.
+- Modo `--no-color` continua imprimindo texto limpo, porque os helpers 24-bit respeitam `options.color`.
+
+Teste primeiro:
+
+- Teste ANSI de code fence exige sequencias `38;2;212;185;122`, `38;2;122;156;198`, `38;2;164;142;199` e `38;2;127;169;143`.
+- Teste ANSI de diff fenced exige `48;2;237;248;240` para `+new` e `48;2;255;240;240` para `-old`.
+- Teste diff confirma ausencia de `\x1b[41` e `\x1b[42`.
+- Teste de fence com linguagem separada por espaco prova que ` ``` ts` renderiza `ts` uma vez.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: adicionar struct `Rgb` e constantes da paleta TS.
+- `render.zig`: adicionar `writeRgb`, `writeRgbBg`, `writeRgbFgBg` e `writeCyanDim`.
+- `render.zig`: renderizar fence com partes separadas: gutter, backticks, lang e resto.
+- `render.zig`: trocar highlight generico para tons TS por categoria.
+- `render.zig`: trocar diff fenced para background pastel e gutter com fg/bg.
+
+Passos de implementacao:
+
+1. Ler a paleta e regras de diff em `stream-markdown-renderer.ts`.
+2. Portar apenas os tons necessarios para o renderer Zig atual.
+3. Adicionar testes ANSI exatos para code e diff.
+4. Rodar renderer isolado.
+5. Rodar build completo e release.
+6. Rodar smoke real colorido com Markdown contendo code e diff.
+7. Instalar binario atualizado.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: sem alocacao nova; helpers escrevem direto no writer.
+- Bounds: `writeFenceLine` usa slices calculadas sobre a linha atual; fence sem lang cai para texto restante; fence com espaco antes da linguagem usa `fenceLangStart` para nao duplicar bytes.
+- ANSI: helpers respeitam `options.color`; modo plain nao recebe escape.
+- Terminal: ANSI 24-bit e background pastel sao append-only; nao usam cursor movement.
+- Compatibilidade: highlighter continua lexical simples; nao tenta portar todo regex engine do TS nesta task.
+- Limite deliberado: a cobertura e por categoria visual principal, nao por todos os dialetos (`html/css/json/yaml/sql`) do TS; esses devem entrar com fixtures dedicadas quando forem exigidos.
+
+Criterio de aceite:
+
+- `zig test src/render.zig -lc` passa com testes de paleta 24-bit.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real colorido mostra sequencias ANSI `38;2` em codigo e `48;2` em diff.
+- `install-local` passa.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/render.zig -lc` -> passou; 27 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 180 --prompt 'responda somente este markdown: ```ts\nconst value = "ok";\nrun(value);\n```\n```diff\n-old\n+new\n```'` -> passou; transcript emitiu `38;2` para code e `48;2` para diff pastel.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.
