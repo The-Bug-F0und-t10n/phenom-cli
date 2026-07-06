@@ -6571,3 +6571,73 @@ Validacao executada:
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --no-color --max-tokens 120 --prompt 'responda somente este markdown: ```diff\n@@ -7,2 +9,2 @@\n-old\n+new\n same\n```'` -> passou; transcript mostrou `7 - │ old`, `9 + │ new`, `10   │ same`.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 120 --prompt 'responda somente este markdown: ```diff\n@@ -7,2 +9,2 @@\n-old\n+new\n```'` -> passou; transcript mostrou ANSI de add/remove no numero, marcador e texto, mas `│` em dim sem background.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.
+
+## T252 - Aplicar syntax highlight do `phenom-cli-ts` no texto do diff Markdown
+
+Status: implemented-verified.
+
+Motivacao: o diff Markdown ja tinha numeros, marcadores e pipe estrutural, mas o texto da linha ainda nao seguia o `phenom-cli-ts`. O conteudo de linhas `+/-` ficava chapado com a cor de add/remove. No TS, o meta do diff usa cor de edicao, mas o texto do codigo preserva syntax highlight por linguagem sobre o background de add/remove.
+
+Evidencia:
+
+- `../phenom-cli-ts/src/cli-renderer.ts:2797-2819`: calcula `codeLang = codeLangFromPath(diff.path)`, aplica `highlightCode(text, codeLang)` e depois envolve o texto com `addBg`/`delBg`.
+- `phenom-zig/src/render.zig`: `writeMarkdownDiffEditLine` chamava `writeRgbFgBg(fg, bg, text)`, entao `const`, strings, numeros e funcoes nao recebiam a paleta de codigo.
+- Smoke real anterior mostrava o conteudo inteiro em verde/vermelho escuro, nao keywords/strings como no renderer TS.
+
+Impacto esperado:
+
+- File headers `--- a/app.ts`/`+++ b/app.ts` definem a linguagem do diff Markdown.
+- Texto de linhas editadas usa syntax highlight por categoria sobre o background de add/remove.
+- Numeros e marcadores continuam usando cor de edicao.
+- Pipe continua dim/estrutural.
+- Sem path conhecido, texto cai para `tone_text` sobre o background, equivalente ao fallback TS.
+
+Teste primeiro:
+
+- Teste ANSI com `app.ts` exige `const` em `#a48ec7` sobre background add/del.
+- Teste ANSI exige strings em `#7fa98f` sobre background add/del.
+- Teste garante que `const` nao usa a cor verde/vermelha do marcador.
+- Testes anteriores de numeros, marker e pipe continuam passando.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: adicionar estado `markdown_diff_code_lang`.
+- `render.zig`: inferir linguagem a partir de `+++ b/path.ext`/`--- a/path.ext`.
+- `render.zig`: adicionar helpers `firstToken`, `stripDiffPathPrefix` e `codeLangFromPath`.
+- `render.zig`: extrair `writeHighlightedCodeBg` para reutilizar highlighter com background opcional.
+- `render.zig`: `writeMarkdownDiffEditLine` passa a chamar `writeHighlightedDiffText`.
+- `render.zig`: context lines tambem usam highlighter quando linguagem e conhecida, mas sem background.
+
+Passos de implementacao:
+
+1. Confirmar comportamento do TS em `renderFileDiff`.
+2. Adicionar estado de linguagem no diff Markdown.
+3. Inferir linguagem pelos file headers.
+4. Reusar highlighter existente com background opcional.
+5. Atualizar testes ANSI.
+6. Rodar renderer isolado, build completo, release e smoke real.
+7. Instalar binario atualizado.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: estado de linguagem usa array fixo `[24]u8`; sem alocacao.
+- Bounds: `codeLangFromPath` e parser de header operam com slices checadas.
+- ANSI: cada token recebe foreground e background; reset apos token evita vazamento.
+- Fallback: path ausente ou extensao desconhecida nao quebra render, usa `tone_text`.
+- Escopo: nao porta todos os regex sofisticados do TS; aplica a paleta/categorias ja existentes no highlighter Zig.
+
+Criterio de aceite:
+
+- `zig test src/render.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real com `app.ts` mostra `const` e strings com syntax highlight sobre background de diff.
+- `install-local` passa.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/render.zig -lc` -> passou; 29 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 180 --prompt 'responda somente este markdown: ```diff\n--- a/app.ts\n+++ b/app.ts\n@@ -1 +1 @@\n-const value = "old";\n+const value = "new";\n```'` -> passou; transcript mostrou `const` em `38;2;164;142;199` e strings em `38;2;127;169;143` com background add/del.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.

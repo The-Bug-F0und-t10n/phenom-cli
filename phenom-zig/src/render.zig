@@ -33,6 +33,8 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         markdown_code_lang_len: usize = 0,
         markdown_diff_old_line: ?usize = null,
         markdown_diff_new_line: ?usize = null,
+        markdown_diff_code_lang: [24]u8 = undefined,
+        markdown_diff_code_lang_len: usize = 0,
         markdown_table: [8192]u8 = undefined,
         markdown_table_len: usize = 0,
         markdown_table_rows: usize = 0,
@@ -443,12 +445,14 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 if (isDiffLang(lang)) {
                     self.markdown_diff_old_line = 1;
                     self.markdown_diff_new_line = 1;
+                    self.markdown_diff_code_lang_len = 0;
                 }
             } else {
                 self.markdown_in_code = false;
                 self.markdown_code_lang_len = 0;
                 self.markdown_diff_old_line = null;
                 self.markdown_diff_new_line = null;
+                self.markdown_diff_code_lang_len = 0;
             }
         }
 
@@ -472,6 +476,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 return;
             }
             if (std.mem.startsWith(u8, line, "+++") or std.mem.startsWith(u8, line, "---")) {
+                self.setMarkdownDiffCodeLang(line);
                 try self.writeDim("    │ ");
                 try self.writeRgb(tone_preproc, line);
                 return;
@@ -493,7 +498,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             if (self.markdown_diff_new_line) |new| self.markdown_diff_new_line = new + 1;
             try self.writeDimLineNumber(n);
             try self.writeDim("   │ ");
-            try self.writeRgb(tone_text, if (std.mem.startsWith(u8, line, " ")) line[1..] else line);
+            try self.writeHighlightedDiffText(if (std.mem.startsWith(u8, line, " ")) line[1..] else line, null);
         }
 
         fn writeMarkdownDiffEditLine(self: *Self, line_no: usize, marker: u8, text: []const u8, fg: Rgb, bg: Rgb) !void {
@@ -503,7 +508,28 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             try self.writeRgbFgBg(fg, bg, &marker_text);
             try self.writer.writeAll(" ");
             try self.writeDim("│ ");
-            try self.writeRgbFgBg(fg, bg, text);
+            try self.writeHighlightedDiffText(text, bg);
+        }
+
+        fn setMarkdownDiffCodeLang(self: *Self, line: []const u8) void {
+            if (line.len < 4) return;
+            const raw_path = trimLeft(line[4..], " \t");
+            if (raw_path.len == 0 or std.mem.eql(u8, raw_path, "/dev/null")) return;
+            const path = stripDiffPathPrefix(firstToken(raw_path));
+            const lang = codeLangFromPath(path);
+            if (lang.len == 0 or isDiffLang(lang)) return;
+            const len = @min(lang.len, self.markdown_diff_code_lang.len);
+            @memcpy(self.markdown_diff_code_lang[0..len], lang[0..len]);
+            self.markdown_diff_code_lang_len = len;
+        }
+
+        fn writeHighlightedDiffText(self: *Self, text: []const u8, bg: ?Rgb) !void {
+            const lang = self.markdown_diff_code_lang[0..self.markdown_diff_code_lang_len];
+            if (lang.len == 0) {
+                try self.writeRgbMaybeBg(tone_text, bg, text);
+                return;
+            }
+            try self.writeHighlightedCodeBg(text, lang, bg);
         }
 
         fn writeDiffLineNumber(self: *Self, line_no: usize, fg: Rgb, bg: Rgb) !void {
@@ -664,6 +690,10 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         }
 
         fn writeHighlightedCode(self: *Self, line: []const u8, lang: []const u8) !void {
+            try self.writeHighlightedCodeBg(line, lang, null);
+        }
+
+        fn writeHighlightedCodeBg(self: *Self, line: []const u8, lang: []const u8, bg: ?Rgb) !void {
             var i: usize = 0;
             while (i < line.len) {
                 if (line[i] == '"' or line[i] == '\'' or line[i] == '`') {
@@ -675,12 +705,12 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                             break;
                         }
                     }
-                    try self.writeRgb(tone_string, line[i..@min(end, line.len)]);
+                    try self.writeRgbMaybeBg(tone_string, bg, line[i..@min(end, line.len)]);
                     i = @min(end, line.len);
                     continue;
                 }
                 if (std.mem.startsWith(u8, line[i..], "//") or std.mem.startsWith(u8, line[i..], "--") or line[i] == '#') {
-                    try self.writeRgb(tone_comment, line[i..]);
+                    try self.writeRgbMaybeBg(tone_comment, bg, line[i..]);
                     break;
                 }
                 if (isIdentStart(line[i])) {
@@ -688,13 +718,13 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                     while (end < line.len and isIdent(line[end])) : (end += 1) {}
                     const word = line[i..end];
                     if (isCodeKeyword(word, lang)) {
-                        try self.writeRgb(tone_keyword, word);
+                        try self.writeRgbMaybeBg(tone_keyword, bg, word);
                     } else if (isTypeToken(word)) {
-                        try self.writeRgb(tone_type, word);
+                        try self.writeRgbMaybeBg(tone_type, bg, word);
                     } else if (end < line.len and line[end] == '(') {
-                        try self.writeRgb(tone_fn, word);
+                        try self.writeRgbMaybeBg(tone_fn, bg, word);
                     } else {
-                        try self.writeRgb(tone_text, word);
+                        try self.writeRgbMaybeBg(tone_text, bg, word);
                     }
                     i = end;
                     continue;
@@ -702,12 +732,12 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 if (line[i] >= '0' and line[i] <= '9') {
                     var end = i + 1;
                     while (end < line.len and ((line[end] >= '0' and line[end] <= '9') or line[end] == '.')) : (end += 1) {}
-                    try self.writeRgb(tone_number, line[i..end]);
+                    try self.writeRgbMaybeBg(tone_number, bg, line[i..end]);
                     i = end;
                     continue;
                 }
                 const len = utf8ByteLen(line[i]);
-                try self.writeRgb(tone_text, line[i..@min(line.len, i + len)]);
+                try self.writeRgbMaybeBg(tone_text, bg, line[i..@min(line.len, i + len)]);
                 i += len;
             }
         }
@@ -907,6 +937,14 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             try self.writer.print("\x1b[38;2;{};{};{}m{s}\x1b[0m", .{ rgb.r, rgb.g, rgb.b, text });
         }
 
+        fn writeRgbMaybeBg(self: *Self, fg: Rgb, bg: ?Rgb, text: []const u8) !void {
+            if (bg) |value| {
+                try self.writeRgbFgBg(fg, value, text);
+            } else {
+                try self.writeRgb(fg, text);
+            }
+        }
+
         fn writeRgbBg(self: *Self, bg: Rgb, text: []const u8) !void {
             if (!self.options.color) {
                 try self.writer.writeAll(text);
@@ -977,6 +1015,35 @@ fn toolDetail(name: []const u8) []const u8 {
 fn firstLine(text: []const u8) []const u8 {
     const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
     return text[0..@min(end, 200)];
+}
+
+fn firstToken(text: []const u8) []const u8 {
+    const end = std.mem.indexOfAny(u8, text, " \t") orelse text.len;
+    return text[0..end];
+}
+
+fn stripDiffPathPrefix(path: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, path, "a/") or std.mem.startsWith(u8, path, "b/")) return path[2..];
+    return path;
+}
+
+fn codeLangFromPath(path: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return "";
+    const ext = path[dot + 1 ..];
+    if (std.ascii.eqlIgnoreCase(ext, "zig")) return "zig";
+    if (std.ascii.eqlIgnoreCase(ext, "ts") or std.ascii.eqlIgnoreCase(ext, "tsx")) return "ts";
+    if (std.ascii.eqlIgnoreCase(ext, "js") or std.ascii.eqlIgnoreCase(ext, "jsx") or std.ascii.eqlIgnoreCase(ext, "mjs") or std.ascii.eqlIgnoreCase(ext, "cjs")) return "js";
+    if (std.ascii.eqlIgnoreCase(ext, "py")) return "py";
+    if (std.ascii.eqlIgnoreCase(ext, "sh") or std.ascii.eqlIgnoreCase(ext, "bash") or std.ascii.eqlIgnoreCase(ext, "zsh")) return "bash";
+    if (std.ascii.eqlIgnoreCase(ext, "html") or std.ascii.eqlIgnoreCase(ext, "htm")) return "html";
+    if (std.ascii.eqlIgnoreCase(ext, "xml") or std.ascii.eqlIgnoreCase(ext, "svg")) return "xml";
+    if (std.ascii.eqlIgnoreCase(ext, "css") or std.ascii.eqlIgnoreCase(ext, "scss") or std.ascii.eqlIgnoreCase(ext, "sass") or std.ascii.eqlIgnoreCase(ext, "less")) return "css";
+    if (std.ascii.eqlIgnoreCase(ext, "lua")) return "lua";
+    if (std.ascii.eqlIgnoreCase(ext, "json") or std.ascii.eqlIgnoreCase(ext, "jsonc")) return "json";
+    if (std.ascii.eqlIgnoreCase(ext, "yaml") or std.ascii.eqlIgnoreCase(ext, "yml")) return "yaml";
+    if (std.ascii.eqlIgnoreCase(ext, "sql")) return "sql";
+    if (std.ascii.eqlIgnoreCase(ext, "diff") or std.ascii.eqlIgnoreCase(ext, "patch")) return "diff";
+    return "";
 }
 
 fn countNeedle(haystack: []const u8, needle: []const u8) usize {
@@ -1691,14 +1758,39 @@ test "assistant markdown diff uses readable codex style foreground and backgroun
 
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;47;111;69;48;2;237;248;240m   1") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;47;111;69;48;2;237;248;240m+") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;47;111;69;48;2;237;248;240mnew") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;154;166;178;48;2;237;248;240mnew") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;138;48;48;48;2;255;240;240m   1") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;138;48;48;48;2;255;240;240m-") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;138;48;48;48;2;255;240;240mold") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;154;166;178;48;2;255;240;240mold") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;47;111;69;48;2;237;248;240m│ ") == null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;138;48;48;48;2;255;240;240m│ ") == null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[41") == null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[42") == null);
+}
+
+test "assistant markdown diff text follows syntax highlight over edit background" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = true });
+    try renderer.assistantStart();
+    try renderer.assistantDelta(
+        \\```diff
+        \\--- a/app.ts
+        \\+++ b/app.ts
+        \\@@ -1 +1 @@
+        \\-const value = "old";
+        \\+const value = "new";
+        \\```
+    );
+    try renderer.done();
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;164;142;199;48;2;237;248;240mconst") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;127;169;143;48;2;237;248;240m\"new\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;164;142;199;48;2;255;240;240mconst") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;127;169;143;48;2;255;240;240m\"old\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;47;111;69;48;2;237;248;240mconst") == null);
 }
 
 test "assistant markdown diff exposes line numbers and edit markers in plain mode" {
