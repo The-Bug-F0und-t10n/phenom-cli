@@ -95,6 +95,11 @@ pub fn parseFirst(
     if (!active_contract.allows(call.name)) {
         return try rejectedCall(allocator, active_contract, call, .tool_not_advertised);
     }
+    if (call.strategy) |strategy| {
+        if (!contracts.strategyAllowed(active_contract.name, strategy)) {
+            return try rejectedCall(allocator, active_contract, call, .invalid_strategy);
+        }
+    }
 
     return try ToolCallEnvelope.fromAcceptedCall(allocator, active_contract, call);
 }
@@ -171,6 +176,21 @@ test "invalid strategy is a rejected envelope" {
         \\<tool_call>
         \\<function=collect_evidence>
         \\<parameter=strategy>made_up</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.rejected, envelope.state);
+    try std.testing.expectEqual(RejectionReason.invalid_strategy, envelope.rejection_reason.?);
+}
+
+test "inactive collect evidence strategy is rejected by active contract" {
+    const active = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
+    const output =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=strategy>semantic</parameter>
         \\</function>
         \\</tool_call>
     ;

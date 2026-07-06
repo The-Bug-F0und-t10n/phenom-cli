@@ -37,7 +37,7 @@ pub const Result = struct {
 
 pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: Args) !Result {
     if (args.budget_bytes == 0) return error.InvalidEvidenceBudget;
-    const strategy = contracts.resolveCollectEvidenceStrategy(args.strategy);
+    const strategy = contracts.resolveCollectEvidenceStrategy(args.strategy) orelse return error.InvalidStrategy;
     if (strategy == .path or args.path != null) return executePath(allocator, args, strategy);
     return executeRanked(allocator, io, args, strategy);
 }
@@ -229,16 +229,14 @@ test "collect evidence ranked lexical uses rg candidates and audit without raw r
     try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "---BEGIN CONTENT---") == null);
 }
 
-test "collect evidence symbol semantic diagnostic runtime and diff strategies are executable" {
+test "collect evidence rejects inactive strategies instead of falling back" {
     const strategies = [_]contracts.StrategyName{ .symbol, .semantic, .diagnostic, .runtime, .diff };
     for (strategies) |strategy| {
-        const result = try execute(std.testing.allocator, std.testing.io, .{
+        try std.testing.expectError(error.InvalidStrategy, execute(std.testing.allocator, std.testing.io, .{
             .task = "collect_evidence tool_event diff error",
             .strategy = strategy,
             .budget_bytes = 6000,
-        });
-        defer result.deinit(std.testing.allocator);
-        try std.testing.expect(result.range_count > 0);
+        }));
     }
 }
 

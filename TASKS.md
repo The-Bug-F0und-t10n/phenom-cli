@@ -8081,3 +8081,187 @@ Validacao executada:
 - `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 620 --prompt 'Analise esse projeto e me diga, em termos simples, o que ele faz. Termine exatamente com: PHENOM_AMBIG_TOOL_270F' --expect-contains PHENOM_AMBIG_TOOL_270F --show-expect-status --fail-on-model-error --session ambiguous-tool-270f` -> passou; modelo chamou `collect_evidence(auto)`, recebeu evidencia e respondeu com `PHENOM_AMBIG_TOOL_270F`.
 - `sqlite3 .phenom-zig/phenom.db "select kind, substr(body,1,900) from events where session='ambiguous-tool-270f' and kind in ('model_context','tool_envelope','tool_start','tool_event','evidence','assistant_delta','turn_done') order by id;"` -> mostrou `tool_envelope state=accepted`, `tool_start collect_evidence auto`, `[CANDIDATE_RANKING]`, `source=workspace_overview`, evidencia, resposta e `turn_done status=ok`.
 - `sqlite3 .phenom-zig/phenom.db "select count(*) from events where session='ambiguous-tool-270f' and body like '%---BEGIN CONTENT---%';"` -> retornou `0`.
+
+## T271 - Alinhar superficie ativa e ranking ao produto final
+
+Status: implemented-verified.
+
+Motivacao: revisao de alinhamento apontou cinco riscos de regressao para os mesmos problemas do `phenom-cli-ts`: ranking com vies por linguagem/teste, estrategias anunciadas sem executor maduro, manifesto model-visible maior que o runtime real, contrato ativo fixo sem honestidade de superficie, e reparo de path com falso positivo para `..` textual. Como o projeto nao e mais tratado como spike, a correcao deve estabilizar a regra de negocio: o modelo so ve e so consegue usar contratos que o controller executa de forma auditavel; qualquer estrategia futura fica fora da superficie ativa ate existir executor real.
+
+Evidencia:
+
+- `doc/AGENTE_AI_BAIXO_CONSUMO_TOKENS_AUDIT.md` define que o controller nao deve inferir direcao operacional por palavras-chave do prompt.
+- `doc/AGENTE_AI_BAIXO_CONSUMO_TOKENS_AUDIT.md` aponta a falha real de tool `content` fora da allowlist e exige envelope validado contra tools anunciadas.
+- `phenom-zig/src/evidence_ranker.zig` ainda dava bonus para `.zig`, penalizava `test` e injetava termos como `pub`, `fn`, `error`, `patch`, `audit` por estrategia.
+- `phenom-zig/src/contracts.zig` marcava muitas tools como `model_visible`, mas o contrato ativo real so executava `collect_evidence`.
+- Smoke real `align-271` passou no marcador, mas respondeu sem ferramenta e alucinou um projeto To-Do List. Isso mostrou que o marcador sozinho nao prova o fluxo de negocio.
+- Smoke real `align-271b` chamou `collect_evidence`, mas ainda extrapolou capacidades nao evidenciadas. Isso mostrou que evidencia coletada precisa virar restricao de groundedness, nao sugestao.
+
+Impacto esperado:
+
+- Ranking nao privilegia extensao `.zig` nem penaliza arquivos de teste.
+- Estrategias inativas (`symbol`, `semantic`, `diagnostic`, `runtime`, `diff`) nao sao anunciadas ao modelo, nao sao aceitas pelo envelope e nao fazem fallback silencioso para `auto`.
+- `compactModelVisibleTools` passa a refletir a superficie executavel atual: apenas `collect_evidence` e model-visible.
+- `collect_evidence` ativo fica limitado a `auto`, `path` e `lexical`.
+- Path repair aceita nomes legitimos como `foo..txt` e continua rejeitando traversal por componente `..`.
+- O contrato inicial obriga evidencia antes de qualquer claim sobre projeto/repo/codigo/arquivos/implementacao.
+- O contexto apos tool obriga resposta final a usar apenas evidencia coletada e nao adicionar capacidades ausentes.
+
+Teste primeiro:
+
+- Teste de ranker prova que score de arquivo `.zig` e arquivo de teste equivalente e igual.
+- Teste de ranker prova que estrategia inativa nao injeta termos sinteticos (`pub`, `fn`).
+- Teste de contracts prova que `apply_patch`, `run_tests` e `set_operational_contract` nao aparecem em `compactModelVisibleTools`.
+- Teste de envelope prova que estrategia `semantic` e rejeitada pelo contrato ativo.
+- Teste de collect_evidence prova que estrategias inativas retornam `InvalidStrategy`, sem fallback para `auto`.
+- Teste de main prova schema sem `symbol|semantic|diagnostic|runtime|diff`.
+- Teste de path repair prova que `foo..txt` e aceito e `../README.md` continua rejeitado.
+
+Implementacao:
+
+- `phenom-zig/src/evidence_ranker.zig`: remover seed de termos por estrategia.
+- `phenom-zig/src/evidence_ranker.zig`: remover lista hardcoded de termos conhecidos de contrato; aceitar somente sinais estruturais (`_`, `.`, `-`, CamelCase, token diagnostico).
+- `phenom-zig/src/evidence_ranker.zig`: remover bonus por `.zig`, penalidade por `test` e boost de definicao baseado em `fn/const/pub`.
+- `phenom-zig/src/contracts.zig`: mover todas as tools nao executaveis agora para `internal_context`.
+- `phenom-zig/src/contracts.zig`: manter apenas `auto`, `path` e `lexical` como estrategias ativas de `collect_evidence`.
+- `phenom-zig/src/contracts.zig`: mudar `resolveCollectEvidenceStrategy` para retornar `null` em estrategia inativa.
+- `phenom-zig/src/collect_evidence.zig`: retornar `InvalidStrategy` quando a estrategia nao esta ativa.
+- `phenom-zig/src/tool_envelope.zig`: rejeitar estrategia parseada que nao pertence ao contrato ativo.
+- `phenom-zig/src/main.zig`: reduzir schema model-visible para `auto|path|lexical`.
+- `phenom-zig/src/main.zig`: trocar rejeicao de qualquer substring `..` por validacao de componente traversal.
+- `phenom-zig/src/main.zig`: fortalecer contrato inicial e contexto pos-tool contra claims sem evidencia.
+
+Passos de implementacao:
+
+1. Remover pesos enviesados do ranker.
+2. Reduzir estrategias ativas ao que existe de fato.
+3. Fazer envelope validar estrategia contra contrato ativo.
+4. Fazer executor rejeitar estrategia inativa sem fallback silencioso.
+5. Reduzir manifesto model-visible ao runtime executavel atual.
+6. Corrigir reparo de path para distinguir traversal real de nome legitimo.
+7. Fortalecer contrato textual para exigir evidencia em claims sobre workspace.
+8. Fortalecer contexto pos-tool para limitar resposta a evidencia coletada.
+9. Validar offline, build release, smoke real e SQLite.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: sem novos buffers persistentes alem das strings ja owned por context/render; alteracoes de contrato usam arrays estaticos.
+- Ownership: envelope rejeitado continua liberando `ToolCall`; executor rejeita antes de alocar `Result`.
+- Bounds: nenhuma nova coleta amplia `max_candidates`, `max_ranges`, `model_budget_limit` ou `max_rg_bytes`.
+- Subprocesso: `rg` permanece via argv separado, sem shell.
+- Raw leak: query SQLite do smoke final retornou `0` para marcador `---BEGIN CONTENT---`.
+- Regra de negocio: controller nao classifica intencao por keyword; ele reduz a superficie e valida protocolo/contrato.
+- Ranker: sem stopwords, sem lista fixa de arquivos e sem lista semantica de nomes de contratos; candidatos usam `rg`, paths explicitos ou inventario estrutural auditado.
+- Produto: features futuras nao sao removidas do roadmap; ficam internal/inativas ate terem executor real e testes reais.
+
+Criterio de aceite:
+
+- `zig test src/contracts.zig -lc` passa.
+- `zig test src/evidence_ranker.zig -lc` passa.
+- `zig test src/collect_evidence.zig -lc` passa.
+- `zig test src/tool_envelope.zig -lc` passa.
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real de pergunta ambigua sobre projeto chama `collect_evidence(auto)` antes da resposta.
+- SQLite do smoke real mostra `tool_start=1`, `evidence=1` e zero raw marker.
+
+Pendencias deliberadas:
+
+- `set_operational_contract` ainda nao e model-visible porque nao existe executor/estado real para trocar contratos em runtime.
+- `symbol`, `semantic`, `diagnostic`, `runtime` e `diff` continuam no enum/roadmap, mas nao sao estrategias ativas ate terem implementacao propria.
+- O smoke `align-271c` ainda mostrou que o modelo pode extrapolar detalhes em linguagem natural mesmo apos evidencia. Nao foi adicionado filtro por blacklist porque isso seria nova heuristica fragil. A solucao correta e uma proxima task de groundedness por claims/citacoes: claims sobre workspace devem apontar para evidence ids/ranges ou serem marcadas como nao evidenciadas.
+- README ainda descreve `phenom-zig spike`; isso afeta a resposta real porque a evidencia vem do arquivo. Deve ser tratado em task separada de documentacao/produto, nao no controller.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/contracts.zig -lc` -> passou; 5 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/evidence_ranker.zig -lc` -> passou; 12 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc` -> passou; 33 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_envelope.zig -lc` -> passou; 16 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 133 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 620 --prompt 'Analise esse projeto e me diga, em termos simples, o que ele faz. Termine exatamente com: PHENOM_ALIGN_271' --expect-contains PHENOM_ALIGN_271 --show-expect-status --fail-on-model-error --session align-271` -> passou no marcador, mas falhou semanticamente: sem tool/evidence e resposta To-Do List. Usado como evidencia para fortalecer contrato.
+- `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 620 --prompt 'Analise esse projeto e me diga, em termos simples, o que ele faz. Termine exatamente com: PHENOM_ALIGN_271B' --expect-contains PHENOM_ALIGN_271B --show-expect-status --fail-on-model-error --session align-271b` -> chamou `collect_evidence(auto)`, mas ainda extrapolou capacidades. Usado como evidencia para fortalecer contexto pos-tool.
+- `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 620 --prompt 'Analise esse projeto e me diga, em termos simples, o que ele faz. Termine exatamente com: PHENOM_ALIGN_271C' --expect-contains PHENOM_ALIGN_271C --show-expect-status --fail-on-model-error --session align-271c` -> chamou `collect_evidence(auto)`, recebeu evidencia e respondeu com marcador.
+- `sqlite3 .phenom-zig/phenom.db "select count(*) from events where session='align-271c' and kind='tool_start'; select count(*) from events where session='align-271c' and kind='evidence'; select count(*) from events where session='align-271c' and body like '%---BEGIN CONTENT---%';"` -> retornou `1`, `1`, `0`.
+
+## T272 - Tornar evidencia inicial propriedade do controller
+
+Status: implemented-verified.
+
+Motivacao: revisao da regra de negocio apos a T271 apontou um erro conceitual: para perguntas sobre workspace/codigo/projeto, `collect_evidence` nao deve depender de uma decisao opcional do modelo. A evidencia e o contexto minimo que o modelo usa para responder e para decidir se precisa de outra tool. Logo, a primeira coleta deve ser preflight do controller quando o tool loop esta ativo; o modelo so deve pedir novas coletas quando a evidencia inicial for insuficiente ou quando precisar de outro range/path/estrategia.
+
+Evidencia:
+
+- O audit exige que tools de coleta serializem dados em contexto destilado minimo com evidencia tangivel, sem vazar raw context.
+- A T271 reduziu superficie e estrategias, mas ainda deixava a primeira evidencia depender do comportamento do modelo.
+- Smoke real `align-271` mostrou que o modelo pode responder sem ferramenta e ainda passar no marcador, criando falsa confiabilidade.
+- Smoke real `align-271b` e `align-271c` mostraram que, quando a evidencia entra no contexto, o fluxo melhora, mas a decisao inicial ainda estava no lugar errado.
+
+Impacto esperado:
+
+- Todo turno com `PHENOM_TOOL_LOOP_V1=1` executa `collect_evidence(auto)` antes da primeira inferencia.
+- O primeiro `model_context` ja contem `[EVIDENCE]`, sem exigir que o modelo descubra sozinho que precisa de contexto do workspace.
+- O modelo continua autorizado a chamar `collect_evidence` de novo, mas somente para evidencia adicional diferente e dentro de budget/qualidade.
+- Falha no preflight vira `tool_error` auditado e status visual, nao falha falsa de infraestrutura.
+- O fluxo fica alinhado com a visao do projeto: controller cuida de protocolo, evidencia, budget e auditoria; modelo raciocina sobre contexto destilado.
+
+Teste primeiro:
+
+- Teste de `buildInitialModelContext` prova que evidencia inicial entra no contexto com schema compacto.
+- Teste de schema prova que apenas `auto|path|lexical` continuam visiveis.
+- Smoke real de pergunta ambigua sobre projeto deve renderizar `collect_evidence: preflight:auto` antes da resposta.
+- SQLite do smoke real deve mostrar `tool_start=1`, `evidence=1`, `model_context` contendo `[EVIDENCE]` e zero raw marker.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: criar `collectInitialEvidence` para executar `collect_evidence(auto)` antes da primeira chamada ao backend quando `PHENOM_TOOL_LOOP_V1=1`.
+- `phenom-zig/src/main.zig`: auditar preflight com `tool_start`, `tool_event`, `evidence` e renderizar evento visual de tool.
+- `phenom-zig/src/main.zig`: passar `initial_evidence` para `buildInitialModelContext`.
+- `phenom-zig/src/main.zig`: atualizar `next_action` inicial para tratar `[EVIDENCE]` como contexto minimo do workspace, nao como sugestao opcional.
+- `phenom-zig/src/main.zig`: manter schema `collect_evidence` disponivel para coletas adicionais diferentes.
+
+Passos de implementacao:
+
+1. Inserir preflight antes de `buildInitialModelContext`.
+2. Auditar e renderizar a coleta inicial como tool normal.
+3. Injetar EvidencePacket no primeiro `model_context`.
+4. Ajustar instrucao inicial para groundedness sobre evidencia ja coletada.
+5. Validar teste unitario, build, smoke real e SQLite.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: `preflight_evidence` fica owned pelo turno e e liberado com `defer result.deinit(allocator)`.
+- Ownership: `buildInitialModelContext` recebe slice emprestado de `preflight_evidence` apenas durante renderizacao, antes do `defer`.
+- Bounds: preflight usa budget fixo de 6000 bytes e o executor continua aplicando limites internos de candidatos/ranges.
+- Erro: falha de preflight e registrada como `tool_error` e o turno pode seguir sem mascarar como `ConnectFailed`.
+- Raw leak: SQLite do smoke final retornou zero ocorrencias de `---BEGIN CONTENT---`.
+- Regra de negocio: nao ha heuristica linguistica nem inferencia por prompt; o preflight e uma etapa do perfil `code_micro` quando o tool loop esta ativo.
+
+Criterio de aceite:
+
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real com pergunta natural sobre o projeto passa e mostra preflight.
+- SQLite confirma que a evidencia entrou no primeiro contexto enviado ao modelo.
+
+Pendencias deliberadas:
+
+- O preflight ainda usa `auto`; selecao de contrato/perfil alem de `code_micro` deve vir de `context profiles`, nao de keywords do prompt.
+- `README.md` ainda descreve o produto como spike; a resposta real herdou esse termo da evidencia correta. Isso deve ser corrigido em task de documentacao/produto.
+- Ainda falta groundedness formal por claims/citacoes para impedir que o modelo acrescente detalhes nao evidenciados em linguagem natural.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/contracts.zig -lc` -> passou; 5 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/evidence_ranker.zig -lc` -> passou; 12 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc` -> passou; 33 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_envelope.zig -lc` -> passou; 16 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 133 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 620 --prompt 'Analise esse projeto e me diga, em termos simples, o que ele faz. Termine exatamente com: PHENOM_PREFLIGHT_272' --expect-contains PHENOM_PREFLIGHT_272 --show-expect-status --fail-on-model-error --session preflight-272` -> passou; renderizou `collect_evidence: preflight:auto` e respondeu com marcador.
+- `sqlite3 phenom-zig/.phenom-zig/phenom.db "select 'tool_start', count(*) from events where session='preflight-272' and kind='tool_start'; select 'evidence', count(*) from events where session='preflight-272' and kind='evidence'; select 'raw_marker', count(*) from events where session='preflight-272' and body like '%---BEGIN CONTENT---%'; select 'model_context_evidence', count(*) from events where session='preflight-272' and kind='model_context' and body like '%[EVIDENCE]%';"` -> retornou `1`, `1`, `0`, `1`.

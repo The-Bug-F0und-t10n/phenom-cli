@@ -63,26 +63,26 @@ pub const ActiveContract = struct {
 
 pub const all_tools = [_]ToolSpec{
     .{ .name = "collect_evidence", .visibility = .model_visible },
-    .{ .name = "read_file", .visibility = .model_visible },
-    .{ .name = "path_exists", .visibility = .model_visible },
-    .{ .name = "list_dir", .visibility = .model_visible },
-    .{ .name = "write_file", .visibility = .model_visible },
-    .{ .name = "create_file", .visibility = .model_visible },
-    .{ .name = "apply_patch", .visibility = .model_visible },
-    .{ .name = "delete_file", .visibility = .model_visible },
-    .{ .name = "delete_dir", .visibility = .model_visible },
-    .{ .name = "run_validation", .visibility = .model_visible },
-    .{ .name = "validate_syntax", .visibility = .model_visible },
-    .{ .name = "run_tests", .visibility = .model_visible },
-    .{ .name = "run_code", .visibility = .model_visible },
-    .{ .name = "browser_check", .visibility = .model_visible },
-    .{ .name = "git_status", .visibility = .model_visible },
-    .{ .name = "git_diff", .visibility = .model_visible },
-    .{ .name = "git_log", .visibility = .model_visible },
-    .{ .name = "date", .visibility = .model_visible },
-    .{ .name = "get_session_context", .visibility = .model_visible },
-    .{ .name = "list_session_files", .visibility = .model_visible },
-    .{ .name = "set_operational_contract", .visibility = .model_visible },
+    .{ .name = "read_file", .visibility = .internal_context },
+    .{ .name = "path_exists", .visibility = .internal_context },
+    .{ .name = "list_dir", .visibility = .internal_context },
+    .{ .name = "write_file", .visibility = .internal_context },
+    .{ .name = "create_file", .visibility = .internal_context },
+    .{ .name = "apply_patch", .visibility = .internal_context },
+    .{ .name = "delete_file", .visibility = .internal_context },
+    .{ .name = "delete_dir", .visibility = .internal_context },
+    .{ .name = "run_validation", .visibility = .internal_context },
+    .{ .name = "validate_syntax", .visibility = .internal_context },
+    .{ .name = "run_tests", .visibility = .internal_context },
+    .{ .name = "run_code", .visibility = .internal_context },
+    .{ .name = "browser_check", .visibility = .internal_context },
+    .{ .name = "git_status", .visibility = .internal_context },
+    .{ .name = "git_diff", .visibility = .internal_context },
+    .{ .name = "git_log", .visibility = .internal_context },
+    .{ .name = "date", .visibility = .internal_context },
+    .{ .name = "get_session_context", .visibility = .internal_context },
+    .{ .name = "list_session_files", .visibility = .internal_context },
+    .{ .name = "set_operational_contract", .visibility = .internal_context },
     .{ .name = "build_task_context", .visibility = .internal_context },
     .{ .name = "get_context", .visibility = .internal_context },
     .{ .name = "get_minimal_context", .visibility = .internal_context },
@@ -131,11 +131,6 @@ pub const strategy_specs = [_]StrategySpec{
     .{ .contract = .collect_evidence, .strategy = .auto, .max_budget_bytes = 3800 },
     .{ .contract = .collect_evidence, .strategy = .path, .max_budget_bytes = 3800 },
     .{ .contract = .collect_evidence, .strategy = .lexical, .max_budget_bytes = 6000 },
-    .{ .contract = .collect_evidence, .strategy = .symbol, .max_budget_bytes = 6000 },
-    .{ .contract = .collect_evidence, .strategy = .diagnostic, .max_budget_bytes = 6000 },
-    .{ .contract = .collect_evidence, .strategy = .runtime, .max_budget_bytes = 6000 },
-    .{ .contract = .collect_evidence, .strategy = .diff, .max_budget_bytes = 6000 },
-    .{ .contract = .collect_evidence, .strategy = .semantic, .max_budget_bytes = 10000 },
     .{ .contract = .news, .strategy = .news_table, .max_budget_bytes = 24000 },
     .{ .contract = .inspect_runtime, .strategy = .document_summary, .max_budget_bytes = 24000 },
 };
@@ -161,10 +156,10 @@ pub fn strategyAllowed(contract: ContractName, strategy: StrategyName) bool {
     return false;
 }
 
-pub fn resolveCollectEvidenceStrategy(requested: ?StrategyName) StrategyName {
+pub fn resolveCollectEvidenceStrategy(requested: ?StrategyName) ?StrategyName {
     const strategy = requested orelse .auto;
     if (strategyAllowed(.collect_evidence, strategy)) return strategy;
-    return .auto;
+    return null;
 }
 
 pub fn activeContract(name: ContractName) ?ActiveContract {
@@ -194,7 +189,8 @@ pub fn compactModelVisibleTools(allocator: std.mem.Allocator) ![]u8 {
 
 test "tool manifest keeps internal context tools hidden from model surface" {
     try std.testing.expect(isModelVisible("collect_evidence"));
-    try std.testing.expect(isModelVisible("apply_patch"));
+    try std.testing.expect(!isModelVisible("apply_patch"));
+    try std.testing.expect(isInternalContextTool("apply_patch"));
     try std.testing.expect(!isModelVisible("grep_file"));
     try std.testing.expect(isInternalContextTool("grep_file"));
     try std.testing.expect(isInternalContextTool("rag_search"));
@@ -202,8 +198,8 @@ test "tool manifest keeps internal context tools hidden from model surface" {
 }
 
 test "tool manifest includes referenced ts project tools" {
-    try std.testing.expect(isModelVisible("read_file"));
-    try std.testing.expect(isModelVisible("git_diff"));
+    try std.testing.expect(isInternalContextTool("read_file"));
+    try std.testing.expect(isInternalContextTool("git_diff"));
     try std.testing.expect(isInternalContextTool("get_civic_briefing"));
     try std.testing.expect(isInternalContextTool("record_skills"));
     try std.testing.expect(isInternalContextTool("start_background_command"));
@@ -211,9 +207,11 @@ test "tool manifest includes referenced ts project tools" {
 
 test "collect evidence accepts bounded strategies without expanding tool surface" {
     try std.testing.expect(strategyAllowed(.collect_evidence, .path));
-    try std.testing.expect(strategyAllowed(.collect_evidence, .semantic));
+    try std.testing.expect(strategyAllowed(.collect_evidence, .lexical));
+    try std.testing.expect(!strategyAllowed(.collect_evidence, .semantic));
+    try std.testing.expect(!strategyAllowed(.collect_evidence, .symbol));
     try std.testing.expect(!strategyAllowed(.collect_evidence, .news_table));
-    try std.testing.expectEqual(StrategyName.auto, resolveCollectEvidenceStrategy(.news_table));
+    try std.testing.expect(resolveCollectEvidenceStrategy(.news_table) == null);
 }
 
 test "active collect evidence contract comes from manifest allowlist" {
@@ -228,7 +226,9 @@ test "compact model visible tools excludes internal collectors" {
     const rendered = try compactModelVisibleTools(std.testing.allocator);
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "collect_evidence") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "set_operational_contract") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "set_operational_contract") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "apply_patch") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "run_tests") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "grep_file") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "rag_search") == null);
 }

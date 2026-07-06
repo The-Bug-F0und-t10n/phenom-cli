@@ -122,31 +122,10 @@ pub fn rankForPrompt(
 }
 
 fn extractTerms(out: *TermList, prompt: []const u8, strategy: contracts.StrategyName) !void {
+    _ = strategy;
     var it = std.mem.tokenizeAny(u8, prompt, " \t\r\n\"'`()[]{}<>:;,");
     while (it.next()) |raw| {
         try out.add(raw);
-    }
-
-    switch (strategy) {
-        .diagnostic => {
-            try out.add("error");
-            try out.add("fail");
-            try out.add("diagnostic");
-        },
-        .runtime => {
-            try out.add("audit");
-            try out.add("recordEvent");
-            try out.add("tool_event");
-        },
-        .diff => {
-            try out.add("diff");
-            try out.add("patch");
-        },
-        .symbol => {
-            try out.add("pub");
-            try out.add("fn");
-        },
-        else => {},
     }
 }
 
@@ -231,6 +210,7 @@ fn collectFallbackCandidates(
     strategy: contracts.StrategyName,
     budget: RankBudget,
 ) !void {
+    _ = strategy;
     var cwd = std.Io.Dir.cwd();
     var walker = try cwd.walk(allocator);
     defer walker.deinit();
@@ -250,7 +230,7 @@ fn collectFallbackCandidates(
                 .path = try allocator.dupe(u8, entry.path),
                 .start_line = start,
                 .end_line = @min(line_no + budget.window_after, start + budget.max_lines_per_range - 1),
-                .score = 35 + strategyBonus(strategy),
+                .score = 35,
                 .source = .fallback_scan,
                 .reasons = reasons,
             });
@@ -265,6 +245,7 @@ fn addPromptPathCandidates(
     strategy: contracts.StrategyName,
     budget: RankBudget,
 ) !void {
+    _ = strategy;
     var it = std.mem.tokenizeAny(u8, prompt, " \t\r\n\"'`()[]{}<>:;,");
     while (it.next()) |raw| {
         if (!looksLikePath(raw) or skipPath(raw)) continue;
@@ -274,7 +255,7 @@ fn addPromptPathCandidates(
             .path = try allocator.dupe(u8, raw),
             .start_line = 1,
             .end_line = budget.max_lines_per_range,
-            .score = 55 + strategyBonus(strategy),
+            .score = 55,
             .source = .prompt_path,
             .reasons = reasons,
         });
@@ -413,25 +394,12 @@ pub fn qualityEnough(score: i32) bool {
 }
 
 fn scoreMatch(path: []const u8, text: []const u8, term: []const u8, strategy: contracts.StrategyName) i32 {
-    var score: i32 = 20 + strategyBonus(strategy);
+    _ = strategy;
+    var score: i32 = 20;
     if (containsIgnoreCase(text, term)) score += 35;
-    if (containsIgnoreCase(path, term)) score += 18;
-    if (looksLikeDefinition(text, term)) score += 30;
-    if (std.mem.endsWith(u8, path, ".zig")) score += 8;
     if (containsIgnoreCase(path, term)) score += 22;
-    if (containsIgnoreCase(path, "test") or std.mem.indexOf(u8, text, "test \"") != null) score -= 25;
     if (skipPath(path)) score -= 80;
     return score;
-}
-
-fn strategyBonus(strategy: contracts.StrategyName) i32 {
-    return switch (strategy) {
-        .symbol => 12,
-        .semantic => 10,
-        .diagnostic, .runtime, .diff => 8,
-        .lexical, .auto => 6,
-        else => 0,
-    };
 }
 
 fn reasonText(allocator: std.mem.Allocator, path: []const u8, text: []const u8, term: []const u8, strategy: contracts.StrategyName) ![]u8 {
@@ -440,7 +408,6 @@ fn reasonText(allocator: std.mem.Allocator, path: []const u8, text: []const u8, 
     try out.appendSlice(allocator, "rg");
     if (containsIgnoreCase(text, term)) try out.appendSlice(allocator, ",exact_term_match");
     if (containsIgnoreCase(path, term)) try out.appendSlice(allocator, ",path_match");
-    if (looksLikeDefinition(text, term)) try out.appendSlice(allocator, ",symbol_definition_match");
     if (strategy != .auto) {
         try out.appendSlice(allocator, ",strategy=");
         try out.appendSlice(allocator, @tagName(strategy));
@@ -544,11 +511,6 @@ fn looksLikeTextCode(path: []const u8) bool {
         std.mem.endsWith(u8, path, ".toml");
 }
 
-fn looksLikeDefinition(text: []const u8, term: []const u8) bool {
-    return (std.mem.indexOf(u8, text, "fn ") != null or std.mem.indexOf(u8, text, "const ") != null or std.mem.indexOf(u8, text, "pub const ") != null) and
-        containsIgnoreCase(text, term);
-}
-
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len > haystack.len) return false;
     var i: usize = 0;
@@ -568,7 +530,6 @@ fn isStructuredSearchTerm(term: []const u8) bool {
     if (std.mem.indexOfScalar(u8, term, '.') != null) return true;
     if (std.mem.indexOfScalar(u8, term, '-') != null) return true;
     if (hasUpperAfterLower(term)) return true;
-    if (isKnownContractTerm(term)) return true;
     if (looksLikeDiagnosticToken(term)) return true;
     return false;
 }
@@ -578,29 +539,6 @@ fn hasUpperAfterLower(term: []const u8) bool {
     for (term) |byte| {
         if (std.ascii.isLower(byte)) saw_lower = true;
         if (saw_lower and std.ascii.isUpper(byte)) return true;
-    }
-    return false;
-}
-
-fn isKnownContractTerm(term: []const u8) bool {
-    const terms = [_][]const u8{
-        "collect_evidence",
-        "tool_call",
-        "tool_loop",
-        "ToolCall",
-        "ToolLoop",
-        "EvidencePacket",
-        "MicroContext",
-        "ModelTurnContext",
-        "read_file_range",
-        "apply_patch",
-        "run_validation",
-        "browser_check",
-        "recordEvent",
-        "RawContextLeak",
-    };
-    for (terms) |known| {
-        if (std.ascii.eqlIgnoreCase(term, known)) return true;
     }
     return false;
 }
@@ -676,6 +614,20 @@ test "term extraction keeps structured symbols and ignores prose without stopwor
     try std.testing.expect(!hasTerm(terms.items.items, "Use"));
     try std.testing.expect(!hasTerm(terms.items.items, "strategy"));
     try std.testing.expect(!hasTerm(terms.items.items, "path"));
+}
+
+test "ranking score does not privilege language extension or penalize tests" {
+    const code_score = scoreMatch("src/app.zig", "needle here", "needle", .lexical);
+    const test_score = scoreMatch("tests/app.test.ts", "needle here", "needle", .lexical);
+    try std.testing.expectEqual(code_score, test_score);
+}
+
+test "inactive strategy names do not inject synthetic search terms" {
+    var terms = TermList.init(std.testing.allocator);
+    defer terms.deinit();
+    try extractTerms(&terms, "corrija este problema", .symbol);
+    try std.testing.expect(!hasTerm(terms.items.items, "pub"));
+    try std.testing.expect(!hasTerm(terms.items.items, "fn"));
 }
 
 test "adaptive budget scales by quality and range count" {
