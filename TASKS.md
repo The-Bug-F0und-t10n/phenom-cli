@@ -6705,3 +6705,67 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 180 --prompt 'responda somente este markdown: ```diff\n--- a/app.ts\n+++ b/app.ts\n@@ -1 +1 @@\n-const value = "old";\n+const value = "new";\n```'` -> passou; transcript mostrou `48;2;247;251;248` e `48;2;255;248;248`.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.
+
+## T254 - Simular transparencia no diff Markdown removendo background do texto
+
+Status: implemented-verified.
+
+Motivacao: terminal ANSI nao suporta transparencia real. Mesmo com background mais suave, pintar todo o texto do codigo criava uma faixa visual que ainda competia com a leitura. A simulacao mais pragmatica de transparencia e limitar o background aos metadados do diff (numero e marcador), deixando o texto do codigo com syntax highlight normal.
+
+Evidencia:
+
+- `phenom-zig/src/render.zig`: `writeMarkdownDiffEditLine` passava `bg` para `writeHighlightedDiffText(text, bg)`, aplicando background em cada token do codigo.
+- Smoke real mostrava `const`, strings e pontuacao com `48;2` no conteudo inteiro da linha.
+- O usuario pediu coloracao "mais transparente", ou seja, menor peso visual no diff.
+
+Impacto esperado:
+
+- Numero de linha e marcador `+/-` continuam com background sutil de diff.
+- Pipe continua dim e estrutural.
+- Texto do codigo nao recebe background; fica apenas com syntax highlight.
+- O diff ainda e identificavel, mas o foco volta para o codigo.
+
+Teste primeiro:
+
+- Testes ANSI garantem que `new`, `old`, `const` e strings nao carregam `48;2`.
+- Testes continuam exigindo background nos numeros e marcadores.
+- Testes continuam impedindo backgrounds antigos e saturados.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: trocar `writeHighlightedDiffText(text, bg)` por `writeHighlightedDiffText(text, null)`.
+- `render.zig`: atualizar asserts para syntax highlight sem background no conteudo.
+- `render.zig`: renomear teste para `without edit background`.
+
+Passos de implementacao:
+
+1. Confirmar que ANSI nao oferece alpha real.
+2. Remover background apenas do conteudo editado.
+3. Manter background no meta do diff.
+4. Atualizar snapshots ANSI.
+5. Rodar renderer isolado, build completo, release e smoke real.
+6. Instalar binario atualizado.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: sem alocacao nova.
+- ANSI: menos sequencias de background no conteudo, menor risco de vazamento visual.
+- Acessibilidade: codigo fica mais legivel por preservar contraste do tema.
+- Compatibilidade: modo sem cor nao muda.
+- Escopo: altera apenas diff Markdown; diff standalone nao muda.
+
+Criterio de aceite:
+
+- `zig test src/render.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real mostra `48;2` em numeros/marcadores e ausencia de background no texto do codigo.
+- `install-local` passa.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/render.zig -lc` -> passou; 29 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 180 --prompt 'responda somente este markdown: ```diff\n--- a/app.ts\n+++ b/app.ts\n@@ -1 +1 @@\n-const value = "old";\n+const value = "new";\n```'` -> passou; transcript mostrou background so em numero/marcador e texto do codigo sem `48;2`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.

@@ -508,7 +508,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             try self.writeRgbFgBg(fg, bg, &marker_text);
             try self.writer.writeAll(" ");
             try self.writeDim("│ ");
-            try self.writeHighlightedDiffText(text, bg);
+            try self.writeHighlightedDiffText(text, null);
         }
 
         fn setMarkdownDiffCodeLang(self: *Self, line: []const u8) void {
@@ -1758,19 +1758,21 @@ test "assistant markdown diff uses readable codex style foreground and backgroun
 
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;31;122;70;48;2;247;251;248m   1") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;31;122;70;48;2;247;251;248m+") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;154;166;178;48;2;247;251;248mnew") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;154;166;178mnew") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;163;58;58;48;2;255;248;248m   1") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;163;58;58;48;2;255;248;248m-") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;154;166;178;48;2;255;248;248mold") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;154;166;178mold") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;31;122;70;48;2;247;251;248m│ ") == null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;163;58;58;48;2;255;248;248m│ ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "48;2;247;251;248mnew") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "48;2;255;248;248mold") == null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "48;2;237;248;240") == null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "48;2;255;240;240") == null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[41") == null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[42") == null);
 }
 
-test "assistant markdown diff text follows syntax highlight over edit background" {
+test "assistant markdown diff text keeps syntax highlight without edit background" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
 
@@ -1788,11 +1790,12 @@ test "assistant markdown diff text follows syntax highlight over edit background
     );
     try renderer.done();
 
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;164;142;199;48;2;247;251;248mconst") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;127;169;143;48;2;247;251;248m\"new\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;164;142;199;48;2;255;248;248mconst") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;127;169;143;48;2;255;248;248m\"old\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;164;142;199mconst") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;127;169;143m\"new\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;127;169;143m\"old\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;31;122;70;48;2;247;251;248mconst") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "48;2;247;251;248mconst") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "48;2;255;248;248mconst") == null);
 }
 
 test "assistant markdown diff exposes line numbers and edit markers in plain mode" {
