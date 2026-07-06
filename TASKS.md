@@ -4714,6 +4714,83 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc` -> passou; 23 testes.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+
+## T260 - Carregar MEMORY/SKILLS somente de fontes persistentes
+
+Status: implemented-verified.
+
+Motivacao: depois do `ModelTurnContext`, faltava provar a regra de que MEMORY/SKILLS nao sao storage operacional nem tool output. As tasks T074, T162 e T206 exigem carregar somente arquivos persistentes textuais visiveis, sem inventar blocos e sem transformar audit/sqlite/cache em memoria conversacional.
+
+Evidencia:
+
+- `TASKS.md` define MEMORY/SKILLS como unicas fontes persistentes textuais visiveis ao modelo.
+- `TASKS.md` T074 pede fallback `MEMORY.md -> .MEMORY.md` e `SKILLS.md -> .SKILL.md`.
+- `TASKS.md` T162 pede prova de que storage operacional nao compete com MEMORY/SKILLS.
+- `phenom-zig/src/model_context.zig` ja renderizava memory/skills quando arrays eram fornecidos, mas nao havia loader real.
+
+Impacto esperado:
+
+- `MEMORY.md` e `.MEMORY.md` viram as unicas fontes de `[MEMORY]`.
+- `SKILLS.md` e `.SKILL.md` viram as unicas fontes de `[SKILLS]`.
+- Nomes sem ponto têm prioridade sobre fallback com ponto.
+- Arquivo ausente gera array vazio e nao cria heading vazio.
+- Arquivo com marcador de raw/tool output e rejeitado para evitar contaminacao persistente.
+- Loader recebe `std.Io`, entao nao depende de test IO em release.
+
+Teste primeiro:
+
+- Sem arquivos: memory e skills vazios, sem paths.
+- `MEMORY.md` e `.MEMORY.md`: prefere `MEMORY.md`.
+- Apenas `.MEMORY.md`/`.SKILL.md`: fallback carrega.
+- Arquivo com `---BEGIN CONTENT---` nao produz entradas.
+- Saida carregada passa pelo `ModelTurnContext`; `[MEMORY]` ausente nao aparece e `[SKILLS]` presente aparece.
+
+Implementacao:
+
+- `phenom-zig/src/persistent_context.zig`: criar `Loaded`, `loadFromCwd`, `loadFromDir`, parser de entradas e filtro anti-raw.
+- `phenom-zig/src/main.zig`: incluir `persistent_context.zig` na suite principal.
+
+Passos de implementacao:
+
+1. Definir `Loaded` owned com listas de memory/skills e paths opcionais.
+2. Implementar leitura por prioridade de nomes.
+3. Limitar arquivo a 32 KiB.
+4. Parsear linhas/headings/bullets compactos.
+5. Limitar entradas e tamanho por entrada.
+6. Rejeitar arquivos com marcadores raw/tool output.
+7. Testar integracao com `ModelTurnContext`.
+8. Rodar testes focados, build completo e release.
+9. Revisar ownership, release build e anti-vazamento antes do commit.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: `Loaded.deinit` libera cada entrada e path opcional.
+- Ownership: `loadFirst` retorna content/path owned; `Loaded` duplica path antes de liberar arquivo temporario.
+- Bounds: `readFileAlloc` usa `.limited(32 * 1024)`; entradas usam `max_entries=24` e `max_entry_bytes=240`.
+- Anti-vazamento: se o arquivo contem `---BEGIN CONTENT---`, `[READ_FILE]`, `[TOOL_EVENT]`, `rawOutput`, `raw_output` ou `rg --json`, o arquivo e rejeitado.
+- Release: loader recebe `std.Io`; nao usa `std.testing.io` fora dos testes.
+- Escopo: loader nao promove nada automaticamente para MEMORY/SKILLS.
+
+Criterio de aceite:
+
+- `zig test src/persistent_context.zig -lc` passa.
+- `zig test src/model_context.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+
+Pendencias deliberadas:
+
+- Integrar loader ao fluxo real de inferencia ainda nao foi feito.
+- Promocao explicita para MEMORY/SKILLS ainda nao existe.
+- Audit ainda nao registra quais entradas persistentes foram usadas no turno.
+- Storage operacional SQLite/news/cache continua separado e ainda nao tem teste dedicado de nao competicao.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/persistent_context.zig -lc` -> passou; 34 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/model_context.zig -lc` -> passou; 29 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest` dentro do sandbox -> falhou com `SocketCreateFailed`, mostrando que o teste nao chegou ao servidor nesse perfil de permissao.
 - O mesmo `real-smoke` com permissao de rede liberada -> passou e imprimiu:
 

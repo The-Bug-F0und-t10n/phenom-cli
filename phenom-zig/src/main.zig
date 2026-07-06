@@ -11,6 +11,7 @@ const gate = @import("gate.zig");
 const http = @import("http.zig");
 const micro_context = @import("micro_context.zig");
 const model_context = @import("model_context.zig");
+const persistent_context = @import("persistent_context.zig");
 const reasoning_filter = @import("reasoning_filter.zig");
 const render = @import("render.zig");
 const tool_call = @import("tool_call.zig");
@@ -514,6 +515,7 @@ test {
     _ = http;
     _ = micro_context;
     _ = model_context;
+    _ = persistent_context;
     _ = reasoning_filter;
     _ = render;
     _ = tool_call;
