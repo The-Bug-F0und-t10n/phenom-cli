@@ -40,13 +40,21 @@ pub const LocalModelClient = struct {
         prompt: []const u8,
         sink: anytype,
     ) !void {
+        try self.streamInference(.{ .user_prompt = prompt }, sink);
+    }
+
+    pub fn streamInference(
+        self: *LocalModelClient,
+        input: InferenceInput,
+        sink: anytype,
+    ) !void {
         const parsed = try parseHost(self.allocator, self.host, self.backend);
         defer parsed.deinit(self.allocator);
 
         const fd = try tcpConnect(self.allocator, parsed.host, parsed.port);
         defer _ = c.close(fd);
 
-        const body = try self.buildBody(prompt);
+        const body = try self.buildBodyForInput(input);
         defer self.allocator.free(body);
 
         const path = pathForBackend(self.backend);
@@ -100,27 +108,41 @@ pub const LocalModelClient = struct {
     }
 
     fn buildBody(self: *LocalModelClient, prompt: []const u8) ![]u8 {
-        const escaped_prompt = try jsonEscape(self.allocator, prompt);
+        return self.buildBodyForInput(.{ .user_prompt = prompt });
+    }
+
+    fn buildBodyForInput(self: *LocalModelClient, input: InferenceInput) ![]u8 {
+        const escaped_prompt = try jsonEscape(self.allocator, input.user_prompt);
         defer self.allocator.free(escaped_prompt);
+        const escaped_context = if (input.model_context) |context| try jsonEscape(self.allocator, context) else null;
+        defer if (escaped_context) |context| self.allocator.free(context);
         const escaped_model = try jsonEscape(self.allocator, self.model);
         defer self.allocator.free(escaped_model);
 
         return switch (self.backend) {
-            .ollama => try std.fmt.allocPrint(
+            .ollama => if (escaped_context) |context| try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"model\":\"{s}\",\"stream\":true,\"messages\":[{{\"role\":\"system\",\"content\":\"Responda de forma direta, curta e no idioma do usuario. Nao mostre raciocinio.\"}},{{\"role\":\"user\",\"content\":\"{s}\"}},{{\"role\":\"user\",\"content\":\"{s}\"}}],\"options\":{{\"temperature\":0.2,\"num_predict\":{}}}}}",
+                .{ escaped_model, context, escaped_prompt, self.max_tokens },
+            ) else try std.fmt.allocPrint(
                 self.allocator,
                 "{{\"model\":\"{s}\",\"stream\":true,\"messages\":[{{\"role\":\"system\",\"content\":\"Responda de forma direta, curta e no idioma do usuario. Nao mostre raciocinio.\"}},{{\"role\":\"user\",\"content\":\"{s}\"}}],\"options\":{{\"temperature\":0.2,\"num_predict\":{}}}}}",
                 .{ escaped_model, escaped_prompt, self.max_tokens },
             ),
             .llamacpp => blk: {
-                const resolved_thinking = resolveThinking(self.thinking, prompt);
+                const resolved_thinking = resolveThinking(self.thinking, input.user_prompt);
                 const generation_prefix = if (resolved_thinking == .on)
                     "<think>\n"
                 else
                     "<think>\n\n</think>\n\n";
-                const chat_prompt = try std.fmt.allocPrint(
+                const chat_prompt = if (input.model_context) |context| try std.fmt.allocPrint(
+                    self.allocator,
+                    "<|im_start|>system\nResponda de forma direta, curta e no idioma do usuario. Quando thinking estiver habilitado, use o bloco <think> somente para raciocinio interno e finalize com resposta visivel fora dele.<|im_end|>\n<|im_start|>user\n{s}<|im_end|>\n<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n{s}",
+                    .{ context, input.user_prompt, generation_prefix },
+                ) else try std.fmt.allocPrint(
                     self.allocator,
                     "<|im_start|>system\nResponda de forma direta, curta e no idioma do usuario. Quando thinking estiver habilitado, use o bloco <think> somente para raciocinio interno e finalize com resposta visivel fora dele.<|im_end|>\n<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n{s}",
-                    .{ prompt, generation_prefix },
+                    .{ input.user_prompt, generation_prefix },
                 );
                 defer self.allocator.free(chat_prompt);
                 const escaped_chat_prompt = try jsonEscape(self.allocator, chat_prompt);
@@ -133,6 +155,11 @@ pub const LocalModelClient = struct {
             },
         };
     }
+};
+
+pub const InferenceInput = struct {
+    user_prompt: []const u8,
+    model_context: ?[]const u8 = null,
 };
 
 pub const ProbeResult = struct {
@@ -689,6 +716,50 @@ test "llamacpp thinking on opens reasoning block" {
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "<|im_start|>assistant\\n<think>\\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "<think>\\n\\n</think>\\n\\n") == null);
+}
+
+test "ollama body can include model context as separate user message" {
+    var client = LocalModelClient{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1:11434",
+        .backend = .ollama,
+        .model = "phenom:latest",
+        .max_tokens = 64,
+        .thinking = .off,
+    };
+    const body = try client.buildBodyForInput(.{
+        .user_prompt = "corrija",
+        .model_context = "[TURN_CONTEXT v1]\ntask: corrigir\n",
+    });
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "Responda de forma direta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "[TURN_CONTEXT v1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "corrija") != null);
+    const context_idx = std.mem.indexOf(u8, body, "[TURN_CONTEXT v1]") orelse return error.MissingContext;
+    const user_idx = std.mem.indexOf(u8, body, "corrija") orelse return error.MissingPrompt;
+    try std.testing.expect(context_idx < user_idx);
+}
+
+test "llamacpp body can include model context before user request" {
+    var client = LocalModelClient{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1:11434",
+        .backend = .llamacpp,
+        .model = "phenom:latest",
+        .max_tokens = 64,
+        .thinking = .off,
+    };
+    const body = try client.buildBodyForInput(.{
+        .user_prompt = "corrija",
+        .model_context = "[TURN_CONTEXT v1]\\ntask: corrigir\\n",
+    });
+    defer std.testing.allocator.free(body);
+
+    const context_idx = std.mem.indexOf(u8, body, "[TURN_CONTEXT v1]") orelse return error.MissingContext;
+    const user_idx = std.mem.indexOf(u8, body, "corrija") orelse return error.MissingPrompt;
+    try std.testing.expect(context_idx < user_idx);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n") != null);
 }
 
 test "thinking auto resolves simple prompt off and code prompt on" {

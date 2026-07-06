@@ -4791,6 +4791,89 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/model_context.zig -lc` -> passou; 29 testes.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+
+## T261 - Integrar `ModelTurnContext` no HTTP com rollout controlado
+
+Status: implemented-verified.
+
+Motivacao: T259 e T260 criaram renderer e loader persistente, mas nada ainda chegava ao backend. A task T076 pede integrar contexto variavel apos system prompt, com system prompt estavel e rollout por flag. O cuidado principal: nao anunciar contratos/tools antes do tool loop real estar pronto, porque isso induz o modelo a emitir tools que o runtime ainda nao executa em streaming.
+
+Evidencia:
+
+- `phenom-zig/src/http.zig` so aceitava `prompt` simples em `streamChat`.
+- `phenom-zig/src/main.zig` chamava `client.streamChat(prompt, &sink)`, sem caminho para contexto variavel.
+- `TASKS.md` T076 pede `PHENOM_MODEL_CONTEXT_V1=1` no primeiro rollout.
+- Smoke real inicial com contexto contendo `model_visible_tools` fez o modelo tentar `collect_evidence` antes do loop real, provando que contratos nao podem entrar agora.
+
+Impacto esperado:
+
+- Sem `PHENOM_MODEL_CONTEXT_V1=1`, payload e comportamento continuam no caminho antigo.
+- Com `PHENOM_MODEL_CONTEXT_V1=1`, contexto so e injetado quando ha MEMORY/SKILLS persistentes carregados.
+- Contratos/tools nao sao anunciados no contexto real ate o tool loop streaming existir.
+- Ollama recebe contexto como mensagem `user` separada antes do pedido atual.
+- llama.cpp recebe contexto como bloco `<|im_start|>user` separado antes do pedido atual.
+- Audit registra `model_context` somente quando contexto realmente foi injetado.
+
+Teste primeiro:
+
+- `http` prova payload llama.cpp antigo sem contexto.
+- `http` prova payload Ollama com contexto como mensagem separada.
+- `http` prova payload llama.cpp com contexto antes do user request.
+- `main` prova parser da env opt-in.
+- Smoke real sem flag passa.
+- Smoke real com flag e sem MEMORY/SKILLS passa e nao grava novo `model_context`.
+
+Implementacao:
+
+- `phenom-zig/src/http.zig`: adicionar `InferenceInput`, `streamInference` e `buildBodyForInput`.
+- `phenom-zig/src/main.zig`: passar `std.Io` ate o turno, criar `buildOptionalModelContext`, checar `PHENOM_MODEL_CONTEXT_V1`.
+- `main.zig`: trocar chamada para `streamInference`.
+- `main.zig`: carregar MEMORY/SKILLS persistentes apenas quando flag estiver ativa e so renderizar contexto se houver entradas persistentes.
+
+Passos de implementacao:
+
+1. Manter `streamChat(prompt)` como wrapper compatível.
+2. Criar payload HTTP com contexto opcional.
+3. Inserir contexto separado antes do user request.
+4. Criar helper opt-in por env.
+5. Carregar persistent context no turno.
+6. Evitar tool/contracts surface antes do loop real.
+7. Registrar `model_context` no audit somente quando usado.
+8. Rodar testes unitarios, build, release e smoke real.
+9. Revisar regressao real quando o modelo tentou tool antes do loop.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: `model_context_text` e owned e liberado com `defer`; `persistent.deinit` libera entradas apos render copiar o texto.
+- Payload: `jsonEscape` roda em prompt e contexto; strings escapadas sao liberadas.
+- Compatibilidade: `streamChat` continua existindo e chama `streamInference` sem contexto.
+- Rollout: env aceita somente `1`, `true` ou `on`; default e off.
+- Regra de negocio: contratos/tools nao entram no contexto real ainda, porque o loop real nao esta pronto.
+- Audit: nao grava contexto quando nao ha MEMORY/SKILLS; evita ruido e prova que storage operacional nao virou memoria.
+
+Criterio de aceite:
+
+- `zig test src/http.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- `zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest` passa.
+- `PHENOM_MODEL_CONTEXT_V1=1 ./zig-out/bin/phenom chat ... PHENOM_CTX_261 ...` passa.
+
+Pendencias deliberadas:
+
+- Contexto de contratos/tools so deve voltar quando o tool loop real streaming estiver implementado.
+- Ainda falta integrar evidence de tool call real ao segundo turno do modelo.
+- Ainda falta registrar no audit quais MEMORY/SKILLS foram usados quando existirem.
+- Ainda falta teste real com MEMORY/SKILLS presentes e prompt de codigo, depois do comportamento de tool loop estar seguro.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/http.zig -lc` -> passou; 19 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest` -> passou; resposta visivel continha `PHENOM_REAL_7319`.
+- `PHENOM_MODEL_CONTEXT_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 96 --prompt 'Complete: PHENOM_CTX_261' --expect-contains PHENOM_CTX_261 --show-expect-status --fail-on-model-error` -> passou com permissao escalada; resposta visivel continha `PHENOM_CTX_261`.
+- `sqlite3 .phenom-zig/phenom.db "select kind ..."` -> confirmou que o ultimo smoke com flag nao gravou `model_context` quando nao havia MEMORY/SKILLS no cwd.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest` dentro do sandbox -> falhou com `SocketCreateFailed`, mostrando que o teste nao chegou ao servidor nesse perfil de permissao.
 - O mesmo `real-smoke` com permissao de rede liberada -> passou e imprimiu:
 

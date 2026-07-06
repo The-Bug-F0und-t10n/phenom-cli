@@ -49,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
     switch (config.command) {
         .help => try cli.printUsage(fd_writer.FdWriter{ .fd = 1 }),
         .version => try (fd_writer.FdWriter{ .fd = 1 }).print("phenom-zig spike 0.1.0\n", .{}),
-        .chat => try runChat(allocator, config),
+        .chat => try runChat(allocator, init.io, config),
         .probe => try runProbe(allocator, config),
         .snapshot => try runSnapshot(),
     }
@@ -101,13 +101,13 @@ fn currentTerminalColumns() usize {
     return tui.terminalSize().cols;
 }
 
-fn runChat(allocator: std.mem.Allocator, config: cli.Config) !void {
+fn runChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Config) !void {
     const stdout = fd_writer.FdWriter{ .fd = 1 };
-    if (!config.prompt_provided) return runInteractiveChat(allocator, config, stdout);
-    try runChatTurn(allocator, config, stdout, config.prompt);
+    if (!config.prompt_provided) return runInteractiveChat(allocator, io, config, stdout);
+    try runChatTurn(allocator, io, config, stdout, config.prompt);
 }
 
-fn runInteractiveChat(allocator: std.mem.Allocator, config: cli.Config, stdout: fd_writer.FdWriter) !void {
+fn runInteractiveChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Config, stdout: fd_writer.FdWriter) !void {
     var ui = tui.TerminalUi(@TypeOf(stdout)).init(allocator, stdout, !config.no_color);
     var attached = false;
     defer if (attached) ui.deinit();
@@ -159,16 +159,16 @@ fn runInteractiveChat(allocator: std.mem.Allocator, config: cli.Config, stdout: 
 
         try ui.showStatus("Thinking");
         try ui.positionContent();
-        try runChatTurnWithUi(allocator, config, stdout, prompt, &ui);
+        try runChatTurnWithUi(allocator, io, config, stdout, prompt, &ui);
         try ui.showPrompt();
     }
 }
 
-fn runChatTurn(allocator: std.mem.Allocator, config: cli.Config, stdout: fd_writer.FdWriter, prompt: []const u8) !void {
-    try runChatTurnWithUi(allocator, config, stdout, prompt, null);
+fn runChatTurn(allocator: std.mem.Allocator, io: std.Io, config: cli.Config, stdout: fd_writer.FdWriter, prompt: []const u8) !void {
+    try runChatTurnWithUi(allocator, io, config, stdout, prompt, null);
 }
 
-fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: fd_writer.FdWriter, prompt: []const u8, ui: anytype) !void {
+fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Config, stdout: fd_writer.FdWriter, prompt: []const u8, ui: anytype) !void {
     const size = tui.terminalSize();
     const ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter) = ui;
     var transcript_writer = fd_writer.NewlineWriter(fd_writer.FdWriter){ .inner = stdout, .crlf = ui_ptr != null };
@@ -238,7 +238,15 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, config: cli.Config, stdout: f
             .trim_visible_leading_whitespace = false,
         };
         defer sink.deinit();
-        client.streamChat(prompt, &sink) catch |err| {
+        const model_context_text = try buildOptionalModelContext(allocator, io, prompt);
+        defer if (model_context_text) |text| allocator.free(text);
+        if (model_context_text) |text| try db.recordEvent(config.session, "model_context", text);
+
+        const inference_input = http.InferenceInput{
+            .user_prompt = prompt,
+            .model_context = model_context_text,
+        };
+        client.streamInference(inference_input, &sink) catch |err| {
             const endpoint = client.endpointSummary(allocator) catch "unknown-endpoint";
             defer if (!std.mem.eql(u8, endpoint, "unknown-endpoint")) allocator.free(endpoint);
             const message = try std.fmt.allocPrint(
@@ -300,6 +308,30 @@ fn recordAndEmitTurnDone(
     defer allocator.free(body);
     try db.recordEvent(session, "turn_done", body);
     try events.emit(.{ .turn_done = .{ .elapsed_ms = elapsed_ms } });
+}
+
+fn buildOptionalModelContext(allocator: std.mem.Allocator, io: std.Io, prompt: []const u8) !?[]u8 {
+    if (!modelContextEnabled()) return null;
+
+    var persistent = try persistent_context.loadFromCwd(allocator, io);
+    defer persistent.deinit();
+    if (persistent.memory.items.len == 0 and persistent.skills.items.len == 0) return null;
+
+    return try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .memory = persistent.memory.items,
+        .skills = persistent.skills.items,
+        .next_action = "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
+    });
+}
+
+fn modelContextEnabled() bool {
+    const raw = c.getenv("PHENOM_MODEL_CONTEXT_V1") orelse return false;
+    return modelContextValueEnabled(std.mem.span(raw));
+}
+
+fn modelContextValueEnabled(value: []const u8) bool {
+    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on");
 }
 
 fn renderRestoredSession(
@@ -576,6 +608,15 @@ test "restored sqlite session is rendered through styled transcript events" {
     try std.testing.expectEqual(@as(?u64, null), parseElapsedMs("ok"));
     try std.testing.expectEqual(@as(?u64, 2000), restoredElapsedMs("ok", 100, 102));
     try std.testing.expectEqual(@as(?u64, null), restoredElapsedMs("ok", 102, 100));
+}
+
+test "model context env parser is opt in only" {
+    try std.testing.expect(modelContextValueEnabled("1"));
+    try std.testing.expect(modelContextValueEnabled("true"));
+    try std.testing.expect(modelContextValueEnabled("on"));
+    try std.testing.expect(!modelContextValueEnabled(""));
+    try std.testing.expect(!modelContextValueEnabled("0"));
+    try std.testing.expect(!modelContextValueEnabled("false"));
 }
 
 fn countNeedle(haystack: []const u8, needle: []const u8) usize {
