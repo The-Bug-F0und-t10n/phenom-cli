@@ -20,6 +20,7 @@ pub const ToolLoopResult = struct {
 
 pub fn runOnce(
     allocator: std.mem.Allocator,
+    io: std.Io,
     model_output: []const u8,
     allowed_tools: []const []const u8,
 ) !ToolLoopResult {
@@ -55,7 +56,7 @@ pub fn runOnce(
 
     if (std.mem.eql(u8, call.name, "collect_evidence")) {
         const path = call.path orelse return error.MissingPath;
-        const result = try collect_evidence.execute(allocator, .{
+        const result = try collect_evidence.execute(allocator, io, .{
             .path = path,
             .strategy = call.strategy orelse .path,
             .start_line = call.start_line,
@@ -94,7 +95,7 @@ test "tool loop executes announced read_file_range into evidence and micro conte
         \\</function>
         \\</tool_call>
     ;
-    const result = try runOnce(std.testing.allocator, output, &.{"read_file_range"});
+    const result = try runOnce(std.testing.allocator, std.testing.io, output, &.{"read_file_range"});
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expect(result.executed);
@@ -113,7 +114,7 @@ test "tool loop rejects unannounced tool before execution" {
         \\</function>
         \\</tool_call>
     ;
-    const result = try runOnce(std.testing.allocator, output, &.{"read_file_range"});
+    const result = try runOnce(std.testing.allocator, std.testing.io, output, &.{"read_file_range"});
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expect(!result.executed);
@@ -139,7 +140,7 @@ test "tool loop executes announced collect_evidence into evidence and micro cont
         \\</function>
         \\</tool_call>
     ;
-    const result = try runOnce(std.testing.allocator, output, &.{ "collect_evidence", "read_file_range" });
+    const result = try runOnce(std.testing.allocator, std.testing.io, output, &.{ "collect_evidence", "read_file_range" });
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expect(result.executed);

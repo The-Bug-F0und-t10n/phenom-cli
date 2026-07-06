@@ -2,13 +2,15 @@ const std = @import("std");
 
 const contracts = @import("contracts.zig");
 const evidence = @import("evidence.zig");
+const evidence_ranker = @import("evidence_ranker.zig");
 const micro_context = @import("micro_context.zig");
 const tool_event = @import("tool_event.zig");
 const tools = @import("tools.zig");
 
 pub const Args = struct {
-    path: []const u8,
-    strategy: contracts.StrategyName = .path,
+    path: ?[]const u8 = null,
+    task: []const u8 = "",
+    strategy: contracts.StrategyName = .auto,
     start_line: usize = 1,
     max_lines: usize = 12,
     budget_bytes: usize = 3800,
@@ -22,6 +24,8 @@ pub const Result = struct {
     tool_event_audit_text: []u8,
     raw_bytes_read: usize,
     model_bytes: usize,
+    quality_score: i32,
+    range_count: usize,
 
     pub fn deinit(self: Result, allocator: std.mem.Allocator) void {
         allocator.free(self.context_id);
@@ -31,18 +35,22 @@ pub const Result = struct {
     }
 };
 
-pub fn execute(allocator: std.mem.Allocator, args: Args) !Result {
+pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: Args) !Result {
     if (args.budget_bytes == 0) return error.InvalidEvidenceBudget;
     const strategy = contracts.resolveCollectEvidenceStrategy(args.strategy);
-    if (strategy != .auto and strategy != .path) return error.StrategyNotImplemented;
+    if (strategy == .path or args.path != null) return executePath(allocator, args, strategy);
+    return executeRanked(allocator, io, args, strategy);
+}
 
-    const range = try tools.readFileRange(allocator, args.path, args.start_line, args.max_lines, args.budget_bytes);
+fn executePath(allocator: std.mem.Allocator, args: Args, strategy: contracts.StrategyName) !Result {
+    const path = args.path orelse return error.MissingPath;
+    const range = try tools.readFileRange(allocator, path, args.start_line, args.max_lines, args.budget_bytes);
     defer range.deinit(allocator);
 
     const args_summary = try std.fmt.allocPrint(
         allocator,
         "strategy={s} path={s} start_line={} max_lines={} budget_bytes={}",
-        .{ @tagName(strategy), args.path, args.start_line, args.max_lines, args.budget_bytes },
+        .{ @tagName(if (strategy == .auto) .path else strategy), path, args.start_line, args.max_lines, args.budget_bytes },
     );
     defer allocator.free(args_summary);
 
@@ -74,11 +82,122 @@ pub fn execute(allocator: std.mem.Allocator, args: Args) !Result {
         .tool_event_audit_text = tool_event_audit_text,
         .raw_bytes_read = range.text.len,
         .model_bytes = evidence_text.len + micro_context_text.len,
+        .quality_score = 72,
+        .range_count = 1,
     };
 }
 
+fn executeRanked(allocator: std.mem.Allocator, io: std.Io, args: Args, strategy: contracts.StrategyName) !Result {
+    const task = if (args.task.len > 0) args.task else "collect evidence";
+    var ranked = try evidence_ranker.rankForPrompt(allocator, io, task, strategy, .{
+        .max_ranges = adaptiveRangeLimit(args.budget_bytes),
+        .max_lines_per_range = adaptiveLineLimit(args.budget_bytes),
+    });
+    defer ranked.deinit(allocator);
+    if (ranked.candidates.items.len == 0) return error.NoEvidenceCandidates;
+
+    var packet = evidence.EvidencePacket.init(allocator);
+    defer packet.deinit();
+    var micro_contexts = std.ArrayList(micro_context.MicroContext).empty;
+    defer {
+        for (micro_contexts.items) |ctx| ctx.deinit(allocator);
+        micro_contexts.deinit(allocator);
+    }
+
+    var raw_bytes_read: usize = 0;
+    var best_quality: i32 = 0;
+    const per_range_budget = evidence_ranker.adaptiveBudget(args.budget_bytes, ranked.candidates.items[0].score, ranked.candidates.items.len);
+
+    for (ranked.candidates.items) |candidate| {
+        best_quality = @max(best_quality, candidate.score);
+        const max_lines = candidate.end_line - candidate.start_line + 1;
+        const range = tools.readFileRange(allocator, candidate.path, candidate.start_line, max_lines, per_range_budget) catch continue;
+        defer range.deinit(allocator);
+        if (containsForbiddenModelMarker(range.text)) continue;
+        raw_bytes_read += range.text.len;
+        try packet.add(try evidence.fromFileRangeBudgeted(allocator, range, per_range_budget));
+        try micro_contexts.append(allocator, try micro_context.fromFileRange(allocator, range, "collect_evidence", per_range_budget));
+    }
+    if (packet.entries.items.len == 0) return error.NoEvidenceCandidatesReadable;
+
+    const evidence_text = try packet.render(allocator);
+    errdefer allocator.free(evidence_text);
+    const micro_context_text = try renderMicroContexts(allocator, micro_contexts.items);
+    errdefer allocator.free(micro_context_text);
+    const first_context_id = try allocator.dupe(u8, micro_contexts.items[0].id);
+    errdefer allocator.free(first_context_id);
+    const tool_event_audit_text = try renderRankedAudit(allocator, strategy, task, args.budget_bytes, ranked.audit_text, packet.entries.items.len, raw_bytes_read, best_quality);
+    errdefer allocator.free(tool_event_audit_text);
+
+    return .{
+        .strategy = strategy,
+        .context_id = first_context_id,
+        .evidence_text = evidence_text,
+        .micro_context_text = micro_context_text,
+        .tool_event_audit_text = tool_event_audit_text,
+        .raw_bytes_read = raw_bytes_read,
+        .model_bytes = evidence_text.len + micro_context_text.len,
+        .quality_score = best_quality,
+        .range_count = packet.entries.items.len,
+    };
+}
+
+fn containsForbiddenModelMarker(text: []const u8) bool {
+    const forbidden = [_][]const u8{
+        "---BEGIN CONTENT---",
+        "[READ_FILE]",
+        "rawOutput",
+        "raw_output",
+        "SECRET_RAW_TAIL",
+    };
+    for (forbidden) |needle| {
+        if (std.mem.indexOf(u8, text, needle) != null) return true;
+    }
+    return false;
+}
+
+fn renderMicroContexts(allocator: std.mem.Allocator, contexts: []const micro_context.MicroContext) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (contexts) |ctx| {
+        const rendered = try ctx.render(allocator);
+        defer allocator.free(rendered);
+        try out.appendSlice(allocator, rendered);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn renderRankedAudit(
+    allocator: std.mem.Allocator,
+    strategy: contracts.StrategyName,
+    task: []const u8,
+    budget_bytes: usize,
+    ranking_audit: []const u8,
+    range_count: usize,
+    raw_bytes_read: usize,
+    quality_score: i32,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "[TOOL_EVENT]\ntool=collect_evidence\nsuccess=true\nargs=strategy={s} task_bytes={} budget_bytes={} ranges={} raw_bytes={} quality_score={}\n{s}",
+        .{ @tagName(strategy), task.len, budget_bytes, range_count, raw_bytes_read, quality_score, ranking_audit },
+    );
+}
+
+fn adaptiveRangeLimit(budget_bytes: usize) usize {
+    if (budget_bytes >= 12000) return 5;
+    if (budget_bytes >= 7000) return 4;
+    return 3;
+}
+
+fn adaptiveLineLimit(budget_bytes: usize) usize {
+    if (budget_bytes >= 12000) return 140;
+    if (budget_bytes >= 7000) return 100;
+    return 72;
+}
+
 test "collect evidence path returns budgeted evidence and micro context" {
-    const result = try execute(std.testing.allocator, .{
+    const result = try execute(std.testing.allocator, std.testing.io, .{
         .path = "README.md",
         .strategy = .path,
         .start_line = 1,
@@ -93,13 +212,45 @@ test "collect evidence path returns budgeted evidence and micro context" {
     try std.testing.expect(std.mem.indexOf(u8, result.micro_context_text, "[MICRO_CONTEXT") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "[TOOL_EVENT]") != null);
     try std.testing.expect(result.model_bytes == result.evidence_text.len + result.micro_context_text.len);
+    try std.testing.expectEqual(@as(usize, 1), result.range_count);
 }
 
-test "collect evidence rejects unimplemented non path strategies explicitly" {
-    try std.testing.expectError(error.StrategyNotImplemented, execute(std.testing.allocator, .{
-        .path = "README.md",
-        .strategy = .symbol,
-    }));
+test "collect evidence ranked lexical uses rg candidates and audit without raw rg output" {
+    const result = try execute(std.testing.allocator, std.testing.io, .{
+        .task = "collect_evidence execute",
+        .strategy = .lexical,
+        .budget_bytes = 6000,
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.range_count > 0);
+    try std.testing.expect(result.quality_score > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "[EVIDENCE]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "[CANDIDATE_RANKING]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "---BEGIN CONTENT---") == null);
+}
+
+test "collect evidence symbol semantic diagnostic runtime and diff strategies are executable" {
+    const strategies = [_]contracts.StrategyName{ .symbol, .semantic, .diagnostic, .runtime, .diff };
+    for (strategies) |strategy| {
+        const result = try execute(std.testing.allocator, std.testing.io, .{
+            .task = "collect_evidence tool_event diff error",
+            .strategy = strategy,
+            .budget_bytes = 6000,
+        });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.range_count > 0);
+    }
+}
+
+test "collect evidence ranked output skips forbidden raw marker ranges" {
+    const result = try execute(std.testing.allocator, std.testing.io, .{
+        .task = "RawContextLeak collect_evidence",
+        .strategy = .auto,
+        .budget_bytes = 6000,
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "---BEGIN CONTENT---") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.micro_context_text, "---BEGIN CONTENT---") == null);
 }
 
 test "collect evidence does not leak raw tail beyond budget" {
@@ -110,7 +261,7 @@ test "collect evidence does not leak raw tail beyond budget" {
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
-    const result = try execute(std.testing.allocator, .{
+    const result = try execute(std.testing.allocator, std.testing.io, .{
         .path = path,
         .strategy = .path,
         .start_line = 1,
@@ -128,7 +279,7 @@ test "collect evidence does not leak raw tail beyond budget" {
 }
 
 test "collect evidence rejects zero budget" {
-    try std.testing.expectError(error.InvalidEvidenceBudget, execute(std.testing.allocator, .{
+    try std.testing.expectError(error.InvalidEvidenceBudget, execute(std.testing.allocator, std.testing.io, .{
         .path = "README.md",
         .budget_bytes = 0,
     }));

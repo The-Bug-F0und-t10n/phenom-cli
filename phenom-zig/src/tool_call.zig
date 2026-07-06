@@ -24,7 +24,7 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
     const name_start = fn_start + fn_marker.len;
     const name_end = std.mem.indexOfScalar(u8, body[name_start..], '>') orelse return null;
     const name = std.mem.trim(u8, body[name_start .. name_start + name_end], " \r\n\t");
-    const path = parseParameter(body, "path");
+    const path = normalizeOptionalPath(parseParameter(body, "path"));
     const strategy = try parseStrategyParameter(body);
 
     return .{
@@ -43,6 +43,15 @@ fn parseParameter(body: []const u8, comptime name: []const u8) ?[]const u8 {
     const value_start = start + open.len;
     const end_rel = std.mem.indexOf(u8, body[value_start..], close) orelse return null;
     return std.mem.trim(u8, body[value_start .. value_start + end_rel], " \r\n\t");
+}
+
+fn normalizeOptionalPath(value: ?[]const u8) ?[]const u8 {
+    const path = value orelse return null;
+    if (path.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(path, "none")) return null;
+    if (std.ascii.eqlIgnoreCase(path, "null")) return null;
+    if (std.ascii.eqlIgnoreCase(path, "undefined")) return null;
+    return path;
 }
 
 fn parseIntParameter(body: []const u8, comptime name: []const u8) ?usize {
@@ -139,4 +148,20 @@ test "collect evidence without path is parsed for repair" {
     try std.testing.expectEqualStrings("collect_evidence", call.name);
     try std.testing.expect(call.path == null);
     try std.testing.expectEqual(contracts.StrategyName.path, call.strategy.?);
+}
+
+test "collect evidence path none is treated as missing path" {
+    const output =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=path>None</parameter>
+        \\<parameter=strategy>auto</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("collect_evidence", call.name);
+    try std.testing.expect(call.path == null);
+    try std.testing.expectEqual(contracts.StrategyName.auto, call.strategy.?);
 }

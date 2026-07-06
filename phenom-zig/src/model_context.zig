@@ -197,7 +197,7 @@ test "model context accepts collect evidence output without raw tail" {
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
-    const result = try collect_evidence.execute(std.testing.allocator, .{
+    const result = try collect_evidence.execute(std.testing.allocator, std.testing.io, .{
         .path = path,
         .budget_bytes = "alpha\nbeta\n".len,
         .max_lines = 10,

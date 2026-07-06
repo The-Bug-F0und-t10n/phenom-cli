@@ -6,6 +6,7 @@ const collect_evidence = @import("collect_evidence.zig");
 const contracts = @import("contracts.zig");
 const config_file = @import("config_file.zig");
 const evidence = @import("evidence.zig");
+const evidence_ranker = @import("evidence_ranker.zig");
 const fd_writer = @import("fd_writer.zig");
 const gate = @import("gate.zig");
 const http = @import("http.zig");
@@ -265,7 +266,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         };
         try sink.flush();
         if (enable_tool_loop) {
-            const handled_by_tool_loop = runToolLoopIterations(allocator, config, prompt, sink.raw_visible.items, &client, &events, &db, ui_ptr, &sink) catch |err| blk: {
+            const handled_by_tool_loop = runToolLoopIterations(allocator, io, config, prompt, sink.raw_visible.items, &client, &events, &db, ui_ptr, &sink) catch |err| blk: {
                 const message = try std.fmt.allocPrint(allocator, "tool loop failed: {s}", .{@errorName(err)});
                 defer allocator.free(message);
                 try events.emit(.{ .progress_update = message });
@@ -346,7 +347,7 @@ fn buildInitialModelContext(allocator: std.mem.Allocator, io: std.Io, prompt: []
     });
 }
 
-const max_tool_iterations = 2;
+const max_tool_emergency_iterations = 8;
 const max_tool_repairs = 1;
 const max_duplicate_tool_repairs = 1;
 
@@ -358,6 +359,7 @@ const ToolLoopNext = union(enum) {
 
 fn runToolLoopIterations(
     allocator: std.mem.Allocator,
+    io: std.Io,
     config: cli.Config,
     prompt: []const u8,
     model_output: []const u8,
@@ -383,6 +385,7 @@ fn runToolLoopIterations(
 
         const next = try runOneToolLoopStep(
             allocator,
+            io,
             config,
             prompt,
             &call,
@@ -409,6 +412,7 @@ fn runToolLoopIterations(
 
 fn runOneToolLoopStep(
     allocator: std.mem.Allocator,
+    io: std.Io,
     config: cli.Config,
     prompt: []const u8,
     call: *const tool_call.ToolCall,
@@ -430,7 +434,9 @@ fn runOneToolLoopStep(
         return .stopped;
     }
 
-    const path = call.path orelse {
+    const strategy = call.strategy orelse if (call.path == null) contracts.StrategyName.auto else contracts.StrategyName.path;
+    const path = call.path;
+    if (path == null and strategy == .path) {
         if (repairs.* >= max_tool_repairs) {
             try db.recordEvent(config.session, "tool_rejected", "collect_evidence missing path after repair");
             return .stopped;
@@ -450,7 +456,7 @@ fn runOneToolLoopStep(
         defer allocator.free(repair_context);
         try db.recordEvent(config.session, "model_context", repair_context);
         return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink);
-    };
+    }
 
     if (state.hasExecuted(call.*)) {
         if (state.duplicate_repairs >= max_duplicate_tool_repairs) {
@@ -458,7 +464,7 @@ fn runOneToolLoopStep(
             return .stopped;
         }
         state.duplicate_repairs += 1;
-        const duplicate_body = try std.fmt.allocPrint(allocator, "collect_evidence\t{s}", .{path});
+        const duplicate_body = try std.fmt.allocPrint(allocator, "collect_evidence\t{s}", .{path orelse @tagName(strategy)});
         defer allocator.free(duplicate_body);
         try db.recordEvent(config.session, "tool_duplicate", duplicate_body);
         try events.emit(.{ .progress_update = "skipping duplicate collect_evidence; answering with existing evidence" });
@@ -474,24 +480,25 @@ fn runOneToolLoopStep(
         return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink);
     }
 
-    if (tool_iterations.* >= max_tool_iterations) {
-        try db.recordEvent(config.session, "tool_loop_stop", "max tool iterations reached");
+    if (tool_iterations.* >= max_tool_emergency_iterations or !state.hasBudgetForMoreEvidence()) {
+        try db.recordEvent(config.session, "tool_loop_stop", "evidence budget exhausted");
         return .stopped;
     }
     tool_iterations.* += 1;
 
     if (ui_ptr) |active_ui| try active_ui.showStatus("Reading");
-    const tool_start = try std.fmt.allocPrint(allocator, "collect_evidence\t{s}", .{path});
+    const tool_start = try std.fmt.allocPrint(allocator, "collect_evidence\t{s}", .{path orelse @tagName(strategy)});
     defer allocator.free(tool_start);
     try db.recordEvent(config.session, "tool_start", tool_start);
-    try events.emit(.{ .tool_start = .{ .name = "collect_evidence", .detail = path } });
+    try events.emit(.{ .tool_start = .{ .name = "collect_evidence", .detail = path orelse @tagName(strategy) } });
 
-    const result = collect_evidence.execute(allocator, .{
+    const result = collect_evidence.execute(allocator, io, .{
         .path = path,
-        .strategy = call.strategy orelse .path,
+        .task = prompt,
+        .strategy = strategy,
         .start_line = call.start_line,
         .max_lines = call.max_lines,
-        .budget_bytes = 3800,
+        .budget_bytes = state.remainingBudget(),
     }) catch |err| {
         try db.recordEvent(config.session, "tool_error", @errorName(err));
         try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = @errorName(err) } });
@@ -503,13 +510,15 @@ fn runOneToolLoopStep(
     try db.recordEvent(config.session, "evidence", result.evidence_text);
     try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = result.evidence_text } });
     try state.rememberExecuted(call.*, result.evidence_text);
+    state.model_budget_used += result.model_bytes;
+    state.best_quality = @max(state.best_quality, result.quality_score);
 
     const follow_context = try renderCollectedEvidenceContext(
         allocator,
         prompt,
         state.evidence_texts.items,
-        if (tool_iterations.* < max_tool_iterations)
-            "Answer using the evidence above. If one different file is strictly required, emit one collect_evidence call with path. Do not request the same file/range again."
+        if (state.shouldAllowMoreEvidence())
+            "Answer using the evidence above. If a different evidence range is strictly required and budget remains, emit one collect_evidence call. Do not request the same file/range again."
         else
             "Answer the current user request using the evidence above. Do not call tools again in this turn.",
     );
@@ -571,9 +580,9 @@ const ToolCallKey = struct {
     }
 
     fn matches(self: ToolCallKey, call: tool_call.ToolCall) bool {
-        const path = call.path orelse return false;
+        const path = call.path orelse "<auto>";
         return std.mem.eql(u8, self.path, path) and
-            self.strategy == (call.strategy orelse .path) and
+            self.strategy == (call.strategy orelse if (call.path == null) contracts.StrategyName.auto else contracts.StrategyName.path) and
             self.start_line == call.start_line and
             self.max_lines == call.max_lines;
     }
@@ -584,6 +593,9 @@ const ToolLoopState = struct {
     executed: std.ArrayList(ToolCallKey),
     evidence_texts: std.ArrayList([]u8),
     duplicate_repairs: usize = 0,
+    model_budget_limit: usize = 18 * 1024,
+    model_budget_used: usize = 0,
+    best_quality: i32 = 0,
 
     fn init(allocator: std.mem.Allocator) ToolLoopState {
         return .{
@@ -608,18 +620,33 @@ const ToolLoopState = struct {
     }
 
     fn rememberExecuted(self: *ToolLoopState, call: tool_call.ToolCall, evidence_text: []const u8) !void {
-        const path = call.path orelse return error.MissingPath;
+        const path = call.path orelse "<auto>";
         const owned_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned_path);
         const owned_evidence = try self.allocator.dupe(u8, evidence_text);
         errdefer self.allocator.free(owned_evidence);
         try self.executed.append(self.allocator, .{
             .path = owned_path,
-            .strategy = call.strategy orelse .path,
+            .strategy = call.strategy orelse if (call.path == null) contracts.StrategyName.auto else contracts.StrategyName.path,
             .start_line = call.start_line,
             .max_lines = call.max_lines,
         });
         try self.evidence_texts.append(self.allocator, owned_evidence);
+    }
+
+    fn hasBudgetForMoreEvidence(self: ToolLoopState) bool {
+        return self.remainingBudget() >= 2200;
+    }
+
+    fn remainingBudget(self: ToolLoopState) usize {
+        if (self.model_budget_used >= self.model_budget_limit) return 0;
+        return self.model_budget_limit - self.model_budget_used;
+    }
+
+    fn shouldAllowMoreEvidence(self: ToolLoopState) bool {
+        if (!self.hasBudgetForMoreEvidence()) return false;
+        if (self.best_quality >= 82) return false;
+        return true;
     }
 };
 
@@ -644,8 +671,9 @@ fn renderCollectedEvidenceContext(
 fn collectEvidenceToolSchema() []const u8 {
     return
         \\[TOOLS v1]
-        \\collect_evidence(path, strategy=path, start_line=1, max_lines=12)
-        \\Format:
+        \\collect_evidence(path?, strategy=auto|path|lexical|symbol|semantic|diagnostic|runtime|diff, start_line=1, max_lines=12)
+        \\Use strategy=auto without path for ranked evidence. Use strategy=path only with path.
+        \\Format with path:
         \\<tool_call>
         \\<function=collect_evidence>
         \\<parameter=path>relative/path</parameter>
@@ -654,6 +682,8 @@ fn collectEvidenceToolSchema() []const u8 {
         \\<parameter=max_lines>12</parameter>
         \\</function>
         \\</tool_call>
+        \\Format ranked:
+        \\<tool_call><function=collect_evidence><parameter=strategy>auto</parameter></function></tool_call>
     ;
 }
 
@@ -923,6 +953,7 @@ test {
     _ = collect_evidence;
     _ = contracts;
     _ = evidence;
+    _ = evidence_ranker;
     _ = fd_writer;
     _ = gate;
     _ = http;
@@ -1012,6 +1043,8 @@ test "tool loop env parser is opt in only" {
 test "tool loop schema is compact and only offered for evidence-like prompts" {
     const schema = collectEvidenceToolSchema();
     try std.testing.expect(std.mem.indexOf(u8, schema, "collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=auto") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "symbol") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "apply_patch") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "grep_file") == null);
     try std.testing.expect(shouldOfferCollectEvidence("analise o arquivo README.md"));

@@ -7581,3 +7581,105 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 220 --prompt 'Use collect_evidence no arquivo README.md e depois responda exatamente: PHENOM_TOOL_DONE_263' --expect-contains PHENOM_TOOL_DONE_263 --show-expect-status --fail-on-model-error` -> passou; renderizou um unico `collect_evidence README.md` e resposta final `PHENOM_TOOL_DONE_263`.
 - `sqlite3 .phenom-zig/phenom.db "with last_turn as (select max(id) as start_id from events where session='default' and kind='turn_start' and body='Use collect_evidence no arquivo README.md e depois responda exatamente: PHENOM_TOOL_DONE_263') select kind, count(*) from events, last_turn where id >= start_id group by kind order by kind;"` -> retornou `tool_start|1`, `evidence|1`, `assistant_delta|1`, `turn_done|1`.
+
+## T265 - Maturar `collect_evidence` com ranking rg, merge, estrategias e budget por qualidade
+
+Status: implemented-verified.
+
+Motivacao: `collect_evidence` nao pode depender do modelo pequeno para escolher ranges perfeitos. O agente precisa fazer recuperacao deterministica, auditavel e barata: buscar candidatos com `rg`, pontuar por sinais objetivos, fundir ranges sobrepostos/adjacentes, aplicar budget adaptativo e decidir novas coletas por budget/qualidade, nao por numero fixo de chamadas.
+
+Evidencia:
+
+- `collect_evidence.zig` so executava `path|auto` como leitura direta de arquivo/range.
+- `symbol`, `lexical`, `semantic`, `diagnostic`, `runtime` e `diff` retornavam `StrategyNotImplemented`.
+- `main.zig` ainda tinha limite operacional de 2 coletas por turno.
+- Smoke real com `strategy=auto` revelou dois bugs de alinhamento: o modelo emitiu `path=None`, e o ranking inicial escolheu evidencia ruim por termos genericos.
+- Smoke real seguinte revelou risco de `RawContextLeak` quando ranking pegava range de teste contendo marcador bruto proibido.
+
+Impacto esperado:
+
+- `collect_evidence(strategy=auto|lexical|symbol|semantic|diagnostic|runtime|diff)` funciona sem path fixo.
+- Ranking usa `rg` como tool interna auditada, sem shell/interpolacao e com stdout limitado.
+- Audit registra `[CANDIDATE_RANKING]`, `rg_invocations`, `rg_available`, candidatos, scores e reasons, sem raw rg output.
+- Ranges sobrepostos/adjacentes sao fundidos antes da leitura.
+- Orçamento por range e quantidade de ranges variam conforme budget e score.
+- Tool loop permite nova coleta por budget/qualidade (`remainingBudget`, `best_quality`), com hard cap apenas como fusivel.
+- `path=None|null|undefined` vindo do modelo vira path ausente.
+- Ranges contendo marcadores brutos proibidos sao descartados antes de entrar em EvidencePacket/MicroContext.
+
+Teste primeiro:
+
+- Teste de merge combina ranges adjacentes/sobrepostos.
+- Teste de ranker prova uso auditado de `rg` e ausencia de marcador bruto no audit.
+- Teste de budget adaptativo prova diferenca por qualidade.
+- Teste de `collect_evidence` lexical prova ranking rg -> evidence/micro-context.
+- Teste de estrategias `symbol`, `semantic`, `diagnostic`, `runtime` e `diff` prova que todas executam.
+- Teste de raw marker prova que ranking descarta ranges proibidos.
+- Teste de parser prova que `path=None` e tratado como ausente.
+- Smoke real prova `strategy=auto` sem path no modelo, evidencia correta e resposta final.
+
+Implementacao:
+
+- `phenom-zig/src/evidence_ranker.zig`: novo modulo com extração de termos, stopwords, ordenacao por especificidade, chamada `std.process.run` para `rg`, fallback scan, score, reasons, merge e audit.
+- `phenom-zig/src/collect_evidence.zig`: `Args.path` virou opcional, `Args.task` foi adicionado, `execute` recebe `std.Io`, e estrategias ranqueadas geram EvidencePacket multi-range.
+- `phenom-zig/src/main.zig`: tool loop passa `io`, schema compacto anuncia `auto|path|lexical|symbol|semantic|diagnostic|runtime|diff`, e limite principal passa a ser budget/qualidade.
+- `phenom-zig/src/tool_call.zig`: normaliza `path=None|null|undefined` para path ausente.
+- `phenom-zig/src/tool_loop.zig` e `model_context.zig`: atualizados para nova assinatura de `collect_evidence.execute`.
+
+Passos de implementacao:
+
+1. Criar ranker deterministico baseado em `rg`.
+2. Extrair termos do prompt e filtrar stopwords.
+3. Priorizar termos especificos como `collect_evidence` sobre palavras comuns.
+4. Pontuar candidatos por match, path, definicao, estrategia e penalidade de teste/cache.
+5. Fundir ranges sobrepostos/adjacentes.
+6. Gerar audit compacto de ranking.
+7. Executar estrategias reais sobre ranking.
+8. Aplicar budget adaptativo por qualidade/range count.
+9. Trocar loop para budget/qualidade com hard cap de emergencia.
+10. Validar com testes e smoke real.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: `RankingResult.deinit` libera candidatos e audit; `EvidenceCandidate.deinit` libera path/reasons; `ToolLoopState.deinit` libera keys/evidencias.
+- Ownership: `collect_evidence` duplica evidence/context/audit antes de retornar; micro-contexts temporarios sao liberados.
+- Subprocesso: `rg` e chamado via argv separado, sem shell, stdout/stderr limitados.
+- Bounds: `max_candidates`, `max_ranges`, `max_lines_per_range`, `max_rg_bytes` e `model_budget_limit` limitam crescimento.
+- Raw leak: ranges com `---BEGIN CONTENT---`, `[READ_FILE]`, `rawOutput`, `raw_output` e `SECRET_RAW_TAIL` sao descartados.
+- Dedupe: chamadas iguais ainda sao reutilizadas; chamadas diferentes podem executar se budget/qualidade permitirem.
+- Qualidade: `best_quality >= 82` encerra novas coletas; budget restante abaixo de 2200 tambem encerra.
+- Fusivel: `max_tool_emergency_iterations=8` existe apenas contra loop infinito, nao como criterio normal.
+
+Criterio de aceite:
+
+- `zig test src/evidence_ranker.zig -lc` passa.
+- `zig test src/collect_evidence.zig -lc` passa.
+- `zig test src/tool_call.zig -lc` passa.
+- `zig test src/tool_loop.zig -lc` passa.
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real `strategy=auto` sem path passa e coleta arquivo relacionado a `collect_evidence`.
+- Audit do ultimo turno tem `[CANDIDATE_RANKING]`, `rg_invocations`, `tool_start collect_evidence auto` e zero marcador bruto.
+
+Pendencias deliberadas:
+
+- Ranking ainda e heuristico; nao usa AST real nem LSP.
+- `semantic` ainda e semantica heuristica por termos e paths, nao embedding/RAG.
+- `diagnostic`, `runtime` e `diff` executam como estrategias reais de recuperacao textual/rankeada, mas ainda nao integram fontes estruturadas de build logs, sqlite audit ou git diff parser.
+- Merge nao faz uniao inteligente de ranges distantes no mesmo simbolo; apenas sobrepostos/adjacentes.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/evidence_ranker.zig -lc` -> passou; 7 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc` -> passou; 28 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_call.zig -lc` -> passou; 10 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_loop.zig -lc` -> passou; 36 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 126 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- Smoke real inicial de `strategy=auto` falhou com `path=None` tratado como arquivo; corrigido no parser.
+- Smoke real seguinte falhou com `RawContextLeak`; corrigido descartando ranges com marcadores proibidos e penalizando testes.
+- `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --prompt 'Use collect_evidence com strategy auto sem path para achar evidencia sobre collect_evidence e depois responda exatamente: PHENOM_AUTO_EVIDENCE_265' --expect-contains PHENOM_AUTO_EVIDENCE_265 --show-expect-status --fail-on-model-error` -> passou; coletou `src/collect_evidence.zig` e resposta final `PHENOM_AUTO_EVIDENCE_265`.
+- `sqlite3 .phenom-zig/phenom.db "with last_turn as (select max(id) as start_id from events where session='default' and kind='turn_start' and body like 'Use collect_evidence com strategy auto%') select kind, substr(body,1,160) from events,last_turn where id >= start_id and kind in ('tool_event','tool_start','evidence','assistant_delta') order by id;"` -> mostrou `tool_start collect_evidence auto`, `[CANDIDATE_RANKING]`, `rg_invocations`, evidencia em `src/collect_evidence.zig` e resposta final.
+- `sqlite3 .phenom-zig/phenom.db "with last_turn as (select max(id) as start_id from events where session='default' and kind='turn_start' and body like 'Use collect_evidence com strategy auto%') select count(*) from events,last_turn where id >= start_id and body like '%---BEGIN CONTENT---%';"` -> retornou `0`.
