@@ -8371,3 +8371,134 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 620 --prompt 'o que este projeto implementa em cwd ?' --session flow-terms-273 --fail-on-model-error` -> passou sem env; renderizou `collect_evidence: auto`, respondeu e nao mostrou `StreamTooLong`.
 - `sqlite3 .phenom-zig/phenom.db "select 'tool_start', count(*) from events where session='flow-terms-273' and kind='tool_start'; select 'tool_error', count(*) from events where session='flow-terms-273' and kind='tool_error'; select 'raw_marker', count(*) from events where session='flow-terms-273' and body like '%---BEGIN CONTENT---%'; select 'terms_marker', count(*) from events where session='flow-terms-273' and body like '%terms=%';"` -> retornou `1`, `0`, `0`, `1`.
+
+## T274 - Implementar contexto descartavel para exploracao guiada por modelo
+
+Status: planned.
+
+Motivacao: a T273 corrigiu a causa principal do fluxo errado: o agente nao deve adivinhar o que buscar a partir do prompt original; o modelo deve inferir a intencao e chamar `collect_evidence` com `terms`, `path`, `strategy` e demais parametros. Falta agora impedir que varias exploracoes corretas inflem o contexto do modelo. O fluxo desejado e exploratorio: o modelo pode analisar uma evidencia, concluir que ela e insuficiente e emitir outra coleta mais especifica. Isso exige um working set descartavel/compactavel, como a referencia TS ja fazia com working memory, active micro-context e `compact=true`, mas sem reintroduzir `build_task_context`, preflight do controller ou heuristicas semanticas.
+
+Evidencia:
+
+- `doc/AGENTE_AI_BAIXO_CONSUMO_TOKENS_AUDIT.md` pede `collect_evidence` como contrato operacional unico, micro-contexto com id/hash/range e raw context descartado.
+- `TASKS.md` ja define que tools sao coletores e que o modelo recebe apenas evidencia destilada em `EvidencePacket`/`ModelTurnContext`.
+- `../phenom-cli-ts/src/tools/registrars/context-tools.ts` retorna `raw_context_persisted: false`, `[MICRO_CONTEXT]`, `[NEXT_ACTION]` e orienta nova chamada quando a evidencia esta incompleta.
+- `../phenom-cli-ts/src/memory/memory-orchestrator.ts` separa `[WORKING_MEMORY]` de `[PERSISTENT_MEMORY]` e limpa working memory com `collect_evidence(compact=true)`.
+- `../phenom-cli-ts/src/tests/integration/test-use-cases.ts` prova active micro-context apos compactacao, rehidratacao em follow-up e supressao de snippets ativos quando ficam stale.
+- `phenom-zig/src/main.zig` hoje acumula `state.evidence_texts` completos e renderiza todos no proximo `ModelTurnContext`; isso funciona para uma ou duas coletas, mas nao escala para exploracao guiada longa.
+
+Regra de negocio:
+
+- O modelo e o cerebro da busca: ele define `terms`, `path`, `strategy`, `selected`, `need` ou `compact`.
+- O agente nao cria termos, nao escolhe foco por palavras do prompt, nao prefere source/docs/test por semantica hardcoded e nao executa preflight de evidencia antes da intencao do modelo.
+- O agente executa contrato, valida allowlist/schema/budget/duplicidade/stale/raw leak, audita e compacta contexto operacional.
+- Contexto descartavel nao e `MEMORY.md` nem `SKILLS.md`. MEMORY/SKILLS continuam sendo contexto persistente de projeto/usuario. Working evidence e storage operacional do turno/sessao.
+
+Alvo final:
+
+1. O modelo recebe schema compacto de `collect_evidence` com parametros model-driven:
+   - `terms`: consulta criada pelo modelo;
+   - `path`: path relativo quando conhecido;
+   - `strategy`: somente estrategias ativas e executaveis;
+   - `start_line`/`max_lines`: range quando conhecido;
+   - `compact`: sinal explicito de que a exploracao atual pode virar resumo/anchors;
+   - futuro `selected`: ids de evidencias/candidatos retornados por chamada anterior.
+2. Cada chamada de `collect_evidence` gera uma entrada de working evidence com:
+   - id estavel (`E1`, `E2` ou `ev_*`);
+   - args normalizados;
+   - path/range/hash/contextId quando houver;
+   - qualidade/custo;
+   - texto destilado model-visible;
+   - raw output somente no SQLite/audit, nunca no prompt.
+3. O `ModelTurnContext` renderiza somente:
+   - evidencias ativas recentes ou selecionadas;
+   - anchors compactos das evidencias antigas;
+   - `[NEXT_ACTION]` curto dizendo que o modelo pode refinar se a evidencia nao bastar.
+4. O loop para por budget/duplicidade/ausencia de progresso/erro recuperavel, nao por numero fixo de chamadas.
+5. A cada patch/mutacao futura, micro-context stale remove snippets ativos e preserva apenas anchors/obrigacoes.
+
+Teste primeiro:
+
+- `working_context` guarda duas coletas diferentes com `terms` diferentes e renderiza ambas enquanto cabem no budget.
+- `working_context` bloqueia coleta duplicada com mesmos `path/terms/strategy/range`, mas permite coleta diferente no mesmo turno.
+- `working_context` compacta evidencia antiga para anchors quando o budget model-visible e excedido.
+- `working_context compact=true` limpa snippets ativos e preserva somente anchors/next action.
+- `model_context` nunca renderiza `---BEGIN CONTENT---`, raw `rg`, stdout bruto ou markers internos.
+- `runOneToolLoopStep` usa working context para renderizar follow-up, nao `state.evidence_texts` bruto.
+- Smoke real ambigue deve permitir: primeira coleta ampla -> modelo emite segunda coleta refinada -> resposta final grounded, sem repetir evidencia identica.
+
+Implementacao:
+
+- Criar `phenom-zig/src/working_context.zig`.
+- Definir `WorkingEvidence` owned:
+  - `id`;
+  - `path`;
+  - `terms`;
+  - `strategy`;
+  - `start_line`;
+  - `max_lines`;
+  - `context_id`;
+  - `evidence_text`;
+  - `anchor_text`;
+  - `model_bytes`;
+  - `quality_score`;
+  - `stale`.
+- Definir `WorkingContext` owned:
+  - lista de evidencias;
+  - `model_budget_limit`;
+  - `model_budget_used`;
+  - `best_quality`;
+  - contador de duplicidade;
+  - metodos `remember`, `hasDuplicate`, `remainingBudget`, `shouldAllowMoreEvidence`, `compact`, `renderEvidenceBlocks`.
+- Migrar `ToolLoopState` em `phenom-zig/src/main.zig` para usar `WorkingContext`.
+- Manter `ToolCallKey` somente se ainda for o menor caminho; se `WorkingEvidence` ja cobre duplicidade, remover duplicacao.
+- Atualizar `renderCollectedEvidenceContext` para receber working context e renderizar active evidence + compact anchors.
+- Adicionar `compact` ao parser de tool call somente depois do teste falhar.
+- Atualizar schema de `collectEvidenceToolSchema` com `compact=true`, deixando claro que o modelo decide quando compactar apos explorar.
+- Auditar eventos novos no SQLite:
+  - `working_context_add`;
+  - `working_context_compact`;
+  - `working_context_duplicate`;
+  - `working_context_budget`.
+
+Passos de implementacao:
+
+1. Criar testes de `working_context.zig` para ownership, dedupe, budget, compactacao e render sem raw leak.
+2. Implementar `working_context.zig` minimo ate os testes passarem.
+3. Criar teste em `tool_call.zig` para `<parameter=compact>true</parameter>` owned/boolean.
+4. Implementar parse de `compact`.
+5. Criar teste em `main.zig` provando que duas coletas diferentes entram no working context e duplicata nao reexecuta.
+6. Trocar `ToolLoopState.evidence_texts` por `WorkingContext`.
+7. Atualizar schema e `NEXT_ACTION` para refinamento model-driven sem exemplos enviesados de dominio.
+8. Registrar eventos SQLite de add/compact/duplicate/budget.
+9. Rodar unit tests, build release e smoke real com query ambigua.
+10. Revisar memoria/ownership/bounds/raw leak antes do commit.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Ownership: toda string em `WorkingEvidence` deve ser duplicated/owned e liberada em `deinit`.
+- Stale pointer: nenhum `EvidenceBlock` pode apontar para stack temporaria apos render.
+- Bounds: compactacao deve acontecer antes de ultrapassar `model_budget_limit`; nenhum append pode depender de `ArrayList.items` apos possivel realloc sem reobter slice.
+- Raw leak: `working_context.render*` deve chamar ou espelhar `model_context.assertNoRawContextLeak`.
+- Duplicidade: chave deve incluir `path`, `terms`, `strategy`, `start_line`, `max_lines`; chamada diferente nao pode ser bloqueada.
+- SQLite: audit pode guardar resumo bruto suficiente, mas prompt so recebe destilado/anchors.
+- Regra de negocio: nenhuma lista de stopwords, lista fixa de arquivos, preferencia por linguagem, preferencia source/docs/test ou extracao de termos do prompt original.
+
+Criterio de aceite:
+
+- `zig test src/working_context.zig -lc` passa.
+- `zig test src/tool_call.zig -lc` passa.
+- `zig test src/model_context.zig -lc` passa.
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real sem env mostra pelo menos uma chamada model-driven de `collect_evidence`.
+- Smoke real de refinamento nao repete evidencia identica; se o modelo pedir outra coleta com termos/path diferentes, o agente executa.
+- SQLite mostra `working_context_add`, zero raw marker em `model_context`, e motivo de parada por budget/qualidade/duplicidade quando aplicavel.
+
+Pendencias deliberadas:
+
+- `selectedCandidates`/`selected` deve ficar para a proxima task se exigir mudar o ranker para emitir ids candidatos antes de materializar snippets.
+- Estrategias `symbol`, `semantic`, `diagnostic`, `runtime` e `diff` continuam inativas ate terem executor real.
+- Groundedness por claim/citacao ainda e task separada: esta task limita crescimento de contexto e preserva evidencia, mas nao valida cada frase final do modelo.
+- Persistencia cross-session do working context deve usar SQLite/audit e rehidratacao controlada; nao deve ser promovida para MEMORY automaticamente.
