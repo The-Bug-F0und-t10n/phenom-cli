@@ -6,7 +6,6 @@ const collect_evidence = @import("collect_evidence.zig");
 const contracts = @import("contracts.zig");
 const config_file = @import("config_file.zig");
 const evidence = @import("evidence.zig");
-const evidence_ranker = @import("evidence_ranker.zig");
 const fd_writer = @import("fd_writer.zig");
 const gate = @import("gate.zig");
 const http = @import("http.zig");
@@ -227,7 +226,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             .max_tokens = config.max_tokens,
             .thinking = config.thinking,
         };
-        const enable_tool_loop = toolLoopEnabled();
+        const enable_tool_loop = true;
         var sink = StreamSink{
             .allocator = allocator,
             .events = &events,
@@ -242,24 +241,11 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             .trim_visible_leading_whitespace = false,
         };
         defer sink.deinit();
-        var preflight_evidence: ?collect_evidence.Result = null;
-        defer if (preflight_evidence) |result| result.deinit(allocator);
-        if (enable_tool_loop) {
-            preflight_evidence = collectInitialEvidence(allocator, io, config, prompt, &events, &db, ui_ptr) catch |err| blk: {
-                const body = try std.fmt.allocPrint(allocator, "collect_evidence preflight:auto {s}", .{@errorName(err)});
-                defer allocator.free(body);
-                try db.recordEvent(config.session, "tool_error", body);
-                try events.emit(.{ .progress_update = body });
-                break :blk null;
-            };
-        }
-
         const model_context_text = try buildInitialModelContext(
             allocator,
             io,
             prompt,
             enable_tool_loop,
-            if (preflight_evidence) |result| result.evidence_text else null,
         );
         defer if (model_context_text) |text| allocator.free(text);
         if (model_context_text) |text| try db.recordEvent(config.session, "model_context", text);
@@ -343,59 +329,30 @@ fn recordAndEmitTurnDone(
     try events.emit(.{ .turn_done = .{ .elapsed_ms = elapsed_ms } });
 }
 
-fn collectInitialEvidence(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    config: cli.Config,
-    prompt: []const u8,
-    events: *ui_events.EventBus,
-    db: *audit.AuditDb,
-    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
-) !collect_evidence.Result {
-    if (ui_ptr) |active_ui| try active_ui.showStatus("Reading");
-    try db.recordEvent(config.session, "tool_start", "collect_evidence\tpreflight:auto");
-    try events.emit(.{ .tool_start = .{ .name = "collect_evidence", .detail = "preflight:auto" } });
-    const result = try collect_evidence.execute(allocator, io, .{
-        .task = prompt,
-        .strategy = .auto,
-        .budget_bytes = 6000,
-    });
-    errdefer result.deinit(allocator);
-    try db.recordEvent(config.session, "tool_event", result.tool_event_audit_text);
-    try db.recordEvent(config.session, "evidence", result.evidence_text);
-    try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = result.evidence_text } });
-    if (ui_ptr) |active_ui| try active_ui.showStatus("Thinking");
-    return result;
-}
-
 fn buildInitialModelContext(
     allocator: std.mem.Allocator,
     io: std.Io,
     prompt: []const u8,
     enable_tool_loop: bool,
-    initial_evidence: ?[]const u8,
 ) !?[]u8 {
     const include_persistent = modelContextEnabled();
     const include_collect_evidence_schema = enable_tool_loop;
-    if (!include_persistent and !include_collect_evidence_schema and initial_evidence == null) return null;
+    if (!include_persistent and !include_collect_evidence_schema) return null;
 
     var persistent = persistent_context.Loaded.init(allocator);
     defer persistent.deinit();
     if (include_persistent) persistent = try persistent_context.loadFromCwd(allocator, io);
 
-    if (!include_collect_evidence_schema and persistent.memory.items.len == 0 and persistent.skills.items.len == 0 and initial_evidence == null) return null;
-
-    var evidence_blocks = [_]model_context.EvidenceBlock{.{ .text = initial_evidence orelse "" }};
-    const evidence_slice = if (initial_evidence != null) evidence_blocks[0..] else &[_]model_context.EvidenceBlock{};
+    if (!include_collect_evidence_schema and persistent.memory.items.len == 0 and persistent.skills.items.len == 0) return null;
 
     return try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
         .contracts = if (include_collect_evidence_schema) collectEvidenceToolSchema() else "",
-        .evidence = evidence_slice,
+        .evidence = &[_]model_context.EvidenceBlock{},
         .memory = persistent.memory.items,
         .skills = persistent.skills.items,
         .next_action = if (include_collect_evidence_schema)
-            "Use the provided [EVIDENCE] as the minimal workspace context. Any claim about the current project, repository, source code, files, or implementation must be grounded in evidence. If more context is strictly required, call collect_evidence again with a different path/range/strategy. If the request is not about this workspace, answer directly."
+            "First infer the user's intent. Before making claims about the current workspace, repository, source code, files, or implementation, call collect_evidence. Use terms to describe exactly what you need to find. Use path only when you know a concrete relative path. After evidence returns, answer using only that evidence or request a different evidence range."
         else
             "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
     });
@@ -540,7 +497,7 @@ fn runOneToolLoopStep(
         return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink);
     }
 
-    if (state.hasExecutedArgs(path, strategy, call.start_line, call.max_lines)) {
+    if (state.hasExecutedArgs(path, call.terms, strategy, call.start_line, call.max_lines)) {
         if (state.duplicate_repairs >= max_duplicate_tool_repairs) {
             try db.recordEvent(config.session, "tool_loop_stop", "duplicate collect_evidence repeated after repair");
             return .stopped;
@@ -576,6 +533,7 @@ fn runOneToolLoopStep(
 
     const result = collect_evidence.execute(allocator, io, .{
         .path = path,
+        .terms = call.terms,
         .task = prompt,
         .strategy = strategy,
         .start_line = call.start_line,
@@ -584,14 +542,22 @@ fn runOneToolLoopStep(
     }) catch |err| {
         try db.recordEvent(config.session, "tool_error", @errorName(err));
         try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = @errorName(err) } });
-        return .stopped;
+        const follow_context = try renderCollectedEvidenceContext(
+            allocator,
+            prompt,
+            state.evidence_texts.items,
+            "collect_evidence encountered an error. Answer the current user request directly.",
+        );
+        defer allocator.free(follow_context);
+        try db.recordEvent(config.session, "model_context", follow_context);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink);
     };
     defer result.deinit(allocator);
 
     try db.recordEvent(config.session, "tool_event", result.tool_event_audit_text);
     try db.recordEvent(config.session, "evidence", result.evidence_text);
     try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = result.evidence_text } });
-    try state.rememberExecutedArgs(path, strategy, call.start_line, call.max_lines, result.evidence_text);
+    try state.rememberExecutedArgs(path, call.terms, strategy, call.start_line, call.max_lines, result.evidence_text);
     state.model_budget_used += result.model_bytes;
     state.best_quality = @max(state.best_quality, result.quality_score);
 
@@ -718,17 +684,21 @@ fn hasKnownTextExtension(path: []const u8) bool {
 
 const ToolCallKey = struct {
     path: []u8,
+    terms: []u8,
     strategy: contracts.StrategyName,
     start_line: usize,
     max_lines: usize,
 
     fn deinit(self: ToolCallKey, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
+        allocator.free(self.terms);
     }
 
-    fn matches(self: ToolCallKey, path: ?[]const u8, strategy: contracts.StrategyName, start_line: usize, max_lines: usize) bool {
+    fn matches(self: ToolCallKey, path: ?[]const u8, terms: ?[]const u8, strategy: contracts.StrategyName, start_line: usize, max_lines: usize) bool {
         const effective_path = path orelse "<auto>";
+        const effective_terms = terms orelse "";
         return std.mem.eql(u8, self.path, effective_path) and
+            std.mem.eql(u8, self.terms, effective_terms) and
             self.strategy == strategy and
             self.start_line == start_line and
             self.max_lines == max_lines;
@@ -759,21 +729,25 @@ const ToolLoopState = struct {
         self.evidence_texts.deinit(self.allocator);
     }
 
-    fn hasExecutedArgs(self: ToolLoopState, path: ?[]const u8, strategy: contracts.StrategyName, start_line: usize, max_lines: usize) bool {
+    fn hasExecutedArgs(self: ToolLoopState, path: ?[]const u8, terms: ?[]const u8, strategy: contracts.StrategyName, start_line: usize, max_lines: usize) bool {
         for (self.executed.items) |key| {
-            if (key.matches(path, strategy, start_line, max_lines)) return true;
+            if (key.matches(path, terms, strategy, start_line, max_lines)) return true;
         }
         return false;
     }
 
-    fn rememberExecutedArgs(self: *ToolLoopState, path: ?[]const u8, strategy: contracts.StrategyName, start_line: usize, max_lines: usize, evidence_text: []const u8) !void {
+    fn rememberExecutedArgs(self: *ToolLoopState, path: ?[]const u8, terms: ?[]const u8, strategy: contracts.StrategyName, start_line: usize, max_lines: usize, evidence_text: []const u8) !void {
         const effective_path = path orelse "<auto>";
+        const effective_terms = terms orelse "";
         const owned_path = try self.allocator.dupe(u8, effective_path);
         errdefer self.allocator.free(owned_path);
+        const owned_terms = try self.allocator.dupe(u8, effective_terms);
+        errdefer self.allocator.free(owned_terms);
         const owned_evidence = try self.allocator.dupe(u8, evidence_text);
         errdefer self.allocator.free(owned_evidence);
         try self.executed.append(self.allocator, .{
             .path = owned_path,
+            .terms = owned_terms,
             .strategy = strategy,
             .start_line = start_line,
             .max_lines = max_lines,
@@ -810,10 +784,10 @@ fn renderCollectedEvidenceContext(
     }
     return model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
+        .contracts = collectEvidenceToolSchema(),
         .evidence = evidence_blocks,
         .obligations = &.{
             "Use only collected evidence for claims about this workspace.",
-            "Do not add capabilities, files, tools, or architecture absent from evidence.",
         },
         .next_action = next_action,
     });
@@ -822,10 +796,10 @@ fn renderCollectedEvidenceContext(
 fn collectEvidenceToolSchema() []const u8 {
     return
     \\[TOOLS v1]
-    \\collect_evidence(path?, strategy=auto|path|lexical, start_line=1, max_lines=12)
+    \\collect_evidence(path?, terms?, strategy=auto|path|lexical, start_line=1, max_lines=12)
     \\The current workspace files are available through this tool.
     \\Before making claims about the current project, repository, source code, files, or implementation, emit this tool call and wait for [EVIDENCE].
-    \\Use strategy=auto without path for ranked workspace evidence. Use strategy=path only with path.
+    \\Use terms to express your search intent. Use strategy=auto with terms for ranked workspace evidence. Use strategy=path only with path.
     \\Format with path:
     \\<tool_call>
     \\<function=collect_evidence>
@@ -836,7 +810,7 @@ fn collectEvidenceToolSchema() []const u8 {
     \\</function>
     \\</tool_call>
     \\Format ranked:
-    \\<tool_call><function=collect_evidence><parameter=strategy>auto</parameter></function></tool_call>
+    \\<tool_call><function=collect_evidence><parameter=strategy>auto</parameter><parameter=terms>what to find</parameter></function></tool_call>
     ;
 }
 
@@ -846,15 +820,6 @@ fn modelContextEnabled() bool {
 }
 
 fn modelContextValueEnabled(value: []const u8) bool {
-    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on");
-}
-
-fn toolLoopEnabled() bool {
-    const raw = c.getenv("PHENOM_TOOL_LOOP_V1") orelse return false;
-    return toolLoopValueEnabled(std.mem.span(raw));
-}
-
-fn toolLoopValueEnabled(value: []const u8) bool {
     return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on");
 }
 
@@ -1081,7 +1046,6 @@ test {
     _ = collect_evidence;
     _ = contracts;
     _ = evidence;
-    _ = evidence_ranker;
     _ = fd_writer;
     _ = gate;
     _ = http;
@@ -1159,15 +1123,6 @@ test "model context env parser is opt in only" {
     try std.testing.expect(!modelContextValueEnabled("false"));
 }
 
-test "tool loop env parser is opt in only" {
-    try std.testing.expect(toolLoopValueEnabled("1"));
-    try std.testing.expect(toolLoopValueEnabled("true"));
-    try std.testing.expect(toolLoopValueEnabled("on"));
-    try std.testing.expect(!toolLoopValueEnabled(""));
-    try std.testing.expect(!toolLoopValueEnabled("0"));
-    try std.testing.expect(!toolLoopValueEnabled("false"));
-}
-
 test "tool loop schema is compact and offered without linguistic gating" {
     const schema = collectEvidenceToolSchema();
     try std.testing.expect(std.mem.indexOf(u8, schema, "collect_evidence") != null);
@@ -1183,15 +1138,13 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "apply_patch") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "grep_file") == null);
 
-    const with_tools = (try buildInitialModelContext(std.testing.allocator, std.testing.io, "ola tudo bem", true, "[EVIDENCE]\n- README.md L1-L2 hash=abc\n")) orelse return error.MissingContext;
+    const with_tools = (try buildInitialModelContext(std.testing.allocator, std.testing.io, "ola tudo bem", true)) orelse return error.MissingContext;
     defer std.testing.allocator.free(with_tools);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "collect_evidence") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "[EVIDENCE]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "README.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "minimal workspace context") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "grounded in evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "[CONTRACTS]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "call collect_evidence") != null);
 
-    try std.testing.expect((try buildInitialModelContext(std.testing.allocator, std.testing.io, "analise esse projeto", false, null)) == null);
+    try std.testing.expect((try buildInitialModelContext(std.testing.allocator, std.testing.io, "analise esse projeto", false)) == null);
 }
 
 test "deferred stream sink buffers tool call text before rendering" {
@@ -1285,9 +1238,9 @@ test "tool loop state detects duplicate collect evidence calls and preserves evi
     var state = ToolLoopState.init(std.testing.allocator);
     defer state.deinit();
     const strategy = call.strategy orelse contracts.StrategyName.path;
-    try std.testing.expect(!state.hasExecutedArgs(call.path, strategy, call.start_line, call.max_lines));
-    try state.rememberExecutedArgs(call.path, strategy, call.start_line, call.max_lines, "[EVIDENCE]\n- README.md L1-L12 hash=abc\n");
-    try std.testing.expect(state.hasExecutedArgs(call.path, strategy, call.start_line, call.max_lines));
+    try std.testing.expect(!state.hasExecutedArgs(call.path, call.terms, strategy, call.start_line, call.max_lines));
+    try state.rememberExecutedArgs(call.path, call.terms, strategy, call.start_line, call.max_lines, "[EVIDENCE]\n- README.md L1-L12 hash=abc\n");
+    try std.testing.expect(state.hasExecutedArgs(call.path, call.terms, strategy, call.start_line, call.max_lines));
     try std.testing.expectEqual(@as(usize, 1), state.evidence_texts.items.len);
     try std.testing.expect(std.mem.indexOf(u8, state.evidence_texts.items[0], "README.md") != null);
 }
@@ -1310,12 +1263,15 @@ test "structured prompt path repair extracts only one explicit path" {
 test "tool loop state dedupe uses repaired effective path" {
     var state = ToolLoopState.init(std.testing.allocator);
     defer state.deinit();
-    try state.rememberExecutedArgs("README.md", .path, 1, 12, "[EVIDENCE]\n- README.md L1-L12 hash=abc\n");
-    try std.testing.expect(state.hasExecutedArgs("README.md", .path, 1, 12));
-    try std.testing.expect(!state.hasExecutedArgs(null, .auto, 1, 12));
+    try state.rememberExecutedArgs("README.md", null, .path, 1, 12, "[EVIDENCE]\n- README.md L1-L12 hash=abc\n");
+    try std.testing.expect(state.hasExecutedArgs("README.md", null, .path, 1, 12));
+    try std.testing.expect(!state.hasExecutedArgs(null, null, .auto, 1, 12));
+    try state.rememberExecutedArgs(null, "render", .auto, 1, 12, "[EVIDENCE]\n- src/render.zig L1-L12 hash=abc\n");
+    try std.testing.expect(state.hasExecutedArgs(null, "render", .auto, 1, 12));
+    try std.testing.expect(!state.hasExecutedArgs(null, "http", .auto, 1, 12));
 }
 
-test "duplicate evidence context keeps evidence and hides tool schema" {
+test "duplicate evidence context keeps evidence and tool schema" {
     const evidence_text = try std.testing.allocator.dupe(u8, "[EVIDENCE]\n- README.md L1-L12 hash=abc\n");
     defer std.testing.allocator.free(evidence_text);
     const evidence_texts = [_][]u8{evidence_text};
@@ -1329,7 +1285,8 @@ test "duplicate evidence context keeps evidence and hides tool schema" {
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[EVIDENCE]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "README.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[TOOLS v1]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[TOOLS v1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "collect_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Use only collected evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Do not call tools again") != null);
 }

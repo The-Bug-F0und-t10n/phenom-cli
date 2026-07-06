@@ -9,6 +9,7 @@ const tools = @import("tools.zig");
 
 pub const Args = struct {
     path: ?[]const u8 = null,
+    terms: ?[]const u8 = null,
     task: []const u8 = "",
     strategy: contracts.StrategyName = .auto,
     start_line: usize = 1,
@@ -88,8 +89,9 @@ fn executePath(allocator: std.mem.Allocator, args: Args, strategy: contracts.Str
 }
 
 fn executeRanked(allocator: std.mem.Allocator, io: std.Io, args: Args, strategy: contracts.StrategyName) !Result {
-    const task = if (args.task.len > 0) args.task else "collect evidence";
-    var ranked = try evidence_ranker.rankForPrompt(allocator, io, task, strategy, .{
+    const search_terms = args.terms orelse "";
+    const audit_task = if (search_terms.len > 0) search_terms else "workspace_overview";
+    var ranked = try evidence_ranker.rankForPrompt(allocator, io, search_terms, strategy, .{
         .max_ranges = adaptiveRangeLimit(args.budget_bytes),
         .max_lines_per_range = adaptiveLineLimit(args.budget_bytes),
     });
@@ -126,7 +128,7 @@ fn executeRanked(allocator: std.mem.Allocator, io: std.Io, args: Args, strategy:
     errdefer allocator.free(micro_context_text);
     const first_context_id = try allocator.dupe(u8, micro_contexts.items[0].id);
     errdefer allocator.free(first_context_id);
-    const tool_event_audit_text = try renderRankedAudit(allocator, strategy, task, args.budget_bytes, ranked.audit_text, packet.entries.items.len, raw_bytes_read, best_quality);
+    const tool_event_audit_text = try renderRankedAudit(allocator, strategy, audit_task, args.budget_bytes, ranked.audit_text, packet.entries.items.len, raw_bytes_read, best_quality);
     errdefer allocator.free(tool_event_audit_text);
 
     return .{
@@ -217,7 +219,8 @@ test "collect evidence path returns budgeted evidence and micro context" {
 
 test "collect evidence ranked lexical uses rg candidates and audit without raw rg output" {
     const result = try execute(std.testing.allocator, std.testing.io, .{
-        .task = "collect_evidence execute",
+        .task = "user prompt should not be the search query",
+        .terms = "collect_evidence execute",
         .strategy = .lexical,
         .budget_bytes = 6000,
     });
@@ -242,13 +245,26 @@ test "collect evidence rejects inactive strategies instead of falling back" {
 
 test "collect evidence ranked output skips forbidden raw marker ranges" {
     const result = try execute(std.testing.allocator, std.testing.io, .{
-        .task = "RawContextLeak collect_evidence",
+        .task = "user prompt should not drive search",
+        .terms = "RawContextLeak collect_evidence",
         .strategy = .auto,
         .budget_bytes = 6000,
     });
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "---BEGIN CONTENT---") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.micro_context_text, "---BEGIN CONTENT---") == null);
+}
+
+test "collect evidence auto without model terms uses structural overview" {
+    const result = try execute(std.testing.allocator, std.testing.io, .{
+        .task = "o que este projeto implementa em cwd",
+        .strategy = .auto,
+        .budget_bytes = 6000,
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.range_count > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "terms=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "workspace_overview") != null);
 }
 
 test "collect evidence does not leak raw tail beyond budget" {

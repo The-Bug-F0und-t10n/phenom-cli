@@ -2,11 +2,16 @@ const std = @import("std");
 
 const contracts = @import("contracts.zig");
 
+const c = @cImport({
+    @cInclude("dirent.h");
+});
+
 pub const CandidateSource = enum {
     prompt_path,
     rg,
     fallback_scan,
     workspace_overview,
+    keyword_discovery,
 };
 
 pub const RankBudget = struct {
@@ -15,7 +20,7 @@ pub const RankBudget = struct {
     max_lines_per_range: usize = 80,
     window_before: usize = 12,
     window_after: usize = 24,
-    max_rg_bytes: usize = 96 * 1024,
+    max_rg_bytes: usize = 512 * 1024,
 };
 
 pub const EvidenceCandidate = struct {
@@ -61,7 +66,7 @@ const TermList = struct {
     fn add(self: *TermList, term: []const u8) !void {
         const cleaned = cleanTerm(term);
         if (cleaned.len < 3) return;
-        if (!isStructuredSearchTerm(cleaned)) return;
+        if (!isSearchableTerm(cleaned)) return;
         for (self.items.items) |existing| {
             if (std.ascii.eqlIgnoreCase(existing, cleaned)) return;
         }
@@ -86,8 +91,11 @@ pub fn rankForPrompt(
 
     var rg_invocations: usize = 0;
     var rg_available = true;
+
+    // Phase 1: per-term rg for structured terms only (paths, code symbols, camelCase, etc.)
     for (terms.items.items) |term| {
         if (candidates.items.len >= budget.max_candidates) break;
+        if (!isStructuredSearchTerm(term)) continue;
         collectRgCandidates(allocator, io, &candidates, term, strategy, budget) catch |err| switch (err) {
             error.RgUnavailable => {
                 rg_available = false;
@@ -98,9 +106,17 @@ pub fn rankForPrompt(
         rg_invocations += 1;
     }
 
+    // Phase 2: batch file discovery via plain keywords (single rg -l call for all NL-like words)
+    if (candidates.items.len < budget.max_candidates and strategy == .auto) {
+        try discoverFilesByKeywords(allocator, io, &candidates, terms.items.items, budget);
+    }
+
+    // Phase 3: path candidates from prompt text
     if (candidates.items.len == 0) {
         try addPromptPathCandidates(allocator, &candidates, prompt, strategy, budget);
     }
+
+    // Phase 4: workspace overview fallback
     if (candidates.items.len == 0 and strategy == .auto) {
         try addWorkspaceOverviewCandidates(allocator, io, &candidates, budget);
     }
@@ -157,6 +173,7 @@ fn collectRgCandidates(
         .stderr_limit = .limited(8 * 1024),
     }) catch |err| switch (err) {
         error.FileNotFound => return error.RgUnavailable,
+        error.StreamTooLong => return,
         else => return err,
     };
     defer allocator.free(result.stdout);
@@ -211,7 +228,9 @@ fn collectFallbackCandidates(
     budget: RankBudget,
 ) !void {
     _ = strategy;
-    var cwd = std.Io.Dir.cwd();
+    const root = std.Io.Dir.cwd();
+    var cwd = try root.openDir(io, ".", .{ .iterate = true });
+    defer cwd.close(io);
     var walker = try cwd.walk(allocator);
     defer walker.deinit();
     while (try walker.next(io)) |entry| {
@@ -235,6 +254,71 @@ fn collectFallbackCandidates(
                 .reasons = reasons,
             });
         }
+    }
+}
+
+fn discoverFilesByKeywords(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    out: *std.ArrayList(EvidenceCandidate),
+    term_slice: []const []u8,
+    budget: RankBudget,
+) !void {
+    var plain_count: usize = 0;
+    for (term_slice) |term| {
+        if (isStructuredSearchTerm(term)) continue;
+        plain_count += 1;
+    }
+    if (plain_count == 0) return;
+
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "rg");
+    try argv.append(allocator, "-c");
+    try argv.append(allocator, "--color");
+    try argv.append(allocator, "never");
+    try argv.append(allocator, "--glob");
+    try argv.append(allocator, "!{.git,zig-cache,zig-out,node_modules,bin}/**");
+    for (term_slice) |term| {
+        if (isStructuredSearchTerm(term)) continue;
+        try argv.append(allocator, "-e");
+        try argv.append(allocator, term);
+    }
+    try argv.append(allocator, ".");
+
+    const result = std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .stdout_limit = .limited(budget.max_rg_bytes),
+        .stderr_limit = .limited(8 * 1024),
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        error.StreamTooLong => return,
+        else => return err,
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const colon = std.mem.lastIndexOfScalar(u8, line, ':') orelse continue;
+        const path = normalizeRgPath(std.mem.trim(u8, line[0..colon], " \t\r\n"));
+        const count = std.fmt.parseInt(usize, line[colon + 1 ..], 10) catch continue;
+        if (count == 0) continue;
+        if (skipPath(path)) continue;
+        if (!looksLikeTextCode(path)) continue;
+        if (out.items.len >= budget.max_candidates) break;
+        const score: i32 = 40 + @as(i32, @intCast(@min(count * 3, 15)));
+        const reasons = try std.fmt.allocPrint(allocator, "keyword_discovery,plain_keyword_match,count={}", .{count});
+        errdefer allocator.free(reasons);
+        try out.append(allocator, .{
+            .path = try allocator.dupe(u8, path),
+            .start_line = 1,
+            .end_line = budget.max_lines_per_range,
+            .score = score,
+            .source = .keyword_discovery,
+            .reasons = reasons,
+        });
     }
 }
 
@@ -268,40 +352,14 @@ fn addWorkspaceOverviewCandidates(
     out: *std.ArrayList(EvidenceCandidate),
     budget: RankBudget,
 ) !void {
-    const argv = [_][]const u8{
-        "rg",
-        "--files",
-        "--hidden",
-        "--glob",
-        "!{.git,zig-cache,zig-out,node_modules,bin}/**",
-        ".",
-    };
-    const result = std.process.run(allocator, io, .{
-        .argv = &argv,
-        .stdout_limit = .limited(budget.max_rg_bytes),
-        .stderr_limit = .limited(8 * 1024),
-    }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
+    _ = io;
     var paths = std.ArrayList([]u8).empty;
     defer {
         for (paths.items) |path| allocator.free(path);
         paths.deinit(allocator);
     }
 
-    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
-    while (lines.next()) |line| {
-        const path = normalizeRgPath(std.mem.trim(u8, line, " \t\r\n"));
-        if (path.len == 0) continue;
-        if (skipPath(path)) continue;
-        if (!looksLikeTextCode(path)) continue;
-        if (paths.items.len >= budget.max_candidates * 8) break;
-        try paths.append(allocator, try allocator.dupe(u8, path));
-    }
+    try collectOverviewPathsC(allocator, &paths, budget.max_candidates * 8);
     sortOverviewPaths(paths.items);
 
     const limit = @min(paths.items.len, budget.max_candidates);
@@ -316,6 +374,53 @@ fn addWorkspaceOverviewCandidates(
             .source = .workspace_overview,
             .reasons = reasons,
         });
+    }
+}
+
+fn collectOverviewPathsC(allocator: std.mem.Allocator, paths: *std.ArrayList([]u8), max_paths: usize) !void {
+    var stack = std.ArrayList([]u8).empty;
+    defer {
+        for (stack.items) |path| allocator.free(path);
+        stack.deinit(allocator);
+    }
+    try stack.append(allocator, try allocator.dupe(u8, "."));
+
+    var index: usize = 0;
+    while (index < stack.items.len and paths.items.len < max_paths) : (index += 1) {
+        const dir_path = stack.items[index];
+        const z_dir = try allocator.dupeZ(u8, dir_path);
+        defer allocator.free(z_dir);
+        const dir = c.opendir(z_dir.ptr) orelse continue;
+        defer _ = c.closedir(dir);
+
+        while (paths.items.len < max_paths) {
+            const entry = c.readdir(dir) orelse break;
+            const name = std.mem.sliceTo(entry.*.d_name[0..], 0);
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+
+            const child = if (std.mem.eql(u8, dir_path, "."))
+                try allocator.dupe(u8, name)
+            else
+                try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, name });
+            errdefer allocator.free(child);
+
+            if (skipPath(child)) {
+                allocator.free(child);
+                continue;
+            }
+
+            switch (entry.*.d_type) {
+                c.DT_DIR => try stack.append(allocator, child),
+                c.DT_REG => {
+                    if (looksLikeTextCode(child)) {
+                        try paths.append(allocator, child);
+                    } else {
+                        allocator.free(child);
+                    }
+                },
+                else => allocator.free(child),
+            }
+        }
     }
 }
 
@@ -487,10 +592,21 @@ fn normalizeRgPath(path: []const u8) []const u8 {
 }
 
 fn skipPath(path: []const u8) bool {
-    return std.mem.indexOf(u8, path, ".git/") != null or
+    return std.mem.eql(u8, path, ".git") or
+        std.mem.eql(u8, path, "zig-cache") or
+        std.mem.eql(u8, path, "zig-out") or
+        std.mem.eql(u8, path, "node_modules") or
+        std.mem.eql(u8, path, "bin") or
+        std.mem.eql(u8, path, ".phenom-zig") or
+        std.mem.eql(u8, path, ".phenom-context") or
+        std.mem.eql(u8, path, ".phenom-sessions") or
+        std.mem.indexOf(u8, path, ".git/") != null or
         std.mem.indexOf(u8, path, "zig-cache/") != null or
         std.mem.indexOf(u8, path, "zig-out/") != null or
         std.mem.indexOf(u8, path, "node_modules/") != null or
+        std.mem.indexOf(u8, path, ".phenom-zig/") != null or
+        std.mem.indexOf(u8, path, ".phenom-context/") != null or
+        std.mem.indexOf(u8, path, ".phenom-sessions/") != null or
         std.mem.indexOf(u8, path, "/bin/") != null or
         std.mem.startsWith(u8, path, "bin/");
 }
@@ -522,6 +638,18 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 
 fn cleanTerm(raw: []const u8) []const u8 {
     return std.mem.trim(u8, raw, " \t\r\n\"'`()[]{}<>:;,.!?");
+}
+
+fn isSearchableTerm(term: []const u8) bool {
+    return isStructuredSearchTerm(term) or isPlainKeyword(term);
+}
+
+fn isPlainKeyword(term: []const u8) bool {
+    if (term.len < 3) return false;
+    for (term) |byte| {
+        if (byte < 0x80 and !std.ascii.isAlphabetic(byte) and byte != '_') return false;
+    }
+    return true;
 }
 
 fn isStructuredSearchTerm(term: []const u8) bool {
@@ -595,15 +723,15 @@ test "ranking with rg finds collect evidence implementation without raw output a
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "---BEGIN CONTENT---") == null);
 }
 
-test "auto ranking without structured terms falls back to workspace overview" {
+test "auto ranking discovers files via plain keywords when no structured terms exist" {
     var ranked = try rankForPrompt(std.testing.allocator, std.testing.io, "Analise esse projeto de forma breve", .auto, .{ .max_ranges = 3 });
     defer ranked.deinit(std.testing.allocator);
     try std.testing.expect(ranked.candidates.items.len > 0);
-    try std.testing.expectEqual(CandidateSource.workspace_overview, ranked.candidates.items[0].source);
-    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "workspace_overview_structure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "keyword_discovery") != null or
+        std.mem.indexOf(u8, ranked.audit_text, "workspace_overview") != null);
 }
 
-test "term extraction keeps structured symbols and ignores prose without stopword table" {
+test "term extraction keeps structured symbols and plain keywords" {
     var terms = TermList.init(std.testing.allocator);
     defer terms.deinit();
     try extractTerms(&terms, "Use collect_evidence com strategy auto sem path para RawContextLeak", .auto);
@@ -611,9 +739,9 @@ test "term extraction keeps structured symbols and ignores prose without stopwor
 
     try std.testing.expect(hasTerm(terms.items.items, "collect_evidence"));
     try std.testing.expect(hasTerm(terms.items.items, "RawContextLeak"));
-    try std.testing.expect(!hasTerm(terms.items.items, "Use"));
-    try std.testing.expect(!hasTerm(terms.items.items, "strategy"));
-    try std.testing.expect(!hasTerm(terms.items.items, "path"));
+    try std.testing.expect(hasTerm(terms.items.items, "Use"));
+    try std.testing.expect(hasTerm(terms.items.items, "strategy"));
+    try std.testing.expect(hasTerm(terms.items.items, "path"));
 }
 
 test "ranking score does not privilege language extension or penalize tests" {

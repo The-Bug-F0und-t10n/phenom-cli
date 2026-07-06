@@ -4,6 +4,7 @@ const contracts = @import("contracts.zig");
 pub const ToolCall = struct {
     name: []const u8,
     path: ?[]const u8 = null,
+    terms: ?[]const u8 = null,
     strategy: ?contracts.StrategyName = null,
     start_line: usize = 1,
     max_lines: usize = 12,
@@ -11,6 +12,7 @@ pub const ToolCall = struct {
     pub fn deinit(self: ToolCall, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         if (self.path) |path| allocator.free(path);
+        if (self.terms) |terms| allocator.free(terms);
     }
 };
 
@@ -25,11 +27,13 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
     const name_end = std.mem.indexOfScalar(u8, body[name_start..], '>') orelse return null;
     const name = std.mem.trim(u8, body[name_start .. name_start + name_end], " \r\n\t");
     const path = normalizeOptionalPath(parseParameter(body, "path"));
+    const terms = normalizeOptionalText(parseParameter(body, "terms"));
     const strategy = try parseStrategyParameter(body);
 
     return .{
         .name = try allocator.dupe(u8, name),
         .path = if (path) |value| try allocator.dupe(u8, value) else null,
+        .terms = if (terms) |value| try allocator.dupe(u8, value) else null,
         .strategy = strategy,
         .start_line = parseIntParameter(body, "start_line") orelse 1,
         .max_lines = parseIntParameter(body, "max_lines") orelse 12,
@@ -46,6 +50,10 @@ fn parseParameter(body: []const u8, comptime name: []const u8) ?[]const u8 {
 }
 
 fn normalizeOptionalPath(value: ?[]const u8) ?[]const u8 {
+    return normalizeOptionalText(value);
+}
+
+fn normalizeOptionalText(value: ?[]const u8) ?[]const u8 {
     const path = value orelse return null;
     if (path.len == 0) return null;
     if (std.ascii.eqlIgnoreCase(path, "none")) return null;
@@ -98,6 +106,7 @@ test "parses qwopus xml tool call" {
     defer call.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("read_file_range", call.name);
     try std.testing.expectEqualStrings("README.md", call.path.?);
+    try std.testing.expect(call.terms == null);
     try std.testing.expectEqual(contracts.StrategyName.path, call.strategy.?);
     try std.testing.expectEqual(@as(usize, 2), call.start_line);
     try std.testing.expectEqual(@as(usize, 5), call.max_lines);
@@ -164,4 +173,21 @@ test "collect evidence path none is treated as missing path" {
     try std.testing.expectEqualStrings("collect_evidence", call.name);
     try std.testing.expect(call.path == null);
     try std.testing.expectEqual(contracts.StrategyName.auto, call.strategy.?);
+}
+
+test "collect evidence owns model search terms" {
+    var output = try std.testing.allocator.dupe(u8,
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=strategy>auto</parameter>
+        \\<parameter=terms>CLI render output function</parameter>
+        \\</function>
+        \\</tool_call>
+    );
+    defer std.testing.allocator.free(output);
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    output[80] = 'X';
+    try std.testing.expectEqualStrings("collect_evidence", call.name);
+    try std.testing.expectEqualStrings("CLI render output function", call.terms.?);
 }

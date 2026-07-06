@@ -8265,3 +8265,109 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 620 --prompt 'Analise esse projeto e me diga, em termos simples, o que ele faz. Termine exatamente com: PHENOM_PREFLIGHT_272' --expect-contains PHENOM_PREFLIGHT_272 --show-expect-status --fail-on-model-error --session preflight-272` -> passou; renderizou `collect_evidence: preflight:auto` e respondeu com marcador.
 - `sqlite3 phenom-zig/.phenom-zig/phenom.db "select 'tool_start', count(*) from events where session='preflight-272' and kind='tool_start'; select 'evidence', count(*) from events where session='preflight-272' and kind='evidence'; select 'raw_marker', count(*) from events where session='preflight-272' and body like '%---BEGIN CONTENT---%'; select 'model_context_evidence', count(*) from events where session='preflight-272' and kind='model_context' and body like '%[EVIDENCE]%';"` -> retornou `1`, `1`, `0`, `1`.
+
+## T273 - Corrigir fluxo de intent do modelo antes da coleta de evidencia
+
+Status: implemented-verified.
+
+Motivacao: teste de producao mostrou que a T272 corrigiu uma falha operacional, mas pelo caminho errado. O log real:
+
+```text
+> [ashirak] o que este projeto implementa em cwd ?
+
+│ thinking
+│ ... não há contexto fornecido ...
+
+Não tenho contexto sobre qual projeto você está se referindo.
+```
+
+provou que o tool loop ainda dependia de `PHENOM_TOOL_LOOP_V1` em producao. A primeira reacao de transformar isso em config/flag tambem estava errada: tool loop nao e opcao, e regra de negocio intrinseca do Phenom. A correcao final precisa respeitar o fluxo definido pelo projeto:
+
+1. `prompt -> model intent of user query`;
+2. `model intent -> agent process contract/strategies`;
+3. `contract/strategies -> micro-context/evidence`;
+4. `model process evidence/context`;
+5. `loop inference`.
+
+Evidencia:
+
+- O audit e as tasks descrevem contratos como endpoints model-visible e estrategias como funcoes do contrato.
+- O modelo deve expressar a intencao de busca no proprio tool call; o agente nao deve adivinhar termos pelo prompt original.
+- O log de producao sem env nao executou `collect_evidence`, portanto o contrato nao era intrinseco.
+- O erro posterior `collect_evidence preflight:auto StreamTooLong` mostrou que preflight amplo do controller tambem era errado: alem de pular a intencao do modelo, podia varrer workspace demais.
+- `std.Io.Dir.cwd().walk(std.testing.io)` gerou `BADF`, mostrando outro bug baixo nivel no inventario estrutural.
+
+Impacto esperado:
+
+- Chat real sempre carrega schema de `collect_evidence` e bufferiza possivel tool call; nao ha `PHENOM_TOOL_LOOP_V1`, config `tool_loop` ou flag `--no-tool-loop`.
+- O primeiro passo de contexto e model-visible: o modelo infere a intencao e chama `collect_evidence`.
+- `collect_evidence` aceita `terms` opcional, owned, vindo do modelo.
+- O ranker usa `terms` como consulta; se `terms` nao vier, `auto` cai para inventario estrutural neutro, nao para keywords do prompt do usuario.
+- Inventario estrutural nao usa stdout gigante (`rg --files`/preflight amplo); usa `opendir/readdir` com budget de paths e ignora storage operacional.
+- `StreamTooLong` em keyword discovery deixa de derrubar o turno; vira ausencia de candidatos naquela fase.
+
+Teste primeiro:
+
+- `tool_call` prova parse e ownership de `<parameter=terms>...</parameter>`.
+- `collect_evidence` prova que `terms` guia ranking lexical/auto.
+- `collect_evidence(auto)` sem `terms` prova fallback para `workspace_overview`, com `terms=0` auditado.
+- `evidence_ranker` prova que inventario estrutural nao depende de `std.Io.Dir.walk`.
+- `main` prova que schema contem `terms` e que tool loop nao depende de env.
+- Smoke real sem `PHENOM_TOOL_LOOP_V1` deve executar `collect_evidence`, responder e auditar `tool_error=0`.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: remover dependencia de `toolLoopEnabled`/`PHENOM_TOOL_LOOP_V1`; chat real sempre usa tool loop.
+- `phenom-zig/src/main.zig`: remover preflight do controller criado na T272; contexto inicial volta a conter contrato, nao evidencia pre-coletada.
+- `phenom-zig/src/main.zig`: atualizar schema para `collect_evidence(path?, terms?, strategy=auto|path|lexical, ...)`.
+- `phenom-zig/src/tool_call.zig`: adicionar `terms` owned em `ToolCall`, parser XML e `deinit`.
+- `phenom-zig/src/collect_evidence.zig`: adicionar `Args.terms`; ranking usa `terms`, nao `task`.
+- `phenom-zig/src/evidence_ranker.zig`: limitar stdout de `rg -c`; `StreamTooLong` nao vira erro fatal.
+- `phenom-zig/src/evidence_ranker.zig`: trocar `std.Io.Dir.walk` por inventario C `opendir/readdir`, limitado por budget.
+- `phenom-zig/src/evidence_ranker.zig`: ignorar `.git`, caches, build output e storages operacionais `.phenom-*`.
+
+Passos de implementacao:
+
+1. Remover opcionalidade de tool loop.
+2. Remover preflight automatico do controller.
+3. Adicionar `terms` ao contrato e ao parser.
+4. Propagar `terms` para executor e ranker.
+5. Corrigir inventario estrutural para nao gerar `StreamTooLong` nem `BADF`.
+6. Validar offline, build release e smoke real sem env.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Ownership: `ToolCall.terms` e duplicado no parser e liberado em `deinit`.
+- Ownership: dedupe de tool call duplica `terms` e libera em `ToolCallKey.deinit`.
+- C interop: cada `opendir` bem-sucedido tem `closedir`; strings `dupeZ` sao liberadas.
+- Bounds: inventario estrutural para em `max_candidates * 8`; keyword discovery tem `stdout_limit`.
+- Segurança/contexto: `.git`, `zig-cache`, `zig-out`, `node_modules`, `bin`, `.phenom-zig`, `.phenom-context` e `.phenom-sessions` sao ignorados no inventario.
+- Regra de negocio: agente nao interpreta prompt original como query; `terms` vem do modelo. Sem `terms`, `auto` usa overview estrutural auditado.
+
+Criterio de aceite:
+
+- `zig test src/tool_call.zig -lc` passa.
+- `zig test src/evidence_ranker.zig -lc` passa.
+- `zig test src/collect_evidence.zig -lc` passa.
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real sem env executa `collect_evidence` e nao mostra `StreamTooLong`.
+- SQLite do smoke real mostra `tool_start=1`, `tool_error=0`, `raw_marker=0`, `terms_marker=1`.
+
+Pendencias deliberadas:
+
+- A resposta real ainda depende da qualidade dos `terms` que o modelo escolhe; isso e desejado pelo fluxo, mas a proxima evolucao deve melhorar o schema compacto e exemplos para induzir termos mais especificos.
+- Contratos dinamicos alem de `collect_evidence` continuam pendentes; nao foram falsamente anunciados.
+- Groundedness por claims/citacoes ainda falta para impedir extrapolacao fina em texto final.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_call.zig -lc` -> passou; 12 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/evidence_ranker.zig -lc` -> passou; 12 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc` -> passou; 34 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 134 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 620 --prompt 'o que este projeto implementa em cwd ?' --session flow-terms-273 --fail-on-model-error` -> passou sem env; renderizou `collect_evidence: auto`, respondeu e nao mostrou `StreamTooLong`.
+- `sqlite3 .phenom-zig/phenom.db "select 'tool_start', count(*) from events where session='flow-terms-273' and kind='tool_start'; select 'tool_error', count(*) from events where session='flow-terms-273' and kind='tool_error'; select 'raw_marker', count(*) from events where session='flow-terms-273' and body like '%---BEGIN CONTENT---%'; select 'terms_marker', count(*) from events where session='flow-terms-273' and body like '%terms=%';"` -> retornou `1`, `0`, `0`, `1`.
