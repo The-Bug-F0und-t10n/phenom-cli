@@ -10,6 +10,8 @@ pub const ToolSpec = struct {
     visibility: ToolVisibility,
 };
 
+pub const manifest_version = "contracts.v1";
+
 pub const ContractName = enum {
     collect_evidence,
     mutate_file,
@@ -38,6 +40,25 @@ pub const StrategySpec = struct {
     contract: ContractName,
     strategy: StrategyName,
     max_budget_bytes: usize,
+};
+
+pub const ContractSpec = struct {
+    name: ContractName,
+    endpoint: []const u8,
+    allowed_tools: []const []const u8,
+};
+
+pub const ActiveContract = struct {
+    name: ContractName,
+    version: []const u8,
+    allowed_tools: []const []const u8,
+
+    pub fn allows(self: ActiveContract, tool_name: []const u8) bool {
+        for (self.allowed_tools) |allowed| {
+            if (std.mem.eql(u8, tool_name, allowed)) return true;
+        }
+        return false;
+    }
 };
 
 pub const all_tools = [_]ToolSpec{
@@ -98,6 +119,14 @@ pub const all_tools = [_]ToolSpec{
     .{ .name = "git_commit", .visibility = .internal_context },
 };
 
+pub const contract_specs = [_]ContractSpec{
+    .{
+        .name = .collect_evidence,
+        .endpoint = "collect_evidence",
+        .allowed_tools = &.{"collect_evidence"},
+    },
+};
+
 pub const strategy_specs = [_]StrategySpec{
     .{ .contract = .collect_evidence, .strategy = .auto, .max_budget_bytes = 3800 },
     .{ .contract = .collect_evidence, .strategy = .path, .max_budget_bytes = 3800 },
@@ -138,6 +167,18 @@ pub fn resolveCollectEvidenceStrategy(requested: ?StrategyName) StrategyName {
     return .auto;
 }
 
+pub fn activeContract(name: ContractName) ?ActiveContract {
+    for (contract_specs) |spec| {
+        if (spec.name != name) continue;
+        return .{
+            .name = spec.name,
+            .version = manifest_version,
+            .allowed_tools = spec.allowed_tools,
+        };
+    }
+    return null;
+}
+
 pub fn compactModelVisibleTools(allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -173,6 +214,14 @@ test "collect evidence accepts bounded strategies without expanding tool surface
     try std.testing.expect(strategyAllowed(.collect_evidence, .semantic));
     try std.testing.expect(!strategyAllowed(.collect_evidence, .news_table));
     try std.testing.expectEqual(StrategyName.auto, resolveCollectEvidenceStrategy(.news_table));
+}
+
+test "active collect evidence contract comes from manifest allowlist" {
+    const active = activeContract(.collect_evidence) orelse return error.MissingContract;
+    try std.testing.expectEqualStrings(manifest_version, active.version);
+    try std.testing.expect(active.allows("collect_evidence"));
+    try std.testing.expect(!active.allows("content"));
+    try std.testing.expect(!active.allows("grep_file"));
 }
 
 test "compact model visible tools excludes internal collectors" {

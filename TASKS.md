@@ -7827,3 +7827,87 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --prompt 'Use collect_evidence no arquivo README.md e depois responda exatamente: PHENOM_ENVELOPE_267' --expect-contains PHENOM_ENVELOPE_267 --show-expect-status --fail-on-model-error --session envelope-267` -> passou; renderizou um unico `collect_evidence README.md` e resposta final `PHENOM_ENVELOPE_267`.
 - `sqlite3 .phenom-zig/phenom.db "select kind, substr(body,1,180) from events where session='envelope-267' and kind in ('tool_envelope','tool_rejected','tool_start','tool_event','evidence','assistant_delta','turn_done') order by id;"` -> mostrou `tool_envelope state=accepted`, `tool_start collect_evidence README.md`, `tool_event`, `evidence`, `assistant_delta PHENOM_ENVELOPE_267` e `turn_done status=ok`.
+
+## T268 - Mover contrato ativo para manifesto versionado
+
+Status: implemented-verified.
+
+Motivacao: T267 criou o envelope, mas deixou `ActiveContract.collectEvidence()` dentro de `tool_envelope.zig`. Isso ainda misturava parser/gate com definicao de contrato. A regra de negocio pede contratos como endpoints versionados e auditaveis; o envelope deve validar contra um contrato recebido, nao possuir a surface por conta propria.
+
+Evidencia:
+
+- `TASKS.md` T035 pede manifesto pequeno de contratos como endpoints.
+- `TASKS.md` T036 pede registry separado para estrategias por contrato.
+- `TASKS.md` T267 registrou como pendencia que `ActiveContract.collectEvidence()` ainda era fixo e deveria ir para manifesto/versionamento.
+- `phenom-zig/src/tool_envelope.zig` importava `gate.zig` e possuia a allowlist `&.{"collect_evidence"}` localmente.
+- `phenom-zig/src/main.zig` chamava diretamente `tool_envelope.ActiveContract.collectEvidence()`.
+
+Impacto esperado:
+
+- `contracts.zig` passa a ser dono de `manifest_version`, `ContractSpec` e `ActiveContract`.
+- `tool_envelope.zig` deixa de conhecer a allowlist e apenas valida `active_contract.allows(call.name)`.
+- Audit de envelope inclui `version=contracts.v1`.
+- Comportamento externo permanece igual: apenas `collect_evidence` executa no contrato ativo atual.
+- A proxima task pode trocar `currentActiveContract()` por estado real de `set_operational_contract` sem mexer no parser.
+
+Teste primeiro:
+
+- Teste em `contracts.zig` prova que o contrato ativo vem do manifesto, aceita `collect_evidence` e rejeita `content`/`grep_file`.
+- Teste de envelope continua provando rejeicao de tool nao anunciada.
+- Teste de envelope prova que audit registra `version=contracts.v1`.
+- Teste principal garante que o loop real continua funcionando.
+
+Implementacao:
+
+- `phenom-zig/src/contracts.zig`: adicionar `manifest_version = "contracts.v1"`.
+- `phenom-zig/src/contracts.zig`: criar `ContractSpec`, `ActiveContract`, `contract_specs` e `activeContract`.
+- `phenom-zig/src/contracts.zig`: adicionar `ActiveContract.allows`.
+- `phenom-zig/src/tool_envelope.zig`: remover `ActiveContract` local e import direto de `gate.zig`.
+- `phenom-zig/src/tool_envelope.zig`: aceitar `contracts.ActiveContract` e renderizar version no audit.
+- `phenom-zig/src/main.zig`: adicionar `currentActiveContract()` como ponto unico temporario.
+
+Passos de implementacao:
+
+1. Criar contrato ativo no manifesto.
+2. Migrar allowlist local do envelope para `contracts.zig`.
+3. Atualizar envelope para depender de `contracts.ActiveContract`.
+4. Registrar versao no audit de envelope.
+5. Atualizar `main.zig` para obter o contrato ativo por helper unico.
+6. Rodar testes focados, suite principal, build release e smoke real.
+7. Consultar SQLite para provar `tool_envelope version=contracts.v1`.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: `ActiveContract` usa slices estaticos do manifesto; nao introduz alocacao nem ownership novo.
+- Ownership: `ToolCallEnvelope` continua owning apenas `raw_name` e `ToolCall`.
+- Bounds: `contract_specs` e allowlists sao arrays estaticos pequenos.
+- Regra de negocio: contrato ativo agora e dado operacional, nao detalhe do parser.
+- Audit: replay passa a saber qual versao de contrato validou a chamada.
+- Compatibilidade: `collect_evidence` continua sendo a unica tool permitida no loop real.
+
+Criterio de aceite:
+
+- `zig test src/contracts.zig -lc` passa.
+- `zig test src/tool_envelope.zig -lc` passa.
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real passa e audit contem `tool_envelope contract=collect_evidence version=contracts.v1`.
+
+Pendencias deliberadas:
+
+- `currentActiveContract()` ainda retorna sempre `collect_evidence`; falta estado real por turno.
+- `set_operational_contract` ainda nao executa nem altera surface.
+- O manifesto ainda nao serializa descricoes/inputSchema/outputSchema; isso fica para T035 completo.
+- Smoke real mostrou que, mesmo pedindo `README.md`, o modelo escolheu `strategy=auto`; isso nao quebra T268, mas indica que o schema/contrato ainda precisa de parametros tipados como `target/path` e reparo quando o pedido do usuario inclui arquivo explicito.
+- Native tools ainda nao passam pelo envelope.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/contracts.zig -lc` -> passou; 5 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_envelope.zig -lc` -> passou; 15 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 128 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --prompt 'Use collect_evidence no arquivo README.md e depois responda exatamente: PHENOM_CONTRACT_268' --expect-contains PHENOM_CONTRACT_268 --show-expect-status --fail-on-model-error --session contract-268` -> passou; resposta final `PHENOM_CONTRACT_268`.
+- `sqlite3 .phenom-zig/phenom.db "select kind, substr(body,1,220) from events where session='contract-268' and kind in ('tool_envelope','tool_rejected','tool_start','tool_event','evidence','assistant_delta','turn_done') order by id;"` -> mostrou `tool_envelope contract=collect_evidence version=contracts.v1`, `tool_start collect_evidence auto`, `tool_event`, `evidence`, `assistant_delta PHENOM_CONTRACT_268` e `turn_done status=ok`.

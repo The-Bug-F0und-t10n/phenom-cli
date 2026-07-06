@@ -370,7 +370,8 @@ fn runToolLoopIterations(
     ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
     first_sink: *StreamSink,
 ) !bool {
-    var maybe_envelope = tool_envelope.parseFirst(allocator, model_output, tool_envelope.ActiveContract.collectEvidence()) catch |err| {
+    const active_contract = currentActiveContract();
+    var maybe_envelope = tool_envelope.parseFirst(allocator, model_output, active_contract) catch |err| {
         try db.recordEvent(config.session, "tool_envelope_error", @errorName(err));
         return true;
     };
@@ -419,7 +420,7 @@ fn runToolLoopIterations(
             .final_answer => return true,
             .stopped => return true,
             .tool_call => |next_call| {
-                maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, tool_envelope.ActiveContract.collectEvidence(), next_call);
+                maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, active_contract, next_call);
                 continue;
             },
         }
@@ -574,7 +575,7 @@ fn streamDeferredToolLoopTurn(
     try client.streamInference(.{ .user_prompt = prompt, .model_context = follow_context }, &follow_sink);
     try follow_sink.flush();
 
-    var envelope = (tool_envelope.parseFirst(allocator, follow_sink.raw_visible.items, tool_envelope.ActiveContract.collectEvidence()) catch |err| {
+    var envelope = (tool_envelope.parseFirst(allocator, follow_sink.raw_visible.items, currentActiveContract()) catch |err| {
         try db.recordEvent(config.session, "tool_envelope_error", @errorName(err));
         return .stopped;
     }) orelse {
@@ -597,6 +598,10 @@ fn streamDeferredToolLoopTurn(
     if (envelope.takeCall()) |call| return .{ .tool_call = call };
     try db.recordEvent(config.session, "tool_rejected", "accepted envelope without call");
     return .stopped;
+}
+
+fn currentActiveContract() contracts.ActiveContract {
+    return contracts.activeContract(.collect_evidence).?;
 }
 
 const ToolCallKey = struct {

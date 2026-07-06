@@ -1,7 +1,6 @@
 const std = @import("std");
 
 const contracts = @import("contracts.zig");
-const gate = @import("gate.zig");
 const tool_call = @import("tool_call.zig");
 
 pub const Source = enum {
@@ -21,18 +20,6 @@ pub const RejectionReason = enum {
     tool_not_advertised,
     invalid_strategy,
     parse_error,
-};
-
-pub const ActiveContract = struct {
-    name: contracts.ContractName,
-    allowed_tools: []const []const u8,
-
-    pub fn collectEvidence() ActiveContract {
-        return .{
-            .name = .collect_evidence,
-            .allowed_tools = &.{"collect_evidence"},
-        };
-    }
 };
 
 pub const ToolCallEnvelope = struct {
@@ -69,14 +56,14 @@ pub const ToolCallEnvelope = struct {
     pub fn renderAudit(self: ToolCallEnvelope, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(
             allocator,
-            "contract={s} source={s} parse={s} raw_name={s} state={s}",
-            .{ @tagName(self.contract), @tagName(self.source), @tagName(self.parse_strategy), self.raw_name, self.auditText() },
+            "contract={s} version={s} source={s} parse={s} raw_name={s} state={s}",
+            .{ @tagName(self.contract), contracts.manifest_version, @tagName(self.source), @tagName(self.parse_strategy), self.raw_name, self.auditText() },
         );
     }
 
     pub fn fromAcceptedCall(
         allocator: std.mem.Allocator,
-        active_contract: ActiveContract,
+        active_contract: contracts.ActiveContract,
         call: tool_call.ToolCall,
     ) !ToolCallEnvelope {
         errdefer call.deinit(allocator);
@@ -96,7 +83,7 @@ pub const ToolCallEnvelope = struct {
 pub fn parseFirst(
     allocator: std.mem.Allocator,
     output: []const u8,
-    active_contract: ActiveContract,
+    active_contract: contracts.ActiveContract,
 ) !?ToolCallEnvelope {
     const parsed = tool_call.parseFirst(allocator, output) catch |err| switch (err) {
         error.InvalidStrategy => return try rejectedParse(allocator, active_contract, .invalid_strategy),
@@ -105,7 +92,7 @@ pub fn parseFirst(
     const call = parsed orelse return null;
     errdefer call.deinit(allocator);
 
-    if (!gate.isAllowed(call.name, active_contract.allowed_tools)) {
+    if (!active_contract.allows(call.name)) {
         return try rejectedCall(allocator, active_contract, call, .tool_not_advertised);
     }
 
@@ -114,7 +101,7 @@ pub fn parseFirst(
 
 fn rejectedCall(
     allocator: std.mem.Allocator,
-    active_contract: ActiveContract,
+    active_contract: contracts.ActiveContract,
     call: tool_call.ToolCall,
     reason: RejectionReason,
 ) !ToolCallEnvelope {
@@ -132,7 +119,7 @@ fn rejectedCall(
 
 fn rejectedParse(
     allocator: std.mem.Allocator,
-    active_contract: ActiveContract,
+    active_contract: contracts.ActiveContract,
     reason: RejectionReason,
 ) !?ToolCallEnvelope {
     return .{
@@ -146,6 +133,7 @@ fn rejectedParse(
 }
 
 test "announced collect evidence is accepted" {
+    const active = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
     const output =
         \\<tool_call>
         \\<function=collect_evidence>
@@ -153,7 +141,7 @@ test "announced collect evidence is accepted" {
         \\</function>
         \\</tool_call>
     ;
-    var envelope = (try parseFirst(std.testing.allocator, output, ActiveContract.collectEvidence())) orelse return error.NoToolCall;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
     defer envelope.deinit(std.testing.allocator);
     try std.testing.expectEqual(State.accepted, envelope.state);
     try std.testing.expect(envelope.call != null);
@@ -161,6 +149,7 @@ test "announced collect evidence is accepted" {
 }
 
 test "tool not announced is rejected before execution" {
+    const active = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
     const output =
         \\<tool_call>
         \\<function=content>
@@ -168,7 +157,7 @@ test "tool not announced is rejected before execution" {
         \\</function>
         \\</tool_call>
     ;
-    var envelope = (try parseFirst(std.testing.allocator, output, ActiveContract.collectEvidence())) orelse return error.NoToolCall;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
     defer envelope.deinit(std.testing.allocator);
     try std.testing.expectEqual(State.rejected, envelope.state);
     try std.testing.expectEqual(RejectionReason.tool_not_advertised, envelope.rejection_reason.?);
@@ -177,6 +166,7 @@ test "tool not announced is rejected before execution" {
 }
 
 test "invalid strategy is a rejected envelope" {
+    const active = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
     const output =
         \\<tool_call>
         \\<function=collect_evidence>
@@ -184,24 +174,26 @@ test "invalid strategy is a rejected envelope" {
         \\</function>
         \\</tool_call>
     ;
-    var envelope = (try parseFirst(std.testing.allocator, output, ActiveContract.collectEvidence())) orelse return error.NoToolCall;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
     defer envelope.deinit(std.testing.allocator);
     try std.testing.expectEqual(State.rejected, envelope.state);
     try std.testing.expectEqual(RejectionReason.invalid_strategy, envelope.rejection_reason.?);
 }
 
 test "envelope audit records contract source parser name and state" {
+    const active = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
     const output =
         \\<tool_call>
         \\<function=collect_evidence>
         \\</function>
         \\</tool_call>
     ;
-    var envelope = (try parseFirst(std.testing.allocator, output, ActiveContract.collectEvidence())) orelse return error.NoToolCall;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
     defer envelope.deinit(std.testing.allocator);
     const audit = try envelope.renderAudit(std.testing.allocator);
     defer std.testing.allocator.free(audit);
     try std.testing.expect(std.mem.indexOf(u8, audit, "contract=collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit, "version=contracts.v1") != null);
     try std.testing.expect(std.mem.indexOf(u8, audit, "source=text_protocol") != null);
     try std.testing.expect(std.mem.indexOf(u8, audit, "parse=qwopus_xml") != null);
     try std.testing.expect(std.mem.indexOf(u8, audit, "raw_name=collect_evidence") != null);
