@@ -7620,7 +7620,7 @@ Teste primeiro:
 
 Implementacao:
 
-- `phenom-zig/src/evidence_ranker.zig`: novo modulo com extração de termos, stopwords, ordenacao por especificidade, chamada `std.process.run` para `rg`, fallback scan, score, reasons, merge e audit.
+- `phenom-zig/src/evidence_ranker.zig`: novo modulo com extracao de termos estruturais, ordenacao por especificidade, chamada `std.process.run` para `rg`, fallback scan, score, reasons, merge e audit.
 - `phenom-zig/src/collect_evidence.zig`: `Args.path` virou opcional, `Args.task` foi adicionado, `execute` recebe `std.Io`, e estrategias ranqueadas geram EvidencePacket multi-range.
 - `phenom-zig/src/main.zig`: tool loop passa `io`, schema compacto anuncia `auto|path|lexical|symbol|semantic|diagnostic|runtime|diff`, e limite principal passa a ser budget/qualidade.
 - `phenom-zig/src/tool_call.zig`: normaliza `path=None|null|undefined` para path ausente.
@@ -7629,8 +7629,8 @@ Implementacao:
 Passos de implementacao:
 
 1. Criar ranker deterministico baseado em `rg`.
-2. Extrair termos do prompt e filtrar stopwords.
-3. Priorizar termos especificos como `collect_evidence` sobre palavras comuns.
+2. Extrair apenas termos estruturais do prompt, sem stopwords linguisticas.
+3. Priorizar termos especificos como `collect_evidence`, paths, extensoes, simbolos e diagnosticos.
 4. Pontuar candidatos por match, path, definicao, estrategia e penalidade de teste/cache.
 5. Fundir ranges sobrepostos/adjacentes.
 6. Gerar audit compacto de ranking.
@@ -7740,3 +7740,90 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 127 testes.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+
+## T267 - Criar `ToolCallEnvelope` antes do executor real
+
+Status: implemented-verified.
+
+Motivacao: o audit aponta que uma saida real ja foi interpretada como tool `content`, fora das tools anunciadas. T263/T264/T265 fecharam o loop controlado de `collect_evidence`, mas o parser ainda retornava `ToolCall` direto para o loop real. Isso era suficiente para uma tool unica, mas nao e robusto para a proxima etapa de contratos: toda chamada precisa passar por um envelope tipado, validado contra o contrato ativo e auditado antes de qualquer executor.
+
+Evidencia:
+
+- `doc/AGENTE_AI_BAIXO_CONSUMO_TOKENS_AUDIT.md` exige que tool call extraida exista na allowlist anunciada e que tool inexistente vire protocol repair/rejection, nunca execucao.
+- `TASKS.md` PR002/T010-T014 pedem `ToolCallEnvelope` com origem, estrategia de parser, nome bruto, estado e motivo de rejeicao.
+- `phenom-zig/src/main.zig` chamava `tool_call.parseFirst` diretamente em `runToolLoopIterations` e `streamDeferredToolLoopTurn`.
+- O gate existia, mas estava dentro de `runOneToolLoopStep`; isso ainda deixava parser, gate e audit sem uma fronteira unica.
+
+Impacto esperado:
+
+- Toda tool textual passa por `ToolCallEnvelope` antes do executor.
+- Tool fora do contrato ativo vira `tool_rejected` com `rejected/tool_not_advertised`.
+- Estrategia invalida vira envelope rejeitado com `rejected/invalid_strategy`.
+- O SQLite registra `tool_envelope` com contrato, source, parser, raw name e estado.
+- `collect_evidence` continua sendo a unica tool executavel do contrato ativo atual.
+- O fluxo real continua funcionando com modelo e backend, sem vazar XML de tool call no output.
+
+Teste primeiro:
+
+- Teste de envelope aceita `collect_evidence` anunciado.
+- Teste de envelope rejeita `content` antes de executor.
+- Teste de envelope transforma estrategia invalida em rejeicao auditavel.
+- Teste de audit do envelope registra contrato, source, parser, raw name e state.
+- Teste principal garante que o loop existente continua passando.
+- Smoke real garante que o modelo ainda chama `collect_evidence`, recebe evidencia e finaliza.
+
+Implementacao:
+
+- `phenom-zig/src/tool_envelope.zig`: criar `ToolCallEnvelope`, `ActiveContract`, `Source`, `ParseStrategy`, `State` e `RejectionReason`.
+- `phenom-zig/src/tool_envelope.zig`: validar chamada extraida contra `ActiveContract.collectEvidence()`.
+- `phenom-zig/src/tool_envelope.zig`: adicionar `renderAudit` e `takeCall` para ownership explicito.
+- `phenom-zig/src/main.zig`: substituir parse direto por envelope em `runToolLoopIterations`.
+- `phenom-zig/src/main.zig`: substituir parse direto por envelope em `streamDeferredToolLoopTurn`.
+- `phenom-zig/src/main.zig`: registrar `tool_envelope` antes de executar ou rejeitar.
+
+Passos de implementacao:
+
+1. Criar modulo isolado de envelope.
+2. Mover allowlist do primeiro contrato para `ActiveContract.collectEvidence`.
+3. Converter erros de parse/strategy em estado rejeitado.
+4. Auditar todo envelope aceito ou rejeitado.
+5. Integrar envelope no primeiro output do modelo.
+6. Integrar envelope nos follow-ups apos evidencia.
+7. Rodar testes focados, suite principal, build release e smoke real.
+8. Consultar SQLite para provar `tool_envelope -> tool_start -> evidence -> assistant_delta`.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: `ToolCallEnvelope.deinit` libera `raw_name` e libera `ToolCall` se ainda nao foi consumido.
+- Ownership: `takeCall` zera `self.call`, evitando double free quando o loop assume ownership.
+- Erro de alocacao: `fromAcceptedCall` usa `errdefer call.deinit`, evitando leak se `raw_name` falhar.
+- Rejeicao: `rejectedCall` duplica `raw_name` e libera a `ToolCall` rejeitada antes de retornar.
+- Bounds: nenhuma nova estrutura cresce por turno; envelope e liberado a cada iteracao.
+- Regra de negocio: controller nao infere direcao por prompt; apenas valida se a tool chamada pertence ao contrato ativo.
+- Audit: rejeicao nao cria `tool_start`, `tool_event` nem `evidence`.
+
+Criterio de aceite:
+
+- `zig test src/tool_envelope.zig -lc` passa.
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real com `collect_evidence README.md` passa e registra `tool_envelope state=accepted`.
+- Query SQLite do smoke mostra `tool_envelope`, `tool_start`, `tool_event`, `evidence`, `assistant_delta` e `turn_done`.
+
+Pendencias deliberadas:
+
+- Ainda nao existe `set_operational_contract` real com mudanca dinamica de surface por turno.
+- `ActiveContract.collectEvidence()` ainda e fixo; a proxima task deve mover isso para manifesto/versionamento de contratos.
+- Ainda nao ha repair model-visible para tool nao anunciada; por enquanto rejeita e audita.
+- Native tool calls ainda precisam passar pelo mesmo envelope quando forem reintroduzidas.
+- Mutacao/validacao/runtime continuam fora do contrato executavel ate o micro-contexto e stale patch estarem completos.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_envelope.zig -lc` -> passou; 15 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 127 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --prompt 'Use collect_evidence no arquivo README.md e depois responda exatamente: PHENOM_ENVELOPE_267' --expect-contains PHENOM_ENVELOPE_267 --show-expect-status --fail-on-model-error --session envelope-267` -> passou; renderizou um unico `collect_evidence README.md` e resposta final `PHENOM_ENVELOPE_267`.
+- `sqlite3 .phenom-zig/phenom.db "select kind, substr(body,1,180) from events where session='envelope-267' and kind in ('tool_envelope','tool_rejected','tool_start','tool_event','evidence','assistant_delta','turn_done') order by id;"` -> mostrou `tool_envelope state=accepted`, `tool_start collect_evidence README.md`, `tool_event`, `evidence`, `assistant_delta PHENOM_ENVELOPE_267` e `turn_done status=ok`.

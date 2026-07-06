@@ -16,6 +16,7 @@ const persistent_context = @import("persistent_context.zig");
 const reasoning_filter = @import("reasoning_filter.zig");
 const render = @import("render.zig");
 const tool_call = @import("tool_call.zig");
+const tool_envelope = @import("tool_envelope.zig");
 const tool_event = @import("tool_event.zig");
 const tool_loop = @import("tool_loop.zig");
 const tools = @import("tools.zig");
@@ -369,18 +370,34 @@ fn runToolLoopIterations(
     ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
     first_sink: *StreamSink,
 ) !bool {
-    var maybe_call = tool_call.parseFirst(allocator, model_output) catch |err| {
-        try db.recordEvent(config.session, "tool_parse_error", @errorName(err));
+    var maybe_envelope = tool_envelope.parseFirst(allocator, model_output, tool_envelope.ActiveContract.collectEvidence()) catch |err| {
+        try db.recordEvent(config.session, "tool_envelope_error", @errorName(err));
         return true;
     };
-    if (maybe_call == null) return false;
+    if (maybe_envelope == null) return false;
 
     var tool_iterations: usize = 0;
     var repairs: usize = 0;
     var state = ToolLoopState.init(allocator);
     defer state.deinit();
-    while (maybe_call) |call_value| {
-        var call = call_value;
+    while (maybe_envelope) |envelope_value| {
+        var envelope = envelope_value;
+        defer envelope.deinit(allocator);
+        const envelope_audit = try envelope.renderAudit(allocator);
+        defer allocator.free(envelope_audit);
+        try db.recordEvent(config.session, "tool_envelope", envelope_audit);
+
+        if (envelope.state == .rejected) {
+            const body = try std.fmt.allocPrint(allocator, "{s}\t{s}", .{ envelope.raw_name, envelope.auditText() });
+            defer allocator.free(body);
+            try db.recordEvent(config.session, "tool_rejected", body);
+            return true;
+        }
+
+        var call = envelope.takeCall() orelse {
+            try db.recordEvent(config.session, "tool_rejected", "accepted envelope without call");
+            return true;
+        };
         defer call.deinit(allocator);
 
         const next = try runOneToolLoopStep(
@@ -402,7 +419,7 @@ fn runToolLoopIterations(
             .final_answer => return true,
             .stopped => return true,
             .tool_call => |next_call| {
-                maybe_call = next_call;
+                maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, tool_envelope.ActiveContract.collectEvidence(), next_call);
                 continue;
             },
         }
@@ -557,16 +574,29 @@ fn streamDeferredToolLoopTurn(
     try client.streamInference(.{ .user_prompt = prompt, .model_context = follow_context }, &follow_sink);
     try follow_sink.flush();
 
-    const next_call = tool_call.parseFirst(allocator, follow_sink.raw_visible.items) catch |err| {
-        try db.recordEvent(config.session, "tool_parse_error", @errorName(err));
+    var envelope = (tool_envelope.parseFirst(allocator, follow_sink.raw_visible.items, tool_envelope.ActiveContract.collectEvidence()) catch |err| {
+        try db.recordEvent(config.session, "tool_envelope_error", @errorName(err));
         return .stopped;
+    }) orelse {
+        try follow_sink.flushDeferredVisible();
+        try aggregate_sink.visible.appendSlice(allocator, follow_sink.visible.items);
+        aggregate_sink.visible_bytes += follow_sink.visible_bytes;
+        return .final_answer;
     };
-    if (next_call) |call| return .{ .tool_call = call };
+    defer envelope.deinit(allocator);
+    const envelope_audit = try envelope.renderAudit(allocator);
+    defer allocator.free(envelope_audit);
+    try db.recordEvent(config.session, "tool_envelope", envelope_audit);
 
-    try follow_sink.flushDeferredVisible();
-    try aggregate_sink.visible.appendSlice(allocator, follow_sink.visible.items);
-    aggregate_sink.visible_bytes += follow_sink.visible_bytes;
-    return .final_answer;
+    if (envelope.state == .rejected) {
+        const body = try std.fmt.allocPrint(allocator, "{s}\t{s}", .{ envelope.raw_name, envelope.auditText() });
+        defer allocator.free(body);
+        try db.recordEvent(config.session, "tool_rejected", body);
+        return .stopped;
+    }
+    if (envelope.takeCall()) |call| return .{ .tool_call = call };
+    try db.recordEvent(config.session, "tool_rejected", "accepted envelope without call");
+    return .stopped;
 }
 
 const ToolCallKey = struct {
@@ -670,20 +700,20 @@ fn renderCollectedEvidenceContext(
 
 fn collectEvidenceToolSchema() []const u8 {
     return
-        \\[TOOLS v1]
-        \\collect_evidence(path?, strategy=auto|path|lexical|symbol|semantic|diagnostic|runtime|diff, start_line=1, max_lines=12)
-        \\Use strategy=auto without path for ranked evidence. Use strategy=path only with path.
-        \\Format with path:
-        \\<tool_call>
-        \\<function=collect_evidence>
-        \\<parameter=path>relative/path</parameter>
-        \\<parameter=strategy>path</parameter>
-        \\<parameter=start_line>1</parameter>
-        \\<parameter=max_lines>12</parameter>
-        \\</function>
-        \\</tool_call>
-        \\Format ranked:
-        \\<tool_call><function=collect_evidence><parameter=strategy>auto</parameter></function></tool_call>
+    \\[TOOLS v1]
+    \\collect_evidence(path?, strategy=auto|path|lexical|symbol|semantic|diagnostic|runtime|diff, start_line=1, max_lines=12)
+    \\Use strategy=auto without path for ranked evidence. Use strategy=path only with path.
+    \\Format with path:
+    \\<tool_call>
+    \\<function=collect_evidence>
+    \\<parameter=path>relative/path</parameter>
+    \\<parameter=strategy>path</parameter>
+    \\<parameter=start_line>1</parameter>
+    \\<parameter=max_lines>12</parameter>
+    \\</function>
+    \\</tool_call>
+    \\Format ranked:
+    \\<tool_call><function=collect_evidence><parameter=strategy>auto</parameter></function></tool_call>
     ;
 }
 
