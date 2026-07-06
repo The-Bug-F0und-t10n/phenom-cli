@@ -6641,3 +6641,67 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 180 --prompt 'responda somente este markdown: ```diff\n--- a/app.ts\n+++ b/app.ts\n@@ -1 +1 @@\n-const value = "old";\n+const value = "new";\n```'` -> passou; transcript mostrou `const` em `38;2;164;142;199` e strings em `38;2;127;169;143` com background add/del.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.
+
+## T253 - Suavizar background do diff Markdown para o texto continuar sendo o foco
+
+Status: implemented-verified.
+
+Motivacao: depois da T252, o texto do diff preservava syntax highlight, mas o background ainda era forte demais (`#edf8f0` e `#fff0f0`). Isso competia com o proprio codigo. O comportamento desejado e igual ao file diff do `phenom-cli-ts`: background quase branco, meta do diff discreta e syntax highlight como foco principal.
+
+Evidencia:
+
+- `phenom-zig/src/render.zig`: usava `diff_add_bg = #edf8f0`, `diff_del_bg = #fff0f0`, `diff_add_fg = #2f6f45`, `diff_del_fg = #8a3030`.
+- `../phenom-cli-ts/src/cli-renderer.ts`: file diff usa `addBg = #f7fbf8`, `delBg = #fff8f8`, `addMeta = #1f7a46`, `delMeta = #a33a3a`.
+- Smoke real mostrava background perceptivel demais no conteudo inteiro da linha.
+
+Impacto esperado:
+
+- Background de adicao fica `#f7fbf8`, mais sutil.
+- Background de remocao fica `#fff8f8`, mais sutil.
+- Numeros e marcadores usam meta `#1f7a46`/`#a33a3a`, seguindo o TS.
+- Texto do codigo continua com syntax highlight por linguagem sobre fundo sutil.
+- Background antigo forte fica bloqueado por teste.
+
+Teste primeiro:
+
+- Testes ANSI passam a exigir `48;2;247;251;248` e `48;2;255;248;248`.
+- Teste garante ausencia de `48;2;237;248;240` e `48;2;255;240;240`.
+- Teste de syntax highlight no diff continua exigindo keyword/string com background de diff.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: trocar constantes de background e meta do diff para os valores usados no `phenom-cli-ts`.
+- `render.zig`: atualizar snapshots ANSI.
+- `render.zig`: adicionar asserts anti-regressao contra os backgrounds antigos.
+
+Passos de implementacao:
+
+1. Comparar valores com `phenom-cli-ts/src/cli-renderer.ts`.
+2. Trocar constantes Zig.
+3. Atualizar asserts ANSI.
+4. Rodar renderer isolado, build completo, release e smoke real.
+5. Instalar binario atualizado.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: somente constantes RGB; sem alocacao.
+- ANSI: continua usando foreground/background explicitos com reset por token.
+- Terminal: pipe segue dim e sem background.
+- Compatibilidade: `--no-color` nao muda.
+- Escopo: altera apenas diff Markdown, sem tocar no renderer de diff standalone.
+
+Criterio de aceite:
+
+- `zig test src/render.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real mostra `48;2;247;251;248` e `48;2;255;248;248`, sem os fundos antigos.
+- `install-local` passa.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/render.zig -lc` -> passou; 29 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 180 --prompt 'responda somente este markdown: ```diff\n--- a/app.ts\n+++ b/app.ts\n@@ -1 +1 @@\n-const value = "old";\n+const value = "new";\n```'` -> passou; transcript mostrou `48;2;247;251;248` e `48;2;255;248;248`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.
