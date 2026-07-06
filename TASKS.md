@@ -4874,6 +4874,87 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest` -> passou; resposta visivel continha `PHENOM_REAL_7319`.
 - `PHENOM_MODEL_CONTEXT_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 96 --prompt 'Complete: PHENOM_CTX_261' --expect-contains PHENOM_CTX_261 --show-expect-status --fail-on-model-error` -> passou com permissao escalada; resposta visivel continha `PHENOM_CTX_261`.
 - `sqlite3 .phenom-zig/phenom.db "select kind ..."` -> confirmou que o ultimo smoke com flag nao gravou `model_context` quando nao havia MEMORY/SKILLS no cwd.
+
+## T262 - Integrar primeiro tool loop real de uma iteracao
+
+Status: implemented-verified-partial.
+
+Motivacao: depois de MicroContext, `collect_evidence`, `ToolEvent`, `ModelTurnContext` e persistent context, o proximo risco real era ligar modelo -> tool -> evidence -> modelo. A task T222 ja marcava esse ponto como alta complexidade porque o agente precisa interpretar output do modelo, executar tool, montar contexto destilado e chamar o modelo novamente sem duplicar contexto.
+
+Evidencia:
+
+- `phenom-zig/src/main.zig` fazia apenas uma chamada `client.streamInference`.
+- `phenom-zig/src/tool_loop.zig` executava `collect_evidence` apenas offline.
+- `TASKS.md` T222: "tool loop real com modelo em streaming" ainda faltava.
+- `TASKS.md` T261 mostrou que anunciar tools cedo faz o modelo tentar ferramenta antes do runtime estar pronto.
+
+Impacto esperado:
+
+- `PHENOM_TOOL_LOOP_V1=1` ativa o primeiro loop real.
+- O runtime analisa a resposta visivel do primeiro turno.
+- Se houver tool call valida `collect_evidence`, valida gate, executa tool, audita `tool_event`, emite evidence e chama o modelo uma segunda vez com `ModelTurnContext` contendo EvidencePacket.
+- Se a tool nao foi anunciada, e rejeitada sem execucao.
+- Se nao houver tool call, comportamento permanece igual.
+- Limite inicial: uma tool call e uma segunda inferencia.
+
+Teste primeiro:
+
+- Parser/gate/tool loop offline ja provam `collect_evidence` anunciado.
+- `main` prova flag opt-in `PHENOM_TOOL_LOOP_V1`.
+- Build completo prova integracao.
+- Smoke real com flag ativa e sem tool call prova nao regressao e ausencia de execucao indevida.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: adicionar `runToolLoopFollowup`.
+- `main.zig`: adicionar `toolLoopEnabled`/`toolLoopValueEnabled`.
+- `main.zig`: apos primeira inferencia e `sink.flush`, tentar parsear `tool_call.parseFirst`.
+- `main.zig`: permitir apenas `collect_evidence`.
+- `main.zig`: executar `collect_evidence`, registrar `tool_start`, `tool_event`, `evidence`, emitir eventos visuais e fazer segunda chamada `streamInference`.
+
+Passos de implementacao:
+
+1. Criar flag opt-in.
+2. Detectar tool call apos primeira resposta.
+3. Diferenciar parse error/rejected/missing path de falha de infraestrutura.
+4. Executar `collect_evidence`.
+5. Montar follow-up `ModelTurnContext` com evidence.
+6. Fazer segunda inferencia com o prompt original e contexto destilado.
+7. Agregar visivel do follow-up para expectativas/testes.
+8. Rodar build, release e smoke real idle.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: `call.deinit`, `result.deinit`, `follow_context` e `follow_sink.deinit` liberam ownership.
+- Bounds: `collect_evidence` usa budget fixo inicial de 3800 bytes.
+- Gate: somente `collect_evidence` passa; qualquer outra tool e auditada como rejeitada.
+- Erros: parse/model tool error viram audit/progress; HTTP follow-up respeita `--fail-on-model-error`.
+- Anti-vazamento: segunda inferencia recebe `ModelTurnContext` com EvidencePacket, nao raw tool output.
+- Rollout: comportamento so ativa com `PHENOM_TOOL_LOOP_V1=1`.
+
+Criterio de aceite:
+
+- `zig build test` passa.
+- `zig test src/tool_loop.zig -lc` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real com `PHENOM_TOOL_LOOP_V1=1` e prompt simples passa sem executar tool indevida.
+- Audit do smoke idle nao contem `tool_start`/`tool_event`.
+
+Pendencias deliberadas:
+
+- Ainda nao ha captura streaming que suprime o texto da tool call antes de renderizar no transcript; primeira versao detecta apos a resposta visivel.
+- Ainda falta smoke deterministico em que o modelo emite tool call valida no formato suportado.
+- Ainda falta repair prompt quando o modelo pede `collect_evidence` sem path.
+- Ainda falta mais de uma iteracao de tool loop.
+- Ainda falta schema model-visible claro para forcar formato de tool call sem inchar prompt.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_loop.zig -lc` -> passou; 31 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 96 --prompt 'Complete: PHENOM_LOOP_IDLE_262' --expect-contains PHENOM_LOOP_IDLE_262 --show-expect-status --fail-on-model-error` -> passou com permissao escalada; resposta visivel continha `PHENOM_LOOP_IDLE_262`.
+- `sqlite3 .phenom-zig/phenom.db "select kind ..."` -> confirmou que o ultimo smoke idle nao registrou `tool_start` nem `tool_event`.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest` dentro do sandbox -> falhou com `SocketCreateFailed`, mostrando que o teste nao chegou ao servidor nesse perfil de permissao.
 - O mesmo `real-smoke` com permissao de rede liberada -> passou e imprimiu:
 

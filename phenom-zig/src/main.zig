@@ -262,6 +262,15 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             return;
         };
         try sink.flush();
+        if (toolLoopEnabled()) {
+            runToolLoopFollowup(allocator, config, prompt, sink.visible.items, &client, &events, &db, ui_ptr, &sink) catch |err| {
+                const message = try std.fmt.allocPrint(allocator, "tool loop failed: {s}", .{@errorName(err)});
+                defer allocator.free(message);
+                try events.emit(.{ .progress_update = message });
+                try db.recordEvent(config.session, "tool_loop_error", @errorName(err));
+                if (config.fail_on_model_error) return err;
+            };
+        }
         if (sink.visible_bytes == 0) {
             try events.emit(.{ .progress_update = "model emitted no visible final answer; reasoning was suppressed or generation ended inside <think>" });
             try db.recordEvent(config.session, "empty_visible_answer", "reasoning_suppressed_or_unclosed");
@@ -325,12 +334,103 @@ fn buildOptionalModelContext(allocator: std.mem.Allocator, io: std.Io, prompt: [
     });
 }
 
+fn runToolLoopFollowup(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    model_output: []const u8,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    first_sink: *StreamSink,
+) !void {
+    const call = tool_call.parseFirst(allocator, model_output) catch |err| {
+        try db.recordEvent(config.session, "tool_parse_error", @errorName(err));
+        return;
+    } orelse return;
+    defer call.deinit(allocator);
+
+    if (!gate.isAllowed(call.name, &.{"collect_evidence"})) {
+        try db.recordEvent(config.session, "tool_rejected", call.name);
+        return;
+    }
+    if (!std.mem.eql(u8, call.name, "collect_evidence")) {
+        try db.recordEvent(config.session, "tool_rejected", call.name);
+        return;
+    }
+    const path = call.path orelse {
+        try db.recordEvent(config.session, "tool_rejected", "collect_evidence missing path");
+        return;
+    };
+
+    if (ui_ptr) |active_ui| try active_ui.showStatus("Reading");
+    const tool_start = try std.fmt.allocPrint(allocator, "collect_evidence\t{s}", .{path});
+    defer allocator.free(tool_start);
+    try db.recordEvent(config.session, "tool_start", tool_start);
+    try events.emit(.{ .tool_start = .{ .name = "collect_evidence", .detail = path } });
+
+    const result = collect_evidence.execute(allocator, .{
+        .path = path,
+        .strategy = call.strategy orelse .path,
+        .start_line = call.start_line,
+        .max_lines = call.max_lines,
+        .budget_bytes = 3800,
+    }) catch |err| {
+        try db.recordEvent(config.session, "tool_error", @errorName(err));
+        try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = @errorName(err) } });
+        return;
+    };
+    defer result.deinit(allocator);
+
+    try db.recordEvent(config.session, "tool_event", result.tool_event_audit_text);
+    try db.recordEvent(config.session, "evidence", result.evidence_text);
+    try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = result.evidence_text } });
+
+    const evidence_blocks = [_]model_context.EvidenceBlock{.{ .text = result.evidence_text }};
+    const follow_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .evidence = &evidence_blocks,
+        .next_action = "Answer the current user request using the evidence above. Do not call tools again in this turn.",
+    });
+    defer allocator.free(follow_context);
+    try db.recordEvent(config.session, "model_context", follow_context);
+
+    if (ui_ptr) |active_ui| try active_ui.showStatus("Thinking");
+    var follow_sink = StreamSink{
+        .allocator = allocator,
+        .events = events,
+        .db = db,
+        .session = config.session,
+        .ui = ui_ptr,
+        .filter = reasoning_filter.ReasoningFilter.init(allocator, http.resolveThinking(config.thinking, prompt) == .on),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .trim_visible_leading_whitespace = false,
+    };
+    defer follow_sink.deinit();
+    try client.streamInference(.{ .user_prompt = prompt, .model_context = follow_context }, &follow_sink);
+    try follow_sink.flush();
+    try first_sink.visible.appendSlice(allocator, follow_sink.visible.items);
+    first_sink.visible_bytes += follow_sink.visible_bytes;
+}
+
 fn modelContextEnabled() bool {
     const raw = c.getenv("PHENOM_MODEL_CONTEXT_V1") orelse return false;
     return modelContextValueEnabled(std.mem.span(raw));
 }
 
 fn modelContextValueEnabled(value: []const u8) bool {
+    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on");
+}
+
+fn toolLoopEnabled() bool {
+    const raw = c.getenv("PHENOM_TOOL_LOOP_V1") orelse return false;
+    return toolLoopValueEnabled(std.mem.span(raw));
+}
+
+fn toolLoopValueEnabled(value: []const u8) bool {
     return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on");
 }
 
@@ -617,6 +717,15 @@ test "model context env parser is opt in only" {
     try std.testing.expect(!modelContextValueEnabled(""));
     try std.testing.expect(!modelContextValueEnabled("0"));
     try std.testing.expect(!modelContextValueEnabled("false"));
+}
+
+test "tool loop env parser is opt in only" {
+    try std.testing.expect(toolLoopValueEnabled("1"));
+    try std.testing.expect(toolLoopValueEnabled("true"));
+    try std.testing.expect(toolLoopValueEnabled("on"));
+    try std.testing.expect(!toolLoopValueEnabled(""));
+    try std.testing.expect(!toolLoopValueEnabled("0"));
+    try std.testing.expect(!toolLoopValueEnabled("false"));
 }
 
 fn countNeedle(haystack: []const u8, needle: []const u8) usize {
