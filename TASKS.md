@@ -8374,7 +8374,7 @@ Validacao executada:
 
 ## T274 - Implementar contexto descartavel para exploracao guiada por modelo
 
-Status: planned.
+Status: implemented-verified.
 
 Motivacao: a T273 corrigiu a causa principal do fluxo errado: o agente nao deve adivinhar o que buscar a partir do prompt original; o modelo deve inferir a intencao e chamar `collect_evidence` com `terms`, `path`, `strategy` e demais parametros. Falta agora impedir que varias exploracoes corretas inflem o contexto do modelo. O fluxo desejado e exploratorio: o modelo pode analisar uma evidencia, concluir que ela e insuficiente e emitir outra coleta mais especifica. Isso exige um working set descartavel/compactavel, como a referencia TS ja fazia com working memory, active micro-context e `compact=true`, mas sem reintroduzir `build_task_context`, preflight do controller ou heuristicas semanticas.
 
@@ -8565,3 +8565,39 @@ Pendencias deliberadas:
 - Groundedness por claim/citacao ainda e task separada: esta task limita crescimento de contexto e preserva evidencia, mas nao valida cada frase final do modelo.
 - Persistencia cross-session do working context deve usar SQLite/audit e rehidratacao controlada como contexto operacional minimo, quando explicitamente retomado; nao deve ser promovida para MEMORY automaticamente.
 - Politica fina para backends stateful fica pendente: por enquanto, o contrato de produto assume requests semanticamente stateless e replayavel.
+- Smoke real `working-context-274b` ainda mostrou extrapolacao fina do modelo sobre capacidades model-visible. Isso nao foi corrigido por heuristica nesta task; deve ser tratado por groundedness/citacoes em task propria.
+
+Implementado:
+
+- `phenom-zig/src/working_context.zig`: novo estado operacional interno com `WorkingEvidence`, `WorkingContext`, dedupe por `path/terms/strategy/range`, budget cumulativo de tool, budget de render, anchors compactos, `compactAll`, render de `EvidenceBlock` e anti-raw via `model_context.assertNoRawContextLeak`.
+- `phenom-zig/src/working_context.zig`: evidencias ativas maiores que 12 KiB sao truncadas antes de entrar no prompt com `[EVIDENCE_TRUNCATED]`; bruto permanece auditavel fora do prompt.
+- `phenom-zig/src/tool_call.zig`: parse de `<parameter=compact>true</parameter>` para permitir compactacao model-driven.
+- `phenom-zig/src/main.zig`: `ToolLoopState` passou a delegar armazenamento real para `WorkingContext`.
+- `phenom-zig/src/main.zig`: duplicatas usam `WorkingContext.hasDuplicate`, chamadas diferentes continuam permitidas.
+- `phenom-zig/src/main.zig`: follow-up `ModelTurnContext` agora renderiza blocos derivados do working context, nao array bruto de evidencias.
+- `phenom-zig/src/main.zig`: schema model-visible anuncia `compact=false` de forma compacta e sem exemplos enviesados de dominio.
+- `phenom-zig/src/main.zig`: SQLite registra `working_context_add`, `working_context_compact`, `working_context_duplicate` e `working_context_budget` quando aplicavel.
+
+Revisao baixo nivel realizada:
+
+- Ownership: `WorkingEvidence` duplica `id`, `path`, `terms`, `context_id`, `evidence_text` e `anchor_text`; `deinit` libera todos.
+- Failure path: `WorkingContext.remember` usa `errdefer` para liberar cada alocacao antes de transferir ownership para `ArrayList`.
+- Stale pointer: `renderEvidenceBlocks` retorna apenas array temporario de `EvidenceBlock`; os textos apontam para memoria owned pelo `WorkingContext`, vivo durante `renderModelTurnContext`.
+- Bounds: `tool_budget_spent` e cumulativo e nao diminui com compactacao; compactar contexto nao permite exploracao infinita.
+- Bounds: `max_active_evidence_bytes` limita evidencia ativa model-visible antes de renderizar prompt.
+- Raw leak: `remember` valida evidencia ativa e anchor contra marcadores proibidos.
+- Duplicidade: chave inclui `path`, `terms`, `strategy`, `start_line`, `max_lines`; smoke real e testes provam que `terms` diferentes nao compartilham chave.
+- Backend: nenhuma dependencia nova de session state invisivel; `model_context` continua auditado no SQLite.
+- Regra de negocio: nao foi adicionada lista de stopwords, lista fixa de arquivos, preferencia por linguagem/source/docs/test nem extracao de termos do prompt original.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/working_context.zig -lc` -> passou; 45 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_call.zig -lc` -> passou; 13 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 141 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 620 --prompt "o que este projeto implementa em cwd ?" --session working-context-274b --fail-on-model-error` -> passou; modelo chamou `collect_evidence`.
+- `sqlite3 .phenom-zig/phenom.db "select kind, count(*) from events where session='working-context-274b' and kind in ('tool_start','tool_error','working_context_add','working_context_compact','working_context_duplicate','model_context','evidence') group by kind order by kind;"` -> retornou `evidence=1`, `model_context=2`, `tool_start=1`, `working_context_add=1`, nenhum `tool_error`.
+- `sqlite3 .phenom-zig/phenom.db "select length(body) from events where session='working-context-274b' and kind='model_context' order by id;"` -> retornou `1390` e `14183`, provando follow-up limitado apos teto de evidencia ativa.
+- `sqlite3 .phenom-zig/phenom.db "select 'raw_marker', count(*) ...; select 'memory_block', count(*) ...; select 'skills_block', count(*) ...; select 'truncated', count(*) ...;"` -> retornou `raw_marker=0`, `memory_block=0`, `skills_block=0`, `truncated=1`.

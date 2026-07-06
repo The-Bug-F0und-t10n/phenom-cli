@@ -8,6 +8,7 @@ pub const ToolCall = struct {
     strategy: ?contracts.StrategyName = null,
     start_line: usize = 1,
     max_lines: usize = 12,
+    compact: bool = false,
 
     pub fn deinit(self: ToolCall, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -37,6 +38,7 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
         .strategy = strategy,
         .start_line = parseIntParameter(body, "start_line") orelse 1,
         .max_lines = parseIntParameter(body, "max_lines") orelse 12,
+        .compact = parseBoolParameter(body, "compact") orelse false,
     };
 }
 
@@ -65,6 +67,17 @@ fn normalizeOptionalText(value: ?[]const u8) ?[]const u8 {
 fn parseIntParameter(body: []const u8, comptime name: []const u8) ?usize {
     const value = parseParameter(body, name) orelse return null;
     return std.fmt.parseInt(usize, value, 10) catch null;
+}
+
+fn parseBoolParameter(body: []const u8, comptime name: []const u8) ?bool {
+    const value = parseParameter(body, name) orelse return null;
+    if (std.ascii.eqlIgnoreCase(value, "true")) return true;
+    if (std.mem.eql(u8, value, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+    if (std.mem.eql(u8, value, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "no")) return false;
+    return null;
 }
 
 fn parseStrategyParameter(body: []const u8) !?contracts.StrategyName {
@@ -190,4 +203,20 @@ test "collect evidence owns model search terms" {
     output[80] = 'X';
     try std.testing.expectEqualStrings("collect_evidence", call.name);
     try std.testing.expectEqualStrings("CLI render output function", call.terms.?);
+}
+
+test "collect evidence parses compact flag" {
+    const output =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=strategy>auto</parameter>
+        \\<parameter=terms>final narrow evidence</parameter>
+        \\<parameter=compact>true</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("collect_evidence", call.name);
+    try std.testing.expect(call.compact);
 }
