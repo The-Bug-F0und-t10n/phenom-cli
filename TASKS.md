@@ -6769,3 +6769,71 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 180 --prompt 'responda somente este markdown: ```diff\n--- a/app.ts\n+++ b/app.ts\n@@ -1 +1 @@\n-const value = "old";\n+const value = "new";\n```'` -> passou; transcript mostrou background so em numero/marcador e texto do codigo sem `48;2`.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.
+
+## T255 - Fazer tint do diff Markdown percorrer a linha inteira com baixo contraste
+
+Status: implemented-verified.
+
+Motivacao: remover o background do texto reduziu o peso visual, mas criou outro problema: a coloracao nao percorria a linha inteira. Terminal ANSI nao tem alpha real, entao a solucao pragmaticamente correta e usar um tint escuro de baixo contraste em toda a linha editada, mantendo o syntax highlight por cima.
+
+Evidencia:
+
+- `phenom-zig/src/render.zig`: T254 chamava `writeHighlightedDiffText(text, null)`, entao o texto e o restante da linha nao tinham background.
+- Smoke real mostrava background apenas no numero/marcador.
+- O usuario pediu a coloracao menos solida e tambem percorrendo toda a linha.
+
+Impacto esperado:
+
+- Linhas adicionadas usam tint escuro `#0f1d16` em texto e preenchimento ate o fim da largura.
+- Linhas removidas usam tint escuro `#231414` em texto e preenchimento ate o fim da largura.
+- Syntax highlight continua visivel por cima do tint.
+- Numero e marcador continuam com foreground de diff.
+- O tint e discreto, nao branco/pastel solido.
+
+Teste primeiro:
+
+- Testes ANSI exigem background `48;2;15;29;22` e `48;2;35;20;20`.
+- Testes garantem que o preenchimento final da linha tambem recebe background.
+- Testes garantem que o pipe nao recebe background de diff.
+- Testes impedem retorno aos fundos claros `#f7fbf8/#fff8f8` e fortes `#edf8f0/#fff0f0`.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: trocar constantes do background do diff para tint escuro.
+- `render.zig`: `writeMarkdownDiffEditLine` volta a passar `bg` para `writeHighlightedDiffText`.
+- `render.zig`: adicionar `writeDiffLineFill` para preencher ate `contentWrapWidth`.
+- `render.zig`: adicionar `writeRgbBgSpaces` sem alocacao.
+- `render.zig`: adicionar `visibleTextWidth` para calcular preenchimento simples.
+
+Passos de implementacao:
+
+1. Definir tint escuro baixo contraste para add/del.
+2. Aplicar tint no texto editado.
+3. Preencher restante da linha com o mesmo tint.
+4. Atualizar asserts ANSI.
+5. Rodar renderer isolado, build completo, release e smoke real.
+6. Instalar binario atualizado.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: sem alocacao; preenchimento usa fatias de string estatica.
+- Bounds: `writeDiffLineFill` so escreve se largura usada for menor que `contentWrapWidth`.
+- UTF-8: largura visual usa contagem por codepoint simples, suficiente para codigo ASCII/UTF-8 comum.
+- ANSI: cada trecho reseta; fill final tambem reseta, evitando vazamento para proxima linha.
+- Terminal: background percorre ate a largura de conteudo, nao a ultima coluna do terminal.
+
+Criterio de aceite:
+
+- `zig test src/render.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real mostra tint escuro em texto e preenchimento ate o fim da linha.
+- `install-local` passa.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/render.zig -lc` -> passou; 29 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 180 --prompt 'responda somente este markdown: ```diff\n--- a/app.ts\n+++ b/app.ts\n@@ -1 +1 @@\n-const value = "old";\n+const value = "new";\n```'` -> passou; transcript mostrou `48;2;15;29;22`/`48;2;35;20;20` no texto e no preenchimento final.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.
