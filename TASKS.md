@@ -6837,3 +6837,89 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 180 --prompt 'responda somente este markdown: ```diff\n--- a/app.ts\n+++ b/app.ts\n@@ -1 +1 @@\n-const value = "old";\n+const value = "new";\n```'` -> passou; transcript mostrou `48;2;15;29;22`/`48;2;35;20;20` no texto e no preenchimento final.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.
+
+## T256 - Maturar MicroContext e manifesto de contratos/tools antes do tool loop real
+
+Status: implemented-verified.
+
+Motivacao: antes do modelo executar tool call em loop real, o agente precisa de micro-contexto maduro. `collect_evidence` depende de tools internas e estrategias; se o loop vier antes, ele so executa texto bruto e nao cria base segura para patch, replay e anti-vazamento.
+
+Evidencia:
+
+- `phenom-zig/src/micro_context.zig` tinha apenas `path`, `start_line`, `end_line` e `hash`, sem `context_id`, sha do range, registry, budget ou stale check.
+- `phenom-zig/src/tool_loop.zig` ja executava `read_file_range`, mas retornava micro-contexto textual simples.
+- `../phenom-cli-ts/src/tools/micro-context.ts` prova o desenho necessario: `ctx_*`, sha256 do range, registry limitado, validacao stale e erro reparavel.
+- `../phenom-cli-ts/src/agent-control/intent-tool-contract.ts` separa tools model-visible de internal context tools.
+- `../phenom-cli-ts/src/tools/registrars/*` lista a superficie real: filesystem, search, context, workflow, git, utility, news, rag, session, project, memory e document.
+
+Impacto esperado:
+
+- Micro-contexto passa a ter `id`, `path`, `range`, `sha256`, `source_tool`, `budget_bytes` e `excerpt` limitado.
+- Registry em memoria controla contexts por turno e evita crescimento sem limite.
+- Stale context passa a ser detectavel antes de patch ou mutacao.
+- Manifesto Zig declara todas as tools relevantes do TS, separando model-visible de internal context.
+- Contratos/estrategias iniciais ficam pequenos: `collect_evidence` aceita `auto`, `path`, `lexical`, `symbol`, `diagnostic`, `runtime`, `diff` e `semantic`; news/documentos ficam em perfis proprios, nao em micro-contexto de codigo.
+
+Teste primeiro:
+
+- Teste de render do micro-contexto exige `ctx_`, sha256 de 64 chars, source tool e excerpt limitado por budget.
+- Teste de registry exige eviction do registro mais antigo.
+- Teste de stale altera arquivo apos criar contexto e exige `StaleMicroContext`.
+- Teste de manifesto prova que `collect_evidence` e `apply_patch` sao model-visible.
+- Teste de manifesto prova que `grep_file`, `rag_search` e `build_task_context` ficam internal context.
+- Teste de estrategia prova que `news_table` nao e estrategia valida de `collect_evidence`.
+
+Implementacao:
+
+- `phenom-zig/src/micro_context.zig`: substituir struct simples por `MicroContext` owned, `Registry`, `fromFileRange`, id sha256 e validacao stale.
+- `phenom-zig/src/tools.zig`: adicionar `total_lines` em `FileRange`, contando linhas durante streaming sem manter o arquivo inteiro em memoria.
+- `phenom-zig/src/evidence.zig`: ajustar fixture manual de `FileRange` para o novo contrato.
+- `phenom-zig/src/contracts.zig`: criar manifesto canonico de tools importado da referencia TS e registry de estrategias por contrato.
+- `phenom-zig/src/tool_loop.zig`: gerar `MicroContext` maduro no fluxo offline atual.
+- `phenom-zig/src/main.zig`: incluir `contracts.zig` na suite de testes Zig.
+
+Passos de implementacao:
+
+1. Portar semantica de id `ctx_*` e sha256 do range.
+2. Garantir ownership completo de strings retornadas.
+3. Limitar excerpt por `budget_bytes`.
+4. Criar registry com limite e eviction.
+5. Validar stale relendo o range atual.
+6. Criar manifesto com model-visible/internal-context.
+7. Criar estrategias permitidas por contrato.
+8. Atualizar tool loop offline para usar o micro-contexto novo.
+9. Rodar testes unitarios, build completo e release.
+10. Commitar somente arquivos desta task.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: `MicroContext` owns `id`, `path`, `sha256`, `source_tool` e `excerpt`; `Registry.deinit` libera todos os registros.
+- Ownership: `Registry.remember` assume ownership e usa `errdefer` para limpar em falha.
+- Bounds: budget usa `min(text.len, budget_bytes)`; eviction so ocorre quando `len >= max_records`; `max_records=0` falha como `InvalidRegistryLimit`.
+- Hash: sha256 e calculado sobre texto normalizado CRLF -> LF, alinhado com a referencia TS.
+- Stale: validacao relê exatamente `start_line..end_line` e compara sha256, sem depender do hash Wyhash do arquivo.
+- Streaming: `read_file_range` conta `total_lines` lendo chunks e guarda em memoria apenas ate `max(max_bytes, 64 KiB)`.
+- Escopo: manifestar todas as tools nao significa implementar todas agora; implementacao real vem na task seguinte de executor/collect_evidence.
+
+Criterio de aceite:
+
+- `zig test src/micro_context.zig -lc` passa.
+- `zig test src/contracts.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- `TASKS.md` explicita que a task pavimenta o tool loop, mas nao implementa o loop real ainda.
+
+Pendencias deliberadas:
+
+- Integracao do `collect_evidence` executor ainda nao esta feita.
+- Tool loop real modelo -> tool -> evidencia -> modelo ainda nao esta feito.
+- Patch engine usando `context_id` ainda nao esta feito.
+- Audit detalhado de ToolEvent ainda nao esta feito.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/micro_context.zig -lc` -> passou; 9 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/contracts.zig -lc` -> passou; 4 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- Teste com servidor/modelo: nao emitido nesta task porque nao ha chamada ao backend; a proxima task de `collect_evidence`/tool loop real deve ter smoke com servidor.

@@ -42,7 +42,8 @@ pub fn runOnce(
         defer packet.deinit();
         try packet.add(entry);
 
-        const ctx = micro_context.MicroContext.fromFileRange(range);
+        const ctx = try micro_context.fromFileRange(allocator, range, "read_file_range", 16 * 1024);
+        defer ctx.deinit(allocator);
         return .{
             .executed = true,
             .rejected = false,

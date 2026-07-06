@@ -12,6 +12,7 @@ pub const FileRange = struct {
     path: []const u8,
     start_line: usize,
     end_line: usize,
+    total_lines: usize,
     hash: u64,
     text: []const u8,
 
@@ -44,12 +45,24 @@ pub fn readFileRange(
     defer raw.deinit(allocator);
     var buf: [4096]u8 = undefined;
     const read_limit = @max(max_bytes, stale_hash_bytes);
-    while (raw.items.len < read_limit) {
-        const remaining = @min(buf.len, read_limit - raw.items.len);
-        const n = c.fread(&buf, 1, remaining, file);
+    var saw_byte = false;
+    var newline_count: usize = 0;
+    var last_was_newline = false;
+    while (true) {
+        const n = c.fread(&buf, 1, buf.len, file);
         if (n == 0) break;
-        try raw.appendSlice(allocator, buf[0..n]);
+        saw_byte = true;
+        for (buf[0..n]) |byte| {
+            if (byte == '\n') newline_count += 1;
+        }
+        last_was_newline = buf[n - 1] == '\n';
+
+        if (raw.items.len < read_limit) {
+            const remaining = read_limit - raw.items.len;
+            try raw.appendSlice(allocator, buf[0..@min(n, remaining)]);
+        }
     }
+    const total_lines = if (!saw_byte) 0 else newline_count + @intFromBool(!last_was_newline);
     const hash_len = @min(raw.items.len, stale_hash_bytes);
     const hash = std.hash.Wyhash.hash(0, raw.items[0..hash_len]);
 
@@ -76,6 +89,7 @@ pub fn readFileRange(
         .path = try allocator.dupe(u8, path),
         .start_line = start_line,
         .end_line = if (emitted == 0) start_line else start_line + emitted - 1,
+        .total_lines = total_lines,
         .hash = hash,
         .text = text,
     };

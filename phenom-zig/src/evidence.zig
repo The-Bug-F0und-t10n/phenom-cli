@@ -93,6 +93,7 @@ test "from file range owns source kind range and excerpt" {
         .path = path,
         .start_line = 1,
         .end_line = 1,
+        .total_lines = 1,
         .hash = 0x42,
         .text = text,
     };
