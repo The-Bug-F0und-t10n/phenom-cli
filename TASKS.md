@@ -4637,6 +4637,83 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/audit.zig -lc -lsqlite3` -> passou; 16 testes.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+
+## T259 - Criar `ModelTurnContext` minimo e renderer anti-raw
+
+Status: implemented-verified.
+
+Motivacao: T258 separou raw interno de evidencia destilada, mas ainda faltava a funcao que define exatamente o que sera enviado ao modelo. As tasks T075, T077 e T205 indicam que o system prompt deve ficar compacto e o contexto variavel deve ser um bloco unico, sem MEMORY/SKILLS falsos, sem blocos vazios e sem raw output.
+
+Evidencia:
+
+- `TASKS.md` T075 pede renderer de `[TURN_CONTEXT v1]`, `[CONTRACTS]`, `[SKILLS]`, `[MEMORY]`, `[EVIDENCE]`, `[OBLIGATIONS]` e `[NEXT_ACTION]`.
+- `TASKS.md` T077 pede testes anti-vazamento para `---BEGIN CONTENT---`, `[READ_FILE]`, `rawOutput` e `rg --json`.
+- `TASKS.md` T205 pede system prompt compacto e `ModelTurnContext` por perfil.
+- `phenom-zig/src/collect_evidence.zig` ja produz EvidencePacket/MicroContext budgetados, mas ainda nao havia renderer oficial do contexto variavel.
+
+Impacto esperado:
+
+- Existe um renderer unico para o contexto variavel do modelo.
+- `[MEMORY]` e `[SKILLS]` so aparecem quando explicitamente fornecidos.
+- `[EVIDENCE]` so aparece quando ha evidencias.
+- Raw markers falham como `RawContextLeak`.
+- System prompt inicial fica curto e estavel, separado do contexto variavel.
+- A proxima integracao de inferencia pode usar esse renderer sem inventar formato novo.
+
+Teste primeiro:
+
+- System prompt fica menor que 240 chars e contem regra contra MEMORY/SKILLS inventados.
+- Contexto sem memory/skills/evidence nao renderiza blocos vazios.
+- Contexto com evidence/obligations/next action renderiza formato fixo.
+- Contexto com memory/skills so renderiza quando os arrays sao fornecidos.
+- Renderer rejeita raw markers.
+- Saida real de `collect_evidence` entra no `ModelTurnContext` sem vazar `SECRET_RAW_TAIL`.
+
+Implementacao:
+
+- `phenom-zig/src/model_context.zig`: criar `system_prompt_v1`, `EvidenceBlock`, `ModelTurnContext`, `renderSystemPrompt`, `renderModelTurnContext` e `assertNoRawContextLeak`.
+- `phenom-zig/src/main.zig`: incluir `model_context.zig` na suite principal.
+
+Passos de implementacao:
+
+1. Definir struct borrowed de `ModelTurnContext` sem ownership complexo.
+2. Criar renderer append-only em `ArrayList`.
+3. Renderizar blocos somente quando presentes.
+4. Normalizar evidence removendo cabecalho `[EVIDENCE]` interno duplicado.
+5. Implementar `assertNoRawContextLeak`.
+6. Criar testes isolados e teste com `collect_evidence`.
+7. Rodar testes focados, build completo e release.
+8. Revisar bounds/alloc/raw leak antes do commit.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: renderer retorna slice owned; caller libera; structs usam slices borrowed e nao precisam `deinit`.
+- Allocations temporarias de labels `E{}`/`O{}` usam `defer`.
+- Bounds: render usa `appendSlice`/`allocPrint`; sem escrita em buffer fixo.
+- Anti-vazamento: `assertNoRawContextLeak` roda sobre o output final antes de retornar.
+- Escopo: ainda nao integra no HTTP/model call; evita alterar comportamento real antes de T076 equivalente no Zig.
+- Server/modelo: nao ha chamada ao backend nesta task; smoke real nao e pertinente.
+
+Criterio de aceite:
+
+- `zig test src/model_context.zig -lc` passa.
+- `zig test src/collect_evidence.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+
+Pendencias deliberadas:
+
+- Carregamento real de MEMORY/SKILLS de arquivos persistentes ainda nao existe.
+- Integracao do `ModelTurnContext` na chamada HTTP/modelo ainda nao existe.
+- Selecao/ranking de multiplas evidencias por budget ainda nao existe.
+- Perfis `news_operational` e `mass_read` ainda nao renderizam formatos proprios.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/model_context.zig -lc` -> passou; 29 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc` -> passou; 23 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest` dentro do sandbox -> falhou com `SocketCreateFailed`, mostrando que o teste nao chegou ao servidor nesse perfil de permissao.
 - O mesmo `real-smoke` com permissao de rede liberada -> passou e imprimiu:
 
