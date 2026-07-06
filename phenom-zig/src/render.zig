@@ -31,6 +31,8 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         markdown_in_code: bool = false,
         markdown_code_lang: [24]u8 = undefined,
         markdown_code_lang_len: usize = 0,
+        markdown_diff_old_line: ?usize = null,
+        markdown_diff_new_line: ?usize = null,
         markdown_table: [8192]u8 = undefined,
         markdown_table_len: usize = 0,
         markdown_table_rows: usize = 0,
@@ -438,9 +440,15 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 const len = @min(lang.len, self.markdown_code_lang.len);
                 if (len > 0) @memcpy(self.markdown_code_lang[0..len], lang[0..len]);
                 self.markdown_code_lang_len = len;
+                if (isDiffLang(lang)) {
+                    self.markdown_diff_old_line = 1;
+                    self.markdown_diff_new_line = 1;
+                }
             } else {
                 self.markdown_in_code = false;
                 self.markdown_code_lang_len = 0;
+                self.markdown_diff_old_line = null;
+                self.markdown_diff_new_line = null;
             }
         }
 
@@ -448,26 +456,66 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             const lang = self.markdown_code_lang[0..self.markdown_code_lang_len];
             try self.writeContentGutter();
             if (isDiffLang(lang)) {
-                if (std.mem.startsWith(u8, line, "+")) {
-                    try self.writeRgbFgBg(diff_add_fg, diff_add_bg, "│ ");
-                    try self.writeRgbFgBg(diff_add_fg, diff_add_bg, line);
-                } else if (std.mem.startsWith(u8, line, "-")) {
-                    try self.writeRgbFgBg(diff_del_fg, diff_del_bg, "│ ");
-                    try self.writeRgbFgBg(diff_del_fg, diff_del_bg, line);
-                } else if (std.mem.startsWith(u8, line, "@@")) {
-                    try self.writeCyan("│ ");
-                    try self.writeRgb(tone_fn, line);
-                } else if (std.mem.startsWith(u8, line, "+++") or std.mem.startsWith(u8, line, "---")) {
-                    try self.writeDim("│ ");
-                    try self.writeRgb(tone_preproc, line);
-                } else {
-                    try self.writeDim("│ ");
-                    try self.writeRgb(tone_text, line);
-                }
+                try self.writeMarkdownDiffLine(line);
                 return;
             }
             try self.writeCyanDim("│ ");
             try self.writeHighlightedCode(line, lang);
+        }
+
+        fn writeMarkdownDiffLine(self: *Self, line: []const u8) !void {
+            if (parseUnifiedHunk(line)) |hunk| {
+                self.markdown_diff_old_line = hunk.old_start;
+                self.markdown_diff_new_line = hunk.new_start;
+                try self.writeCyan("    │ ");
+                try self.writeRgb(tone_fn, line);
+                return;
+            }
+            if (std.mem.startsWith(u8, line, "+++") or std.mem.startsWith(u8, line, "---")) {
+                try self.writeDim("    │ ");
+                try self.writeRgb(tone_preproc, line);
+                return;
+            }
+            if (std.mem.startsWith(u8, line, "+")) {
+                const n = self.markdown_diff_new_line orelse 1;
+                self.markdown_diff_new_line = n + 1;
+                try self.writeMarkdownDiffEditLine(n, '+', line[1..], diff_add_fg, diff_add_bg);
+                return;
+            }
+            if (std.mem.startsWith(u8, line, "-")) {
+                const n = self.markdown_diff_old_line orelse 1;
+                self.markdown_diff_old_line = n + 1;
+                try self.writeMarkdownDiffEditLine(n, '-', line[1..], diff_del_fg, diff_del_bg);
+                return;
+            }
+            const n = self.markdown_diff_new_line orelse self.markdown_diff_old_line orelse 1;
+            if (self.markdown_diff_old_line) |old| self.markdown_diff_old_line = old + 1;
+            if (self.markdown_diff_new_line) |new| self.markdown_diff_new_line = new + 1;
+            try self.writeDimLineNumber(n);
+            try self.writeDim("   │ ");
+            try self.writeRgb(tone_text, if (std.mem.startsWith(u8, line, " ")) line[1..] else line);
+        }
+
+        fn writeMarkdownDiffEditLine(self: *Self, line_no: usize, marker: u8, text: []const u8, fg: Rgb, bg: Rgb) !void {
+            try self.writeDiffLineNumber(line_no, fg, bg);
+            const marker_text = [1]u8{marker};
+            try self.writer.writeAll(" ");
+            try self.writeRgbFgBg(fg, bg, &marker_text);
+            try self.writer.writeAll(" ");
+            try self.writeDim("│ ");
+            try self.writeRgbFgBg(fg, bg, text);
+        }
+
+        fn writeDiffLineNumber(self: *Self, line_no: usize, fg: Rgb, bg: Rgb) !void {
+            var buf: [16]u8 = undefined;
+            const text = try std.fmt.bufPrint(&buf, "{d: >4}", .{line_no});
+            try self.writeRgbFgBg(fg, bg, text);
+        }
+
+        fn writeDimLineNumber(self: *Self, line_no: usize) !void {
+            var buf: [16]u8 = undefined;
+            const text = try std.fmt.bufPrint(&buf, "{d: >4}", .{line_no});
+            try self.writeDim(text);
         }
 
         fn writeFenceLine(self: *Self, line: []const u8) !void {
@@ -968,6 +1016,39 @@ fn fenceLangStart(line: []const u8) usize {
 
 fn isDiffLang(lang: []const u8) bool {
     return std.ascii.eqlIgnoreCase(lang, "diff") or std.ascii.eqlIgnoreCase(lang, "patch");
+}
+
+const UnifiedHunk = struct {
+    old_start: usize,
+    new_start: usize,
+};
+
+fn parseUnifiedHunk(line: []const u8) ?UnifiedHunk {
+    if (!std.mem.startsWith(u8, line, "@@")) return null;
+    var i: usize = 2;
+    while (i < line.len and line[i] == ' ') : (i += 1) {}
+    if (i >= line.len or line[i] != '-') return null;
+    i += 1;
+    const old_start = parsePositiveInt(line, &i) orelse return null;
+    if (i < line.len and line[i] == ',') {
+        i += 1;
+        _ = parsePositiveInt(line, &i) orelse return null;
+    }
+    while (i < line.len and line[i] == ' ') : (i += 1) {}
+    if (i >= line.len or line[i] != '+') return null;
+    i += 1;
+    const new_start = parsePositiveInt(line, &i) orelse return null;
+    return .{ .old_start = old_start, .new_start = new_start };
+}
+
+fn parsePositiveInt(text: []const u8, cursor: *usize) ?usize {
+    const start = cursor.*;
+    var value: usize = 0;
+    while (cursor.* < text.len and text[cursor.*] >= '0' and text[cursor.*] <= '9') : (cursor.* += 1) {
+        value = value * 10 + (text[cursor.*] - '0');
+    }
+    if (cursor.* == start) return null;
+    return value;
 }
 
 fn headingLevel(line: []const u8) usize {
@@ -1506,8 +1587,8 @@ test "assistant markdown renders diff fences without saturated backgrounds" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[41") == null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[42") == null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "@@ -1,2 +1,2 @@") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "-old") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "+new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "old") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "new") != null);
 }
 
 test "assistant markdown buffers and renders tables as boxed output" {
@@ -1608,12 +1689,41 @@ test "assistant markdown diff uses readable codex style foreground and backgroun
     );
     try renderer.done();
 
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;47;111;69;48;2;237;248;240m+new") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;138;48;48;48;2;255;240;240m-old") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;47;111;69;48;2;237;248;240m│ ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;138;48;48;48;2;255;240;240m│ ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;47;111;69;48;2;237;248;240m   1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;47;111;69;48;2;237;248;240m+") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;47;111;69;48;2;237;248;240mnew") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;138;48;48;48;2;255;240;240m   1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;138;48;48;48;2;255;240;240m-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;138;48;48;48;2;255;240;240mold") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;47;111;69;48;2;237;248;240m│ ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;138;48;48;48;2;255;240;240m│ ") == null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[41") == null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[42") == null);
+}
+
+test "assistant markdown diff exposes line numbers and edit markers in plain mode" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false });
+    try renderer.assistantStart();
+    try renderer.assistantDelta(
+        \\```diff
+        \\@@ -7,2 +9,2 @@
+        \\-old
+        \\+new
+        \\ same
+        \\```
+    );
+    try renderer.done();
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "    │ @@ -7,2 +9,2 @@") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "   7 - │ old") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "   9 + │ new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "  10   │ same") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "-old") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "+new") == null);
 }
 
 test "assistant markdown spaced fence language renders once" {

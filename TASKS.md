@@ -6497,3 +6497,77 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --offline --no-color --prompt 'oi'` -> passou; transcript renderizou user block com linha vazia acima e abaixo da query.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.
+
+## T251 - Renderizar diff Markdown com numero de linha, marcador e pipe estrutural
+
+Status: implemented-verified.
+
+Motivacao: mesmo depois da cor legivel, o diff Markdown ainda nao parecia um diff operacional. A coloracao ficava aplicada sobre o `│`, que deveria ser estrutura, e o conteudo aparecia como `+new`/`-old` cru, sem coluna de numero de linha nem marcador de edicao separado. O comportamento correto e codex-like: `lineNo marker │ text`, onde numero/marcador/texto recebem cor e o pipe fica como separador estrutural.
+
+Evidencia:
+
+- `phenom-zig/src/render.zig`: `writeCodeLine` em diff fenced escrevia `│ ` com foreground/background e depois a linha inteira `+new`/`-old` tambem com foreground/background.
+- `../phenom-cli-ts/src/cli-renderer.ts:2774-2829`: render de file diff usa formato `N marker │ text`, com line number, marcador e pipe separados.
+- Smoke real anterior mostrava `│ ` colorido com background e sem numeros/sinais em colunas separadas.
+
+Impacto esperado:
+
+- Diff fenced em Markdown passa a renderizar linhas editadas como `   7 - │ old` e `   9 + │ new`.
+- O hunk `@@ -7,2 +9,2 @@` define os numeros iniciais.
+- Context lines incrementam old/new e aparecem como `  10   │ same`.
+- O `│` nao recebe background de add/remove; fica dim/estrutural.
+- Sinal `+`/`-` fica em coluna propria e colorida.
+- Conteudo nao inclui mais o sinal cru; `+new` vira `+ │ new`.
+
+Teste primeiro:
+
+- Teste plain exige `   7 - │ old`, `   9 + │ new`, `  10   │ same`.
+- Teste plain garante ausencia de `-old` e `+new`.
+- Teste ANSI garante que `│ ` nao recebe `fg+bg` de add/remove.
+- Suite antiga de Markdown/diff continua passando.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: adicionar estado `markdown_diff_old_line` e `markdown_diff_new_line`.
+- `render.zig`: resetar estado ao abrir/fechar fence `diff`/`patch`.
+- `render.zig`: adicionar `parseUnifiedHunk` para extrair old/new start de `@@ -a,b +c,d @@`.
+- `render.zig`: substituir render bruto de `+/-` por `writeMarkdownDiffEditLine`.
+- `render.zig`: adicionar `writeDiffLineNumber` e `writeDimLineNumber`.
+- `render.zig`: manter file headers e hunk headers como linhas estruturais sem coluna falsa de edicao.
+
+Passos de implementacao:
+
+1. Comparar comportamento atual com `renderFileDiff` do TS.
+2. Adicionar estado numerico do diff fenced.
+3. Parsear hunk headers.
+4. Renderizar add/remove/context com colunas separadas.
+5. Atualizar testes ANSI e plain.
+6. Rodar renderer isolado, build completo, release e smoke real.
+7. Instalar binario atualizado.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: sem alocacao; numeros sao escalares no renderer.
+- Bounds: parser de hunk anda por indices checados e retorna `null` para formato invalido.
+- ANSI: background fica em numero/marcador/texto; pipe usa `writeDim`, sem background.
+- Estado: abertura de fence diff inicia old/new em 1; hunk sobrescreve; fechamento limpa estado.
+- Compatibilidade: diffs sem hunk ainda recebem numeros a partir de 1.
+- Escopo: altera apenas diff fenced Markdown; diff preview standalone permanece como estava.
+
+Criterio de aceite:
+
+- `zig test src/render.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real sem cor mostra `line marker │ text`.
+- Smoke real com cor mostra `│` sem background add/remove.
+- `install-local` passa.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/render.zig -lc` -> passou; 28 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --no-color --max-tokens 120 --prompt 'responda somente este markdown: ```diff\n@@ -7,2 +9,2 @@\n-old\n+new\n same\n```'` -> passou; transcript mostrou `7 - │ old`, `9 + │ new`, `10   │ same`.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 120 --prompt 'responda somente este markdown: ```diff\n@@ -7,2 +9,2 @@\n-old\n+new\n```'` -> passou; transcript mostrou ANSI de add/remove no numero, marcador e texto, mas `│` em dim sem background.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.
