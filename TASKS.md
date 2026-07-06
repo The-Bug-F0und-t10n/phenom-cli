@@ -7911,3 +7911,84 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --prompt 'Use collect_evidence no arquivo README.md e depois responda exatamente: PHENOM_CONTRACT_268' --expect-contains PHENOM_CONTRACT_268 --show-expect-status --fail-on-model-error --session contract-268` -> passou; resposta final `PHENOM_CONTRACT_268`.
 - `sqlite3 .phenom-zig/phenom.db "select kind, substr(body,1,220) from events where session='contract-268' and kind in ('tool_envelope','tool_rejected','tool_start','tool_event','evidence','assistant_delta','turn_done') order by id;"` -> mostrou `tool_envelope contract=collect_evidence version=contracts.v1`, `tool_start collect_evidence auto`, `tool_event`, `evidence`, `assistant_delta PHENOM_CONTRACT_268` e `turn_done status=ok`.
+
+## T269 - Reparar `collect_evidence(auto)` quando existe um unico path estruturado explicito
+
+Status: implemented-verified.
+
+Motivacao: o smoke da T268 mostrou um desalinhamento operacional: o usuario pediu evidencia alvo em `README.md`, mas o modelo chamou `collect_evidence` com `strategy=auto` sem path e o ranker coletou `src/collect_evidence.zig`. Isso nao e falha de infraestrutura, mas prejudica confiabilidade do micro-contexto. A correcao nao pode virar inferencia por palavras-chave; deve usar apenas argumento estruturado comprovavel.
+
+Evidencia:
+
+- `TASKS.md` arquitetura canonica diz que micro-contexto de codigo e orientado a path/range/hash.
+- `TASKS.md` PR003 permite o controller adaptar estrategia com base em disponibilidade, custo e evidencia, sem inferir direcao por keyword do prompt.
+- T268 registrou explicitamente que o schema/contrato precisava melhorar quando o pedido do usuario inclui arquivo explicito.
+- Smoke real `contract-268` mostrou `tool_start collect_evidence auto` e evidencia em `src/collect_evidence.zig`, apesar de `README.md` estar no prompt.
+
+Impacto esperado:
+
+- Se o modelo chama `collect_evidence` sem path e o prompt contem exatamente um token que parece path seguro, o controller usa esse path como argumento efetivo.
+- Se ha zero ou mais de um path estruturado, nao ha reparo automatico.
+- O reparo muda `strategy=auto` para `strategy=path` somente quando o path foi recuperado de forma estruturada.
+- O audit registra `tool_arg_repair` quando o reparo acontece.
+- Dedupe passa a usar os argumentos efetivos, nao a chamada bruta `<auto>`.
+
+Teste primeiro:
+
+- Teste extrai `README.md` de prompt com um unico path.
+- Teste extrai `README.md` mesmo com pontuacao final `README.md.`.
+- Teste nao repara quando existem dois paths (`README.md` e `TASKS.md`).
+- Teste nao repara texto sem path.
+- Teste nao aceita traversal como `../README.md`.
+- Teste de dedupe usa path efetivo reparado.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: adicionar `singleStructuredPathFromPrompt`.
+- `phenom-zig/src/main.zig`: aceitar apenas tokens com extensoes textuais conhecidas e sem absoluto/traversal/hidden-prefix.
+- `phenom-zig/src/main.zig`: em `runOneToolLoopStep`, calcular `repaired_path` antes de decidir estrategia.
+- `phenom-zig/src/main.zig`: registrar `tool_arg_repair` quando o path foi recuperado.
+- `phenom-zig/src/main.zig`: trocar `ToolLoopState.hasExecuted/rememberExecuted` para variantes por args efetivos.
+
+Passos de implementacao:
+
+1. Criar helper de extracao estruturada de path.
+2. Garantir que mais de um path nao gera reparo.
+3. Corrigir pontuacao final de path (`README.md.`).
+4. Aplicar path reparado antes de missing-path repair.
+5. Ajustar dedupe para usar path/strategy/start/max efetivos.
+6. Rodar teste principal, build release e smoke real.
+7. Consultar SQLite para verificar path efetivo no tool event.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: `singleStructuredPathFromPrompt` retorna path owned; caminho de multiplos paths libera o primeiro candidato antes de retornar `null`.
+- Ownership: `repaired_path` e liberado no fim de `runOneToolLoopStep`; o executor duplica path internamente quando precisa persistir.
+- Bounds: extracao itera tokens do prompt uma vez, sem buffers grandes.
+- Seguranca: path absoluto, traversal e token iniciado com `.` sao rejeitados antes de virar argumento.
+- Regra de negocio: nao ha classificacao por palavras comuns; apenas token estruturado de path apos o modelo ja ter chamado `collect_evidence`.
+- Audit: quando o reparo acontece, `tool_arg_repair` registra `path<-prompt_structured_path`.
+
+Criterio de aceite:
+
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real com `README.md` continua coletando `README.md`.
+- Smoke real forcado com `strategy auto sem path` nao pode voltar a coletar arquivo aleatorio quando `README.md` e o unico path estruturado.
+
+Pendencias deliberadas:
+
+- Smoke real nao acionou `tool_arg_repair` porque o modelo emitiu path corretamente mesmo quando o prompt pediu `sem path`; o reparo fica provado offline por teste unitario.
+- O schema ainda deveria ter campo `target/path` mais claro dentro do manifesto completo.
+- A extracao cobre extensoes textuais conhecidas; novos dominios devem declarar extensoes no contrato/perfil, nao ampliar por heuristica solta.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 130 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- Primeiro smoke forçado mostrou bug de pontuacao: `README.md.` nao era aceito como path estruturado; corrigido no trim e coberto por teste.
+- `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --prompt 'Use collect_evidence no arquivo README.md e depois responda exatamente: PHENOM_PATH_REPAIR_269' --expect-contains PHENOM_PATH_REPAIR_269 --show-expect-status --fail-on-model-error --session path-repair-269` -> passou; coletou `README.md`.
+- `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --prompt 'Use collect_evidence com strategy auto sem path, mas a evidencia alvo e README.md. Depois responda exatamente: PHENOM_PATH_REPAIR_FORCED_269B' --expect-contains PHENOM_PATH_REPAIR_FORCED_269B --show-expect-status --fail-on-model-error --session path-repair-forced-269b` -> passou; coletou `README.md`.
+- `sqlite3 .phenom-zig/phenom.db "select kind, substr(body,1,220) from events where session='path-repair-forced-269b' and kind in ('tool_envelope','tool_arg_repair','tool_start','tool_event','evidence','assistant_delta','turn_done') order by id;"` -> mostrou `tool_start collect_evidence README.md`, `tool_event args=strategy=path path=README.md`, evidencia de `README.md` e resposta final.

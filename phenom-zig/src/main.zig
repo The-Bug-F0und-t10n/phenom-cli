@@ -452,8 +452,19 @@ fn runOneToolLoopStep(
         return .stopped;
     }
 
-    const strategy = call.strategy orelse if (call.path == null) contracts.StrategyName.auto else contracts.StrategyName.path;
-    const path = call.path;
+    const repaired_path = if (call.path == null) try singleStructuredPathFromPrompt(allocator, prompt) else null;
+    defer if (repaired_path) |owned| allocator.free(owned);
+    if (repaired_path) |owned| {
+        const body = try std.fmt.allocPrint(allocator, "collect_evidence path<-prompt_structured_path {s}", .{owned});
+        defer allocator.free(body);
+        try db.recordEvent(config.session, "tool_arg_repair", body);
+    }
+
+    const path = call.path orelse repaired_path;
+    const strategy = if (call.path == null and repaired_path != null and (call.strategy == null or call.strategy.? == .auto))
+        contracts.StrategyName.path
+    else
+        call.strategy orelse if (path == null) contracts.StrategyName.auto else contracts.StrategyName.path;
     if (path == null and strategy == .path) {
         if (repairs.* >= max_tool_repairs) {
             try db.recordEvent(config.session, "tool_rejected", "collect_evidence missing path after repair");
@@ -476,7 +487,7 @@ fn runOneToolLoopStep(
         return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink);
     }
 
-    if (state.hasExecuted(call.*)) {
+    if (state.hasExecutedArgs(path, strategy, call.start_line, call.max_lines)) {
         if (state.duplicate_repairs >= max_duplicate_tool_repairs) {
             try db.recordEvent(config.session, "tool_loop_stop", "duplicate collect_evidence repeated after repair");
             return .stopped;
@@ -527,7 +538,7 @@ fn runOneToolLoopStep(
     try db.recordEvent(config.session, "tool_event", result.tool_event_audit_text);
     try db.recordEvent(config.session, "evidence", result.evidence_text);
     try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = result.evidence_text } });
-    try state.rememberExecuted(call.*, result.evidence_text);
+    try state.rememberExecutedArgs(path, strategy, call.start_line, call.max_lines, result.evidence_text);
     state.model_budget_used += result.model_bytes;
     state.best_quality = @max(state.best_quality, result.quality_score);
 
@@ -604,6 +615,46 @@ fn currentActiveContract() contracts.ActiveContract {
     return contracts.activeContract(.collect_evidence).?;
 }
 
+fn singleStructuredPathFromPrompt(allocator: std.mem.Allocator, prompt: []const u8) !?[]u8 {
+    var found: ?[]u8 = null;
+    errdefer if (found) |owned| allocator.free(owned);
+
+    var it = std.mem.tokenizeAny(u8, prompt, " \t\r\n\"'`()[]{}<>:;,!?");
+    while (it.next()) |raw| {
+        const candidate = trimPathToken(raw);
+        if (!isStructuredPathToken(candidate)) continue;
+        if (found) |owned| {
+            allocator.free(owned);
+            found = null;
+            return null;
+        }
+        found = try allocator.dupe(u8, candidate);
+    }
+    return found;
+}
+
+fn trimPathToken(raw: []const u8) []const u8 {
+    return std.mem.trim(u8, raw, " \t\r\n\"'`()[]{}<>:;,.!?");
+}
+
+fn isStructuredPathToken(token: []const u8) bool {
+    if (token.len == 0) return false;
+    if (std.fs.path.isAbsolute(token)) return false;
+    if (std.mem.indexOf(u8, token, "..") != null) return false;
+    if (std.mem.indexOfScalar(u8, token, '/') == null and std.mem.indexOfScalar(u8, token, '.') == null) return false;
+    if (std.mem.endsWith(u8, token, ".")) return false;
+    if (std.mem.startsWith(u8, token, ".")) return false;
+    return hasKnownTextExtension(token);
+}
+
+fn hasKnownTextExtension(path: []const u8) bool {
+    const exts = [_][]const u8{ ".zig", ".ts", ".js", ".md", ".json", ".toml", ".txt", ".lua", ".py", ".rs", ".c", ".h", ".cpp", ".hpp" };
+    for (exts) |ext| {
+        if (std.mem.endsWith(u8, path, ext)) return true;
+    }
+    return false;
+}
+
 const ToolCallKey = struct {
     path: []u8,
     strategy: contracts.StrategyName,
@@ -614,12 +665,12 @@ const ToolCallKey = struct {
         allocator.free(self.path);
     }
 
-    fn matches(self: ToolCallKey, call: tool_call.ToolCall) bool {
-        const path = call.path orelse "<auto>";
-        return std.mem.eql(u8, self.path, path) and
-            self.strategy == (call.strategy orelse if (call.path == null) contracts.StrategyName.auto else contracts.StrategyName.path) and
-            self.start_line == call.start_line and
-            self.max_lines == call.max_lines;
+    fn matches(self: ToolCallKey, path: ?[]const u8, strategy: contracts.StrategyName, start_line: usize, max_lines: usize) bool {
+        const effective_path = path orelse "<auto>";
+        return std.mem.eql(u8, self.path, effective_path) and
+            self.strategy == strategy and
+            self.start_line == start_line and
+            self.max_lines == max_lines;
     }
 };
 
@@ -647,24 +698,24 @@ const ToolLoopState = struct {
         self.evidence_texts.deinit(self.allocator);
     }
 
-    fn hasExecuted(self: ToolLoopState, call: tool_call.ToolCall) bool {
+    fn hasExecutedArgs(self: ToolLoopState, path: ?[]const u8, strategy: contracts.StrategyName, start_line: usize, max_lines: usize) bool {
         for (self.executed.items) |key| {
-            if (key.matches(call)) return true;
+            if (key.matches(path, strategy, start_line, max_lines)) return true;
         }
         return false;
     }
 
-    fn rememberExecuted(self: *ToolLoopState, call: tool_call.ToolCall, evidence_text: []const u8) !void {
-        const path = call.path orelse "<auto>";
-        const owned_path = try self.allocator.dupe(u8, path);
+    fn rememberExecutedArgs(self: *ToolLoopState, path: ?[]const u8, strategy: contracts.StrategyName, start_line: usize, max_lines: usize, evidence_text: []const u8) !void {
+        const effective_path = path orelse "<auto>";
+        const owned_path = try self.allocator.dupe(u8, effective_path);
         errdefer self.allocator.free(owned_path);
         const owned_evidence = try self.allocator.dupe(u8, evidence_text);
         errdefer self.allocator.free(owned_evidence);
         try self.executed.append(self.allocator, .{
             .path = owned_path,
-            .strategy = call.strategy orelse if (call.path == null) contracts.StrategyName.auto else contracts.StrategyName.path,
-            .start_line = call.start_line,
-            .max_lines = call.max_lines,
+            .strategy = strategy,
+            .start_line = start_line,
+            .max_lines = max_lines,
         });
         try self.evidence_texts.append(self.allocator, owned_evidence);
     }
@@ -1177,11 +1228,32 @@ test "tool loop state detects duplicate collect evidence calls and preserves evi
 
     var state = ToolLoopState.init(std.testing.allocator);
     defer state.deinit();
-    try std.testing.expect(!state.hasExecuted(call));
-    try state.rememberExecuted(call, "[EVIDENCE]\n- README.md L1-L12 hash=abc\n");
-    try std.testing.expect(state.hasExecuted(call));
+    const strategy = call.strategy orelse contracts.StrategyName.path;
+    try std.testing.expect(!state.hasExecutedArgs(call.path, strategy, call.start_line, call.max_lines));
+    try state.rememberExecutedArgs(call.path, strategy, call.start_line, call.max_lines, "[EVIDENCE]\n- README.md L1-L12 hash=abc\n");
+    try std.testing.expect(state.hasExecutedArgs(call.path, strategy, call.start_line, call.max_lines));
     try std.testing.expectEqual(@as(usize, 1), state.evidence_texts.items.len);
     try std.testing.expect(std.mem.indexOf(u8, state.evidence_texts.items[0], "README.md") != null);
+}
+
+test "structured prompt path repair extracts only one explicit path" {
+    const repaired = (try singleStructuredPathFromPrompt(std.testing.allocator, "Use collect_evidence no arquivo README.md")) orelse return error.MissingPath;
+    defer std.testing.allocator.free(repaired);
+    try std.testing.expectEqualStrings("README.md", repaired);
+    const punctuated = (try singleStructuredPathFromPrompt(std.testing.allocator, "a evidencia alvo e README.md.")) orelse return error.MissingPath;
+    defer std.testing.allocator.free(punctuated);
+    try std.testing.expectEqualStrings("README.md", punctuated);
+    try std.testing.expect((try singleStructuredPathFromPrompt(std.testing.allocator, "compare README.md e TASKS.md")) == null);
+    try std.testing.expect((try singleStructuredPathFromPrompt(std.testing.allocator, "analise o arquivo")) == null);
+    try std.testing.expect((try singleStructuredPathFromPrompt(std.testing.allocator, "../README.md")) == null);
+}
+
+test "tool loop state dedupe uses repaired effective path" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.rememberExecutedArgs("README.md", .path, 1, 12, "[EVIDENCE]\n- README.md L1-L12 hash=abc\n");
+    try std.testing.expect(state.hasExecutedArgs("README.md", .path, 1, 12));
+    try std.testing.expect(!state.hasExecutedArgs(null, .auto, 1, 12));
 }
 
 test "duplicate evidence context keeps evidence and hides tool schema" {
