@@ -7683,3 +7683,60 @@ Validacao executada:
 - `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --prompt 'Use collect_evidence com strategy auto sem path para achar evidencia sobre collect_evidence e depois responda exatamente: PHENOM_AUTO_EVIDENCE_265' --expect-contains PHENOM_AUTO_EVIDENCE_265 --show-expect-status --fail-on-model-error` -> passou; coletou `src/collect_evidence.zig` e resposta final `PHENOM_AUTO_EVIDENCE_265`.
 - `sqlite3 .phenom-zig/phenom.db "with last_turn as (select max(id) as start_id from events where session='default' and kind='turn_start' and body like 'Use collect_evidence com strategy auto%') select kind, substr(body,1,160) from events,last_turn where id >= start_id and kind in ('tool_event','tool_start','evidence','assistant_delta') order by id;"` -> mostrou `tool_start collect_evidence auto`, `[CANDIDATE_RANKING]`, `rg_invocations`, evidencia em `src/collect_evidence.zig` e resposta final.
 - `sqlite3 .phenom-zig/phenom.db "with last_turn as (select max(id) as start_id from events where session='default' and kind='turn_start' and body like 'Use collect_evidence com strategy auto%') select count(*) from events,last_turn where id >= start_id and body like '%---BEGIN CONTENT---%';"` -> retornou `0`.
+
+## T266 - Remover stopwords linguisticas do ranking de evidencia
+
+Status: implemented-verified.
+
+Motivacao: a implementacao inicial da T265 adicionou uma tabela hardcoded de stopwords (`use`, `com`, `sem`, `para`, `strategy`, `path`, `auto` etc.) para impedir que o ranking por `rg` usasse termos fracos do prompt. Isso contradiz a regra de negocio descrita no audit: o controller nao deve inferir direcao operacional por palavras soltas do prompt. Mesmo sendo usado dentro de `collect_evidence`, esse filtro linguistico cria comportamento opaco, dependente de idioma e perigoso para modelos pequenos.
+
+Evidencia:
+
+- `doc/AGENTE_AI_BAIXO_CONSUMO_TOKENS_AUDIT.md` afirma que o controller nao deve inferir direcao operacional por palavras-chave do prompt; ele deve executar contratos e estrategias.
+- `TASKS.md` arquitetura canonica diz que tools coletam bruto e o controller destila evidencia, mas nao promove varias fontes/contextos por heuristica escondida.
+- A T265 registrava "filtrar stopwords" como passo, o que estava desalinhado com o proprio objetivo de ranking deterministico auditavel.
+- O codigo em `evidence_ranker.zig` tinha `isStopWord`, uma lista linguistica fixa e dependente de portugues/ingles.
+
+Impacto esperado:
+
+- O ranker nao usa mais tabela de palavras comuns.
+- A extracao de termos passa a aceitar apenas sinais estruturais: path, extensao, snake_case, camelCase, tokens com `.`/`-`, nomes canonicos de contratos/tools e tokens de diagnostico.
+- Prosa comum do prompt nao entra como termo de busca.
+- O audit continua mostrando termos/ranking, mas agora os termos sao tecnicamente justificaveis.
+- A decisao operacional continua vindo do contrato `collect_evidence` chamado pelo modelo; o ranker so recupera evidencia objetiva.
+
+Teste primeiro:
+
+- Teste de extracao prova que `collect_evidence` e `RawContextLeak` entram.
+- Teste de extracao prova que `Use`, `strategy` e `path` nao entram por prosa.
+- Testes existentes de ranking, collect_evidence e main continuam passando.
+
+Implementacao:
+
+- `phenom-zig/src/evidence_ranker.zig`: remover `isStopWord`.
+- `phenom-zig/src/evidence_ranker.zig`: remover conversao generica de qualquer palavra para snake_case.
+- `phenom-zig/src/evidence_ranker.zig`: adicionar `isStructuredSearchTerm`, `hasUpperAfterLower`, `isKnownContractTerm` e `looksLikeDiagnosticToken`.
+- `phenom-zig/src/evidence_ranker.zig`: manter apenas expansoes canonicas de frases de contrato como `tool loop`, `tool call` e `collect evidence`, pois elas mapeiam para nomes internos versionados.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: nenhuma nova alocacao persistente; `TermList.deinit` continua liberando termos aceitos.
+- Bounds: menos termos reduzem invocacoes de `rg` e custo de audit.
+- Regra de negocio: controller nao classifica intencao por idioma; ele apenas usa tokens estruturais apos o modelo chamar `collect_evidence`.
+- Compatibilidade: `collect_evidence` por path nao muda; estrategias ranqueadas continuam usando `rg`.
+- Risco residual: se o modelo nao fornecer nenhum token estruturado nem path, `collect_evidence(auto)` pode retornar poucos candidatos. Isso e preferivel a inferir por prosa solta; a solucao futura e schema com `target/symbol/query` tipado, nao stopwords.
+
+Criterio de aceite:
+
+- `zig test src/evidence_ranker.zig -lc` passa.
+- `zig test src/collect_evidence.zig -lc` passa.
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `TASKS.md` registra que stopwords linguisticas foram removidas por violarem o eixo do audit.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/evidence_ranker.zig -lc` -> passou; 8 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc` -> passou; 29 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 127 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.

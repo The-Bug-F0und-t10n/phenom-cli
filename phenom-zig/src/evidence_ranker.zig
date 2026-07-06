@@ -60,7 +60,7 @@ const TermList = struct {
     fn add(self: *TermList, term: []const u8) !void {
         const cleaned = cleanTerm(term);
         if (cleaned.len < 3) return;
-        if (isStopWord(cleaned)) return;
+        if (!isStructuredSearchTerm(cleaned)) return;
         for (self.items.items) |existing| {
             if (std.ascii.eqlIgnoreCase(existing, cleaned)) return;
         }
@@ -121,11 +121,6 @@ fn extractTerms(out: *TermList, prompt: []const u8, strategy: contracts.Strategy
     var it = std.mem.tokenizeAny(u8, prompt, " \t\r\n\"'`()[]{}<>:;,");
     while (it.next()) |raw| {
         try out.add(raw);
-        if (std.mem.indexOfScalar(u8, raw, '_') == null and raw.len >= 4) {
-            var snake_buf: [128]u8 = undefined;
-            const snake = makeSnake(raw, &snake_buf);
-            try out.add(snake);
-        }
     }
 
     if (std.mem.indexOf(u8, prompt, "tool loop") != null) try out.add("tool_loop");
@@ -404,7 +399,7 @@ fn freeCandidates(allocator: std.mem.Allocator, candidates: *std.ArrayList(Evide
 
 fn sortCandidates(candidates: []EvidenceCandidate) void {
     std.mem.sort(EvidenceCandidate, candidates, {}, struct {
-    fn lessThan(_: void, a: EvidenceCandidate, b: EvidenceCandidate) bool {
+        fn lessThan(_: void, a: EvidenceCandidate, b: EvidenceCandidate) bool {
             if (a.score != b.score) return a.score > b.score;
             if (!std.mem.eql(u8, a.path, b.path)) return std.mem.lessThan(u8, a.path, b.path);
             return a.start_line < b.start_line;
@@ -482,40 +477,55 @@ fn cleanTerm(raw: []const u8) []const u8 {
     return std.mem.trim(u8, raw, " \t\r\n\"'`()[]{}<>:;,.!?");
 }
 
-fn isStopWord(term: []const u8) bool {
-    const words = [_][]const u8{
-        "use",
-        "com",
-        "sem",
-        "para",
-        "por",
-        "que",
-        "uma",
-        "sobre",
-        "achar",
-        "depois",
-        "responda",
-        "exatamente",
-        "evidencia",
-        "evidência",
-        "strategy",
-        "path",
-        "auto",
-    };
-    for (words) |word| {
-        if (std.ascii.eqlIgnoreCase(term, word)) return true;
+fn isStructuredSearchTerm(term: []const u8) bool {
+    if (looksLikePath(term)) return true;
+    if (std.mem.indexOfScalar(u8, term, '_') != null) return true;
+    if (std.mem.indexOfScalar(u8, term, '.') != null) return true;
+    if (std.mem.indexOfScalar(u8, term, '-') != null) return true;
+    if (hasUpperAfterLower(term)) return true;
+    if (isKnownContractTerm(term)) return true;
+    if (looksLikeDiagnosticToken(term)) return true;
+    return false;
+}
+
+fn hasUpperAfterLower(term: []const u8) bool {
+    var saw_lower = false;
+    for (term) |byte| {
+        if (std.ascii.isLower(byte)) saw_lower = true;
+        if (saw_lower and std.ascii.isUpper(byte)) return true;
     }
     return false;
 }
 
-fn makeSnake(raw: []const u8, buf: []u8) []const u8 {
-    var n: usize = 0;
-    for (raw) |byte| {
-        if (n >= buf.len) break;
-        buf[n] = if (byte == '-' or byte == ' ') '_' else std.ascii.toLower(byte);
-        n += 1;
+fn isKnownContractTerm(term: []const u8) bool {
+    const terms = [_][]const u8{
+        "collect_evidence",
+        "tool_call",
+        "tool_loop",
+        "ToolCall",
+        "ToolLoop",
+        "EvidencePacket",
+        "MicroContext",
+        "ModelTurnContext",
+        "read_file_range",
+        "apply_patch",
+        "run_validation",
+        "browser_check",
+        "recordEvent",
+        "RawContextLeak",
+    };
+    for (terms) |known| {
+        if (std.ascii.eqlIgnoreCase(term, known)) return true;
     }
-    return buf[0..n];
+    return false;
+}
+
+fn looksLikeDiagnosticToken(term: []const u8) bool {
+    if (std.mem.endsWith(u8, term, "Error")) return true;
+    if (std.mem.endsWith(u8, term, "Failed")) return true;
+    if (std.mem.endsWith(u8, term, "Leak")) return true;
+    if (std.mem.indexOf(u8, term, "error.") != null) return true;
+    return false;
 }
 
 fn lineNumberAt(text: []const u8, idx: usize) usize {
@@ -562,8 +572,28 @@ test "ranking with rg finds collect evidence implementation without raw output a
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "---BEGIN CONTENT---") == null);
 }
 
+test "term extraction keeps structured symbols and ignores prose without stopword table" {
+    var terms = TermList.init(std.testing.allocator);
+    defer terms.deinit();
+    try extractTerms(&terms, "Use collect_evidence com strategy auto sem path para RawContextLeak", .auto);
+    sortTermsBySpecificity(terms.items.items);
+
+    try std.testing.expect(hasTerm(terms.items.items, "collect_evidence"));
+    try std.testing.expect(hasTerm(terms.items.items, "RawContextLeak"));
+    try std.testing.expect(!hasTerm(terms.items.items, "Use"));
+    try std.testing.expect(!hasTerm(terms.items.items, "strategy"));
+    try std.testing.expect(!hasTerm(terms.items.items, "path"));
+}
+
 test "adaptive budget scales by quality and range count" {
     try std.testing.expect(adaptiveBudget(6000, 95, 3) > adaptiveBudget(6000, 40, 3));
     try std.testing.expect(qualityEnough(80));
     try std.testing.expect(!qualityEnough(30));
+}
+
+fn hasTerm(terms: []const []u8, needle: []const u8) bool {
+    for (terms) |term| {
+        if (std.mem.eql(u8, term, needle)) return true;
+    }
+    return false;
 }
