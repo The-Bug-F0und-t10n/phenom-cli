@@ -7504,3 +7504,80 @@ Validacao executada:
 - `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 96 --prompt 'Complete: PHENOM_LOOP_IDLE_263' --expect-contains PHENOM_LOOP_IDLE_263 --show-expect-status --fail-on-model-error` -> passou; resposta visivel `PHENOM_LOOP_IDLE_263`.
 - `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 220 --prompt 'Use collect_evidence no arquivo README.md e depois responda exatamente: PHENOM_TOOL_DONE_263' --expect-contains PHENOM_TOOL_DONE_263 --show-expect-status --fail-on-model-error` -> passou; renderizou `collect_evidence README.md` duas vezes pelo limite controlado e resposta final `PHENOM_TOOL_DONE_263`.
 - `sqlite3 .phenom-zig/phenom.db "select count(*) from events where session='default' and kind='assistant_delta' and body like '%<tool_call>%';"` -> retornou `0`.
+
+## T264 - Impedir `collect_evidence` duplicado no mesmo turno
+
+Status: implemented-verified.
+
+Motivacao: o smoke real da T263 passou tecnicamente, mas revelou comportamento ruim para UX e custo: o modelo pediu `collect_evidence README.md` duas vezes e o agente executou duas vezes porque `max_tool_iterations=2` permitia a segunda chamada. Isso nao deve ser tratado como normal; multiplas iteracoes existem para evidencias diferentes, nao para repetir o mesmo path/range/strategy.
+
+Evidencia:
+
+- Transcript real mostrou dois blocos identicos `▸ collect_evidence: README.md`.
+- `runToolLoopIterations` tinha contador de maximo, mas nao guardava chamadas ja executadas.
+- O follow-up apos a primeira evidencia ainda permitia uma segunda tool call e apenas instruia "one more file", sem enforcement no agente.
+- A regra de negocio exige que tool output seja evidencia destilada e auditavel; executar evidencia identica duplica render, audit e tokens sem novo valor.
+
+Impacto esperado:
+
+- Mesmo `collect_evidence(path,strategy,start_line,max_lines)` so executa uma vez por turno.
+- Se o modelo repetir a mesma tool call, o agente registra `tool_duplicate`, nao renderiza nova tool, e chama o modelo com a evidencia ja coletada.
+- O contexto de duplicata nao inclui `[TOOLS v1]`, entao a proxima inferencia fica direcionada a resposta final.
+- Iteracao dupla continua disponivel para arquivo/range diferente.
+
+Teste primeiro:
+
+- Teste de `ToolLoopState` prova que a mesma chamada passa a ser reconhecida como duplicada apos `rememberExecuted`.
+- Teste de contexto de duplicata prova que evidencia coletada continua presente e schema de tool nao aparece.
+- Smoke real repete o prompt que duplicava `README.md` e exige apenas uma execucao no audit.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: adicionar `ToolCallKey` owned com `path`, `strategy`, `start_line` e `max_lines`.
+- `phenom-zig/src/main.zig`: adicionar `ToolLoopState` com chamadas executadas, evidencias owned e contador de reparo de duplicata.
+- `phenom-zig/src/main.zig`: antes de executar `collect_evidence`, verificar `state.hasExecuted`.
+- `phenom-zig/src/main.zig`: em duplicata, registrar `tool_duplicate`, emitir status discreto e renderizar ModelTurnContext com evidencias ja coletadas sem schema de tools.
+- `phenom-zig/src/main.zig`: extrair `renderCollectedEvidenceContext` para montar EvidenceBlocks a partir do estado owned.
+
+Passos de implementacao:
+
+1. Criar chave de dedupe por path/strategy/range.
+2. Guardar evidencia owned apos execucao bem-sucedida.
+3. Bloquear execucao repetida antes de `tool_start`.
+4. Forcar resposta final com evidencia ja coletada.
+5. Limitar reparo de duplicata a uma tentativa.
+6. Rodar testes focados, build completo e smoke real.
+7. Confirmar no SQLite que o ultimo turno tem `tool_start=1` e `evidence=1`.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: `ToolLoopState.deinit` libera todas as keys e evidencias duplicadas.
+- Ownership: `rememberExecuted` duplica `path` e `evidence_text`; nao guarda ponteiro para `collect_evidence.Result`.
+- Bounds: duplicata tem teto `max_duplicate_tool_repairs=1`, evitando loop infinito se o modelo insistir.
+- Audit: duplicata nao cria `tool_start` nem `evidence`; apenas `tool_duplicate` e novo `model_context`.
+- Modelo: contexto de duplicata omite `[TOOLS v1]`, preserva evidencia e instrui resposta final.
+- Terminal: render nao recebe segundo `tool_start`, entao nao duplica bloco visual.
+
+Criterio de aceite:
+
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig test src/tool_call.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real que antes duplicava `collect_evidence README.md` mostra apenas um bloco de tool.
+- Query SQLite do ultimo turno mostra `tool_start=1` e `evidence=1`.
+
+Pendencias deliberadas:
+
+- Dedupe ainda e por chamada exata; ranges sobrepostos em mesmo arquivo ainda podem executar como chamadas diferentes.
+- Nao ha ranking de evidencias nem merge de ranges adjacentes.
+- Ainda falta aplicar a mesma politica quando outras tools forem implementadas.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 120 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_call.zig -lc` -> passou; 9 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 220 --prompt 'Use collect_evidence no arquivo README.md e depois responda exatamente: PHENOM_TOOL_DONE_263' --expect-contains PHENOM_TOOL_DONE_263 --show-expect-status --fail-on-model-error` -> passou; renderizou um unico `collect_evidence README.md` e resposta final `PHENOM_TOOL_DONE_263`.
+- `sqlite3 .phenom-zig/phenom.db "with last_turn as (select max(id) as start_id from events where session='default' and kind='turn_start' and body='Use collect_evidence no arquivo README.md e depois responda exatamente: PHENOM_TOOL_DONE_263') select kind, count(*) from events, last_turn where id >= start_id group by kind order by kind;"` -> retornou `tool_start|1`, `evidence|1`, `assistant_delta|1`, `turn_done|1`.

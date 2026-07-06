@@ -348,6 +348,7 @@ fn buildInitialModelContext(allocator: std.mem.Allocator, io: std.Io, prompt: []
 
 const max_tool_iterations = 2;
 const max_tool_repairs = 1;
+const max_duplicate_tool_repairs = 1;
 
 const ToolLoopNext = union(enum) {
     final_answer,
@@ -374,6 +375,8 @@ fn runToolLoopIterations(
 
     var tool_iterations: usize = 0;
     var repairs: usize = 0;
+    var state = ToolLoopState.init(allocator);
+    defer state.deinit();
     while (maybe_call) |call_value| {
         var call = call_value;
         defer call.deinit(allocator);
@@ -388,6 +391,7 @@ fn runToolLoopIterations(
             db,
             ui_ptr,
             first_sink,
+            &state,
             &tool_iterations,
             &repairs,
         );
@@ -413,6 +417,7 @@ fn runOneToolLoopStep(
     db: *audit.AuditDb,
     ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
     aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
     tool_iterations: *usize,
     repairs: *usize,
 ) !ToolLoopNext {
@@ -447,6 +452,28 @@ fn runOneToolLoopStep(
         return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink);
     };
 
+    if (state.hasExecuted(call.*)) {
+        if (state.duplicate_repairs >= max_duplicate_tool_repairs) {
+            try db.recordEvent(config.session, "tool_loop_stop", "duplicate collect_evidence repeated after repair");
+            return .stopped;
+        }
+        state.duplicate_repairs += 1;
+        const duplicate_body = try std.fmt.allocPrint(allocator, "collect_evidence\t{s}", .{path});
+        defer allocator.free(duplicate_body);
+        try db.recordEvent(config.session, "tool_duplicate", duplicate_body);
+        try events.emit(.{ .progress_update = "skipping duplicate collect_evidence; answering with existing evidence" });
+
+        const duplicate_context = try renderCollectedEvidenceContext(
+            allocator,
+            prompt,
+            state.evidence_texts.items,
+            "The requested evidence was already collected in this turn. Answer now using the evidence above. Do not call tools again.",
+        );
+        defer allocator.free(duplicate_context);
+        try db.recordEvent(config.session, "model_context", duplicate_context);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink);
+    }
+
     if (tool_iterations.* >= max_tool_iterations) {
         try db.recordEvent(config.session, "tool_loop_stop", "max tool iterations reached");
         return .stopped;
@@ -475,17 +502,17 @@ fn runOneToolLoopStep(
     try db.recordEvent(config.session, "tool_event", result.tool_event_audit_text);
     try db.recordEvent(config.session, "evidence", result.evidence_text);
     try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = result.evidence_text } });
+    try state.rememberExecuted(call.*, result.evidence_text);
 
-    const evidence_blocks = [_]model_context.EvidenceBlock{.{ .text = result.evidence_text }};
-    const follow_context = try model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts = if (tool_iterations.* < max_tool_iterations) collectEvidenceToolSchema() else "",
-        .evidence = &evidence_blocks,
-        .next_action = if (tool_iterations.* < max_tool_iterations)
-            "Answer using the evidence above. If one more file is strictly required, emit one collect_evidence call with path."
+    const follow_context = try renderCollectedEvidenceContext(
+        allocator,
+        prompt,
+        state.evidence_texts.items,
+        if (tool_iterations.* < max_tool_iterations)
+            "Answer using the evidence above. If one different file is strictly required, emit one collect_evidence call with path. Do not request the same file/range again."
         else
             "Answer the current user request using the evidence above. Do not call tools again in this turn.",
-    });
+    );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
 
@@ -531,6 +558,87 @@ fn streamDeferredToolLoopTurn(
     try aggregate_sink.visible.appendSlice(allocator, follow_sink.visible.items);
     aggregate_sink.visible_bytes += follow_sink.visible_bytes;
     return .final_answer;
+}
+
+const ToolCallKey = struct {
+    path: []u8,
+    strategy: contracts.StrategyName,
+    start_line: usize,
+    max_lines: usize,
+
+    fn deinit(self: ToolCallKey, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+    }
+
+    fn matches(self: ToolCallKey, call: tool_call.ToolCall) bool {
+        const path = call.path orelse return false;
+        return std.mem.eql(u8, self.path, path) and
+            self.strategy == (call.strategy orelse .path) and
+            self.start_line == call.start_line and
+            self.max_lines == call.max_lines;
+    }
+};
+
+const ToolLoopState = struct {
+    allocator: std.mem.Allocator,
+    executed: std.ArrayList(ToolCallKey),
+    evidence_texts: std.ArrayList([]u8),
+    duplicate_repairs: usize = 0,
+
+    fn init(allocator: std.mem.Allocator) ToolLoopState {
+        return .{
+            .allocator = allocator,
+            .executed = std.ArrayList(ToolCallKey).empty,
+            .evidence_texts = std.ArrayList([]u8).empty,
+        };
+    }
+
+    fn deinit(self: *ToolLoopState) void {
+        for (self.executed.items) |key| key.deinit(self.allocator);
+        self.executed.deinit(self.allocator);
+        for (self.evidence_texts.items) |text| self.allocator.free(text);
+        self.evidence_texts.deinit(self.allocator);
+    }
+
+    fn hasExecuted(self: ToolLoopState, call: tool_call.ToolCall) bool {
+        for (self.executed.items) |key| {
+            if (key.matches(call)) return true;
+        }
+        return false;
+    }
+
+    fn rememberExecuted(self: *ToolLoopState, call: tool_call.ToolCall, evidence_text: []const u8) !void {
+        const path = call.path orelse return error.MissingPath;
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        const owned_evidence = try self.allocator.dupe(u8, evidence_text);
+        errdefer self.allocator.free(owned_evidence);
+        try self.executed.append(self.allocator, .{
+            .path = owned_path,
+            .strategy = call.strategy orelse .path,
+            .start_line = call.start_line,
+            .max_lines = call.max_lines,
+        });
+        try self.evidence_texts.append(self.allocator, owned_evidence);
+    }
+};
+
+fn renderCollectedEvidenceContext(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    evidence_texts: []const []u8,
+    next_action: []const u8,
+) ![]u8 {
+    var evidence_blocks = try allocator.alloc(model_context.EvidenceBlock, evidence_texts.len);
+    defer allocator.free(evidence_blocks);
+    for (evidence_texts, 0..) |text, i| {
+        evidence_blocks[i] = .{ .text = text };
+    }
+    return model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .evidence = evidence_blocks,
+        .next_action = next_action,
+    });
 }
 
 fn collectEvidenceToolSchema() []const u8 {
@@ -983,6 +1091,47 @@ test "deferred stream sink flushes normal answer exactly once" {
     try std.testing.expectEqualStrings("resposta final", sink.visible.items);
     try sink.flushDeferredVisible();
     try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
+}
+
+test "tool loop state detects duplicate collect evidence calls and preserves evidence" {
+    const xml =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=path>README.md</parameter>
+        \\<parameter=strategy>path</parameter>
+        \\<parameter=start_line>1</parameter>
+        \\<parameter=max_lines>12</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const call = (try tool_call.parseFirst(std.testing.allocator, xml)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+    try std.testing.expect(!state.hasExecuted(call));
+    try state.rememberExecuted(call, "[EVIDENCE]\n- README.md L1-L12 hash=abc\n");
+    try std.testing.expect(state.hasExecuted(call));
+    try std.testing.expectEqual(@as(usize, 1), state.evidence_texts.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.evidence_texts.items[0], "README.md") != null);
+}
+
+test "duplicate evidence context keeps evidence and hides tool schema" {
+    const evidence_text = try std.testing.allocator.dupe(u8, "[EVIDENCE]\n- README.md L1-L12 hash=abc\n");
+    defer std.testing.allocator.free(evidence_text);
+    const evidence_texts = [_][]u8{evidence_text};
+    const rendered = try renderCollectedEvidenceContext(
+        std.testing.allocator,
+        "responda",
+        &evidence_texts,
+        "Answer now. Do not call tools again.",
+    );
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[EVIDENCE]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "README.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[TOOLS v1]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Do not call tools again") != null);
 }
 
 const EventRecorder = struct {
