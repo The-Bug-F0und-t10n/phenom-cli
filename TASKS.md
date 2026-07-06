@@ -6923,3 +6923,89 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - Teste com servidor/modelo: nao emitido nesta task porque nao ha chamada ao backend; a proxima task de `collect_evidence`/tool loop real deve ter smoke com servidor.
+
+## T257 - Implementar executor inicial de `collect_evidence` sobre MicroContext
+
+Status: implemented-verified.
+
+Motivacao: T256 criou micro-contexto e manifesto, mas `collect_evidence` ainda era apenas contrato declarado. A regra de negocio exige que tools coletem dados, destilem para EvidencePacket/MicroContext e nao vazem bruto ao modelo. Antes do loop real modelo -> tool -> modelo, o executor precisa existir e ser testado offline.
+
+Evidencia:
+
+- `phenom-zig/src/evidence.zig` copiava `range.text` inteiro em `EvidenceEntry`, sem budget.
+- `phenom-zig/src/tool_loop.zig` so executava `read_file_range`; `collect_evidence` anunciado no manifesto nao tinha executor.
+- `phenom-zig/src/tool_call.zig` nao parseava `strategy`, entao o contrato nao conseguia direcionar estrategia.
+- `TASKS.md` T204 exige `ToolEvent -> EvidenceEntry -> EvidencePacket` e teste anti-vazamento de bruto.
+- `TASKS.md` T256 deixou explicitamente pendente a integracao do executor `collect_evidence`.
+
+Impacto esperado:
+
+- `collect_evidence(strategy=path|auto)` executa `read_file_range` internamente e retorna EvidencePacket + MicroContext budgetados.
+- Tail bruto fora do budget nao aparece no output destinado ao modelo.
+- Estrategias ainda nao implementadas falham como `StrategyNotImplemented`, sem comportamento silencioso ou falso positivo.
+- Tool loop offline passa a aceitar `collect_evidence` quando anunciado no gate.
+- Parser de tool call passa a reconhecer `strategy`.
+
+Teste primeiro:
+
+- `evidence` prova que `fromFileRangeBudgeted` corta tail bruto e adiciona `[TRUNCATED]`.
+- `collect_evidence` prova retorno de EvidencePacket, MicroContext, `ctx_*` e metricas simples.
+- `collect_evidence` prova que `symbol` ainda nao implementado retorna erro explicito.
+- `collect_evidence` prova que budget zero falha.
+- `tool_call` prova parse de `strategy=path`.
+- `tool_call` prova que strategy desconhecida nao vira `path` silenciosamente.
+- `tool_loop` prova que `collect_evidence` anunciado executa e gera evidencia/micro-contexto.
+
+Implementacao:
+
+- `phenom-zig/src/evidence.zig`: adicionar `fromFileRangeBudgeted` e `budgetedExcerpt`.
+- `phenom-zig/src/collect_evidence.zig`: criar executor `execute(args)` para estrategia `path|auto`.
+- `phenom-zig/src/micro_context.zig`: preservar flag `truncated` para renderizar `[TRUNCATED]` depois do corte.
+- `phenom-zig/src/tool_call.zig`: parsear parametro `strategy`.
+- `phenom-zig/src/tool_loop.zig`: executar `collect_evidence` quando permitido pelo gate.
+- `phenom-zig/src/main.zig`: incluir modulo novo na suite principal.
+
+Passos de implementacao:
+
+1. Criar teste anti-vazamento em `evidence`.
+2. Criar executor path de `collect_evidence`.
+3. Criar testes de budget, estrategia nao implementada e budget invalido.
+4. Estender parser para `strategy`.
+5. Integrar `collect_evidence` ao loop offline existente.
+6. Rodar testes focados e build completo.
+7. Revisar ownership/bounds antes do commit.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: `Result.deinit` libera `context_id`, `evidence_text` e `micro_context_text`; `packet.deinit` libera entries mesmo em erro.
+- Ownership: `tool_loop` duplica textos do resultado antes de devolver, evitando dangling apos `result.deinit`.
+- Parser: strategy e validada antes de alocar `name/path`, evitando leak quando strategy e invalida.
+- Bounds: budget usa `min`; budget zero falha antes de ler arquivo.
+- Anti-vazamento: tail alem do budget nao entra em EvidencePacket nem MicroContext; marcador `[TRUNCATED]` e preservado.
+- Estrategia: `symbol/lexical/semantic` nao fingem execucao; retornam erro ate existir implementacao real.
+- Servidor/modelo: nao ha chamada HTTP nesta task, entao smoke real com backend nao e pertinente.
+
+Criterio de aceite:
+
+- `zig test src/evidence.zig -lc` passa.
+- `zig test src/collect_evidence.zig -lc` passa.
+- `zig test src/tool_call.zig -lc` passa.
+- `zig test src/tool_loop.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+
+Pendencias deliberadas:
+
+- Ainda nao existe `ToolEvent` tipado com raw interno persistido no audit.
+- Ainda nao existe `ModelTurnContext` renderizado.
+- Ainda nao existe loop real streaming que chama o modelo de novo com evidence.
+- Estrategias `lexical`, `symbol`, `semantic`, `diagnostic`, `runtime` e `diff` ainda precisam de implementacao propria ou fallback auditado.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/evidence.zig -lc` -> passou; 9 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc` -> passou; 20 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_call.zig -lc` -> passou; 8 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_loop.zig -lc` -> passou; 28 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.

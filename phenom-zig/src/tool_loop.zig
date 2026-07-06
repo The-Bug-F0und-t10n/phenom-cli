@@ -1,4 +1,5 @@
 const std = @import("std");
+const collect_evidence = @import("collect_evidence.zig");
 const evidence = @import("evidence.zig");
 const gate = @import("gate.zig");
 const micro_context = @import("micro_context.zig");
@@ -52,6 +53,28 @@ pub fn runOnce(
         };
     }
 
+    if (std.mem.eql(u8, call.name, "collect_evidence")) {
+        const path = call.path orelse return error.MissingPath;
+        const result = try collect_evidence.execute(allocator, .{
+            .path = path,
+            .strategy = call.strategy orelse .path,
+            .start_line = call.start_line,
+            .max_lines = call.max_lines,
+            .budget_bytes = 16 * 1024,
+        });
+        defer result.deinit(allocator);
+        const evidence_text = try allocator.dupe(u8, result.evidence_text);
+        errdefer allocator.free(evidence_text);
+        const micro_context_text = try allocator.dupe(u8, result.micro_context_text);
+        errdefer allocator.free(micro_context_text);
+        return .{
+            .executed = true,
+            .rejected = false,
+            .evidence_text = evidence_text,
+            .micro_context_text = micro_context_text,
+        };
+    }
+
     return .{ .executed = false, .rejected = true };
 }
 
@@ -95,4 +118,32 @@ test "tool loop rejects unannounced tool before execution" {
 
     try std.testing.expect(!result.executed);
     try std.testing.expect(result.rejected);
+}
+
+test "tool loop executes announced collect_evidence into evidence and micro context" {
+    const output =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=path>
+        \\README.md
+        \\</parameter>
+        \\<parameter=strategy>
+        \\path
+        \\</parameter>
+        \\<parameter=start_line>
+        \\1
+        \\</parameter>
+        \\<parameter=max_lines>
+        \\3
+        \\</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const result = try runOnce(std.testing.allocator, output, &.{ "collect_evidence", "read_file_range" });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.executed);
+    try std.testing.expect(!result.rejected);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_text.?, "[EVIDENCE]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.micro_context_text.?, "source_tool=collect_evidence") != null);
 }

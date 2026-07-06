@@ -2,6 +2,7 @@ const std = @import("std");
 
 const audit = @import("audit.zig");
 const cli = @import("cli.zig");
+const collect_evidence = @import("collect_evidence.zig");
 const contracts = @import("contracts.zig");
 const config_file = @import("config_file.zig");
 const evidence = @import("evidence.zig");
@@ -503,6 +504,7 @@ fn makeDirIfMissing(path: []const u8) !void {
 test {
     _ = audit;
     _ = cli;
+    _ = collect_evidence;
     _ = contracts;
     _ = evidence;
     _ = fd_writer;

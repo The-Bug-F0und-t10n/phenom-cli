@@ -13,6 +13,7 @@ pub const MicroContext = struct {
     source_tool: []const u8,
     budget_bytes: usize,
     excerpt: []const u8,
+    truncated: bool,
 
     pub fn deinit(self: MicroContext, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -33,6 +34,7 @@ pub const MicroContext = struct {
         defer allocator.free(header);
         try out.appendSlice(allocator, header);
         try appendBudgeted(&out, allocator, self.excerpt, self.budget_bytes);
+        if (self.truncated) try out.appendSlice(allocator, "\n[TRUNCATED]\n");
         if (!std.mem.endsWith(u8, out.items, "\n")) try out.append(allocator, '\n');
         return out.toOwnedSlice(allocator);
     }
@@ -108,6 +110,7 @@ pub fn fromFileRange(
         .source_tool = tool,
         .budget_bytes = budget_bytes,
         .excerpt = excerpt,
+        .truncated = range.text.len > budget_bytes,
     };
 }
 

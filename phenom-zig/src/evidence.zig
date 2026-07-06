@@ -50,13 +50,17 @@ pub const EvidencePacket = struct {
 };
 
 pub fn fromFileRange(allocator: std.mem.Allocator, range: tools.FileRange) !EvidenceEntry {
+    return fromFileRangeBudgeted(allocator, range, range.text.len);
+}
+
+pub fn fromFileRangeBudgeted(allocator: std.mem.Allocator, range: tools.FileRange, max_excerpt_bytes: usize) !EvidenceEntry {
     const range_text = try std.fmt.allocPrint(allocator, "L{}-L{}", .{ range.start_line, range.end_line });
     errdefer allocator.free(range_text);
     const source = try allocator.dupe(u8, range.path);
     errdefer allocator.free(source);
     const kind = try allocator.dupe(u8, "file_range");
     errdefer allocator.free(kind);
-    const excerpt = try allocator.dupe(u8, range.text);
+    const excerpt = try budgetedExcerpt(allocator, range.text, max_excerpt_bytes);
     errdefer allocator.free(excerpt);
     return .{
         .source = source,
@@ -65,6 +69,17 @@ pub fn fromFileRange(allocator: std.mem.Allocator, range: tools.FileRange) !Evid
         .hash = range.hash,
         .excerpt = excerpt,
     };
+}
+
+fn budgetedExcerpt(allocator: std.mem.Allocator, text: []const u8, max_excerpt_bytes: usize) ![]u8 {
+    const n = @min(text.len, max_excerpt_bytes);
+    if (text.len <= n) return allocator.dupe(u8, text);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, text[0..n]);
+    if (!std.mem.endsWith(u8, out.items, "\n")) try out.append(allocator, '\n');
+    try out.appendSlice(allocator, "[TRUNCATED]\n");
+    return out.toOwnedSlice(allocator);
 }
 
 test "evidence packet renders compact context" {
@@ -108,4 +123,24 @@ test "from file range owns source kind range and excerpt" {
     try std.testing.expectEqualStrings("file_range", entry.kind);
     try std.testing.expectEqualStrings("L1-L1", entry.range);
     try std.testing.expectEqualStrings("hello\n", entry.excerpt);
+}
+
+test "from file range budget prevents raw tail leak" {
+    const text = "visible\nhidden-tail\n";
+    const range = tools.FileRange{
+        .path = try std.testing.allocator.dupe(u8, "README.md"),
+        .start_line = 1,
+        .end_line = 2,
+        .total_lines = 2,
+        .hash = 0x42,
+        .text = try std.testing.allocator.dupe(u8, text),
+    };
+    defer range.deinit(std.testing.allocator);
+
+    const entry = try fromFileRangeBudgeted(std.testing.allocator, range, "visible\n".len);
+    defer entry.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, entry.excerpt, "visible") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.excerpt, "hidden-tail") == null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.excerpt, "[TRUNCATED]") != null);
 }
