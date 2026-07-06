@@ -8394,6 +8394,59 @@ Regra de negocio:
 - O agente executa contrato, valida allowlist/schema/budget/duplicidade/stale/raw leak, audita e compacta contexto operacional.
 - Contexto descartavel nao e `MEMORY.md` nem `SKILLS.md`. MEMORY/SKILLS continuam sendo contexto persistente de projeto/usuario. Working evidence e storage operacional do turno/sessao.
 
+Ajuste firmado apos revisao:
+
+- `WorkingContext` e nome de estado interno do agente, nao memoria do modelo.
+- O contexto temporario sai da "memoria" do modelo quando o agente deixa de reenviar esse texto no proximo request.
+- O produto model-visible deve ser chamado e tratado como `OperationalEvidenceContext`: evidencia operacional minima, intrinseca, tangivel e proporcional ao pedido atual.
+- O contexto operacional pode existir no SQLite/audit para replay, mas nao vira contexto permanente do modelo e nao aparece em `[MEMORY]`/`[SKILLS]`.
+- O backend local deve ser tratado como stateless do ponto de vista semantico. KV cache, prompt cache ou session cache do servidor sao otimizacoes, nao fonte autoritativa de contexto.
+- Se um backend mantiver conversa invisivel fora do prompt enviado pelo agente, esse modo deve ser considerado incompatível com replay/audit ou deve ser desabilitado.
+- A fonte de verdade de cada turno e: prompt renderizado pelo agente + eventos auditados no SQLite.
+- A memoria persistente textual segue exclusiva: `MEMORY.md`/`.MEMORY.md` e `SKILLS.md`/`.SKILL.md`, somente quando existem ou quando ha promocao explicita futura.
+
+Modelo de requests:
+
+```text
+request 1:
+  [TURN_CONTEXT v1]
+  [CONTRACTS]
+  user prompt
+
+modelo:
+  collect_evidence(terms/path/strategy definidos pelo modelo)
+
+agente:
+  raw tool output -> ToolEvent -> EvidenceEntry -> EvidencePacket -> WorkingContext interno
+
+request 2:
+  [TURN_CONTEXT v1]
+  [CONTRACTS]
+  [EVIDENCE] OperationalEvidenceContext minimo
+  [NEXT_ACTION] responder ou refinar
+
+request 3 opcional:
+  [EVIDENCE] evidencia ativa mais recente
+  [ANCHORS] evidencias antigas compactas
+```
+
+Regra de descarte:
+
+- Texto completo de evidencia so fica model-visible enquanto for ativo e couber no budget.
+- Quando compactado, o texto completo deixa de ser reenviado; ficam apenas anchors como `E1 path/range/hash/contextId/resumo`.
+- Quando nao for mais util, ate o anchor sai do prompt.
+- Nada e apagado da auditoria; apenas deixa de ser renderizado para o modelo.
+- Nao existe tentativa de apagar KV cache interno do servidor; o controle correto e nao reenviar o conteudo e usar modo stateless/reprodutivel.
+
+Compatibilidade com tasks correlatas:
+
+- T050/T204: esta task nao substitui `EvidencePacket`; ela define como o packet entra e sai do contexto model-visible.
+- T060/T061/T062: micro-contexto continua sendo path/range/hash para edicao segura; compactacao nao remove a obrigacao de validar stale antes de patch.
+- T070-T077/T205: `ModelTurnContext` continua sendo o unico renderer oficial do que vai ao modelo.
+- T074/T120/T121/T162/T206: contexto operacional nao compete com MEMORY/SKILLS e nao promove nada automaticamente.
+- T150-T150D/T208-T210: esta task e para `code_micro`; News, PDF/log e runtime continuam dependendo de `ContextProfile` proprio, nao de micro-contexto de codigo.
+- T271/T273: nao reintroduz heuristica, preflight automatico nem gate por keywords; a intencao continua vindo do modelo via contrato.
+
 Alvo final:
 
 1. O modelo recebe schema compacto de `collect_evidence` com parametros model-driven:
@@ -8411,8 +8464,8 @@ Alvo final:
    - texto destilado model-visible;
    - raw output somente no SQLite/audit, nunca no prompt.
 3. O `ModelTurnContext` renderiza somente:
-   - evidencias ativas recentes ou selecionadas;
-   - anchors compactos das evidencias antigas;
+   - `OperationalEvidenceContext` com evidencias ativas recentes ou selecionadas;
+   - anchors compactos das evidencias antigas, sem snippets completos antigos;
    - `[NEXT_ACTION]` curto dizendo que o modelo pode refinar se a evidencia nao bastar.
 4. O loop para por budget/duplicidade/ausencia de progresso/erro recuperavel, nao por numero fixo de chamadas.
 5. A cada patch/mutacao futura, micro-context stale remove snippets ativos e preserva apenas anchors/obrigacoes.
@@ -8423,7 +8476,10 @@ Teste primeiro:
 - `working_context` bloqueia coleta duplicada com mesmos `path/terms/strategy/range`, mas permite coleta diferente no mesmo turno.
 - `working_context` compacta evidencia antiga para anchors quando o budget model-visible e excedido.
 - `working_context compact=true` limpa snippets ativos e preserva somente anchors/next action.
+- `working_context` prova que contexto completo antigo nao e reenviado apos compactacao.
 - `model_context` nunca renderiza `---BEGIN CONTENT---`, raw `rg`, stdout bruto ou markers internos.
+- `model_context` prova que `[MEMORY]`/`[SKILLS]` nao aparecem por causa de working evidence ou SQLite operacional.
+- `http`/`main` deve auditar o prompt/contexto enviado para replay e nao depender de memoria invisivel do backend.
 - `runOneToolLoopStep` usa working context para renderizar follow-up, nao `state.evidence_texts` bruto.
 - Smoke real ambigue deve permitir: primeira coleta ampla -> modelo emite segunda coleta refinada -> resposta final grounded, sem repetir evidencia identica.
 
@@ -8450,6 +8506,7 @@ Implementacao:
   - `best_quality`;
   - contador de duplicidade;
   - metodos `remember`, `hasDuplicate`, `remainingBudget`, `shouldAllowMoreEvidence`, `compact`, `renderEvidenceBlocks`.
+- Definir `OperationalEvidenceContext` como saida renderizavel derivada do `WorkingContext`, sem ownership de raw output.
 - Migrar `ToolLoopState` em `phenom-zig/src/main.zig` para usar `WorkingContext`.
 - Manter `ToolCallKey` somente se ainda for o menor caminho; se `WorkingEvidence` ja cobre duplicidade, remover duplicacao.
 - Atualizar `renderCollectedEvidenceContext` para receber working context e renderizar active evidence + compact anchors.
@@ -8468,11 +8525,12 @@ Passos de implementacao:
 3. Criar teste em `tool_call.zig` para `<parameter=compact>true</parameter>` owned/boolean.
 4. Implementar parse de `compact`.
 5. Criar teste em `main.zig` provando que duas coletas diferentes entram no working context e duplicata nao reexecuta.
-6. Trocar `ToolLoopState.evidence_texts` por `WorkingContext`.
-7. Atualizar schema e `NEXT_ACTION` para refinamento model-driven sem exemplos enviesados de dominio.
-8. Registrar eventos SQLite de add/compact/duplicate/budget.
-9. Rodar unit tests, build release e smoke real com query ambigua.
-10. Revisar memoria/ownership/bounds/raw leak antes do commit.
+6. Criar teste em `model_context.zig` provando que working evidence nao cria MEMORY/SKILLS nem reenvia evidencia compactada completa.
+7. Trocar `ToolLoopState.evidence_texts` por `WorkingContext`.
+8. Atualizar schema e `NEXT_ACTION` para refinamento model-driven sem exemplos enviesados de dominio.
+9. Registrar eventos SQLite de add/compact/duplicate/budget e prompt/contexto renderizado para replay.
+10. Rodar unit tests, build release e smoke real com query ambigua.
+11. Revisar memoria/ownership/bounds/raw leak antes do commit.
 
 Revisao baixo nivel obrigatoria antes do commit:
 
@@ -8482,6 +8540,8 @@ Revisao baixo nivel obrigatoria antes do commit:
 - Raw leak: `working_context.render*` deve chamar ou espelhar `model_context.assertNoRawContextLeak`.
 - Duplicidade: chave deve incluir `path`, `terms`, `strategy`, `start_line`, `max_lines`; chamada diferente nao pode ser bloqueada.
 - SQLite: audit pode guardar resumo bruto suficiente, mas prompt so recebe destilado/anchors.
+- Backend: nenhum codigo deve depender de session state invisivel do servidor; prompt renderizado precisa ser suficiente para replay.
+- Prompt cache: se existir, deve ser tratado como performance; teste de replay deve passar sem assumir cache.
 - Regra de negocio: nenhuma lista de stopwords, lista fixa de arquivos, preferencia por linguagem, preferencia source/docs/test ou extracao de termos do prompt original.
 
 Criterio de aceite:
@@ -8495,10 +8555,13 @@ Criterio de aceite:
 - Smoke real sem env mostra pelo menos uma chamada model-driven de `collect_evidence`.
 - Smoke real de refinamento nao repete evidencia identica; se o modelo pedir outra coleta com termos/path diferentes, o agente executa.
 - SQLite mostra `working_context_add`, zero raw marker em `model_context`, e motivo de parada por budget/qualidade/duplicidade quando aplicavel.
+- SQLite mostra o `model_context` exato usado no follow-up e permite demonstrar que evidencia compactada completa nao foi reenviada.
+- Nenhum teste cria `[MEMORY]`/`[SKILLS]` a partir de working evidence, SQLite ou audit.
 
 Pendencias deliberadas:
 
 - `selectedCandidates`/`selected` deve ficar para a proxima task se exigir mudar o ranker para emitir ids candidatos antes de materializar snippets.
 - Estrategias `symbol`, `semantic`, `diagnostic`, `runtime` e `diff` continuam inativas ate terem executor real.
 - Groundedness por claim/citacao ainda e task separada: esta task limita crescimento de contexto e preserva evidencia, mas nao valida cada frase final do modelo.
-- Persistencia cross-session do working context deve usar SQLite/audit e rehidratacao controlada; nao deve ser promovida para MEMORY automaticamente.
+- Persistencia cross-session do working context deve usar SQLite/audit e rehidratacao controlada como contexto operacional minimo, quando explicitamente retomado; nao deve ser promovida para MEMORY automaticamente.
+- Politica fina para backends stateful fica pendente: por enquanto, o contrato de produto assume requests semanticamente stateless e replayavel.
