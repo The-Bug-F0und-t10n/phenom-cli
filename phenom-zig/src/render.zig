@@ -82,7 +82,11 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             const prefix = try std.fmt.bufPrint(&prefix_buf, "> [{s}] ", .{self.options.user_label});
 
             try self.writer.writeAll("\n");
+            try self.writeUserBlankLine();
+            try self.writer.writeAll("\n");
             try self.writeWrappedUserLine(prefix, text);
+            try self.writer.writeAll("\n");
+            try self.writeUserBlankLine();
             try self.writer.writeAll("\n\n");
             self.last_block = .user;
         }
@@ -302,6 +306,13 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 try self.writer.writeAll("\n");
                 logical_start = logical_end + 1;
             }
+        }
+
+        fn writeUserBlankLine(self: *Self) !void {
+            try self.writeContentGutter();
+            if (self.options.color) try self.writer.writeAll(user_bg ++ user_fg);
+            try self.writeSpaces(self.userInnerWidth() + 1);
+            if (self.options.color) try self.writer.writeAll(reset);
         }
 
         fn writeUserVirtualLine(self: *Self, prefix: []const u8, text: []const u8, pos: usize, take: usize) !void {
@@ -1226,7 +1237,7 @@ test "append only snapshot matches phenom cli ts plain surface" {
     try renderer.assistantDelta("ok");
     try renderer.done();
 
-    const expected = "\n > [user] ola    \n\n ok\n\n─ Worked for 0s ─\n";
+    const expected = "\n                 \n > [user] ola    \n                 \n\n ok\n\n─ Worked for 0s ─\n";
     try std.testing.expectEqualStrings(expected, buffer.items);
 }
 
@@ -1386,7 +1397,9 @@ test "codex style append only turn snapshot covers core blocks" {
 
     const expected =
         "\n" ++
+        "                                         \n" ++
         " > [user] corrija o bug                  \n" ++
+        "                                         \n" ++
         "\n" ++
         " │ thinking\n" ++
         " │ vou inspecionar\n" ++
@@ -1417,7 +1430,7 @@ test "ansi user bubble uses same palette constants as phenom cli ts" {
     var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = true, .terminal_columns = 16 });
     try renderer.user("ola");
 
-    const expected = "\n \x1b[48;5;236m\x1b[38;5;252m> [user] ola  \x1b[0m\n\n";
+    const expected = "\n \x1b[48;5;236m\x1b[38;5;252m              \x1b[0m\n \x1b[48;5;236m\x1b[38;5;252m> [user] ola  \x1b[0m\n \x1b[48;5;236m\x1b[38;5;252m              \x1b[0m\n\n";
     try std.testing.expectEqualStrings(expected, buffer.items);
 }
 

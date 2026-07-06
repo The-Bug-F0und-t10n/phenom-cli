@@ -6433,3 +6433,67 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 120 --prompt 'responda somente este markdown: ```diff\n-old\n+new\n```'` -> passou; transcript mostrou `38;2;138;48;48;48;2;255;240;240m-old` e `38;2;47;111;69;48;2;237;248;240m+new`.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.
+
+## T250 - Adicionar padding vertical pequeno no bloco de user query
+
+Status: implemented-verified.
+
+Motivacao: o bloco de user query no output estava compacto demais: a linha `> [user] ...` ficava colada nas bordas verticais da bubble. O usuario pediu um espacamento vertical pequeno no output. A cor e largura do bloco devem permanecer iguais ao visual do `phenom-cli-ts`; a mudanca e apenas padding interno.
+
+Evidencia:
+
+- `phenom-zig/src/render.zig`: `user()` escrevia `\n`, a linha de query e depois `\n\n`, sem linha pintada vazia antes/depois da query.
+- Snapshots `append only snapshot`, `codex style append only turn snapshot` e `ansi user bubble` provavam a bubble de uma unica linha.
+- Smoke offline mostrava que o texto do usuario ficava visualmente apertado quando comparado ao restante do transcript.
+
+Impacto esperado:
+
+- User query passa a ter uma linha vazia pintada acima e uma abaixo do texto.
+- A bubble continua append-only, copiavel e sem cursor movement.
+- Em `--no-color`, o padding vira linhas de espaco; em TTY colorido, vira area pintada com `USER_BG/USER_FG`.
+- Prompt fixo/statusbar nao muda; so o transcript de user message muda.
+
+Teste primeiro:
+
+- Snapshot plain do turno passa a exigir linha vazia antes/depois de `> [user]`.
+- Snapshot amplo Codex-like passa a exigir o padding no primeiro bloco.
+- Snapshot ANSI exige `USER_BG/USER_FG` nas linhas vazias.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: adicionar `writeUserBlankLine`.
+- `render.zig`: `user()` chama `writeUserBlankLine()` antes e depois de `writeWrappedUserLine`.
+- `render.zig`: atualizar snapshots afetados.
+
+Passos de implementacao:
+
+1. Localizar o render do user block.
+2. Adicionar helper pequeno reaproveitando `userInnerWidth`.
+3. Inserir padding vertical interno.
+4. Atualizar snapshots.
+5. Rodar renderer isolado, build completo, release e smoke offline.
+6. Instalar binario atualizado.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: sem alocacao nova.
+- Bounds: usa `userInnerWidth() + 1`, mesmo tamanho visual da linha pintada atual.
+- Terminal: nao usa cursor movement, alternate screen ou repaint.
+- Compatibilidade: multiline/wrap continua passando pelo mesmo `writeWrappedUserLine`.
+- Escopo: nao altera prompt row fixo nem statusbar.
+
+Criterio de aceite:
+
+- `zig test src/render.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke offline mostra user block com respiro vertical.
+- `install-local` passa.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/render.zig -lc` -> passou; 27 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --offline --no-color --prompt 'oi'` -> passou; transcript renderizou user block com linha vazia acima e abaixo da query.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.
