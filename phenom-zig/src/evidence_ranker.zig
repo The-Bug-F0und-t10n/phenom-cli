@@ -6,6 +6,7 @@ pub const CandidateSource = enum {
     prompt_path,
     rg,
     fallback_scan,
+    workspace_overview,
 };
 
 pub const RankBudget = struct {
@@ -100,6 +101,9 @@ pub fn rankForPrompt(
     if (candidates.items.len == 0) {
         try addPromptPathCandidates(allocator, &candidates, prompt, strategy, budget);
     }
+    if (candidates.items.len == 0 and strategy == .auto) {
+        try addWorkspaceOverviewCandidates(allocator, io, &candidates, budget);
+    }
 
     sortCandidates(candidates.items);
     var merged = try mergeCandidates(allocator, candidates.items, budget);
@@ -122,10 +126,6 @@ fn extractTerms(out: *TermList, prompt: []const u8, strategy: contracts.Strategy
     while (it.next()) |raw| {
         try out.add(raw);
     }
-
-    if (std.mem.indexOf(u8, prompt, "tool loop") != null) try out.add("tool_loop");
-    if (std.mem.indexOf(u8, prompt, "tool call") != null) try out.add("tool_call");
-    if (std.mem.indexOf(u8, prompt, "collect evidence") != null) try out.add("collect_evidence");
 
     switch (strategy) {
         .diagnostic => {
@@ -279,6 +279,91 @@ fn addPromptPathCandidates(
             .reasons = reasons,
         });
     }
+}
+
+fn addWorkspaceOverviewCandidates(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    out: *std.ArrayList(EvidenceCandidate),
+    budget: RankBudget,
+) !void {
+    const argv = [_][]const u8{
+        "rg",
+        "--files",
+        "--hidden",
+        "--glob",
+        "!{.git,zig-cache,zig-out,node_modules,bin}/**",
+        ".",
+    };
+    const result = std.process.run(allocator, io, .{
+        .argv = &argv,
+        .stdout_limit = .limited(budget.max_rg_bytes),
+        .stderr_limit = .limited(8 * 1024),
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    var paths = std.ArrayList([]u8).empty;
+    defer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        const path = normalizeRgPath(std.mem.trim(u8, line, " \t\r\n"));
+        if (path.len == 0) continue;
+        if (skipPath(path)) continue;
+        if (!looksLikeTextCode(path)) continue;
+        if (paths.items.len >= budget.max_candidates * 8) break;
+        try paths.append(allocator, try allocator.dupe(u8, path));
+    }
+    sortOverviewPaths(paths.items);
+
+    const limit = @min(paths.items.len, budget.max_candidates);
+    for (paths.items[0..limit]) |path| {
+        const reasons = try allocator.dupe(u8, "workspace_overview_structure");
+        errdefer allocator.free(reasons);
+        try out.append(allocator, .{
+            .path = try allocator.dupe(u8, path),
+            .start_line = 1,
+            .end_line = budget.max_lines_per_range,
+            .score = overviewScore(path),
+            .source = .workspace_overview,
+            .reasons = reasons,
+        });
+    }
+}
+
+fn overviewScore(path: []const u8) i32 {
+    const depth = pathDepth(path);
+    var score: i32 = 48;
+    score -= @as(i32, @intCast(@min(depth * 6, 30)));
+    score -= @as(i32, @intCast(@min(path.len / 32, 12)));
+    return score;
+}
+
+fn sortOverviewPaths(paths: [][]u8) void {
+    std.mem.sort([]u8, paths, {}, struct {
+        fn lessThan(_: void, a: []u8, b: []u8) bool {
+            const a_depth = pathDepth(a);
+            const b_depth = pathDepth(b);
+            if (a_depth != b_depth) return a_depth < b_depth;
+            if (a.len != b.len) return a.len < b.len;
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+}
+
+fn pathDepth(path: []const u8) usize {
+    var depth: usize = 0;
+    for (path) |byte| {
+        if (byte == '/') depth += 1;
+    }
+    return depth;
 }
 
 pub fn mergeCandidates(
@@ -570,6 +655,14 @@ test "ranking with rg finds collect evidence implementation without raw output a
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "[CANDIDATE_RANKING]") != null);
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "rg_invocations=") != null);
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "---BEGIN CONTENT---") == null);
+}
+
+test "auto ranking without structured terms falls back to workspace overview" {
+    var ranked = try rankForPrompt(std.testing.allocator, std.testing.io, "Analise esse projeto de forma breve", .auto, .{ .max_ranges = 3 });
+    defer ranked.deinit(std.testing.allocator);
+    try std.testing.expect(ranked.candidates.items.len > 0);
+    try std.testing.expectEqual(CandidateSource.workspace_overview, ranked.candidates.items[0].source);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "workspace_overview_structure") != null);
 }
 
 test "term extraction keeps structured symbols and ignores prose without stopword table" {

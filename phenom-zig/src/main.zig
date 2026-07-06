@@ -327,7 +327,7 @@ fn recordAndEmitTurnDone(
 
 fn buildInitialModelContext(allocator: std.mem.Allocator, io: std.Io, prompt: []const u8, enable_tool_loop: bool) !?[]u8 {
     const include_persistent = modelContextEnabled();
-    const include_collect_evidence_schema = enable_tool_loop and shouldOfferCollectEvidence(prompt);
+    const include_collect_evidence_schema = enable_tool_loop;
     if (!include_persistent and !include_collect_evidence_schema) return null;
 
     var persistent = persistent_context.Loaded.init(allocator);
@@ -342,7 +342,7 @@ fn buildInitialModelContext(allocator: std.mem.Allocator, io: std.Io, prompt: []
         .memory = persistent.memory.items,
         .skills = persistent.skills.items,
         .next_action = if (include_collect_evidence_schema)
-            "If file evidence is required, emit exactly one collect_evidence tool call with path. Otherwise answer directly."
+            "You are already inside the user's workspace. If the answer needs workspace evidence and no evidence block is present yet, the next valid output is exactly one collect_evidence call. Use strategy=auto when no path is known. Do not claim that files are unavailable and do not ask the user to paste/upload files that the tool can inspect. If no workspace evidence is needed, answer directly."
         else
             "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
     });
@@ -758,7 +758,9 @@ fn collectEvidenceToolSchema() []const u8 {
     return
     \\[TOOLS v1]
     \\collect_evidence(path?, strategy=auto|path|lexical|symbol|semantic|diagnostic|runtime|diff, start_line=1, max_lines=12)
-    \\Use strategy=auto without path for ranked evidence. Use strategy=path only with path.
+    \\The current workspace files are available through this tool.
+    \\If workspace evidence is needed and no evidence block is present, emit a tool call before final prose.
+    \\Use strategy=auto without path for ranked workspace evidence. Use strategy=path only with path.
     \\Format with path:
     \\<tool_call>
     \\<function=collect_evidence>
@@ -771,31 +773,6 @@ fn collectEvidenceToolSchema() []const u8 {
     \\Format ranked:
     \\<tool_call><function=collect_evidence><parameter=strategy>auto</parameter></function></tool_call>
     ;
-}
-
-fn shouldOfferCollectEvidence(prompt: []const u8) bool {
-    const needles: []const []const u8 = &.{
-        "arquivo",
-        "file",
-        "codigo",
-        "código",
-        "bug",
-        "erro",
-        "implemente",
-        "refator",
-        "analise",
-        "analyze",
-        "tool",
-        "collect_evidence",
-        ".zig",
-        ".ts",
-        ".js",
-        ".md",
-    };
-    for (needles) |needle| {
-        if (std.mem.indexOf(u8, prompt, needle) != null) return true;
-    }
-    return false;
 }
 
 fn modelContextEnabled() bool {
@@ -1126,16 +1103,24 @@ test "tool loop env parser is opt in only" {
     try std.testing.expect(!toolLoopValueEnabled("false"));
 }
 
-test "tool loop schema is compact and only offered for evidence-like prompts" {
+test "tool loop schema is compact and offered without linguistic gating" {
     const schema = collectEvidenceToolSchema();
     try std.testing.expect(std.mem.indexOf(u8, schema, "collect_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=auto") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "symbol") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "current workspace files are available") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "emit a tool call before final prose") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "apply_patch") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "grep_file") == null);
-    try std.testing.expect(shouldOfferCollectEvidence("analise o arquivo README.md"));
-    try std.testing.expect(shouldOfferCollectEvidence("corrija este bug em main.zig"));
-    try std.testing.expect(!shouldOfferCollectEvidence("ola tudo bem"));
+
+    const with_tools = (try buildInitialModelContext(std.testing.allocator, std.testing.io, "ola tudo bem", true)) orelse return error.MissingContext;
+    defer std.testing.allocator.free(with_tools);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "already inside the user's workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "Do not claim that files are unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "do not ask the user to paste/upload files") != null);
+
+    try std.testing.expect((try buildInitialModelContext(std.testing.allocator, std.testing.io, "analise esse projeto", false)) == null);
 }
 
 test "deferred stream sink buffers tool call text before rendering" {

@@ -7716,7 +7716,7 @@ Implementacao:
 - `phenom-zig/src/evidence_ranker.zig`: remover `isStopWord`.
 - `phenom-zig/src/evidence_ranker.zig`: remover conversao generica de qualquer palavra para snake_case.
 - `phenom-zig/src/evidence_ranker.zig`: adicionar `isStructuredSearchTerm`, `hasUpperAfterLower`, `isKnownContractTerm` e `looksLikeDiagnosticToken`.
-- `phenom-zig/src/evidence_ranker.zig`: manter apenas expansoes canonicas de frases de contrato como `tool loop`, `tool call` e `collect evidence`, pois elas mapeiam para nomes internos versionados.
+- `phenom-zig/src/evidence_ranker.zig`: naquele momento ainda manteve expansoes canonicas de frases de contrato como `tool loop`, `tool call` e `collect evidence`; a T270 removeu isso por ainda ser interpretacao textual escondida.
 
 Revisao baixo nivel obrigatoria antes do commit:
 
@@ -7992,3 +7992,92 @@ Validacao executada:
 - `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --prompt 'Use collect_evidence no arquivo README.md e depois responda exatamente: PHENOM_PATH_REPAIR_269' --expect-contains PHENOM_PATH_REPAIR_269 --show-expect-status --fail-on-model-error --session path-repair-269` -> passou; coletou `README.md`.
 - `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --prompt 'Use collect_evidence com strategy auto sem path, mas a evidencia alvo e README.md. Depois responda exatamente: PHENOM_PATH_REPAIR_FORCED_269B' --expect-contains PHENOM_PATH_REPAIR_FORCED_269B --show-expect-status --fail-on-model-error --session path-repair-forced-269b` -> passou; coletou `README.md`.
 - `sqlite3 .phenom-zig/phenom.db "select kind, substr(body,1,220) from events where session='path-repair-forced-269b' and kind in ('tool_envelope','tool_arg_repair','tool_start','tool_event','evidence','assistant_delta','turn_done') order by id;"` -> mostrou `tool_start collect_evidence README.md`, `tool_event args=strategy=path path=README.md`, evidencia de `README.md` e resposta final.
+
+## T270 - Remover vies de inventario no `collect_evidence(auto)`
+
+Status: implemented-verified.
+
+Motivacao: o teste real com uma pergunta ambigua de usuario comum mostrou que o schema sem gate linguistico induziu o modelo a chamar `collect_evidence(auto)`, mas o ranker retornou `NoEvidenceCandidates` quando nao havia path nem termo estruturado util. A primeira tentativa de corrigir isso usou uma lista fixa de arquivos conhecidos (`README.md`, `package.json`, `build.zig`, `Cargo.toml`, `src/main.zig` etc.). Isso foi rejeitado porque introduz vies operacional: o controller passaria a decidir quais arquivos "devem" explicar o projeto por preferencia hardcoded, violando a regra de negocio do audit e da T266.
+
+Evidencia:
+
+- `TASKS.md` T266 estabelece que o controller nao deve inferir direcao operacional por stopwords, palavras do prompt ou tabela linguistica.
+- `doc/AGENTE_AI_BAIXO_CONSUMO_TOKENS_AUDIT.md` exige contratos e estrategias auditaveis, nao contexto montado por inferencia escondida.
+- Smoke real `ambiguous-tool-270e` mostrou `collect_evidence(auto)` seguido de `NoEvidenceCandidates` para uma pergunta natural sobre o projeto.
+- Diff local continha `addWorkspaceOverviewCandidates` com lista fixa de caminhos e `overviewScore` favorecendo nomes como `readme`, `package`, `build`, `cargo`, `pyproject`, `main` e `index`.
+- O mesmo arquivo ainda mapeava frases livres como `tool loop`, `tool call` e `collect evidence` para termos internos, o que era outro caminho de interpretacao textual escondida.
+
+Impacto esperado:
+
+- `collect_evidence(auto)` sem path/termo estruturado passa a ter fallback de inventario estrutural do workspace.
+- O inventario usa `rg --files` como coletor auditavel, com argv separado e limite de stdout/stderr.
+- Nenhum nome de arquivo e privilegiado por lista fixa.
+- Nenhuma frase livre do prompt vira termo interno no ranker.
+- A ordenacao do inventario usa somente propriedades neutras: profundidade menor, path menor e ordem lexicografica.
+- O modelo recebe evidencia destilada; raw output do coletor nao entra no contexto.
+- O contrato continua sendo escolhido pelo modelo; o controller apenas executa `collect_evidence(auto)` dentro do budget.
+
+Teste primeiro:
+
+- Teste `auto ranking without structured terms falls back to workspace overview` prova que prompt sem termo estruturado retorna candidatos `workspace_overview`.
+- Teste `term extraction keeps structured symbols and ignores prose without stopword table` continua provando que prosa comum nao entra como termo.
+- Teste real ambigue de usuario valida que o modelo chama a tool, recebe evidencia e responde sem `NoEvidenceCandidates`.
+
+Implementacao:
+
+- `phenom-zig/src/evidence_ranker.zig`: remover expansoes por frase livre (`tool loop`, `tool call`, `collect evidence`).
+- `phenom-zig/src/evidence_ranker.zig`: implementar `addWorkspaceOverviewCandidates` com `rg --files --hidden` e globs de exclusao para cache/vendor.
+- `phenom-zig/src/evidence_ranker.zig`: filtrar apenas arquivos texto/codigo ja aceitos por `looksLikeTextCode`.
+- `phenom-zig/src/evidence_ranker.zig`: substituir score por nome por `overviewScore` baseado em profundidade e tamanho de path.
+- `phenom-zig/src/evidence_ranker.zig`: adicionar `sortOverviewPaths` e `pathDepth`.
+- `phenom-zig/src/main.zig`: manter schema de `collect_evidence` sempre disponivel quando `PHENOM_TOOL_LOOP_V1=1`, sem gate linguistico por prompt.
+
+Passos de implementacao:
+
+1. Identificar e remover a lista fixa de paths.
+2. Remover scoring por basename.
+3. Remover conversao de frases livres em termos internos.
+4. Criar inventario estrutural via `rg --files`.
+5. Ordenar candidatos por propriedades neutras.
+6. Manter limites de stdout, stderr, quantidade de paths e quantidade de ranges.
+7. Validar testes focados, suite principal e build release.
+8. Rodar smoke real ambigue com servidor.
+9. Consultar SQLite para provar envelope, ranking, evidencia e ausencia de raw marker.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: `result.stdout` e `result.stderr` sao liberados; cada path temporario em `paths` e liberado no `defer`; candidatos finais duplicam `path` e `reasons` e seguem ownership de `RankingResult`.
+- Ownership: `paths.items` so guarda buffers owned temporarios; `out.append` duplica antes do `defer` liberar temporarios.
+- Bounds: `stdout_limit` usa `budget.max_rg_bytes`; `stderr_limit` e 8 KiB; `paths` para em `budget.max_candidates * 8`; saida final para em `budget.max_candidates`.
+- Subprocesso: `rg` e chamado sem shell, com argv separado.
+- Raw leak: audit registra candidatos e reasons, nao stdout bruto; query SQLite confirmou zero `---BEGIN CONTENT---`.
+- Regra de negocio: nao ha stopword, lista de arquivos preferidos, phrase mapping ou classificacao por idioma.
+- Risco operacional: se `rg` nao existir, o fallback estrutural retorna sem candidatos; isso e melhor que inventar evidencia por vies. Uma etapa futura pode adicionar coletor nativo sem mudar regra de ranking.
+
+Criterio de aceite:
+
+- `zig test src/evidence_ranker.zig -lc` passa.
+- `zig test src/collect_evidence.zig -lc` passa.
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real ambigue passa com `collect_evidence(auto)` e resposta final.
+- SQLite mostra `tool_envelope state=accepted`, `tool_start collect_evidence auto`, `[CANDIDATE_RANKING]`, `source=workspace_overview`, `evidence`, `assistant_delta` e `turn_done status=ok`.
+- SQLite mostra `0` ocorrencias de marcador bruto `---BEGIN CONTENT---`.
+
+Pendencias deliberadas:
+
+- O fallback estrutural ainda depende de `rg --files`; coletor nativo de inventario pode ser implementado depois para ambientes sem rg.
+- A estrategia `auto` ainda nao faz leitura semantica do workspace; ela fornece uma visao estrutural neutra quando nao ha alvo tipado.
+- Ordenar por profundidade/path nao garante a melhor evidencia conceitual em todos os projetos; a melhora correta deve vir de contrato/modelo pedindo `path`, `symbol`, `query` ou estrategia especifica, nao de lista hardcoded.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/evidence_ranker.zig -lc` -> passou; 10 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc` -> passou; 31 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 131 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 620 --prompt 'Analise esse projeto e me diga, em termos simples, o que ele faz. Termine exatamente com: PHENOM_AMBIG_TOOL_270F' --expect-contains PHENOM_AMBIG_TOOL_270F --show-expect-status --fail-on-model-error --session ambiguous-tool-270f` -> passou; modelo chamou `collect_evidence(auto)`, recebeu evidencia e respondeu com `PHENOM_AMBIG_TOOL_270F`.
+- `sqlite3 .phenom-zig/phenom.db "select kind, substr(body,1,900) from events where session='ambiguous-tool-270f' and kind in ('model_context','tool_envelope','tool_start','tool_event','evidence','assistant_delta','turn_done') order by id;"` -> mostrou `tool_envelope state=accepted`, `tool_start collect_evidence auto`, `[CANDIDATE_RANKING]`, `source=workspace_overview`, evidencia, resposta e `turn_done status=ok`.
+- `sqlite3 .phenom-zig/phenom.db "select count(*) from events where session='ambiguous-tool-270f' and body like '%---BEGIN CONTENT---%';"` -> retornou `0`.
