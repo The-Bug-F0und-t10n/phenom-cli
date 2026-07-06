@@ -6367,3 +6367,69 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 180 --prompt 'responda somente este markdown: ```ts\nconst value = "ok";\nrun(value);\n```\n```diff\n-old\n+new\n```'` -> passou; transcript emitiu `38;2` para code e `48;2` para diff pastel.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.
+
+## T249 - Tornar diff Markdown legivel com foreground explicito estilo Codex
+
+Status: implemented-verified.
+
+Motivacao: a T248 corrigiu a paleta, mas manteve um erro de legibilidade: o conteudo das linhas `+` e `-` recebia apenas background pastel. A cor do texto ficava dependente do tema do terminal. Em alguns temas, o diff ficava fraco ou invisivel para humanos. O comportamento desejado e codex-like: fundo de destaque e texto com foreground explicito escuro/legivel.
+
+Evidencia:
+
+- `phenom-zig/src/render.zig`: em `writeCodeLine`, o gutter usava `writeRgbFgBg`, mas a linha usava `writeRgbBg(diff_add_bg, line)` e `writeRgbBg(diff_del_bg, line)`.
+- Smoke real mostrava `\x1b[48;2;237;248;240m+new` e `\x1b[48;2;255;240;240m-old`, sem `38;2` no conteudo.
+- O usuario reportou que a coloracao do diff nao era visivel ao humano e pediu coloracao como Codex, com background e texto visivel.
+
+Impacto esperado:
+
+- Linhas adicionadas usam foreground verde escuro `#2f6f45` sobre background `#edf8f0`.
+- Linhas removidas usam foreground vermelho escuro `#8a3030` sobre background `#fff0f0`.
+- Gutter e conteudo da linha usam o mesmo par foreground/background.
+- Background ANSI saturado `41/42` continua proibido.
+- Modo `--no-color` continua sem ANSI.
+
+Teste primeiro:
+
+- Teste ANSI de diff fenced exige `38;2;47;111;69;48;2;237;248;240m+new`.
+- Teste ANSI de diff fenced exige `38;2;138;48;48;48;2;255;240;240m-old`.
+- Teste continua exigindo ausencia de `\x1b[41` e `\x1b[42`.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: trocar `writeRgbBg(diff_add_bg, line)` por `writeRgbFgBg(diff_add_fg, diff_add_bg, line)`.
+- `phenom-zig/src/render.zig`: trocar `writeRgbBg(diff_del_bg, line)` por `writeRgbFgBg(diff_del_fg, diff_del_bg, line)`.
+- `phenom-zig/src/render.zig`: renomear o teste de diff para explicitar foreground/background legivel.
+
+Passos de implementacao:
+
+1. Localizar o ponto exato onde o conteudo `+/-` recebia apenas background.
+2. Aplicar foreground/background no conteudo inteiro.
+3. Endurecer asserts ANSI.
+4. Rodar renderer isolado.
+5. Rodar build completo e release.
+6. Rodar smoke real colorido com diff fenced.
+7. Instalar binario atualizado.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: sem alocacao nova.
+- ANSI: foreground/background sao emitidos em uma unica sequencia por trecho, reduzindo estado parcial do terminal.
+- Terminal: reset continua apos cada trecho, evitando vazamento de background para linhas seguintes.
+- Compatibilidade: modo sem cor preserva texto puro.
+- Escopo: altera apenas diff fenced em Markdown; diff preview standalone continua com sua paleta propria.
+
+Criterio de aceite:
+
+- `zig test src/render.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real mostra `38;2;...;48;2` tanto no gutter quanto no conteudo `+/-`.
+- `install-local` passa.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/render.zig -lc` -> passou; 27 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 120 --prompt 'responda somente este markdown: ```diff\n-old\n+new\n```'` -> passou; transcript mostrou `38;2;138;48;48;48;2;255;240;240m-old` e `38;2;47;111;69;48;2;237;248;240m+new`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou o binario atualizado em `~/.local/bin/phenom`.

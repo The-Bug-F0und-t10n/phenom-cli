@@ -439,10 +439,10 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             if (isDiffLang(lang)) {
                 if (std.mem.startsWith(u8, line, "+")) {
                     try self.writeRgbFgBg(diff_add_fg, diff_add_bg, "│ ");
-                    try self.writeRgbBg(diff_add_bg, line);
+                    try self.writeRgbFgBg(diff_add_fg, diff_add_bg, line);
                 } else if (std.mem.startsWith(u8, line, "-")) {
                     try self.writeRgbFgBg(diff_del_fg, diff_del_bg, "│ ");
-                    try self.writeRgbBg(diff_del_bg, line);
+                    try self.writeRgbFgBg(diff_del_fg, diff_del_bg, line);
                 } else if (std.mem.startsWith(u8, line, "@@")) {
                     try self.writeCyan("│ ");
                     try self.writeRgb(tone_fn, line);
@@ -1577,7 +1577,7 @@ test "assistant markdown code uses phenom cli ts 24 bit syntax palette" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;122;156;198mrun") != null);
 }
 
-test "assistant markdown diff uses phenom cli ts pastel backgrounds" {
+test "assistant markdown diff uses readable codex style foreground and background" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
 
@@ -1595,8 +1595,8 @@ test "assistant markdown diff uses phenom cli ts pastel backgrounds" {
     );
     try renderer.done();
 
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[48;2;237;248;240m+new") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[48;2;255;240;240m-old") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;47;111;69;48;2;237;248;240m+new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;138;48;48;48;2;255;240;240m-old") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;47;111;69;48;2;237;248;240m│ ") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;138;48;48;48;2;255;240;240m│ ") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[41") == null);
