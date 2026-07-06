@@ -1,4 +1,5 @@
 const std = @import("std");
+const tool_event = @import("tool_event.zig");
 
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -88,6 +89,12 @@ pub const AuditDb = struct {
         if (c.sqlite3_bind_text(stmt, 3, z_body.ptr, @as(c_int, @intCast(body.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteStepFailed;
+    }
+
+    pub fn recordToolEventSummary(self: *AuditDb, session: []const u8, event: tool_event.ToolEvent) !void {
+        const body = try event.renderAuditSummary(self.allocator);
+        defer self.allocator.free(body);
+        try self.recordEvent(session, "tool_event", body);
     }
 
     pub fn recordInputHistory(self: *AuditDb, line: []const u8) !void {
@@ -259,6 +266,34 @@ test "session events load in insertion order" {
     try std.testing.expectEqualStrings("ola", events.items[0].body);
     try std.testing.expectEqualStrings("assistant_delta", events.items[1].kind);
     try std.testing.expectEqualStrings("ok", events.items[1].body);
+}
+
+test "tool event audit summary stores metadata without raw output" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    const range = @import("tools.zig").FileRange{
+        .path = try std.testing.allocator.dupe(u8, "README.md"),
+        .start_line = 1,
+        .end_line = 1,
+        .total_lines = 1,
+        .hash = 0,
+        .text = try std.testing.allocator.dupe(u8, "VISIBLE\nSECRET_RAW_TAIL\n"),
+    };
+    defer range.deinit(std.testing.allocator);
+    const event = try tool_event.ToolEvent.fromFileRange(std.testing.allocator, "collect_evidence", "strategy=path", range);
+    defer event.deinit(std.testing.allocator);
+
+    try db.recordToolEventSummary("s1", event);
+
+    var events = try db.loadSessionEvents(std.testing.allocator, "s1", 20);
+    defer freeAuditEvents(std.testing.allocator, &events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqualStrings("tool_event", events.items[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "raw_bytes=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "raw_hash=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "SECRET_RAW_TAIL") == null);
 }
 
 test "input history trims to newest 200 distinct lines" {

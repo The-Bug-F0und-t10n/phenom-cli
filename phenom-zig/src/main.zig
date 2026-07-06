@@ -13,6 +13,7 @@ const micro_context = @import("micro_context.zig");
 const reasoning_filter = @import("reasoning_filter.zig");
 const render = @import("render.zig");
 const tool_call = @import("tool_call.zig");
+const tool_event = @import("tool_event.zig");
 const tool_loop = @import("tool_loop.zig");
 const tools = @import("tools.zig");
 const tui = @import("tui.zig");
@@ -514,6 +515,7 @@ test {
     _ = reasoning_filter;
     _ = render;
     _ = tool_call;
+    _ = tool_event;
     _ = tool_loop;
     _ = tools;
     _ = tui;

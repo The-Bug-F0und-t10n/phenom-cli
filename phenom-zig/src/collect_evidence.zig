@@ -3,6 +3,7 @@ const std = @import("std");
 const contracts = @import("contracts.zig");
 const evidence = @import("evidence.zig");
 const micro_context = @import("micro_context.zig");
+const tool_event = @import("tool_event.zig");
 const tools = @import("tools.zig");
 
 pub const Args = struct {
@@ -18,6 +19,7 @@ pub const Result = struct {
     context_id: []const u8,
     evidence_text: []u8,
     micro_context_text: []u8,
+    tool_event_audit_text: []u8,
     raw_bytes_read: usize,
     model_bytes: usize,
 
@@ -25,6 +27,7 @@ pub const Result = struct {
         allocator.free(self.context_id);
         allocator.free(self.evidence_text);
         allocator.free(self.micro_context_text);
+        allocator.free(self.tool_event_audit_text);
     }
 };
 
@@ -36,7 +39,17 @@ pub fn execute(allocator: std.mem.Allocator, args: Args) !Result {
     const range = try tools.readFileRange(allocator, args.path, args.start_line, args.max_lines, args.budget_bytes);
     defer range.deinit(allocator);
 
-    const entry = try evidence.fromFileRangeBudgeted(allocator, range, args.budget_bytes);
+    const args_summary = try std.fmt.allocPrint(
+        allocator,
+        "strategy={s} path={s} start_line={} max_lines={} budget_bytes={}",
+        .{ @tagName(strategy), args.path, args.start_line, args.max_lines, args.budget_bytes },
+    );
+    defer allocator.free(args_summary);
+
+    const event = try tool_event.ToolEvent.fromFileRange(allocator, "collect_evidence", args_summary, range);
+    defer event.deinit(allocator);
+
+    const entry = try event.toEvidenceEntryBudgeted(allocator, args.budget_bytes);
     var packet = evidence.EvidencePacket.init(allocator);
     defer packet.deinit();
     try packet.add(entry);
@@ -48,6 +61,8 @@ pub fn execute(allocator: std.mem.Allocator, args: Args) !Result {
     errdefer allocator.free(evidence_text);
     const micro_context_text = try ctx.render(allocator);
     errdefer allocator.free(micro_context_text);
+    const tool_event_audit_text = try event.renderAuditSummary(allocator);
+    errdefer allocator.free(tool_event_audit_text);
     const context_id = try allocator.dupe(u8, ctx.id);
     errdefer allocator.free(context_id);
 
@@ -56,6 +71,7 @@ pub fn execute(allocator: std.mem.Allocator, args: Args) !Result {
         .context_id = context_id,
         .evidence_text = evidence_text,
         .micro_context_text = micro_context_text,
+        .tool_event_audit_text = tool_event_audit_text,
         .raw_bytes_read = range.text.len,
         .model_bytes = evidence_text.len + micro_context_text.len,
     };
@@ -75,6 +91,7 @@ test "collect evidence path returns budgeted evidence and micro context" {
     try std.testing.expect(std.mem.startsWith(u8, result.context_id, "ctx_"));
     try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "[EVIDENCE]") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.micro_context_text, "[MICRO_CONTEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "[TOOL_EVENT]") != null);
     try std.testing.expect(result.model_bytes == result.evidence_text.len + result.micro_context_text.len);
 }
 
@@ -104,6 +121,8 @@ test "collect evidence does not leak raw tail beyond budget" {
 
     try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "SECRET_RAW_TAIL") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.micro_context_text, "SECRET_RAW_TAIL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "SECRET_RAW_TAIL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "raw_bytes=") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "[TRUNCATED]") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.micro_context_text, "[TRUNCATED]") != null);
 }

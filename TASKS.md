@@ -4555,6 +4555,88 @@ Validacao executada:
 - `curl -sS http://192.168.1.122:11434/completion ... thinking-off ... n_predict=96 ...` -> retornou `PHENOM_REAL_7319`.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+
+## T258 - Criar `ToolEvent` tipado e audit summary sem vazamento de raw
+
+Status: implemented-verified.
+
+Motivacao: T257 criou o executor `collect_evidence`, mas ainda faltava a fronteira formal entre raw interno e evidencia destilada. As tasks T070, T071, T072, T161, T201, T204 e T208 apontam o mesmo risco: se outputs de tools continuarem como texto solto, o loop real pode reinjetar bruto no modelo, perder replay e confundir falha de tool com falha de modelo.
+
+Evidencia:
+
+- `TASKS.md` T070 pede `ToolEvent`, `EvidenceEntry` e `ModelTurnContext`.
+- `TASKS.md` T071 pede raw output no event store, nao no prompt.
+- `TASKS.md` T204 pede pipeline `ToolEvent -> EvidenceEntry -> EvidencePacket`.
+- `TASKS.md` T257 deixou pendente `ToolEvent` tipado com raw interno persistido no audit.
+- `phenom-zig/src/collect_evidence.zig` ainda criava EvidenceEntry diretamente do range, sem evento intermediario.
+
+Impacto esperado:
+
+- `ToolEvent` passa a ser a fronteira owned de resultado bruto de tool.
+- Raw output existe no event store em memoria para audit/replay operacional.
+- EvidenceEntry passa a ser derivada de ToolEvent com budget.
+- Audit SQLite recebe resumo com tool, args, path, range, raw_bytes e raw_hash, sem conteudo bruto.
+- O proximo `ModelTurnContext` pode consumir EvidencePacket sabendo que raw nao entra no prompt.
+
+Teste primeiro:
+
+- `tool_event` prova que raw existe no evento, mas nao aparece no audit summary.
+- `tool_event` prova destilacao budgetada para EvidenceEntry sem tail bruto.
+- `tool_event` prova Store owns dos eventos appendados.
+- `collect_evidence` prova que `tool_event_audit_text` contem metadata e nao contem tail bruto.
+- `audit` prova que `recordToolEventSummary` grava metadata e nao grava raw output.
+
+Implementacao:
+
+- `phenom-zig/src/tool_event.zig`: criar `ToolEvent`, `Store`, `fromFileRange`, `toEvidenceEntryBudgeted` e `renderAuditSummary`.
+- `phenom-zig/src/collect_evidence.zig`: trocar fluxo para `ToolEvent -> EvidenceEntry`.
+- `phenom-zig/src/audit.zig`: adicionar `recordToolEventSummary`.
+- `phenom-zig/src/main.zig`: incluir `tool_event.zig` na suite principal.
+
+Passos de implementacao:
+
+1. Criar ToolEvent owned com raw output e metadata.
+2. Criar Store simples em memoria.
+3. Criar conversao ToolEvent -> EvidenceEntry budgetada.
+4. Criar audit summary sem raw.
+5. Integrar collect_evidence ao evento.
+6. Criar metodo de audit SQLite para summary.
+7. Rodar testes focados e build completo.
+8. Revisar ownership, leak, truncamento e anti-vazamento antes do commit.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: `ToolEvent.deinit` libera tool, args, path, raw e erro opcional.
+- Store: `Store.append` assume ownership e usa `errdefer` em falha de append.
+- Distilacao: `toEvidenceEntryBudgeted` cria `FileRange` temporario owned e libera no defer.
+- Audit: summary usa `allocPrint` e `recordEvent`; nao inclui `raw_output`.
+- Anti-vazamento: testes usam `SECRET_RAW_TAIL` e falham se aparecer em evidence/model/audit summary.
+- Limite: esta task nao cria persistencia de blob raw em SQLite; raw fica no event store em memoria. Persistencia raw dedicada so deve entrar se replay byte-a-byte exigir, com tabela propria e politica de retencao.
+
+Criterio de aceite:
+
+- `zig test src/tool_event.zig -lc` passa.
+- `zig test src/collect_evidence.zig -lc` passa.
+- `zig test src/tool_loop.zig -lc` passa.
+- `zig test src/audit.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+
+Pendencias deliberadas:
+
+- `ModelTurnContext` ainda nao existe.
+- Loop real streaming ainda nao consome ToolEvent.
+- Audit ainda nao grava tools anunciadas/rejeitadas/aceitas por turno em um envelope unico.
+- Persistencia raw byte-a-byte em SQLite ainda nao existe; por ora ha raw no event store em memoria e resumo auditavel no SQLite.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_event.zig -lc` -> passou; 12 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc` -> passou; 23 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_loop.zig -lc` -> passou; 31 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/audit.zig -lc -lsqlite3` -> passou; 16 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest` dentro do sandbox -> falhou com `SocketCreateFailed`, mostrando que o teste nao chegou ao servidor nesse perfil de permissao.
 - O mesmo `real-smoke` com permissao de rede liberada -> passou e imprimiu:
 
