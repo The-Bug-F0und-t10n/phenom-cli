@@ -125,3 +125,18 @@ test "invalid strategy is not silently converted to path" {
     ;
     try std.testing.expectError(error.InvalidStrategy, parseFirst(std.testing.allocator, output));
 }
+
+test "collect evidence without path is parsed for repair" {
+    const output =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=strategy>path</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("collect_evidence", call.name);
+    try std.testing.expect(call.path == null);
+    try std.testing.expectEqual(contracts.StrategyName.path, call.strategy.?);
+}

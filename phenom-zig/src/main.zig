@@ -225,6 +225,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             .max_tokens = config.max_tokens,
             .thinking = config.thinking,
         };
+        const enable_tool_loop = toolLoopEnabled();
         var sink = StreamSink{
             .allocator = allocator,
             .events = &events,
@@ -235,10 +236,11 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             .visible = std.ArrayList(u8).empty,
             .visible_bytes = 0,
             .thinking_bytes = 0,
+            .defer_visible = enable_tool_loop,
             .trim_visible_leading_whitespace = false,
         };
         defer sink.deinit();
-        const model_context_text = try buildOptionalModelContext(allocator, io, prompt);
+        const model_context_text = try buildInitialModelContext(allocator, io, prompt, enable_tool_loop);
         defer if (model_context_text) |text| allocator.free(text);
         if (model_context_text) |text| try db.recordEvent(config.session, "model_context", text);
 
@@ -262,14 +264,16 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             return;
         };
         try sink.flush();
-        if (toolLoopEnabled()) {
-            runToolLoopFollowup(allocator, config, prompt, sink.visible.items, &client, &events, &db, ui_ptr, &sink) catch |err| {
+        if (enable_tool_loop) {
+            const handled_by_tool_loop = runToolLoopIterations(allocator, config, prompt, sink.raw_visible.items, &client, &events, &db, ui_ptr, &sink) catch |err| blk: {
                 const message = try std.fmt.allocPrint(allocator, "tool loop failed: {s}", .{@errorName(err)});
                 defer allocator.free(message);
                 try events.emit(.{ .progress_update = message });
                 try db.recordEvent(config.session, "tool_loop_error", @errorName(err));
                 if (config.fail_on_model_error) return err;
+                break :blk true;
             };
+            if (!handled_by_tool_loop) try sink.flushDeferredVisible();
         }
         if (sink.visible_bytes == 0) {
             try events.emit(.{ .progress_update = "model emitted no visible final answer; reasoning was suppressed or generation ended inside <think>" });
@@ -319,22 +323,39 @@ fn recordAndEmitTurnDone(
     try events.emit(.{ .turn_done = .{ .elapsed_ms = elapsed_ms } });
 }
 
-fn buildOptionalModelContext(allocator: std.mem.Allocator, io: std.Io, prompt: []const u8) !?[]u8 {
-    if (!modelContextEnabled()) return null;
+fn buildInitialModelContext(allocator: std.mem.Allocator, io: std.Io, prompt: []const u8, enable_tool_loop: bool) !?[]u8 {
+    const include_persistent = modelContextEnabled();
+    const include_collect_evidence_schema = enable_tool_loop and shouldOfferCollectEvidence(prompt);
+    if (!include_persistent and !include_collect_evidence_schema) return null;
 
-    var persistent = try persistent_context.loadFromCwd(allocator, io);
+    var persistent = persistent_context.Loaded.init(allocator);
     defer persistent.deinit();
-    if (persistent.memory.items.len == 0 and persistent.skills.items.len == 0) return null;
+    if (include_persistent) persistent = try persistent_context.loadFromCwd(allocator, io);
+
+    if (!include_collect_evidence_schema and persistent.memory.items.len == 0 and persistent.skills.items.len == 0) return null;
 
     return try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
+        .contracts = if (include_collect_evidence_schema) collectEvidenceToolSchema() else "",
         .memory = persistent.memory.items,
         .skills = persistent.skills.items,
-        .next_action = "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
+        .next_action = if (include_collect_evidence_schema)
+            "If file evidence is required, emit exactly one collect_evidence tool call with path. Otherwise answer directly."
+        else
+            "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
     });
 }
 
-fn runToolLoopFollowup(
+const max_tool_iterations = 2;
+const max_tool_repairs = 1;
+
+const ToolLoopNext = union(enum) {
+    final_answer,
+    tool_call: tool_call.ToolCall,
+    stopped,
+};
+
+fn runToolLoopIterations(
     allocator: std.mem.Allocator,
     config: cli.Config,
     prompt: []const u8,
@@ -344,25 +365,93 @@ fn runToolLoopFollowup(
     db: *audit.AuditDb,
     ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
     first_sink: *StreamSink,
-) !void {
-    const call = tool_call.parseFirst(allocator, model_output) catch |err| {
+) !bool {
+    var maybe_call = tool_call.parseFirst(allocator, model_output) catch |err| {
         try db.recordEvent(config.session, "tool_parse_error", @errorName(err));
-        return;
-    } orelse return;
-    defer call.deinit(allocator);
+        return true;
+    };
+    if (maybe_call == null) return false;
 
+    var tool_iterations: usize = 0;
+    var repairs: usize = 0;
+    while (maybe_call) |call_value| {
+        var call = call_value;
+        defer call.deinit(allocator);
+
+        const next = try runOneToolLoopStep(
+            allocator,
+            config,
+            prompt,
+            &call,
+            client,
+            events,
+            db,
+            ui_ptr,
+            first_sink,
+            &tool_iterations,
+            &repairs,
+        );
+        switch (next) {
+            .final_answer => return true,
+            .stopped => return true,
+            .tool_call => |next_call| {
+                maybe_call = next_call;
+                continue;
+            },
+        }
+    }
+    return true;
+}
+
+fn runOneToolLoopStep(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    call: *const tool_call.ToolCall,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    tool_iterations: *usize,
+    repairs: *usize,
+) !ToolLoopNext {
     if (!gate.isAllowed(call.name, &.{"collect_evidence"})) {
         try db.recordEvent(config.session, "tool_rejected", call.name);
-        return;
+        return .stopped;
     }
     if (!std.mem.eql(u8, call.name, "collect_evidence")) {
         try db.recordEvent(config.session, "tool_rejected", call.name);
-        return;
+        return .stopped;
     }
+
     const path = call.path orelse {
-        try db.recordEvent(config.session, "tool_rejected", "collect_evidence missing path");
-        return;
+        if (repairs.* >= max_tool_repairs) {
+            try db.recordEvent(config.session, "tool_rejected", "collect_evidence missing path after repair");
+            return .stopped;
+        }
+        repairs.* += 1;
+        try db.recordEvent(config.session, "tool_repair", "collect_evidence missing path");
+        try events.emit(.{ .progress_update = "repairing tool call: collect_evidence requires path" });
+        const repair_context = try model_context.renderModelTurnContext(allocator, .{
+            .task = prompt,
+            .contracts = collectEvidenceToolSchema(),
+            .obligations = &.{
+                "A collect_evidence call must include <parameter=path>relative/file</parameter>.",
+                "Do not answer with prose until evidence is collected or you decide evidence is unnecessary.",
+            },
+            .next_action = "Emit one corrected collect_evidence tool call with path, or answer directly if no file evidence is needed.",
+        });
+        defer allocator.free(repair_context);
+        try db.recordEvent(config.session, "model_context", repair_context);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink);
     };
+
+    if (tool_iterations.* >= max_tool_iterations) {
+        try db.recordEvent(config.session, "tool_loop_stop", "max tool iterations reached");
+        return .stopped;
+    }
+    tool_iterations.* += 1;
 
     if (ui_ptr) |active_ui| try active_ui.showStatus("Reading");
     const tool_start = try std.fmt.allocPrint(allocator, "collect_evidence\t{s}", .{path});
@@ -379,7 +468,7 @@ fn runToolLoopFollowup(
     }) catch |err| {
         try db.recordEvent(config.session, "tool_error", @errorName(err));
         try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = @errorName(err) } });
-        return;
+        return .stopped;
     };
     defer result.deinit(allocator);
 
@@ -390,12 +479,30 @@ fn runToolLoopFollowup(
     const evidence_blocks = [_]model_context.EvidenceBlock{.{ .text = result.evidence_text }};
     const follow_context = try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
+        .contracts = if (tool_iterations.* < max_tool_iterations) collectEvidenceToolSchema() else "",
         .evidence = &evidence_blocks,
-        .next_action = "Answer the current user request using the evidence above. Do not call tools again in this turn.",
+        .next_action = if (tool_iterations.* < max_tool_iterations)
+            "Answer using the evidence above. If one more file is strictly required, emit one collect_evidence call with path."
+        else
+            "Answer the current user request using the evidence above. Do not call tools again in this turn.",
     });
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
 
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink);
+}
+
+fn streamDeferredToolLoopTurn(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    follow_context: []const u8,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+) !ToolLoopNext {
     if (ui_ptr) |active_ui| try active_ui.showStatus("Thinking");
     var follow_sink = StreamSink{
         .allocator = allocator,
@@ -407,13 +514,64 @@ fn runToolLoopFollowup(
         .visible = std.ArrayList(u8).empty,
         .visible_bytes = 0,
         .thinking_bytes = 0,
+        .defer_visible = true,
         .trim_visible_leading_whitespace = false,
     };
     defer follow_sink.deinit();
     try client.streamInference(.{ .user_prompt = prompt, .model_context = follow_context }, &follow_sink);
     try follow_sink.flush();
-    try first_sink.visible.appendSlice(allocator, follow_sink.visible.items);
-    first_sink.visible_bytes += follow_sink.visible_bytes;
+
+    const next_call = tool_call.parseFirst(allocator, follow_sink.raw_visible.items) catch |err| {
+        try db.recordEvent(config.session, "tool_parse_error", @errorName(err));
+        return .stopped;
+    };
+    if (next_call) |call| return .{ .tool_call = call };
+
+    try follow_sink.flushDeferredVisible();
+    try aggregate_sink.visible.appendSlice(allocator, follow_sink.visible.items);
+    aggregate_sink.visible_bytes += follow_sink.visible_bytes;
+    return .final_answer;
+}
+
+fn collectEvidenceToolSchema() []const u8 {
+    return
+        \\[TOOLS v1]
+        \\collect_evidence(path, strategy=path, start_line=1, max_lines=12)
+        \\Format:
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=path>relative/path</parameter>
+        \\<parameter=strategy>path</parameter>
+        \\<parameter=start_line>1</parameter>
+        \\<parameter=max_lines>12</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+}
+
+fn shouldOfferCollectEvidence(prompt: []const u8) bool {
+    const needles: []const []const u8 = &.{
+        "arquivo",
+        "file",
+        "codigo",
+        "código",
+        "bug",
+        "erro",
+        "implemente",
+        "refator",
+        "analise",
+        "analyze",
+        "tool",
+        "collect_evidence",
+        ".zig",
+        ".ts",
+        ".js",
+        ".md",
+    };
+    for (needles) |needle| {
+        if (std.mem.indexOf(u8, prompt, needle) != null) return true;
+    }
+    return false;
 }
 
 fn modelContextEnabled() bool {
@@ -561,13 +719,16 @@ const StreamSink = struct {
     ui: ?*tui.TerminalUi(fd_writer.FdWriter),
     filter: reasoning_filter.ReasoningFilter,
     visible: std.ArrayList(u8),
+    raw_visible: std.ArrayList(u8) = std.ArrayList(u8).empty,
     visible_bytes: usize,
     thinking_bytes: usize,
+    defer_visible: bool = false,
     trim_visible_leading_whitespace: bool = false,
 
     pub fn deinit(ctx: *StreamSink) void {
         ctx.filter.deinit();
         ctx.visible.deinit(ctx.allocator);
+        ctx.raw_visible.deinit(ctx.allocator);
     }
 
     pub fn onDelta(ctx: *StreamSink, delta: []const u8) !void {
@@ -581,6 +742,18 @@ const StreamSink = struct {
     pub fn writeVisible(ctx: *StreamSink, visible: []const u8) !void {
         const text = trimLeadingWhitespaceAfterThinking(visible, &ctx.trim_visible_leading_whitespace);
         if (text.len == 0) return;
+        try ctx.raw_visible.appendSlice(ctx.allocator, text);
+        if (ctx.defer_visible) return;
+        try ctx.emitVisibleText(text);
+    }
+
+    pub fn flushDeferredVisible(ctx: *StreamSink) !void {
+        if (!ctx.defer_visible or ctx.raw_visible.items.len == 0) return;
+        ctx.defer_visible = false;
+        try ctx.emitVisibleText(ctx.raw_visible.items);
+    }
+
+    fn emitVisibleText(ctx: *StreamSink, text: []const u8) !void {
         ctx.visible_bytes += text.len;
         try ctx.visible.appendSlice(ctx.allocator, text);
         if (ctx.ui) |ui| try ui.showStatus("Responding");
@@ -727,6 +900,102 @@ test "tool loop env parser is opt in only" {
     try std.testing.expect(!toolLoopValueEnabled("0"));
     try std.testing.expect(!toolLoopValueEnabled("false"));
 }
+
+test "tool loop schema is compact and only offered for evidence-like prompts" {
+    const schema = collectEvidenceToolSchema();
+    try std.testing.expect(std.mem.indexOf(u8, schema, "collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "apply_patch") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "grep_file") == null);
+    try std.testing.expect(shouldOfferCollectEvidence("analise o arquivo README.md"));
+    try std.testing.expect(shouldOfferCollectEvidence("corrija este bug em main.zig"));
+    try std.testing.expect(!shouldOfferCollectEvidence("ola tudo bem"));
+}
+
+test "deferred stream sink buffers tool call text before rendering" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var recorder = EventRecorder{};
+    try bus.on(&recorder, EventRecorder.handleOpaque);
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "defer-test",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = true,
+    };
+    defer sink.deinit();
+
+    const xml =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=path>README.md</parameter>
+        \\<parameter=strategy>path</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    try sink.writeVisible(xml);
+    try std.testing.expectEqual(@as(usize, 0), recorder.message_chunks);
+    try std.testing.expectEqual(@as(usize, 0), sink.visible_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, sink.raw_visible.items, "<tool_call>") != null);
+
+    const call = (try tool_call.parseFirst(std.testing.allocator, sink.raw_visible.items)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("collect_evidence", call.name);
+    try std.testing.expectEqualStrings("README.md", call.path.?);
+}
+
+test "deferred stream sink flushes normal answer exactly once" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var recorder = EventRecorder{};
+    try bus.on(&recorder, EventRecorder.handleOpaque);
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "defer-answer-test",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = true,
+    };
+    defer sink.deinit();
+
+    try sink.writeVisible("resposta final");
+    try std.testing.expectEqual(@as(usize, 0), recorder.message_chunks);
+    try sink.flushDeferredVisible();
+    try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
+    try std.testing.expectEqualStrings("resposta final", sink.visible.items);
+    try sink.flushDeferredVisible();
+    try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
+}
+
+const EventRecorder = struct {
+    message_chunks: usize = 0,
+
+    fn handleOpaque(ctx: *anyopaque, event: ui_events.Event) !void {
+        const self: *EventRecorder = @ptrCast(@alignCast(ctx));
+        switch (event) {
+            .message_chunk => self.message_chunks += 1,
+            else => {},
+        }
+    }
+};
 
 fn countNeedle(haystack: []const u8, needle: []const u8) usize {
     if (needle.len == 0) return 0;

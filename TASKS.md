@@ -7409,3 +7409,98 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_loop.zig -lc` -> passou; 28 testes.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+
+## T263 - Fechar limitacoes do tool loop real controlado
+
+Status: implemented-verified.
+
+Motivacao: T262/T257 deixaram o loop real funcional, mas ainda inseguro para uso continuo: o texto bruto da tool call era renderizado antes da execucao, o modelo nao recebia schema compacto suficiente, `collect_evidence` sem `path` virava rejeicao seca, e o loop fazia apenas uma volta. Isso quebrava a regra central do agente: tool call e protocolo interno, evidencia destilada e o unico contexto que deve voltar ao modelo.
+
+Evidencia:
+
+- `phenom-zig/src/main.zig` renderizava `StreamSink.writeVisible` imediatamente e so chamava `tool_call.parseFirst` depois de `sink.flush()`.
+- `runToolLoopFollowup` aceitava apenas uma tool call e sempre enviava o follow-up com `Do not call tools again`.
+- `runToolLoopFollowup` rejeitava `collect_evidence` sem path com `tool_rejected`, sem reparo model-visible.
+- `buildOptionalModelContext` so injetava MEMORY/SKILLS quando `PHENOM_MODEL_CONTEXT_V1=1`; o modelo nao recebia formato compacto de tool call quando `PHENOM_TOOL_LOOP_V1=1`.
+- Smoke real anterior provou que anunciar tools demais induz tool call indevida em prompt simples; portanto o schema precisava ser minimo e condicionado ao prompt.
+
+Impacto esperado:
+
+- Texto `<tool_call>...</tool_call>` fica buffered e nao aparece na UI nem no audit como `assistant_delta`.
+- Prompt simples com `PHENOM_TOOL_LOOP_V1=1` continua respondendo direto sem schema de tools.
+- Prompt de codigo/arquivo recebe apenas schema compacto de `collect_evidence`.
+- `collect_evidence` sem `path` gera reparo compacto e uma nova chance de inferencia.
+- Loop suporta ate 2 execucoes de tool por turno, sem risco de loop infinito.
+- Expectation/assert de output usa apenas resposta visivel final, nao protocolo interno.
+
+Teste primeiro:
+
+- Teste de `StreamSink` deferred prova que XML de tool call fica em `raw_visible`, mas nao em `message_chunk` nem em `visible_bytes`.
+- Teste de `StreamSink` deferred prova que resposta normal e liberada exatamente uma vez.
+- Teste de schema prova que o contrato compacto contem `collect_evidence`, mas nao `apply_patch`/`grep_file`.
+- Teste de heuristica prova que prompt de arquivo/codigo recebe schema e saudacao simples nao recebe.
+- Smoke real idle prova que prompt simples nao dispara tool.
+- Smoke real de tool prova que o modelo emite tool call valida, a tool executa, o XML e suprimido e a resposta final aparece.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: adicionar `raw_visible` e `defer_visible` ao `StreamSink`.
+- `phenom-zig/src/main.zig`: `flushDeferredVisible` libera resposta normal depois da decisao do loop.
+- `phenom-zig/src/main.zig`: substituir `runToolLoopFollowup` por `runToolLoopIterations`.
+- `phenom-zig/src/main.zig`: limitar `max_tool_iterations=2` e `max_tool_repairs=1`.
+- `phenom-zig/src/main.zig`: criar `collectEvidenceToolSchema` com somente `collect_evidence`.
+- `phenom-zig/src/main.zig`: criar `shouldOfferCollectEvidence` para nao anunciar tool em prompt simples.
+- `phenom-zig/src/main.zig`: reparar `collect_evidence` sem path com contexto compacto e audit `tool_repair`.
+
+Passos de implementacao:
+
+1. Bufferizar visible output quando `PHENOM_TOOL_LOOP_V1=1`.
+2. Parsear tool call sobre `raw_visible`.
+3. Se nao houver tool call, liberar o buffer exatamente uma vez.
+4. Se houver tool call valida, suprimir o protocolo e executar `collect_evidence`.
+5. Enviar EvidencePacket em ModelTurnContext destilado.
+6. Permitir segunda tool call se a resposta seguinte ainda solicitar evidencia.
+7. Parar no limite fixo de 2 tools.
+8. Reparar uma chamada sem `path`.
+9. Rodar testes unitarios, build completo e smoke real.
+10. Confirmar no SQLite que `assistant_delta` nao contem `<tool_call>`.
+
+Revisao baixo nivel obrigatoria antes do commit:
+
+- Memoria: `StreamSink.deinit` libera `visible`, `raw_visible` e `ReasoningFilter`.
+- Ownership: `tool_call.parseFirst` retorna `ToolCall` owned; cada iteracao chama `deinit` antes de seguir.
+- Bounds: loop tem teto fixo `max_tool_iterations=2`; repair tem teto `max_tool_repairs=1`.
+- Raw leak: tool call fica em `raw_visible` transitorio e nao e persistida como `assistant_delta`.
+- Audit: `tool_start`, `tool_event`, `evidence`, `model_context`, `tool_repair` e `turn_done` continuam auditaveis.
+- Modelo: schema de tool nao e global; so entra quando `PHENOM_TOOL_LOOP_V1=1` e o prompt parece exigir evidencia de arquivo/codigo.
+- Infra: falha de socket continua `model_error`; falha de tool loop vira `tool_loop_error`, sem parecer erro de infraestrutura.
+- Terminal: o render recebe apenas eventos finais/tool/evidence; nao recebe protocolo XML interno.
+
+Criterio de aceite:
+
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig test src/tool_call.zig -lc` passa.
+- `zig test src/tool_loop.zig -lc` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real idle com `PHENOM_TOOL_LOOP_V1=1` passa sem tool call.
+- Smoke real de `collect_evidence README.md` passa com tool renderizada, resposta final e sem XML visivel.
+- Query SQLite retorna `0` para `assistant_delta like '%<tool_call>%'`.
+
+Pendencias deliberadas:
+
+- Ainda nao existe executor real para todas as tools do manifesto; esta task fecha apenas `collect_evidence`.
+- Ainda nao existe patch engine com `context_id`/stale check no fluxo de mutacao.
+- Ainda nao existe reparo semantico para estrategia invalida alem de audit `tool_parse_error`.
+- Ainda nao existe selecao inteligente de multiplos arquivos; o modelo ainda precisa pedir cada path.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 118 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_call.zig -lc` -> passou; 9 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_loop.zig -lc` -> passou; 31 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 96 --prompt 'Complete: PHENOM_LOOP_IDLE_263' --expect-contains PHENOM_LOOP_IDLE_263 --show-expect-status --fail-on-model-error` -> passou; resposta visivel `PHENOM_LOOP_IDLE_263`.
+- `PHENOM_TOOL_LOOP_V1=1 ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 220 --prompt 'Use collect_evidence no arquivo README.md e depois responda exatamente: PHENOM_TOOL_DONE_263' --expect-contains PHENOM_TOOL_DONE_263 --show-expect-status --fail-on-model-error` -> passou; renderizou `collect_evidence README.md` duas vezes pelo limite controlado e resposta final `PHENOM_TOOL_DONE_263`.
+- `sqlite3 .phenom-zig/phenom.db "select count(*) from events where session='default' and kind='assistant_delta' and body like '%<tool_call>%';"` -> retornou `0`.
