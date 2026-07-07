@@ -46,7 +46,7 @@ ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build real-dialogue-smoke -Dreal-backend
 
 `real-smoke` usa um token sentinela (`PHENOM_REAL_7319`) por padrao e falha se a resposta visivel nao contiver o texto esperado. Em ambientes com sandbox de rede, o mesmo comando pode falhar antes de chegar ao servidor; nesse caso, valide o transporte com `curl` e rode o smoke com rede liberada.
 `real-session-smoke` executa dois turnos reais na mesma sessao: primeiro grava uma palavra-codigo no SQLite operacional, depois exige que o modelo recupere essa palavra-codigo via contexto de sessao.
-`real-dialogue-smoke` executa dois turnos reais para validar continuidade conversacional curta via chat history real.
+`real-dialogue-smoke` executa dois turnos reais para validar continuidade conversacional curta via chat history real; o segundo turno pede um exemplo mais robusto sem repetir o tema.
 
 Regra de validacao:
 
@@ -56,7 +56,7 @@ Regra de validacao:
 - A suite offline nunca deve depender de `127.0.0.1`, Ollama, llama.cpp, rede ou modelo real.
 - `real-smoke` usa `--fail-on-model-error` e `--expect-contains`; se o backend nao conectar, falhar ou nao gerar a saida esperada, o comando retorna exit code nao-zero.
 - `real-session-smoke` usa as mesmas garantias e falha se a recuperacao do segundo turno nao contiver a palavra-codigo esperada.
-- `real-dialogue-smoke` falha se o segundo turno nao tratar uma pergunta curta como referencia a resposta anterior.
+- `real-dialogue-smoke` falha se o segundo turno nao mantiver o tema do exemplo anterior.
 
 Notas de arquitetura:
 

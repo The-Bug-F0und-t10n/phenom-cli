@@ -9855,6 +9855,18 @@ Correcao posterior de continuidade curta:
 - Smoke real reproduzivel: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-dialogue-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest -Dreal-dialogue-session=real-dialogue-smoke-301c` -> passou; segundo turno `da google?` respondeu `Sim`.
 - Audit SQLite da sessao `real-dialogue-smoke-301c`: `recent_dialogue=2`, `raw_marker=0`, `memory_block=0`, `skills_block=0`.
 
+Correcao posterior de linearidade do chat:
+
+- Log real mostrou outro sintoma da mesma familia: apos um exemplo simples de `media(notas)`, o usuario pediu "me de um exemplo mais robusto" e o modelo disse que nao tinha contexto anterior, mudando para Flask/autenticacao.
+- Causa raiz refinada: o contexto operacional ainda era serializado como uma mensagem `user` antes do historico real. Isso inseria uma fala artificial no meio da conversa e reduzia a saliencia linear do historico para modelo pequeno.
+- `phenom-zig/src/http.zig` agora coloca `ModelTurnContext` dentro da mensagem `system`; o fluxo enviado ao backend fica `system(contexto operacional) -> user/assistant recentes -> user atual`.
+- Unitarios HTTP travam que o contexto nao vira `user` artificial e que roles reais precedem o prompt atual.
+- Smoke real manual: sessao `continuity-example-302`; turno 1 pediu exemplo simples de `calcular_media`; turno 2 pediu apenas "me de um exemplo mais robusto"; resposta preservou `calcular_media`.
+- Audit SQLite da sessao `continuity-example-302`: `recent_dialogue=1`, `raw_marker=0`, `memory_block=0`, `skills_block=0`.
+- `real-dialogue-smoke` foi ajustado para esse caso: seed com `calcular_media` e follow-up "me de um exemplo mais robusto"; falha se a resposta nao contiver `calcular_media`.
+- Smoke real reproduzivel: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-dialogue-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest -Dreal-dialogue-session=real-dialogue-smoke-302` -> passou; segundo turno manteve `calcular_media`.
+- Audit SQLite da sessao `real-dialogue-smoke-302`: `recent_dialogue=2`, `raw_marker=0`, `memory_block=0`, `skills_block=0`.
+
 ## T295 - Implementar orchestrator final de MEMORY/SKILLS separado do SQLite operacional
 
 Status: pending-urgent.

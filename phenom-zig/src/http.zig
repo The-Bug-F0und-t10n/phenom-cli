@@ -143,12 +143,12 @@ pub const LocalModelClient = struct {
     fn buildOllamaBody(self: *LocalModelClient, escaped_model: []const u8, escaped_context: ?[]const u8, escaped_prompt: []const u8, dialogue: []const ChatMessage) ![]u8 {
         var messages = std.ArrayList(u8).empty;
         defer messages.deinit(self.allocator);
-        try messages.appendSlice(self.allocator, "{\"role\":\"system\",\"content\":\"Responda de forma direta, curta e no idioma do usuario. Nao mostre raciocinio.\"}");
+        try messages.appendSlice(self.allocator, "{\"role\":\"system\",\"content\":\"Responda de forma direta, curta e no idioma do usuario. Nao mostre raciocinio.");
         if (escaped_context) |context| {
-            try messages.appendSlice(self.allocator, ",{\"role\":\"user\",\"content\":\"");
+            try messages.appendSlice(self.allocator, "\\n\\n");
             try messages.appendSlice(self.allocator, context);
-            try messages.appendSlice(self.allocator, "\"}");
         }
+        try messages.appendSlice(self.allocator, "\"}");
         for (dialogue) |message| {
             const escaped = try jsonEscape(self.allocator, message.content);
             defer self.allocator.free(escaped);
@@ -171,10 +171,12 @@ pub const LocalModelClient = struct {
     fn buildLlamaCppPrompt(self: *LocalModelClient, input: InferenceInput, generation_prefix: []const u8) ![]u8 {
         var out = std.ArrayList(u8).empty;
         errdefer out.deinit(self.allocator);
-        try out.appendSlice(self.allocator, "<|im_start|>system\nResponda de forma direta, curta e no idioma do usuario. Quando thinking estiver habilitado, use o bloco <think> somente para raciocinio interno e finalize com resposta visivel fora dele.<|im_end|>\n");
+        try out.appendSlice(self.allocator, "<|im_start|>system\nResponda de forma direta, curta e no idioma do usuario. Quando thinking estiver habilitado, use o bloco <think> somente para raciocinio interno e finalize com resposta visivel fora dele.");
         if (input.model_context) |context| {
-            try appendChatMessage(&out, self.allocator, .user, context);
+            try out.appendSlice(self.allocator, "\n\n");
+            try out.appendSlice(self.allocator, context);
         }
+        try out.appendSlice(self.allocator, "<|im_end|>\n");
         for (input.dialogue) |message| {
             try appendChatMessage(&out, self.allocator, message.role, message.content);
         }
@@ -772,7 +774,7 @@ test "llamacpp thinking on opens reasoning block" {
     try std.testing.expect(std.mem.indexOf(u8, body, "<think>\\n\\n</think>\\n\\n") == null);
 }
 
-test "ollama body can include model context as separate user message" {
+test "ollama body includes model context in system message" {
     var client = LocalModelClient{
         .allocator = std.testing.allocator,
         .host = "127.0.0.1:11434",
@@ -790,6 +792,7 @@ test "ollama body can include model context as separate user message" {
     try std.testing.expect(std.mem.indexOf(u8, body, "Responda de forma direta") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "[TURN_CONTEXT v1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "corrija") != null);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(body, "\"role\":\"user\""));
     const context_idx = std.mem.indexOf(u8, body, "[TURN_CONTEXT v1]") orelse return error.MissingContext;
     const user_idx = std.mem.indexOf(u8, body, "corrija") orelse return error.MissingPrompt;
     try std.testing.expect(context_idx < user_idx);
@@ -819,10 +822,11 @@ test "ollama body includes recent dialogue as real chat roles" {
     const prior_user_idx = std.mem.indexOf(u8, body, "qual e meu nome?") orelse return error.MissingPriorUser;
     const prior_assistant_idx = std.mem.indexOf(u8, body, "Voce aparece como ashirak.") orelse return error.MissingPriorAssistant;
     const current_idx = std.mem.indexOf(u8, body, "e agora?") orelse return error.MissingPrompt;
+    try std.testing.expectEqual(@as(usize, 2), countNeedle(body, "\"role\":\"user\""));
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(body, "\"role\":\"assistant\""));
     try std.testing.expect(context_idx < prior_user_idx);
     try std.testing.expect(prior_user_idx < prior_assistant_idx);
     try std.testing.expect(prior_assistant_idx < current_idx);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"assistant\"") != null);
 }
 
 test "llamacpp body can include model context before user request" {
@@ -842,6 +846,7 @@ test "llamacpp body can include model context before user request" {
 
     const context_idx = std.mem.indexOf(u8, body, "[TURN_CONTEXT v1]") orelse return error.MissingContext;
     const user_idx = std.mem.indexOf(u8, body, "corrija") orelse return error.MissingPrompt;
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(body, "<|im_start|>user"));
     try std.testing.expect(context_idx < user_idx);
     try std.testing.expect(std.mem.indexOf(u8, body, "<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n") != null);
 }
@@ -870,9 +875,23 @@ test "llamacpp body includes recent dialogue before current user request" {
     const prior_user_idx = std.mem.indexOf(u8, body, "qual e meu nome?") orelse return error.MissingPriorUser;
     const prior_assistant_idx = std.mem.indexOf(u8, body, "Voce aparece como ashirak.") orelse return error.MissingPriorAssistant;
     const current_idx = std.mem.indexOf(u8, body, "da google?") orelse return error.MissingPrompt;
+    try std.testing.expectEqual(@as(usize, 2), countNeedle(body, "<|im_start|>user"));
+    try std.testing.expectEqual(@as(usize, 2), countNeedle(body, "<|im_start|>assistant"));
     try std.testing.expect(context_idx < prior_user_idx);
     try std.testing.expect(prior_user_idx < prior_assistant_idx);
     try std.testing.expect(prior_assistant_idx < current_idx);
+}
+
+fn countNeedle(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0) return 0;
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start <= haystack.len) {
+        const idx = std.mem.indexOf(u8, haystack[start..], needle) orelse break;
+        count += 1;
+        start += idx + needle.len;
+    }
+    return count;
 }
 
 test "thinking auto resolves simple prompt off and code prompt on" {
