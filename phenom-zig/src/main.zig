@@ -887,12 +887,12 @@ fn renderCollectedEvidenceContext(
 fn collectEvidenceToolSchema() []const u8 {
     return
     \\[TOOLS v1]
-    \\collect_evidence(path?, terms?, strategy=auto|path|lexical, start_line=1, max_lines=12, compact=false)
+    \\collect_evidence(path?, terms?, strategy=auto|path|lexical|symbol, start_line=1, max_lines=12, compact=false)
     \\search_session(terms)
     \\The current workspace files are available through this tool.
     \\Prior conversation is available through search_session; use model-chosen terms, never assume hidden chat history.
     \\Before making claims about the current project, repository, source code, files, implementation, or prior conversation, emit the relevant tool call and wait for evidence.
-    \\Use terms to express your search intent. Use strategy=auto with terms for ranked workspace evidence. Use strategy=path only with path. Set compact=true only when prior evidence can be reduced to anchors.
+    \\Use terms to express your search intent. Use strategy=auto with terms for ranked workspace evidence. Use strategy=symbol when looking for a named function/type/constant. Use strategy=path only with path. Set compact=true only when prior evidence can be reduced to anchors.
     \\Format with path:
     \\<tool_call>
     \\<function=collect_evidence>
@@ -904,6 +904,8 @@ fn collectEvidenceToolSchema() []const u8 {
     \\</tool_call>
     \\Format ranked:
     \\<tool_call><function=collect_evidence><parameter=strategy>auto</parameter><parameter=terms>what to find</parameter></function></tool_call>
+    \\Format symbol:
+    \\<tool_call><function=collect_evidence><parameter=strategy>symbol</parameter><parameter=terms>symbol or identifier to find</parameter></function></tool_call>
     \\Format session:
     \\<tool_call><function=search_session><parameter=terms>what prior conversation fact to find</parameter></function></tool_call>
     ;
@@ -1232,7 +1234,7 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "collect_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=auto") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "lexical") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "symbol") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "symbol") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "semantic") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "diagnostic") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "runtime") == null);

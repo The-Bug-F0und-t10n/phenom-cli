@@ -2,6 +2,7 @@ const std = @import("std");
 
 const contracts = @import("contracts.zig");
 const fts_ranker = @import("fts_ranker.zig");
+const symbol_ranker = @import("symbol_ranker.zig");
 
 const c = @cImport({
     @cInclude("dirent.h");
@@ -9,6 +10,7 @@ const c = @cImport({
 
 pub const CandidateSource = enum {
     prompt_path,
+    symbol_ast,
     rg,
     fts_bm25,
     fallback_scan,
@@ -46,6 +48,9 @@ pub const RankingResult = struct {
     rg_available: bool,
     fts_available: bool,
     fts_indexed_files: usize,
+    symbol_available: bool,
+    symbol_indexed_files: usize,
+    symbols_seen: usize,
 
     pub fn deinit(self: *RankingResult, allocator: std.mem.Allocator) void {
         for (self.candidates.items) |candidate| candidate.deinit(allocator);
@@ -97,8 +102,23 @@ pub fn rankForPrompt(
     var rg_available = true;
     var fts_available = true;
     var fts_indexed_files: usize = 0;
+    var symbol_available = true;
+    var symbol_indexed_files: usize = 0;
+    var symbols_seen: usize = 0;
 
-    // Phase 1: per-term rg for structured terms only (paths, code symbols, camelCase, etc.)
+    // Phase 1: syntax-aware symbols for strategy=symbol.
+    if (strategy == .symbol and prompt.len > 0) {
+        const symbol_result = collectSymbolCandidates(allocator, io, &candidates, prompt, budget) catch blk: {
+            symbol_available = false;
+            break :blk null;
+        };
+        if (symbol_result) |stats| {
+            symbol_indexed_files = stats.indexed_files;
+            symbols_seen = stats.symbol_count;
+        }
+    }
+
+    // Phase 2: per-term rg for structured terms only (paths, code symbols, camelCase, etc.)
     for (terms.items.items) |term| {
         if (candidates.items.len >= budget.max_candidates) break;
         if (!isStructuredSearchTerm(term)) continue;
@@ -112,7 +132,7 @@ pub fn rankForPrompt(
         rg_invocations += 1;
     }
 
-    // Phase 2: SQLite FTS5/BM25 over current workspace, using model-provided terms only.
+    // Phase 3: SQLite FTS5/BM25 over current workspace, using model-provided terms only.
     if (candidates.items.len < budget.max_candidates and (strategy == .auto or strategy == .lexical) and prompt.len > 0) {
         const fts_result = collectFtsCandidates(allocator, io, &candidates, prompt, budget) catch |err| switch (err) {
             error.SqliteOpenFailed, error.SqliteExecFailed, error.SqlitePrepareFailed, error.SqliteBindFailed, error.SqliteStepFailed => blk: {
@@ -124,17 +144,17 @@ pub fn rankForPrompt(
         if (fts_result) |indexed| fts_indexed_files = indexed;
     }
 
-    // Phase 3: batch file discovery via plain keywords (single rg -l call for all NL-like words)
+    // Phase 4: batch file discovery via plain keywords (single rg -l call for all NL-like words)
     if (candidates.items.len < budget.max_candidates and strategy == .auto) {
         try discoverFilesByKeywords(allocator, io, &candidates, terms.items.items, budget);
     }
 
-    // Phase 4: path candidates from prompt text
+    // Phase 5: path candidates from prompt text
     if (candidates.items.len == 0) {
         try addPromptPathCandidates(allocator, &candidates, prompt, strategy, budget);
     }
 
-    // Phase 5: workspace overview fallback
+    // Phase 6: workspace overview fallback
     if (candidates.items.len == 0 and strategy == .auto) {
         try addWorkspaceOverviewCandidates(allocator, io, &candidates, budget);
     }
@@ -145,7 +165,7 @@ pub fn rankForPrompt(
     sortCandidates(merged.items);
     trimCandidates(allocator, &merged, budget.max_ranges);
 
-    const audit = try renderAudit(allocator, merged.items, terms.items.items, strategy, rg_invocations, rg_available, fts_available, fts_indexed_files);
+    const audit = try renderAudit(allocator, merged.items, terms.items.items, strategy, rg_invocations, rg_available, fts_available, fts_indexed_files, symbol_available, symbol_indexed_files, symbols_seen);
     errdefer allocator.free(audit);
     return .{
         .candidates = merged,
@@ -154,6 +174,9 @@ pub fn rankForPrompt(
         .rg_available = rg_available,
         .fts_available = fts_available,
         .fts_indexed_files = fts_indexed_files,
+        .symbol_available = symbol_available,
+        .symbol_indexed_files = symbol_indexed_files,
+        .symbols_seen = symbols_seen,
     };
 }
 
@@ -393,6 +416,39 @@ fn collectFtsCandidates(
     return ranked.indexed_files;
 }
 
+const SymbolStats = struct {
+    indexed_files: usize,
+    symbol_count: usize,
+};
+
+fn collectSymbolCandidates(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    out: *std.ArrayList(EvidenceCandidate),
+    terms: []const u8,
+    budget: RankBudget,
+) !SymbolStats {
+    var ranked = try symbol_ranker.rank(allocator, io, terms, budget.max_candidates);
+    defer ranked.deinit(allocator);
+    for (ranked.candidates.items) |candidate| {
+        if (out.items.len >= budget.max_candidates) break;
+        if (skipPath(candidate.path)) continue;
+        const reasons = try std.fmt.allocPrint(allocator, "symbol_ast,symbol={s},indexed_files={},symbols={}", .{ candidate.symbol, ranked.indexed_files, ranked.symbol_count });
+        errdefer allocator.free(reasons);
+        const owned_path = try allocator.dupe(u8, candidate.path);
+        errdefer allocator.free(owned_path);
+        try out.append(allocator, .{
+            .path = owned_path,
+            .start_line = candidate.start_line,
+            .end_line = @min(candidate.end_line, candidate.start_line + budget.max_lines_per_range - 1),
+            .score = candidate.score,
+            .source = .symbol_ast,
+            .reasons = reasons,
+        });
+    }
+    return .{ .indexed_files = ranked.indexed_files, .symbol_count = ranked.symbol_count };
+}
+
 fn addWorkspaceOverviewCandidates(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -576,13 +632,16 @@ fn renderAudit(
     rg_available: bool,
     fts_available: bool,
     fts_indexed_files: usize,
+    symbol_available: bool,
+    symbol_indexed_files: usize,
+    symbols_seen: usize,
 ) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     const header = try std.fmt.allocPrint(
         allocator,
-        "[CANDIDATE_RANKING]\nstrategy={s}\nrg_invocations={}\nrg_available={}\nfts_available={}\nfts_indexed_files={}\nterms={}\n",
-        .{ @tagName(strategy), rg_invocations, rg_available, fts_available, fts_indexed_files, terms.len },
+        "[CANDIDATE_RANKING]\nstrategy={s}\nrg_invocations={}\nrg_available={}\nfts_available={}\nfts_indexed_files={}\nsymbol_available={}\nsymbol_indexed_files={}\nsymbols_seen={}\nterms={}\n",
+        .{ @tagName(strategy), rg_invocations, rg_available, fts_available, fts_indexed_files, symbol_available, symbol_indexed_files, symbols_seen, terms.len },
     );
     defer allocator.free(header);
     try out.appendSlice(allocator, header);

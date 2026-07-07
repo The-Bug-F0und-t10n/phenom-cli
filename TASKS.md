@@ -8821,3 +8821,99 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 760 --session fts-bm25-276c --prompt 'No código deste projeto, onde fica a parte que renderiza markdown e diff no output? Responda com evidências e termine exatamente com: PHENOM_FTS_276C' --expect-contains PHENOM_FTS_276C --show-expect-status --fail-on-model-error` -> passou; evidencia incluiu `src/render.zig` e resposta final correta.
 - `sqlite3 .phenom-zig/phenom.db "select 'raw_marker', count(*) ...; select 'fts_marker', count(*) ...; select 'render_evidence', count(*) ...; select 'tool_error', count(*) ...;"` -> retornou `raw_marker=0`, `fts_marker=1`, `render_evidence=1`, `tool_error=0`.
+
+## T277 - Ativar estrategia `symbol` com coleta estrutural interna
+
+Status: implementado nesta etapa.
+
+Motivacao: T276 melhorou recall para consultas ambiguas com FTS5/BM25, mas ainda faltava uma estrategia de contrato para buscas por simbolo nomeado. O audit e as tasks antigas pedem que `collect_evidence(strategy="symbol")` esconda AST/grep/read_file atras de um contrato unico, sem expor `parse_ast`, `grep_file` ou detalhes de LSP ao modelo. Esta task ativa `symbol` somente agora que existe executor real.
+
+Evidencias analisadas:
+
+- `TASKS.md` T100/T1522/T1553 pediam `collect_evidence(strategy="symbol")` como estrategia interna, com AST/grep e fallback auditado.
+- `doc/AGENTE_AI_BAIXO_CONSUMO_TOKENS_AUDIT.md` aponta que RAG/AST devem ficar atras de `collect_evidence`, nao como tools diretas.
+- `phenom-zig/src/contracts.zig` ja tinha enum `.symbol`, mas estrategia estava inativa.
+- `phenom-zig/src/tool_call.zig` ja parseava `symbol`, mas `collect_evidence` rejeitava por contrato.
+
+Alvo final:
+
+1. `symbol` passa a ser estrategia real de `collect_evidence`.
+2. O modelo continua vendo apenas `collect_evidence`, nao `parse_ast`, `grep_file` ou `symbol_ranker`.
+3. O executor estrutural encontra funcoes/tipos/constantes por sintaxe de linguagem.
+4. Se a coleta estrutural nao bastar, o fluxo existente ainda pode somar `rg` para termos estruturados.
+5. Evidencia final continua sendo path/range/hash.
+6. Nenhuma heuristica linguistica hardcoded e adicionada.
+
+Teste primeiro:
+
+- `symbol_ranker` encontra `AppendOnlyRenderer` em `src/render.zig`.
+- Parser estrutural extrai declaracao TS/JS simples.
+- `collect_evidence(strategy=symbol, terms=AppendOnlyRenderer)` retorna evidencia de `src/render.zig`.
+- `contracts` passa a aceitar `.symbol`, mas continua rejeitando `semantic`, `diagnostic`, `runtime` e `diff`.
+- `main` anuncia `symbol` no schema compacto.
+- Smoke real com modelo chama `collect_evidence: symbol`.
+
+Implementacao:
+
+- Criar `phenom-zig/src/symbol_ranker.zig`.
+- Extrair simbolos de arquivos `.zig`, `.ts` e `.js` com regras sintaticas conservadoras:
+  - Zig: `pub fn`, `fn`, `pub const`, `const`;
+  - TS/JS: `function`, `async function`, `class`, `const`, `let`, `var`, com `export/default`.
+- Pontuar por termos fornecidos pelo modelo contra:
+  - nome do simbolo;
+  - assinatura;
+  - path.
+- Estimar range por braces com teto de linhas.
+- Integrar como `CandidateSource.symbol_ast` em `evidence_ranker`.
+- Ativar `.symbol` em `contracts.strategy_specs`.
+- Atualizar schema model-visible de `collect_evidence` para `auto|path|lexical|symbol`.
+- Manter `semantic`, `diagnostic`, `runtime` e `diff` inativos.
+
+Revisao baixo nivel realizada:
+
+- Ownership: `symbol_ranker.Candidate` owns `path` e `symbol`; `Result.deinit` libera todos.
+- Failure path: duplicacao de path/symbol usa `errdefer` antes de append.
+- Failure path: adaptador `collectSymbolCandidates` duplica path e reasons com `errdefer`.
+- Bounds: indexacao limita `max_indexed_files`, `max_file_bytes`, `max_symbol_lines` e `max_candidates`.
+- Stale: resultado de `symbol_ranker` nao e enviado ao modelo diretamente; vira candidato e depois `tools.readFileRange` materializa hash/range atual.
+- Raw leak: executor estrutural nao guarda corpo bruto em audit; evidencia final passa pelo pipeline existente.
+- Regra de negocio: nao foi adicionada lista de stopwords, preferencia de extensao source/test/docs, ou roteamento por prompt do usuario.
+- Contrato: nenhuma nova tool model-visible foi criada.
+
+Criterio de aceite:
+
+- `zig test src/symbol_ranker.zig -lc -lsqlite3` passa.
+- `zig test src/contracts.zig -lc` passa.
+- `zig test src/evidence_ranker.zig -lc -lsqlite3` passa.
+- `zig test src/collect_evidence.zig -lc -lsqlite3` passa.
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real chama `collect_evidence: symbol` e responde com `src/render.zig`.
+- SQLite mostra `source=symbol_ast`, `raw_marker=0`, `tool_error=0`.
+
+Pendencias deliberadas:
+
+- Isso e parser estrutural/ctags-like, nao AST completa com type resolution. AST completa deve ser avaliada depois com parser real ou LSP, sem quebrar o contrato.
+- LSP/diagnostic real continua pendente para estrategia `diagnostic`.
+- Ranges por braces sao aproximados e limitados; edicao/mutacao futura ainda deve validar stale/range antes de patch.
+
+Implementado:
+
+- `phenom-zig/src/symbol_ranker.zig`: coletor estrutural de simbolos com bounds, scoring por termos do modelo e testes.
+- `phenom-zig/src/evidence_ranker.zig`: fonte `symbol_ast`, audit `symbol_available/symbol_indexed_files/symbols_seen` e fallback para `rg`.
+- `phenom-zig/src/contracts.zig`: estrategia `.symbol` ativa em `collect_evidence`.
+- `phenom-zig/src/main.zig`: schema compacto anuncia `symbol`.
+- `phenom-zig/src/collect_evidence.zig`: teste de estrategia `symbol` real.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/symbol_ranker.zig -lc -lsqlite3` -> passou; 2 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/contracts.zig -lc` -> passou; 5 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/evidence_ranker.zig -lc -lsqlite3` -> passou; 19 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc -lsqlite3` -> passou; 42 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 155 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 720 --session symbol-277 --prompt 'Use collect_evidence com strategy symbol para encontrar AppendOnlyRenderer. Depois responda onde esse símbolo está definido e termine exatamente com: PHENOM_SYMBOL_277' --expect-contains PHENOM_SYMBOL_277 --show-expect-status --fail-on-model-error` -> passou; modelo chamou `collect_evidence: symbol`, evidencia apontou `src/render.zig`, resposta correta.
+- `sqlite3 .phenom-zig/phenom.db "select 'raw_marker', count(*) ...; select 'symbol_source', count(*) ...; select 'render_evidence', count(*) ...; select 'duplicate', count(*) ...; select 'tool_error', count(*) ...;"` -> retornou `raw_marker=0`, `symbol_source=4`, `render_evidence=1`, `duplicate=1`, `tool_error=0`.

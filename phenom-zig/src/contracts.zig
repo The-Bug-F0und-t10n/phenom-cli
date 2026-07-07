@@ -132,6 +132,7 @@ pub const strategy_specs = [_]StrategySpec{
     .{ .contract = .collect_evidence, .strategy = .auto, .max_budget_bytes = 3800 },
     .{ .contract = .collect_evidence, .strategy = .path, .max_budget_bytes = 3800 },
     .{ .contract = .collect_evidence, .strategy = .lexical, .max_budget_bytes = 6000 },
+    .{ .contract = .collect_evidence, .strategy = .symbol, .max_budget_bytes = 6000 },
     .{ .contract = .news, .strategy = .news_table, .max_budget_bytes = 24000 },
     .{ .contract = .inspect_runtime, .strategy = .document_summary, .max_budget_bytes = 24000 },
 };
@@ -210,8 +211,8 @@ test "tool manifest includes referenced ts project tools" {
 test "collect evidence accepts bounded strategies without expanding tool surface" {
     try std.testing.expect(strategyAllowed(.collect_evidence, .path));
     try std.testing.expect(strategyAllowed(.collect_evidence, .lexical));
+    try std.testing.expect(strategyAllowed(.collect_evidence, .symbol));
     try std.testing.expect(!strategyAllowed(.collect_evidence, .semantic));
-    try std.testing.expect(!strategyAllowed(.collect_evidence, .symbol));
     try std.testing.expect(!strategyAllowed(.collect_evidence, .news_table));
     try std.testing.expect(resolveCollectEvidenceStrategy(.news_table) == null);
 }

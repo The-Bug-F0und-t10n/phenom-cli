@@ -233,7 +233,7 @@ test "collect evidence ranked lexical uses rg candidates and audit without raw r
 }
 
 test "collect evidence rejects inactive strategies instead of falling back" {
-    const strategies = [_]contracts.StrategyName{ .symbol, .semantic, .diagnostic, .runtime, .diff };
+    const strategies = [_]contracts.StrategyName{ .semantic, .diagnostic, .runtime, .diff };
     for (strategies) |strategy| {
         try std.testing.expectError(error.InvalidStrategy, execute(std.testing.allocator, std.testing.io, .{
             .task = "collect_evidence tool_event diff error",
@@ -241,6 +241,19 @@ test "collect evidence rejects inactive strategies instead of falling back" {
             .budget_bytes = 6000,
         }));
     }
+}
+
+test "collect evidence symbol strategy uses structural symbols" {
+    const result = try execute(std.testing.allocator, std.testing.io, .{
+        .terms = "AppendOnlyRenderer",
+        .strategy = .symbol,
+        .budget_bytes = 6000,
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(contracts.StrategyName.symbol, result.strategy);
+    try std.testing.expect(result.range_count > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "source=symbol_ast") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "src/render.zig") != null);
 }
 
 test "collect evidence ranked output skips forbidden raw marker ranges" {
