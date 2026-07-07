@@ -9578,3 +9578,400 @@ Criterio de aceite:
 
 - Suite falha se marcador final passar mas evidencia estiver errada.
 - Suite produz relatorio auditavel por turno.
+
+## Fase 22 - Cobertura integral obrigatoria do `alinhamento.md`
+
+Prioridade: urgente/bloqueante.
+
+Motivacao: `T281`-`T290` cobrem a ordem recomendada do `alinhamento.md`, mas o documento tambem contem eixos, problemas novos, acertos a preservar e criterios finais que precisam existir como tarefas explicitas. Esta fase fecha essa lacuna: nenhum ponto do `alinhamento.md` deve ficar dependente de memoria do agente ou de lembranca do usuario.
+
+Regra operacional desta fase:
+
+- Toda task abaixo e urgente.
+- Toda implementacao deve consultar `doc/AGENTE_AI_BAIXO_CONSUMO_TOKENS_AUDIT.md`, `TASKS.md`, `alinhamento.md` e a referencia equivalente em `../phenom-cli-ts` antes de codar.
+- Nenhuma task pode adicionar heuristica linguistica hardcoded, stopwords, preferencia por stack, preferencia por paths de projeto ou adivinhacao de intencao pelo agente.
+- O modelo decide intencao e contrato; o agente executa contrato/estrategia, audita, destila evidencia e protege invariantes.
+- Toda task que alterar Zig exige revisao baixo nivel antes do commit: ownership, lifetimes, bounds, errdefer/defer, SQLite bind, fs safety, subprocess limits, streaming/protocol e raw leak.
+
+Cobertura `alinhamento.md` -> `TASKS.md`:
+
+- Veredito executivo: coberto por `T291` e por esta fase.
+- Regra de auditoria daqui para frente: `T281`, reforcado por `T291`.
+- A0 Contrato central model-driven: `T282`, `T291`.
+- A1 Tool surface e ferramentas reais: `T297`.
+- A2 Tool loop: `T293`.
+- A3 Contexto, evidencia e micro-contexto: `T283`, `T284`, `T285`.
+- A4 Ranking e busca: `T298`.
+- A5 Historico, sessao, memoria e SKILLS: `T294`, `T295`.
+- A6 System prompt e output para modelo: `T296`.
+- A7 Renderer/TUI: `T292`.
+- A8 HTTP/backend/model protocol: `T299`.
+- A9 News e context profiles: `T288`, `T289`.
+- A10 Patch/mutation/validacao: `T285`, `T286`.
+- A11 Testes reais e criterio de confiabilidade: `T290`, `T300`.
+- Mapa de alinhamento por eixo: `T291`-`T300`.
+- Problemas novos introduzidos pelo Zig: `T291`, `T293`, `T296`, `T298`, `T300`.
+- Acertos do Zig que devem ser preservados: `T301`.
+- Criterio para dizer "alinhado": `T300`.
+- Conclusao do `alinhamento.md`: `T291` e gate permanente de `T281`.
+
+## T291 - Criar gate executavel de cobertura total do `alinhamento.md`
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: o `alinhamento.md` virou contrato de auditoria. Se uma task futura puder ignorar uma secao `A0`-`A11`, o Zig volta a implementar por aproximacao e recria os erros do TS.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: todas as referencias citadas no `alinhamento.md`; a task e documental/processual.
+- Falha apontada no AUDIT/TASKS: tarefas anteriores foram executadas sem sempre consultar `phenom-cli-ts`, gerando regressao de contrato.
+- O que sera preservado do TS: comportamento provado passa a ser referencia obrigatoria por eixo.
+- O que sera corrigido no Zig: nenhuma task nova executavel entra sem declarar quais eixos do `alinhamento.md` toca e quais nao toca.
+- O que nao sera portado agora e por que: nenhuma feature runtime; primeiro o gate.
+- Invariantes afetadas: todas.
+- Teste unitario obrigatorio: check documental que valida cobertura `A0`-`A11`, mapa por eixo, problemas novos, acertos preservados e criterio final.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: nao aplicavel.
+- Revisao baixo nivel Zig antes do commit: nao aplicavel; docs/processo.
+
+Passos de implementacao:
+
+1. Criar script/check que leia `alinhamento.md` e valide se cada heading `A0`-`A11` aparece em uma task urgente ou em matriz de cobertura.
+2. Validar que cada task urgente nova tem bloco `Alinhamento AUDIT/TASKS/phenom-cli-ts`.
+3. Validar que cada task urgente nova declara referencia TS consultada ou ausencia de equivalente.
+4. Rodar check antes de implementar qualquer task de `Fase 21` ou `Fase 22`.
+
+Criterio de aceite:
+
+- O check falha se um eixo do `alinhamento.md` nao estiver mapeado.
+- O check falha se uma task urgente nova nao declarar impacto nos criterios finais de alinhamento.
+
+## T292 - Provar TUI/render com regressao visual ampla e restore completo
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: `A7` marcou TUI/render como area madura, mas ainda sem prova visual ampla. O usuario exigiu visual equivalente ao `phenom-cli-ts`, com prompt, thinking, tools, markdown, diff, statusbar/visualizer, spacing, resize, restore e `Worked for`.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/cli-renderer.ts`, `../phenom-cli-ts/src/stream-markdown-renderer.ts`, `../phenom-cli-ts/src/visualizer-mini.ts`, fluxo `npm run dev chat`.
+- Falha apontada no AUDIT/TASKS: renderer TS tinha glitches; diff ofuscava texto; Zig precisa preservar acertos visuais sem regressao.
+- O que sera preservado do TS: prompt permanente, output append-only, thinking em bloco, tools, markdown, diff, divisorias, visualizer/statusbar e restore de sessao.
+- O que sera corrigido no Zig: suite de snapshots por largura e restore a partir do SQLite, nao validacao manual ad hoc.
+- O que nao sera portado agora e por que: TUI fullscreen/alternate screen nao entra; requisito atual e transcript append-only copiavel.
+- Invariantes afetadas: 2, 6, 7.
+- Teste unitario obrigatorio: snapshots 40/80/120/180 cols com user query, thinking, tool output, markdown, code block, diff, done/worked e restore.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, um smoke real deve registrar eventos no SQLite e restaurar o transcript estilizado sem raw leak.
+- Revisao baixo nivel Zig antes do commit: terminal width bounds, ANSI reset, line wrapping, no stale slices, no write parcial sem reset.
+
+Passos de implementacao:
+
+1. Criar fixtures completas de render equivalentes ao chat TS.
+2. Criar snapshots por largura fixa.
+3. Testar restore de SQLite com os mesmos componentes estilizados.
+4. Validar diff com fundo discreto, sinais `+/-`, line numbers e texto legivel.
+5. Validar que statusbar/visualizer nao quebra resize.
+
+Criterio de aceite:
+
+- O render nao quebra em terminal pequeno/grande.
+- O transcript restaurado contem os mesmos componentes visuais do turno original.
+
+## T293 - Portar loop operacional por fases sem estreitar o agente a respondedor com evidencia
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: `A2` diz que o loop Zig esta correto para `collect_evidence`, mas estreito demais para o produto. O TS tinha state, phase context, operational run store, memory/context compaction e executor por fase.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/agent.ts` em "Core tool loop"; `../phenom-cli-ts/src/agent-control/run-tool-loop.ts`; `../phenom-cli-ts/src/agent-control/operational-run-store.ts`.
+- Falha apontada no AUDIT/TASKS: prompt/loop nao podem virar contrato improvisado; cada fase precisa ser auditavel.
+- O que sera preservado do TS: fases operacionais, state por turno, run store, compaction de contexto e separacao de tool/model/infra.
+- O que sera corrigido no Zig: loop tipado menor, sem camadas soltas, com contratos progressivos e erro classificado.
+- O que nao sera portado agora e por que: browser/runtime completos dependem de T297/T299; aqui entra o esqueleto de fases.
+- Invariantes afetadas: 1, 2, 5, 6, 7.
+- Teste unitario obrigatorio: fase `intent -> contract -> evidence -> mutation -> validation -> final` progride com executor fake e rejeita transicao invalida.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, modelo deve declarar contrato, coletar evidencia, refinar e finalizar sem tool nao anunciada.
+- Revisao baixo nivel Zig antes do commit: enum exaustivo, estado por turno sem ponteiro pendurado, limites de iteracao por budget/qualidade, cleanup de buffers.
+
+Passos de implementacao:
+
+1. Definir `OperationalPhase` e `TurnRunState`.
+2. Integrar `set_operational_contract` como entrada de fase.
+3. Auditar transicoes no SQLite.
+4. Impedir que falha de tool caia em resposta direta sem erro tipado.
+5. Permitir multiplas iteracoes por budget/qualidade, nao por numero fixo arbitrario.
+
+Criterio de aceite:
+
+- O agente nao finaliza como "respondedor com evidencia" quando o contrato exige acao.
+- O replay mostra fase, contrato, tools anunciadas, calls, resultado e final.
+
+## T294 - Corrigir continuidade de sessao para equivalencia com `recentMessages` e sumarizacao longa
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: `A5` mostra que `RECENT_DIALOGUE` corrigiu o bug imediato, mas ainda nao e equivalente ao historico por roles do TS nem resolve sessoes longas.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/agent.ts` em `recentMessages`; `../phenom-cli-ts/src/use-cases/build-inference-messages.ts`.
+- Falha apontada no AUDIT/TASKS: multiplas fontes de memoria/contexto competiam; historico bruto e wrappers podiam vazar.
+- O que sera preservado do TS: janela recente como mensagens por role, sanitizacao de wrappers/protocolos crus e current query preservada.
+- O que sera corrigido no Zig: manter continuidade sem promover para MEMORY/SKILLS e sem transformar sessao em evidencia estrita por engano.
+- O que nao sera portado agora e por que: embedding semantic search nao entra; decisao atual e FTS5/BM25 + contratos.
+- Invariantes afetadas: 2, 3, 6, 7.
+- Teste unitario obrigatorio: historico recente vira mensagens/estrutura com roles; wrappers crus sao removidos; prompt atual nao duplica.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, pergunta dependente de conversa anterior deve responder sem `search_session`; fato exato antigo deve usar `search_session`.
+- Revisao baixo nivel Zig antes do commit: bounds de historico, truncamento por mensagem, ownership de blocos, zero raw markers.
+
+Passos de implementacao:
+
+1. Decidir e documentar se Zig vai enviar historico como mensagens reais ou bloco estruturado equivalente.
+2. Implementar sumarizacao longa com FTS5/BM25 de sessao e snippets por role/turn.
+3. Separar `RECENT_DIALOGUE` de `SESSION_EVIDENCE` no renderer e no audit.
+4. Garantir que MEMORY/SKILLS nao recebem eventos de sessao automaticamente.
+5. Auditar bytes/tokens de historico por turno.
+
+Criterio de aceite:
+
+- Conversa recente funciona como continuidade, nao como evidencia litigiosa.
+- Sessao longa e recuperavel sem mandar historico bruto inteiro.
+
+## T295 - Implementar orchestrator final de MEMORY/SKILLS separado do SQLite operacional
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: `A5` e o mapa de alinhamento marcam MEMORY/SKILLS como parcial. A regra do usuario e absoluta: MEMORY/SKILLS sao as unicas fontes persistentes textuais visiveis ao modelo; SQLite operacional nao compete com elas.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/memory/*`, `../phenom-cli-ts/src/session-brain.ts`, usos de memoria em `../phenom-cli-ts/src/agent.ts`.
+- Falha apontada no AUDIT/TASKS: SessionBrain, PersistentMemory, operational stores e arquivos de contexto podiam competir conceitualmente.
+- O que sera preservado do TS: capacidade de lembrar preferencias, regras e fatos praticos quando promovidos.
+- O que sera corrigido no Zig: writer/orchestrator explicito com promocao controlada, sem memoria concorrente e sem tool output automatico.
+- O que nao sera portado agora e por que: UI completa de gerenciamento de memoria pode vir depois; primeiro contrato e store.
+- Invariantes afetadas: 2, 3, 6, 7.
+- Teste unitario obrigatorio: regra do usuario vai para SKILLS; insight verificado vai para MEMORY; tool output bruto nunca vira memoria sem promocao.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, uma regra confirmada deve aparecer em SKILLS em turno posterior; evidence temporaria nao deve aparecer.
+- Revisao baixo nivel Zig antes do commit: escrita atomica de arquivos, merge sem sobrescrever usuario, bounds, locks simples ou estrategia anti-corrupcao.
+
+Passos de implementacao:
+
+1. Definir contrato de promocao para MEMORY e SKILLS.
+2. Implementar leitura/escrita atomica com preservacao de edicoes do usuario.
+3. Auditar promocao no SQLite como evento operacional, nao como contexto bruto.
+4. Renderizar MEMORY/SKILLS somente quando existem e somente como blocos persistentes textuais.
+5. Testar que SQLite/news/session/cache nao geram MEMORY/SKILLS.
+
+Criterio de aceite:
+
+- MEMORY/SKILLS nao competem com storage operacional.
+- O modelo recebe apenas regras/fatos promovidos, nunca logs ou tool output bruto.
+
+## T296 - Tipar output para modelo, token accounting e `NEXT_ACTION`
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: `A6` mostra que o system prompt Zig ficou curto, mas o contexto ainda depende de texto `TURN_CONTEXT v1` e `NEXT_ACTION` pode crescer como micro-system-prompt variavel.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/agent.ts` em `buildSystemPrompt`; `../phenom-cli-ts/src/use-cases/build-inference-messages.ts`.
+- Falha apontada no AUDIT/TASKS: system prompt inchado alucina modelo pequeno; contexto bruto ou estruturacao ruim consome janela rapidamente.
+- O que sera preservado do TS: prefixo estavel, contexto volatil fora do system prompt, sanitizacao de mensagens.
+- O que sera corrigido no Zig: `NEXT_ACTION` vira campo tipado de contrato; prompt/context bytes sao auditados; raw leak e budget viram falha objetiva.
+- O que nao sera portado agora e por que: contagem exata por tokenizer do backend pode vir depois; primeiro bytes/chars e budget conservador.
+- Invariantes afetadas: 2, 3, 6, 7.
+- Teste unitario obrigatorio: renderer rejeita raw markers, mede bytes, falha em budget e renderiza `next_action` tipado.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, SQLite deve registrar system/context bytes e prefix stability.
+- Revisao baixo nivel Zig antes do commit: buffer writer bounds, truncamento seguro, sem alloc nao liberado, assert anti-raw antes de envio.
+
+Passos de implementacao:
+
+1. Criar struct tipada para `ModelTurnContextV1`.
+2. Separar `next_action` como enum/struct, nao texto livre acumulativo.
+3. Auditar bytes por bloco: system, memory, skills, recent dialogue, evidence, session, tools.
+4. Registrar estabilidade de prefixo por hash.
+5. Falhar envio se raw marker entrar no contexto renderizado.
+
+Criterio de aceite:
+
+- O modelo recebe contexto pequeno, tipado e auditavel.
+- O system prompt nao vira deposito de regras variaveis por fase.
+
+## T297 - Expandir tool surface por contratos, nao por lista solta
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: `A1` marcou que o Zig preservou baixo ruido, mas perdeu amplitude operacional. O produto final precisa ferramentas reais sem despejar uma montanha de tools no modelo.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/agent-control/intent-tool-contract.ts`; `../phenom-cli-ts/src/tools.ts`; registrars em `../phenom-cli-ts/src/tools/registrars/*`.
+- Falha apontada no AUDIT/TASKS: ferramentas existiam, mas exposicao e naming podiam ser ruidosos; ferramenta nao anunciada nunca pode executar.
+- O que sera preservado do TS: leitura, filesystem, mutation, validation, runtime/browser, git, session, memory e news como capacidades reais.
+- O que sera corrigido no Zig: capacidades entram por contrato model-visible pequeno e executor interno fechado.
+- O que nao sera portado agora e por que: cada familia entra por task propria; esta task define matriz e allowlist dinamica.
+- Invariantes afetadas: 1, 2, 3, 4, 5, 6, 7.
+- Teste unitario obrigatorio: para cada contrato, tools permitidas executam e tools fora do contrato sao rejeitadas antes do executor.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, modelo deve escolher contrato e nao conseguir chamar tool nao anunciada.
+- Revisao baixo nivel Zig antes do commit: enum/allowlist exaustivos, parser bounds, audit de rejeicao, sem string compare solto espalhado.
+
+Passos de implementacao:
+
+1. Definir familias: `code_read`, `code_mutation`, `validation`, `runtime_browser`, `git`, `session_memory`, `news`.
+2. Mapear cada familia para tools internas e model-visible.
+3. Expor apenas contrato atual por turno.
+4. Auditar manifest anunciado e chamadas rejeitadas.
+5. Criar testes de nao execucao para toda tool nao anunciada.
+
+Criterio de aceite:
+
+- O agente recupera amplitude do TS sem voltar a prompt/tool surface gigante.
+- Tool interna nunca executa por acidente.
+
+## T298 - Medir qualidade de ranking/refinamento sem heuristica de dominio
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: `A4` mostra que o ranking Zig usa fontes objetivas, mas ainda nao prova qualidade suficiente. A regra de negocio proibe vies hardcoded; portanto qualidade deve vir de candidatos, refinamento model-driven e audit.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/tools/registrars/context-tools.ts` em combinacao de RAG/lexical/scope/validation/merge/selection.
+- Falha apontada no AUDIT/TASKS: evidencia insuficiente e falso positivo quebram groundedness; o agente nao deve adivinhar pelo prompt.
+- O que sera preservado do TS: coleta multi-fonte atras de `collect_evidence`, candidatos e selecao/refinamento.
+- O que sera corrigido no Zig: sem stopwords, sem lista de paths preferidos, sem source>docs hardcoded; modelo escolhe refinamento.
+- O que nao sera portado agora e por que: embeddings nao entram; decisao atual e `rg`, FTS5/BM25, AST/LSP e contratos.
+- Invariantes afetadas: 2, 5, 6, 7.
+- Teste unitario obrigatorio: ranking usa somente sinais estruturais/lexicais fornecidos por tool/model; nenhum filtro de linguagem/ecossistema aparece.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, pergunta ambigua deve retornar candidatos, modelo refinar com `selectedCandidates` e resposta citar E#.
+- Revisao baixo nivel Zig antes do commit: limites de candidatos, merge de ranges, dedupe, ownership de excerpts, audit de score sem raw.
+
+Passos de implementacao:
+
+1. Criar metricas auditadas: candidate_count, selected_count, coverage, strategy_mix, dropped_by_budget.
+2. Implementar `stage=candidates` sem snippets grandes.
+3. Implementar `stage=minimum` com `selectedCandidates`.
+4. Permitir refinamento ate budget/qualidade, nao numero fixo arbitrario.
+5. Validar ausencia de heuristica hardcoded via grep/check.
+
+Criterio de aceite:
+
+- Pergunta ambigua melhora por iteracao do modelo, nao por adivinhacao do agente.
+- O audit explica por que uma evidencia foi escolhida ou descartada.
+
+## T299 - Robustecer HTTP/backend/model protocol com classificacao de falhas
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: `A8` marcou HTTP local como bom cliente streaming, mas parcial para agente produtivo multi-backend. Falha de backend, formato, thinking e native tools nao pode parecer erro do modelo.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/agent.ts` em resolucao de formato de chat, mock/backend real e schemaBaselineTokens.
+- Falha apontada no AUDIT/TASKS: falha de modelo nao pode parecer infraestrutura; prompt/context deve respeitar backend real.
+- O que sera preservado do TS: resolucao por turno de backend/formato e separacao mock/real.
+- O que sera corrigido no Zig: probe robusto, erro tipado, contexto/n_ctx auditado quando disponivel e streaming tolerante a formatos suportados.
+- O que nao sera portado agora e por que: DNS/restricao de familia de rede nao e prioridade atual; ja foi explicitamente deixado fora.
+- Invariantes afetadas: 2, 6, 7.
+- Teste unitario obrigatorio: parser separa erro HTTP, erro JSON/protocolo, erro de modelo, EOF dentro de think e resposta vazia.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, Ollama e llama.cpp locais devem registrar endpoint, formato, thinking mode e erro classificado.
+- Revisao baixo nivel Zig antes do commit: socket close, partial read, buffer bounds, JSON streaming, sem ponteiro para host temporario.
+
+Passos de implementacao:
+
+1. Auditar backend, endpoint, formato, thinking mode e max tokens por turno.
+2. Tipar falhas `connect`, `http_status`, `protocol_parse`, `model_empty`, `model_think_only`, `stream_timeout`.
+3. Provar que `--prompt` nunca cai em resposta offline enganosa.
+4. Preparar campo para native tool capability sem expor antes de executor real.
+5. Registrar n_ctx/schema baseline quando backend fornecer.
+
+Criterio de aceite:
+
+- O usuario sabe se a falha foi modelo, protocolo, ferramenta ou infraestrutura.
+- O agente nao responde `ok` sem processamento real quando backend deveria ser usado.
+
+## T300 - Definir checklist final de alinhamento e confiabilidade do produto
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: `alinhamento.md` define criterios objetivos para dizer "alinhado". Eles precisam existir como checklist executavel, nao conclusao solta.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: todos os fluxos TS citados em `alinhamento.md`; suites reais em `../phenom-cli-ts/src/tests/*`.
+- Falha apontada no AUDIT/TASKS: smokes podem passar por marcador final sem provar comportamento do agente.
+- O que sera preservado do TS: testes reais opt-in e comportamento operacional completo.
+- O que sera corrigido no Zig: relatorio final cruza criterio, SQLite e transcript.
+- O que nao sera portado agora e por que: nenhum criterio sera removido; implementacao pode ser incremental, mas checklist deve existir completo.
+- Invariantes afetadas: todas.
+- Teste unitario obrigatorio: checklist falha quando qualquer criterio obrigatório nao tem evidencia registrada.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, suite real deve validar cada criterio com SQLite.
+- Revisao baixo nivel Zig antes do commit: runner sem destrutividade, paths temporarios, cleanup, exit codes confiaveis.
+
+Passos de implementacao:
+
+1. Criar checklist dos criterios finais do `alinhamento.md`.
+2. Ligar cada criterio a query SQLite/teste/snapshot.
+3. Produzir relatorio por turno: prompt, modelo, contrato, tools anunciadas, calls, resultados, contexto enviado e resposta final.
+4. Falhar se qualquer criterio estiver sem prova.
+5. Registrar no `TASKS.md` os comandos reais usados.
+
+Criterio de aceite:
+
+- O projeto so pode ser chamado alinhado quando todos os criterios tiverem prova.
+- O relatorio diferencia "nao implementado", "implementado sem prova" e "provado".
+
+## T301 - Preservar explicitamente os acertos do Zig durante o realinhamento
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: o `alinhamento.md` lista acertos do Zig que nao podem ser perdidos ao portar amplitude do TS. Reintroduzir features do TS sem preservar esses acertos recria a regressao original.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: comparativo geral do `alinhamento.md`; o objetivo e preservar melhorias Zig enquanto porta acertos TS.
+- Falha apontada no AUDIT/TASKS: refatoracao anterior inchou prompt/contexto e misturou storage/memoria/tools.
+- O que sera preservado do TS: amplitude operacional e comportamento provado.
+- O que sera corrigido no Zig: manter binario baixo nivel, TUI previsivel, SQLite auditavel, contexto destilado e ownership seguro.
+- O que nao sera portado agora e por que: nenhum acerto sera removido; esta task cria guardrails.
+- Invariantes afetadas: todas.
+- Teste unitario obrigatorio: regressao que prova sem raw context, tools internas escondidas, config merge preservado, inventory sem vies e ownership/bounds.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, suite real deve continuar provando tool gate, raw leak zero e audit/replay.
+- Revisao baixo nivel Zig antes do commit: toda feature nova precisa passar por checklist de ownership/bounds/raw leak/tool gate.
+
+Passos de implementacao:
+
+1. Criar lista de acertos preservados como assertions de produto.
+2. Ligar cada assertion a teste/unit/smoke existente ou novo.
+3. Bloquear regressao de config merge, TUI append-only, raw leak, tool gate e inventario sem vies.
+4. Exigir review baixo nivel documentada em TASKS para cada task implementada.
+
+Criterio de aceite:
+
+- Portar acerto do TS nao pode remover acerto do Zig.
+- Regressao de qualquer acerto listado no `alinhamento.md` falha teste ou checklist.
