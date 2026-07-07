@@ -9809,23 +9809,30 @@ Implementacao desta etapa:
 - `phenom-zig/src/session_context.zig` adiciona renderer de hits FTS como `[SESSION_EVIDENCE]` temporario, com `source=sqlite_audit_fts`, `semantic_search=fts5_bm25` e `raw_context_persisted=false`.
 - `phenom-zig/src/main.zig` injeta recuperacao longa pequena no contexto inicial via FTS, separada de `[RECENT_DIALOGUE]`, `[MEMORY]` e `[SKILLS]`.
 - `search_session` deixa de carregar 2000 eventos em memoria e passa a usar SQLite FTS5/BM25 com termos definidos pelo modelo.
+- Correcao posterior: `search_session` agora aceita `scope=current|all` e `session?`, permitindo recuperacao operacional de qualquer sessao ativa/inativa gravada no SQLite quando o modelo pedir explicitamente.
+- Hits de sessao agora carregam `session=` no S#, para o modelo diferenciar evidencia da sessao atual, outra sessao especifica ou busca global.
+- `search_session scope=all` filtra `tool_start` do proprio `search_session` para evitar evidencia recursiva da consulta anterior; outros eventos operacionais continuam auditados no SQLite.
 - Nao foram adicionadas stopwords, listas de linguagem, priorizacao de path, ranking por ecossistema ou heuristica linguistica hardcoded.
 
 Revisao baixo nivel Zig:
 
-- Ownership: `SessionSearchHit.kind/body` sao duplicados por coluna e liberados por `freeSessionSearchHits`.
+- Ownership: `SessionSearchHit.session/kind/body` sao duplicados por coluna e liberados por `freeSessionSearchHits`.
 - Bounds: `limit` valida `c_int`; renderer limita saida a `max_search_entries`; cada linha passa por `compactOneLine`.
-- SQLite: binds usam slices null-terminated temporarias liberadas apos `sqlite3_step`; statements sao finalizados com `defer`.
+- SQLite: binds usam slices null-terminated temporarias liberadas apos `sqlite3_step`; `scope=all` usa bind null para remover filtro de sessao sem string SQL dinamica; statements sao finalizados com `defer`.
+- Contaminacao recursiva: `tool_start` de `search_session` e gravado depois da consulta e o FTS exclui `tool_start` cujo body comeca com `search_session`, evitando que a ferramenta encontre a propria chamada.
 - Raw leak: `renderSearchHits` redige markers e chama `assertNoRawContextLeak`; `model_context` continua barrando raw markers.
 - Storage: SQLite operacional nao promove eventos para `MEMORY.md`/`SKILLS.md`.
 
 Validacao executada:
 
-- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test phenom-zig/src/audit.zig -lc -lsqlite3` -> passou; 19 testes.
-- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/session_context.zig -lc -lsqlite3` em `phenom-zig/` -> passou; 70 testes.
-- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` em `phenom-zig/` -> passou; 173 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test phenom-zig/src/audit.zig -lc -lsqlite3` -> passou; 20 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/session_context.zig -lc -lsqlite3` em `phenom-zig/` -> passou; 72 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/tool_call.zig -lc -lsqlite3` em `phenom-zig/` -> passou; 16 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` em `phenom-zig/` -> passou; 181 testes.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` em `phenom-zig/` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` em `phenom-zig/` -> passou.
+- Smoke real cross-session seed: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --session cross-source-306 --prompt 'Nesta sessao, registre este fato operacional para busca global: a palavra-codigo cross-session e CROSS-SESSION-306. Responda exatamente: PHENOM_CROSS_SEED_306' --expect-contains PHENOM_CROSS_SEED_306 --show-expect-status --fail-on-model-error --no-color` -> passou.
+- Smoke real cross-session recall: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 900 --session cross-target-306 --prompt 'Use search_session com terms "cross-session CROSS-SESSION-306 palavra-codigo" e scope all para buscar em qualquer sessao ativa ou inativa. Depois responda exatamente no formato: CODIGO=<valor> PHENOM_CROSS_RECALL_306' --expect-contains CROSS-SESSION-306 --show-expect-status --fail-on-model-error --no-color` -> passou; S1 veio de `session=cross-source-306`, sem `tool_start search_session` como evidencia principal.
 - `sh tools/check_alignment_tasks.sh` -> passou.
 - Smoke real seed: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --session session-fts-294 --prompt 'Nesta sessao, registre este acordo operacional: a palavra-codigo de validacao do contexto de sessao e AZUL-FTS-294. Responda exatamente: PHENOM_SEED_294' --expect-contains PHENOM_SEED_294 --show-expect-status --fail-on-model-error --no-color` -> passou.
 - Smoke real recall: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 420 --session session-fts-294 --prompt 'Qual foi a palavra-codigo de validacao do contexto de sessao que combinamos? Responda exatamente no formato: CODIGO=<valor> PHENOM_RECALL_294' --expect-contains PHENOM_RECALL_294 --show-expect-status --fail-on-model-error --no-color` -> passou; resposta `CODIGO=AZUL-FTS-294 PHENOM_RECALL_294`.
@@ -9838,7 +9845,7 @@ Validacao executada:
 Risco residual:
 
 - A busca e "semantica" no sentido operacional acordado para esta etapa: FTS5/BM25 lexical ranqueado, sem embeddings e sem segundo modelo ativo.
-- Busca cross-session/global continua fora desta task para preservar isolamento e replay por sessao.
+- Busca cross-session/global agora existe por contrato, mas so executa quando o modelo pede `scope=all` ou passa `session`. O contexto inicial continua restrito a sessao atual para nao poluir micro contexto nem quebrar replay.
 
 Correcao posterior de continuidade curta:
 

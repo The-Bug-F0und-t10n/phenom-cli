@@ -386,7 +386,7 @@ fn buildInitialModelContext(
         .skills = persistent.skills.items,
         .grounding = groundingRules(),
         .next_action = if (include_collect_evidence_schema)
-            "First infer the user's intent. Use [RECENT_DIALOGUE] for conversational continuity. Use [SESSION_CONTEXT] only as retrieved prior-session evidence and cite S# for exact prior-session claims. Before making claims about the current workspace, repository, source code, files, or implementation, call collect_evidence. Use terms to describe exactly what you need to find. If session recall is insufficient, call search_session with better model-chosen terms. After evidence returns, answer using cited evidence or request a different evidence range."
+            "First infer the user's intent. Use [RECENT_DIALOGUE] for conversational continuity. Use [SESSION_CONTEXT] only as retrieved prior-session evidence and cite S# for exact prior-session claims. Before making claims about the current workspace, repository, source code, files, or implementation, call collect_evidence. Use terms to describe exactly what you need to find. If session recall is insufficient, call search_session with better model-chosen terms and scope=current or scope=all. After evidence returns, answer using cited evidence or request a different evidence range."
         else
             "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
     });
@@ -770,8 +770,24 @@ fn runSearchSessionStep(
         try db.recordEvent(config.session, "model_context", repair_context);
         return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
     }
-    if (state.hasSessionSearch(terms)) {
-        try db.recordEvent(config.session, "session_context_duplicate", terms);
+    const scope = resolveSessionSearchScope(call.scope, call.session) catch {
+        try db.recordEvent(config.session, "tool_repair", "search_session invalid scope");
+        const repair_context = try renderCollectedEvidenceContext(
+            allocator,
+            prompt,
+            &state.context,
+            null,
+            !state.contract_selected,
+            "Emit one corrected search_session tool call with scope=current or scope=all, or provide a session id. Do not invent session facts.",
+        );
+        defer allocator.free(repair_context);
+        try db.recordEvent(config.session, "model_context", repair_context);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    };
+    const search_key = try renderSessionSearchKey(allocator, scope, call.session, terms);
+    defer allocator.free(search_key);
+    if (state.hasSessionSearch(search_key)) {
+        try db.recordEvent(config.session, "session_context_duplicate", search_key);
         const duplicate_context = try renderCollectedEvidenceContext(
             allocator,
             prompt,
@@ -789,14 +805,20 @@ fn runSearchSessionStep(
         return .stopped;
     }
     tool_iterations.* += 1;
-    try state.rememberSessionSearch(terms);
+    try state.rememberSessionSearch(search_key);
 
     if (ui_ptr) |active_ui| try active_ui.showStatus("Reading");
-    try db.recordEvent(config.session, "tool_start", "search_session");
-    try events.emit(.{ .tool_start = .{ .name = "search_session", .detail = terms } });
+    const tool_start = try std.fmt.allocPrint(allocator, "search_session\t{s}", .{search_key});
+    defer allocator.free(tool_start);
+    try events.emit(.{ .tool_start = .{ .name = "search_session", .detail = search_key } });
 
-    var hits = try db.searchSessionEventsFts(allocator, config.session, terms, prompt, 6);
+    var hits = switch (scope) {
+        .current => try db.searchSessionEventsFts(allocator, config.session, terms, prompt, 6),
+        .all => try db.searchAllSessionEventsFts(allocator, terms, prompt, 6),
+        .session => try db.searchSessionEventsFts(allocator, call.session.?, terms, prompt, 6),
+    };
     defer audit.freeSessionSearchHits(allocator, &hits);
+    try db.recordEvent(config.session, "tool_start", tool_start);
     const result = try session_context.renderSearchHits(allocator, hits.items);
     defer result.deinit(allocator);
     try db.recordEvent(config.session, "session_context", result.text);
@@ -808,11 +830,33 @@ fn runSearchSessionStep(
         &state.context,
         result.text,
         !state.contract_selected,
-        "Use SESSION_CONTEXT as retrieved prior-session evidence. Cite S# when stating what was said or done in the session. Cite E# for workspace facts. For technical judgment, use retrieved context plus the current user request; do not claim unsupported workspace/session facts. If more evidence is needed and budget remains, emit one targeted collect_evidence or search_session call.",
+        "Use SESSION_CONTEXT as retrieved prior-session evidence. Cite S# when stating what was said or done in a session; S# includes session ids when search crossed sessions. Cite E# for workspace facts. For technical judgment, use retrieved context plus the current user request; do not claim unsupported workspace/session facts. If more evidence is needed and budget remains, emit one targeted collect_evidence or search_session call.",
     );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
     return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+const SessionSearchScope = enum {
+    current,
+    all,
+    session,
+};
+
+fn resolveSessionSearchScope(scope: ?[]const u8, session: ?[]const u8) !SessionSearchScope {
+    if (session != null) return .session;
+    const raw = scope orelse return .current;
+    if (std.ascii.eqlIgnoreCase(raw, "current")) return .current;
+    if (std.ascii.eqlIgnoreCase(raw, "all")) return .all;
+    return error.InvalidSessionSearchScope;
+}
+
+fn renderSessionSearchKey(allocator: std.mem.Allocator, scope: SessionSearchScope, session: ?[]const u8, terms: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "scope={s} session={s} terms={s}", .{
+        @tagName(scope),
+        session orelse "",
+        terms,
+    });
 }
 
 fn renderAllowedTools(allocator: std.mem.Allocator, allowed_tools: []const []const u8) ![]u8 {
@@ -1038,10 +1082,10 @@ fn collectEvidenceToolSchema(include_contract_tool: bool) []const u8 {
     \\[TOOLS v1]
     \\set_operational_contract(requiresInspection, requiresMutation, requiresRuntimeValidation, requiresBrowserDiagnostics, reason?)
     \\collect_evidence(path?, terms?, strategy=auto|path|lexical|symbol|diagnostic, start_line=1, max_lines=12, compact=false)
-    \\search_session(terms)
+    \\search_session(terms, scope=current|all, session?)
     \\The current workspace files are available through this tool.
     \\Use set_operational_contract when the request needs inspection, mutation, validation, or runtime/browser diagnostics. This declares controller gates; it does not expose internal tools by itself.
-    \\Recent dialogue may be provided for continuity. Exact prior-session facts are available through search_session with model-chosen terms.
+    \\Recent dialogue may be provided for continuity. Exact prior-session facts are available through search_session with model-chosen terms. Use scope=all when the fact may be in another active or inactive session; use session only when you know the session id.
     \\Before making claims about the current project, repository, source code, files, implementation, or prior conversation, emit the relevant tool call and wait for evidence.
     \\Use terms to express your search intent. Use strategy=symbol when looking for a named function/type/constant. Use strategy=diagnostic with path for Zig syntax diagnostics. Use strategy=path only with path. Set compact=true only when prior evidence can be reduced to anchors.
     \\Format contract:
@@ -1062,15 +1106,17 @@ fn collectEvidenceToolSchema(include_contract_tool: bool) []const u8 {
     \\Format diagnostic:
     \\<tool_call><function=collect_evidence><parameter=path>relative/file.zig</parameter><parameter=strategy>diagnostic</parameter></function></tool_call>
     \\Format session:
-    \\<tool_call><function=search_session><parameter=terms>what prior conversation fact to find</parameter></function></tool_call>
+    \\<tool_call><function=search_session><parameter=terms>what prior conversation fact to find</parameter><parameter=scope>current</parameter></function></tool_call>
+    \\Format all sessions:
+    \\<tool_call><function=search_session><parameter=terms>what prior conversation fact to find</parameter><parameter=scope>all</parameter></function></tool_call>
     ;
     return
     \\[TOOLS v1]
     \\collect_evidence(path?, terms?, strategy=auto|path|lexical|symbol|diagnostic, start_line=1, max_lines=12, compact=false)
-    \\search_session(terms)
+    \\search_session(terms, scope=current|all, session?)
     \\The current workspace files are available through this tool.
     \\The operational contract is already active for this turn. Do not call set_operational_contract again.
-    \\Recent dialogue may be provided for continuity. Exact prior-session facts are available through search_session with model-chosen terms.
+    \\Recent dialogue may be provided for continuity. Exact prior-session facts are available through search_session with model-chosen terms. Use scope=all when the fact may be in another active or inactive session; use session only when you know the session id.
     \\Before making claims about the current project, repository, source code, files, implementation, or prior conversation, emit the relevant tool call and wait for evidence.
     \\Use terms to express your search intent. Use strategy=symbol when looking for a named function/type/constant. Use strategy=diagnostic with path for Zig syntax diagnostics. Use strategy=path only with path. Set compact=true only when prior evidence can be reduced to anchors.
     \\Format with path:
@@ -1089,7 +1135,9 @@ fn collectEvidenceToolSchema(include_contract_tool: bool) []const u8 {
     \\Format diagnostic:
     \\<tool_call><function=collect_evidence><parameter=path>relative/file.zig</parameter><parameter=strategy>diagnostic</parameter></function></tool_call>
     \\Format session:
-    \\<tool_call><function=search_session><parameter=terms>what prior conversation fact to find</parameter></function></tool_call>
+    \\<tool_call><function=search_session><parameter=terms>what prior conversation fact to find</parameter><parameter=scope>current</parameter></function></tool_call>
+    \\Format all sessions:
+    \\<tool_call><function=search_session><parameter=terms>what prior conversation fact to find</parameter><parameter=scope>all</parameter></function></tool_call>
     ;
 }
 
@@ -1496,6 +1544,8 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=diff") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "current workspace files are available") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "search_session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "scope=current|all") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "scope=all") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "Recent dialogue may be provided") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "Exact prior-session facts") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "Before making claims about the current project") != null);
@@ -1522,6 +1572,19 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "call collect_evidence") != null);
 
     try std.testing.expect((try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test-empty", "analise esse projeto", false)) == null);
+}
+
+test "search session scope is model selected without linguistic inference" {
+    try std.testing.expectEqual(SessionSearchScope.current, try resolveSessionSearchScope(null, null));
+    try std.testing.expectEqual(SessionSearchScope.current, try resolveSessionSearchScope("current", null));
+    try std.testing.expectEqual(SessionSearchScope.all, try resolveSessionSearchScope("all", null));
+    try std.testing.expectEqual(SessionSearchScope.session, try resolveSessionSearchScope(null, "session-1"));
+    try std.testing.expectEqual(SessionSearchScope.session, try resolveSessionSearchScope("all", "session-1"));
+    try std.testing.expectError(error.InvalidSessionSearchScope, resolveSessionSearchScope("nearby", null));
+
+    const key = try renderSessionSearchKey(std.testing.allocator, .all, null, "w-90 bootstrap");
+    defer std.testing.allocator.free(key);
+    try std.testing.expectEqualStrings("scope=all session= terms=w-90 bootstrap", key);
 }
 
 test "initial model context reuses long session via fts without memory promotion" {

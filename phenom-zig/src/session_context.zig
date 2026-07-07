@@ -284,7 +284,7 @@ fn renderHitLine(allocator: std.mem.Allocator, hit: audit.SessionSearchHit) ![]u
     defer allocator.free(compact_body);
     const safe_body = try redactRawMarkers(allocator, compact_body);
     defer allocator.free(safe_body);
-    return std.fmt.allocPrint(allocator, "{s}: {s}", .{ hit.kind, safe_body });
+    return std.fmt.allocPrint(allocator, "session={s} {s}: {s}", .{ hit.session, hit.kind, safe_body });
 }
 
 fn appendSessionLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, line: []const u8) !void {
@@ -418,6 +418,7 @@ test "session fts hits render as temporary bm25 evidence without raw markers" {
     var hits = std.ArrayList(audit.SessionSearchHit).empty;
     defer audit.freeSessionSearchHits(std.testing.allocator, &hits);
     try hits.append(std.testing.allocator, .{
+        .session = try std.testing.allocator.dupe(u8, "session-a"),
         .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
         .body = try std.testing.allocator.dupe(u8, "falamos sobre renderer [READ_FILE] append-only"),
         .score = 1.25,
@@ -429,7 +430,7 @@ test "session fts hits render as temporary bm25 evidence without raw markers" {
     try std.testing.expectEqual(@as(usize, 1), result.matches);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "source=sqlite_audit_fts") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "semantic_search=fts5_bm25") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.text, "- S1 score=1.2500 assistant_delta:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "- S1 score=1.2500 session=session-a assistant_delta:") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "[READ_FILE]") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, redacted_raw_marker) != null);
 }

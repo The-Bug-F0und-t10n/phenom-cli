@@ -17,12 +17,14 @@ pub const AuditEvent = struct {
 };
 
 pub const SessionSearchHit = struct {
+    session: []u8,
     kind: []u8,
     body: []u8,
     score: f64,
     created_at_unix_s: ?i64 = null,
 
     pub fn deinit(self: *SessionSearchHit, allocator: std.mem.Allocator) void {
+        allocator.free(self.session);
         allocator.free(self.kind);
         allocator.free(self.body);
     }
@@ -311,6 +313,27 @@ pub const AuditDb = struct {
         current_prompt: []const u8,
         limit: usize,
     ) !std.ArrayList(SessionSearchHit) {
+        return self.searchSessionEventsFtsScoped(allocator, session, terms, current_prompt, limit);
+    }
+
+    pub fn searchAllSessionEventsFts(
+        self: *AuditDb,
+        allocator: std.mem.Allocator,
+        terms: []const u8,
+        current_prompt: []const u8,
+        limit: usize,
+    ) !std.ArrayList(SessionSearchHit) {
+        return self.searchSessionEventsFtsScoped(allocator, null, terms, current_prompt, limit);
+    }
+
+    fn searchSessionEventsFtsScoped(
+        self: *AuditDb,
+        allocator: std.mem.Allocator,
+        session: ?[]const u8,
+        terms: []const u8,
+        current_prompt: []const u8,
+        limit: usize,
+    ) !std.ArrayList(SessionSearchHit) {
         if (limit > std.math.maxInt(c_int)) return error.EventLimitTooLarge;
         const query = try buildFtsQuery(allocator, terms);
         defer allocator.free(query);
@@ -320,13 +343,14 @@ pub const AuditDb = struct {
         if (query.len == 0) return hits;
 
         const sql =
-            \\select e.kind, e.body, -bm25(events_fts) as rank_score, cast(strftime('%s', e.created_at) as integer)
+            \\select e.session, e.kind, e.body, -bm25(events_fts) as rank_score, cast(strftime('%s', e.created_at) as integer)
             \\from events_fts
             \\join events e on e.id = events_fts.rowid
             \\where events_fts match ?1
-            \\  and e.session = ?2
+            \\  and (?2 is null or e.session = ?2)
             \\  and e.body <> ?3
             \\  and e.kind in ('turn_start', 'assistant_delta', 'tool_start', 'working_context_add', 'tool_duplicate', 'turn_done')
+            \\  and not (e.kind = 'tool_start' and e.body like 'search_session%')
             \\order by rank_score desc, e.id desc
             \\limit ?4
         ;
@@ -339,13 +363,16 @@ pub const AuditDb = struct {
 
         const z_query = try self.allocator.dupeZ(u8, query);
         defer self.allocator.free(z_query);
-        const z_session = try self.allocator.dupeZ(u8, session);
-        defer self.allocator.free(z_session);
+        const z_session = if (session) |value| try self.allocator.dupeZ(u8, value) else null;
+        defer if (z_session) |value| self.allocator.free(value);
         const z_prompt = try self.allocator.dupeZ(u8, current_prompt);
         defer self.allocator.free(z_prompt);
 
         if (c.sqlite3_bind_text(stmt, 1, z_query.ptr, @as(c_int, @intCast(query.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
-        if (c.sqlite3_bind_text(stmt, 2, z_session.ptr, @as(c_int, @intCast(session.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (z_session) |value| {
+            const session_len = session.?.len;
+            if (c.sqlite3_bind_text(stmt, 2, value.ptr, @as(c_int, @intCast(session_len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
+        } else if (c.sqlite3_bind_null(stmt, 2) != c.SQLITE_OK) return error.SqliteBindFailed;
         if (c.sqlite3_bind_text(stmt, 3, z_prompt.ptr, @as(c_int, @intCast(current_prompt.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
         if (c.sqlite3_bind_int(stmt, 4, @as(c_int, @intCast(limit))) != c.SQLITE_OK) return error.SqliteBindFailed;
 
@@ -354,13 +381,15 @@ pub const AuditDb = struct {
             if (rc == c.SQLITE_DONE) break;
             if (rc != c.SQLITE_ROW) return error.SqliteStepFailed;
 
-            const kind = try dupeColumnText(allocator, stmt, 0);
+            const hit_session = try dupeColumnText(allocator, stmt, 0);
+            errdefer allocator.free(hit_session);
+            const kind = try dupeColumnText(allocator, stmt, 1);
             errdefer allocator.free(kind);
-            const body = try dupeColumnText(allocator, stmt, 1);
+            const body = try dupeColumnText(allocator, stmt, 2);
             errdefer allocator.free(body);
-            const score = c.sqlite3_column_double(stmt, 2);
-            const created_at_unix_s = if (c.sqlite3_column_type(stmt, 3) == c.SQLITE_NULL) null else @as(i64, @intCast(c.sqlite3_column_int64(stmt, 3)));
-            try hits.append(allocator, .{ .kind = kind, .body = body, .score = score, .created_at_unix_s = created_at_unix_s });
+            const score = c.sqlite3_column_double(stmt, 3);
+            const created_at_unix_s = if (c.sqlite3_column_type(stmt, 4) == c.SQLITE_NULL) null else @as(i64, @intCast(c.sqlite3_column_int64(stmt, 4)));
+            try hits.append(allocator, .{ .session = hit_session, .kind = kind, .body = body, .score = score, .created_at_unix_s = created_at_unix_s });
         }
 
         return hits;
@@ -505,6 +534,7 @@ test "session fts searches body by session and excludes current prompt" {
 
     try std.testing.expectEqual(@as(usize, 2), hits.items.len);
     for (hits.items) |hit| {
+        try std.testing.expectEqualStrings("s1", hit.session);
         try std.testing.expect(std.mem.indexOf(u8, hit.body, "pergunta atual") == null);
         try std.testing.expect(std.mem.indexOf(u8, hit.body, "outra sessao") == null);
         try std.testing.expect(!std.mem.eql(u8, hit.kind, "model_context"));
@@ -521,6 +551,22 @@ test "session fts does not match operational kind metadata" {
     defer freeSessionSearchHits(std.testing.allocator, &hits);
 
     try std.testing.expectEqual(@as(usize, 0), hits.items.len);
+}
+
+test "session fts can search all sessions when the model asks for global recall" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordEvent("old-session", "turn_start", "falamos de w-90 bootstrap layout");
+    try db.recordEvent("tool-noise", "tool_start", "search_session scope=all session= terms=w-90 bootstrap");
+    try db.recordEvent("current-session", "turn_start", "pergunta atual sobre outro assunto");
+
+    var hits = try db.searchAllSessionEventsFts(std.testing.allocator, "w-90 bootstrap", "prompt atual", 10);
+    defer freeSessionSearchHits(std.testing.allocator, &hits);
+
+    try std.testing.expectEqual(@as(usize, 1), hits.items.len);
+    try std.testing.expectEqualStrings("old-session", hits.items[0].session);
+    try std.testing.expect(std.mem.indexOf(u8, hits.items[0].body, "w-90 bootstrap") != null);
 }
 
 test "input history trims to newest 200 distinct lines" {
