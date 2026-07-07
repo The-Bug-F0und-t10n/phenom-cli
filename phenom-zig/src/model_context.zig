@@ -13,12 +13,17 @@ pub const SessionBlock = struct {
     text: []const u8,
 };
 
+pub const DialogueBlock = struct {
+    text: []const u8,
+};
+
 pub const ModelTurnContext = struct {
     task: []const u8,
     mode: []const u8 = "code_micro",
     budget: []const u8 = "small",
     contracts: []const u8 = "",
     evidence: []const EvidenceBlock = &.{},
+    dialogue: []const DialogueBlock = &.{},
     session: []const SessionBlock = &.{},
     memory: []const []const u8 = &.{},
     skills: []const []const u8 = &.{},
@@ -60,6 +65,16 @@ pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContex
         try out.appendSlice(allocator, "\n[EVIDENCE]\n");
         for (ctx.evidence, 0..) |entry, i| {
             const label = try std.fmt.allocPrint(allocator, "E{}:\n", .{i + 1});
+            defer allocator.free(label);
+            try out.appendSlice(allocator, label);
+            try appendEvidenceText(&out, allocator, entry.text);
+        }
+    }
+
+    if (ctx.dialogue.len > 0) {
+        try out.appendSlice(allocator, "\n[RECENT_DIALOGUE]\n");
+        for (ctx.dialogue, 0..) |entry, i| {
+            const label = try std.fmt.allocPrint(allocator, "D{}:\n", .{i + 1});
             defer allocator.free(label);
             try out.appendSlice(allocator, label);
             try appendEvidenceText(&out, allocator, entry.text);
@@ -202,6 +217,21 @@ test "model context renders temporary session context separately from memory" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[GROUNDING]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
+}
+
+test "model context renders recent dialogue separately from session evidence" {
+    const dialogue_blocks = [_]DialogueBlock{.{ .text = "source=sqlite_audit temporary=true raw_context_persisted=false not_evidence=true\nuser: pergunta\nassistant: resposta" }};
+    const rendered = try renderModelTurnContext(std.testing.allocator, .{
+        .task = "continuar",
+        .dialogue = &dialogue_blocks,
+    });
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[RECENT_DIALOGUE]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "user: pergunta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "assistant: resposta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SESSION_CONTEXT]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
 }
 
 test "model context includes memory and skills only when explicitly provided" {

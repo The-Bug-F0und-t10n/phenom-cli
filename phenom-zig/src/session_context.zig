@@ -5,8 +5,12 @@ const model_context = @import("model_context.zig");
 
 const max_entry_bytes: usize = 360;
 const max_recent_entries: usize = 6;
+const max_dialogue_entries: usize = 8;
+const max_dialogue_accum_bytes: usize = 4096;
+const max_dialogue_entry_bytes: usize = 1200;
 const max_search_entries: usize = 6;
 const redacted_raw_marker = "[REDACTED_RAW_CONTEXT_MARKER]";
+const truncated_marker = " [TRUNCATED]";
 
 pub const SearchResult = struct {
     text: []u8,
@@ -20,6 +24,20 @@ pub const SearchResult = struct {
 const Candidate = struct {
     event_index: usize,
     score: usize,
+};
+
+const DialogueRole = enum {
+    user,
+    assistant,
+};
+
+const DialogueEntry = struct {
+    role: DialogueRole,
+    text: []u8,
+
+    fn deinit(self: DialogueEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+    }
 };
 
 pub fn renderRecent(allocator: std.mem.Allocator, events: []const audit.AuditEvent, current_prompt: []const u8) !?[]u8 {
@@ -47,6 +65,50 @@ pub fn renderRecent(allocator: std.mem.Allocator, events: []const audit.AuditEve
     const rendered = try out.toOwnedSlice(allocator);
     errdefer allocator.free(rendered);
     try model_context.assertNoRawContextLeak(rendered);
+    return rendered;
+}
+
+pub fn renderRecentDialogue(allocator: std.mem.Allocator, events: []const audit.AuditEvent, current_prompt: []const u8) !?[]u8 {
+    var entries = std.ArrayList(DialogueEntry).empty;
+    errdefer freeDialogueEntries(allocator, &entries);
+
+    for (events) |event| {
+        if (std.mem.eql(u8, event.kind, "turn_start")) {
+            if (std.mem.eql(u8, event.body, current_prompt)) continue;
+            try appendDialogueEntry(allocator, &entries, .user, event.body);
+        } else if (std.mem.eql(u8, event.kind, "assistant_delta")) {
+            try appendDialogueEntry(allocator, &entries, .assistant, event.body);
+        }
+    }
+
+    if (entries.items.len == 0) {
+        entries.deinit(allocator);
+        return null;
+    }
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "source=sqlite_audit temporary=true raw_context_persisted=false not_evidence=true\n");
+
+    const start = if (entries.items.len > max_dialogue_entries) entries.items.len - max_dialogue_entries else 0;
+    for (entries.items[start..]) |entry| {
+        const compact_body = try compactOneLine(allocator, entry.text, max_dialogue_entry_bytes);
+        defer allocator.free(compact_body);
+        const safe_body = try redactRawMarkers(allocator, compact_body);
+        defer allocator.free(safe_body);
+        if (safe_body.len == 0) continue;
+        try out.appendSlice(allocator, switch (entry.role) {
+            .user => "user: ",
+            .assistant => "assistant: ",
+        });
+        try out.appendSlice(allocator, safe_body);
+        try out.append(allocator, '\n');
+    }
+
+    const rendered = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(rendered);
+    try model_context.assertNoRawContextLeak(rendered);
+    freeDialogueEntries(allocator, &entries);
     return rendered;
 }
 
@@ -100,6 +162,13 @@ pub fn toSessionBlocks(allocator: std.mem.Allocator, rendered: ?[]const u8) ![]m
     return blocks;
 }
 
+pub fn toDialogueBlocks(allocator: std.mem.Allocator, rendered: ?[]const u8) ![]model_context.DialogueBlock {
+    const text = rendered orelse return allocator.alloc(model_context.DialogueBlock, 0);
+    const blocks = try allocator.alloc(model_context.DialogueBlock, 1);
+    blocks[0] = .{ .text = text };
+    return blocks;
+}
+
 fn isUsefulSessionEvent(kind: []const u8) bool {
     return std.mem.eql(u8, kind, "turn_start") or
         std.mem.eql(u8, kind, "assistant_delta") or
@@ -107,6 +176,42 @@ fn isUsefulSessionEvent(kind: []const u8) bool {
         std.mem.eql(u8, kind, "working_context_add") or
         std.mem.eql(u8, kind, "tool_duplicate") or
         std.mem.eql(u8, kind, "turn_done");
+}
+
+fn appendDialogueEntry(allocator: std.mem.Allocator, entries: *std.ArrayList(DialogueEntry), role: DialogueRole, text: []const u8) !void {
+    if (text.len == 0) return;
+    if (role == .assistant and entries.items.len > 0 and entries.items[entries.items.len - 1].role == .assistant) {
+        try appendBounded(allocator, &entries.items[entries.items.len - 1].text, text);
+        return;
+    }
+    var owned = try allocator.alloc(u8, 0);
+    errdefer allocator.free(owned);
+    try appendBounded(allocator, &owned, text);
+    if (owned.len == 0) {
+        allocator.free(owned);
+        return;
+    }
+    try entries.append(allocator, .{ .role = role, .text = owned });
+}
+
+fn appendBounded(allocator: std.mem.Allocator, target: *[]u8, extra: []const u8) !void {
+    if (extra.len == 0 or std.mem.endsWith(u8, target.*, truncated_marker)) return;
+    const target_len = target.*.len;
+    const remaining = if (target_len < max_dialogue_accum_bytes) max_dialogue_accum_bytes - target_len else 0;
+    const take = @min(extra.len, remaining);
+    const truncated = take < extra.len;
+    const new_len = target_len + take + if (truncated) truncated_marker.len else 0;
+    const next = try allocator.alloc(u8, new_len);
+    @memcpy(next[0..target_len], target.*);
+    if (take > 0) @memcpy(next[target_len .. target_len + take], extra[0..take]);
+    if (truncated) @memcpy(next[target_len + take ..], truncated_marker);
+    allocator.free(target.*);
+    target.* = next;
+}
+
+fn freeDialogueEntries(allocator: std.mem.Allocator, entries: *std.ArrayList(DialogueEntry)) void {
+    for (entries.items) |entry| entry.deinit(allocator);
+    entries.deinit(allocator);
 }
 
 fn scoreEvent(event: audit.AuditEvent, terms: []const u8) usize {
@@ -254,5 +359,53 @@ test "session context redacts raw markers from useful events" {
     const rendered = (try renderRecent(std.testing.allocator, events.items, "atual")) orelse return error.MissingSessionContext;
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "---BEGIN CONTENT---") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, redacted_raw_marker) != null);
+}
+
+test "recent dialogue preserves roles groups assistant deltas and excludes current prompt" {
+    var events = std.ArrayList(audit.AuditEvent).empty;
+    defer audit.freeAuditEvents(std.testing.allocator, &events);
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "problema de layout"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "primeira "),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "resposta"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "tool_start"),
+        .body = try std.testing.allocator.dupe(u8, "collect_evidence"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "pedido atual"),
+    });
+
+    const rendered = (try renderRecentDialogue(std.testing.allocator, events.items, "pedido atual")) orelse return error.MissingDialogue;
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[RECENT_DIALOGUE]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "not_evidence=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "user: problema de layout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "assistant: primeira resposta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "tool_start") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "pedido atual") == null);
+}
+
+test "recent dialogue redacts raw markers" {
+    var events = std.ArrayList(audit.AuditEvent).empty;
+    defer audit.freeAuditEvents(std.testing.allocator, &events);
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "safe [READ_FILE] tail"),
+    });
+
+    const rendered = (try renderRecentDialogue(std.testing.allocator, events.items, "atual")) orelse return error.MissingDialogue;
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[READ_FILE]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, redacted_raw_marker) != null);
 }

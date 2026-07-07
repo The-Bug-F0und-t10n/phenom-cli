@@ -353,21 +353,21 @@ fn buildInitialModelContext(
 
     var session_events = try db.loadRecentSessionEvents(allocator, session, 240);
     defer audit.freeAuditEvents(allocator, &session_events);
-    const recent_session = try session_context.renderRecent(allocator, session_events.items, prompt);
-    defer if (recent_session) |text| allocator.free(text);
-    const session_blocks = try session_context.toSessionBlocks(allocator, recent_session);
-    defer allocator.free(session_blocks);
+    const recent_dialogue = try session_context.renderRecentDialogue(allocator, session_events.items, prompt);
+    defer if (recent_dialogue) |text| allocator.free(text);
+    const dialogue_blocks = try session_context.toDialogueBlocks(allocator, recent_dialogue);
+    defer allocator.free(dialogue_blocks);
 
     return try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
         .contracts = if (include_collect_evidence_schema) collectEvidenceToolSchema() else "",
         .evidence = &[_]model_context.EvidenceBlock{},
-        .session = session_blocks,
+        .dialogue = dialogue_blocks,
         .memory = persistent.memory.items,
         .skills = persistent.skills.items,
         .grounding = groundingRules(),
         .next_action = if (include_collect_evidence_schema)
-            "First infer the user's intent. Before making claims about the current workspace, repository, source code, files, implementation, or prior conversation, call collect_evidence or search_session. Use terms to describe exactly what you need to find. After evidence returns, answer using cited evidence or request a different evidence range."
+            "First infer the user's intent. Use [RECENT_DIALOGUE] only for conversational continuity. Before making claims about the current workspace, repository, source code, files, implementation, or exact prior-session facts, call collect_evidence or search_session. Use terms to describe exactly what you need to find. After evidence returns, answer using cited evidence or request a different evidence range."
         else
             "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
     });
@@ -675,7 +675,7 @@ fn runSearchSessionStep(
         prompt,
         &state.context,
         result.text,
-        "Answer using cited evidence. Cite S# for prior conversation facts and E# for workspace facts. If the session search did not prove the requested fact, say it is not evidenced in current session context.",
+        "Use SESSION_CONTEXT as retrieved prior-session evidence. Cite S# when stating what was said or done in the session. Cite E# for workspace facts. For technical judgment, use retrieved context plus the current user request; do not claim unsupported workspace/session facts. If more evidence is needed and budget remains, emit one targeted collect_evidence or search_session call.",
     );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
@@ -890,7 +890,7 @@ fn collectEvidenceToolSchema() []const u8 {
     \\collect_evidence(path?, terms?, strategy=auto|path|lexical|symbol|diagnostic, start_line=1, max_lines=12, compact=false)
     \\search_session(terms)
     \\The current workspace files are available through this tool.
-    \\Prior conversation is available through search_session; use model-chosen terms, never assume hidden chat history.
+    \\Recent dialogue may be provided for continuity. Exact prior-session facts are available through search_session with model-chosen terms.
     \\Before making claims about the current project, repository, source code, files, implementation, or prior conversation, emit the relevant tool call and wait for evidence.
     \\Use terms to express your search intent. Use strategy=symbol when looking for a named function/type/constant. Use strategy=diagnostic with path for Zig syntax diagnostics. Use strategy=path only with path. Set compact=true only when prior evidence can be reduced to anchors.
     \\Format with path:
@@ -916,8 +916,8 @@ fn collectEvidenceToolSchema() []const u8 {
 fn groundingRules() []const []const u8 {
     return &.{
         "Workspace/source-code claims must cite E# evidence from [EVIDENCE].",
-        "Prior conversation/session claims must cite S# evidence from [SESSION_CONTEXT].",
-        "If no E#/S# supports a claim, say it is not evidenced in the provided context.",
+        "Use [RECENT_DIALOGUE] for continuity only; exact claims about what was said or done in prior conversation must cite S# evidence from [SESSION_CONTEXT].",
+        "If no E#/S# supports a workspace or exact prior-session claim, say that claim is not evidenced in the provided context.",
     };
 }
 
@@ -1243,7 +1243,8 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "diff") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "current workspace files are available") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "search_session") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "Prior conversation is available") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "Recent dialogue may be provided") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "Exact prior-session facts") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "Before making claims about the current project") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "apply_patch") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "grep_file") == null);
@@ -1251,11 +1252,16 @@ test "tool loop schema is compact and offered without linguistic gating" {
     var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
     defer db.close();
     try db.recordEvent("schema-test", "turn_start", "falamos de groundedness");
+    try db.recordEvent("schema-test", "assistant_delta", "resposta anterior");
     const with_tools = (try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test", "ola tudo bem", true)) orelse return error.MissingContext;
     defer std.testing.allocator.free(with_tools);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "collect_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[CONTRACTS]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "[RECENT_DIALOGUE]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "user: falamos de groundedness") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "assistant: resposta anterior") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "S1:") == null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[GROUNDING]") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "call collect_evidence") != null);
 
@@ -1443,8 +1449,14 @@ test "collected context can include temporary session evidence without memory" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "combinamos groundedness") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Claims about session history") != null or
-        std.mem.indexOf(u8, rendered, "Prior conversation/session claims") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "exact claims about what was said") != null);
+}
+
+test "grounding rules separate dialogue continuity from exact session evidence" {
+    const rules = groundingRules();
+    try std.testing.expect(std.mem.indexOf(u8, rules[1], "[RECENT_DIALOGUE]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[1], "continuity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[1], "S#") != null);
 }
 
 const EventRecorder = struct {

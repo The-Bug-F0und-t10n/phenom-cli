@@ -9124,3 +9124,91 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 900 --session inventory-279 --prompt 'No codigo deste projeto, onde fica a parte que renderiza markdown no output? Use evidencia e termine exatamente com: PHENOM_INVENTORY_279' --expect-contains PHENOM_INVENTORY_279 --show-expect-status --fail-on-model-error --no-color` -> passou; tool loop executou e finalizou.
 - `sqlite3 .phenom-zig/phenom.db "select 'tool_event', count(*) ...; select 'raw_marker', count(*) ...; select 'tool_error', count(*) ...; select 'expectation_passed', count(*) ...;"` -> retornou `tool_event=1`, `raw_marker=0`, `tool_error=0`, `expectation_passed=1`.
+
+## T280 - Separar continuidade conversacional de evidencia pesquisavel da sessao
+
+Status: implementado nesta etapa.
+
+Motivacao: teste real de uso mostrou regressao de regra de negocio no fluxo de sessao. O usuario perguntou se uma solucao tecnica (`w-90`) fazia sentido dentro de um contexto ja conversado. O modelo chamou `search_session`, recebeu trechos relevantes do SQLite, mas respondeu que nao havia evidencia suficiente. A causa raiz nao era Bootstrap nem ranking; era contrato de contexto errado. O agente tratava conversa anterior como evidencia estrita S#, truncava eventos em linhas de audit e instruia o modelo a dizer "nao evidenciado" quando a busca de sessao nao provasse literalmente a resposta. Isso conflita com o fluxo esperado: o historico recente serve para continuidade conversacional; `search_session` serve para recuperar fatos exatos/auditaveis de sessoes longas.
+
+Evidencias analisadas:
+
+- `phenom-zig/src/session_context.zig` tinha apenas `renderRecent`, que renderizava eventos como `kind: body`, sem papeis `user`/`assistant`.
+- `phenom-zig/src/main.zig` injetava esse conteudo em `[SESSION_CONTEXT]`, competindo com evidencia S# retornada por `search_session`.
+- `runSearchSessionStep` dizia ao modelo: se a busca de sessao nao provar o fato, diga que nao esta evidenciado. Isso bloqueava julgamento tecnico baseado no contexto da conversa.
+- `groundingRules` exigia S# para qualquer claim de conversa/sessao, sem separar continuidade recente de fato exato pesquisado.
+- `phenom-cli-ts` usa mensagens recentes como chat history normal (`recentMessages`) e reserva ferramenta de sessao para recuperacao operacional opcional, nao para substituir continuidade conversacional.
+
+Alvo final:
+
+1. Historico recente entra como dialogo temporario, com papeis claros, sem virar MEMORY/SKILLS.
+2. `search_session` continua sendo ferramenta auditavel para fatos exatos de sessao e retorna S#.
+3. O modelo pode usar dialogo recente para entender a pergunta atual sem precisar provar cada inferencia tecnica com S#.
+4. Claims sobre workspace/source continuam exigindo E#.
+5. Claims exatas sobre o que foi dito/feito em sessao continuam exigindo S#.
+6. Raw context, tool events e evidencia bruta nao vazam para o modelo como conversa.
+7. O ajuste nao adiciona heuristica linguistica, regra por linguagem, regra por framework nem caso especial para `w-90`.
+
+Teste primeiro:
+
+- `renderRecentDialogue` preserva `user:` e `assistant:`.
+- `renderRecentDialogue` agrupa deltas consecutivos de assistente.
+- `renderRecentDialogue` remove o prompt atual.
+- `renderRecentDialogue` ignora eventos operacionais como `tool_start`.
+- `renderRecentDialogue` redige marcadores de raw context.
+- `renderModelTurnContext` renderiza `[RECENT_DIALOGUE]` separado de `[SESSION_CONTEXT]`.
+- `buildInitialModelContext` injeta `[RECENT_DIALOGUE]`, mas nao cria `[SESSION_CONTEXT]` sem chamada explicita de `search_session`.
+- `renderCollectedEvidenceContext` continua aceitando `[SESSION_CONTEXT]` de `search_session`.
+
+Implementacao:
+
+- Adicionar `DialogueBlock` em `model_context.zig`.
+- Renderizar `[RECENT_DIALOGUE]` antes de `[SESSION_CONTEXT]`.
+- Adicionar `session_context.renderRecentDialogue`.
+- Adicionar `session_context.toDialogueBlocks`.
+- Alterar `buildInitialModelContext` para usar dialogo recente em vez de contexto S# inicial.
+- Ajustar `collectEvidenceToolSchema` para deixar claro que dialogo recente e continuidade, e fatos exatos de sessao vêm de `search_session`.
+- Ajustar `runSearchSessionStep` para permitir julgamento tecnico usando o contexto recuperado, sem transformar resultado insuficiente em negativa automatica.
+- Ajustar `groundingRules` para separar:
+  - E# para workspace/source;
+  - S# para fatos exatos de sessao;
+  - `[RECENT_DIALOGUE]` somente para continuidade.
+
+Revisao baixo nivel realizada:
+
+- Ownership: `DialogueEntry.text` e owned e liberado por `freeDialogueEntries`.
+- Failure path: `renderRecentDialogue` usa `errdefer` para liberar entries e output parcial; revisao encontrou e removeu risco de double-free entre `errdefer` e `defer`.
+- Bounds: acumulacao por mensagem limitada por `max_dialogue_accum_bytes`; renderizacao final limitada por `max_dialogue_entry_bytes`.
+- Raw leak: dialogo passa por `redactRawMarkers` e `assertNoRawContextLeak`.
+- Stale context: dialogo recente nao vira evidencia E#/S# e nao autoriza claims de workspace.
+- Regra de negocio: sem stopwords, sem keywords hardcoded, sem preferencia source/docs/test, sem caso especial de framework.
+
+Criterio de aceite:
+
+- `zig test src/session_context.zig -lc -lsqlite3` passa.
+- `zig test src/model_context.zig -lc -lsqlite3` passa.
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real de continuidade de sessao deve mostrar que o modelo consegue usar conversa recente como contexto e, quando precisar de fato exato de sessao, chamar `search_session`.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/session_context.zig -lc -lsqlite3` -> passou; 66 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/model_context.zig -lc -lsqlite3` -> passou; 56 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 165 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- Smoke real `dialogue-280` chamada 1 registrou contexto conversacional e passou com `CONTEXTO_REGISTRADO_280`.
+- Smoke real `dialogue-280` chamada 2 respondeu pergunta dependente do historico e passou com `PHENOM_DIALOGUE_280`.
+- Audit SQLite `dialogue-280` retornou `recent_dialogue_context=1`, `session_context_block=0`, `raw_marker=0`, `expectation_passed=2`.
+
+Observacao de smoke:
+
+- O modelo deixou de responder "sem evidencia" e usou continuidade da conversa. Ainda houve extrapolacao tecnica sobre `w-90` como se fosse utility padrao ampla. Isso confirma que T280 corrige o contrato de historico, mas nao encerra a frente de groundedness tecnica. A correcao dessa extrapolacao deve vir por citações/contratos de conhecimento ou evidencia quando o usuario pedir fato de framework, nao por heuristica hardcoded no agente.
+
+Pendencias deliberadas:
+
+- Ainda nao ha resumo semantico longo de sessao; esta task corrige a separacao contratual do historico recente.
+- `search_session` ainda usa busca textual simples sobre audit events; FTS/BM25 de sessao pode entrar depois sem mudar o contrato.
+- A resposta tecnica final ainda depende do modelo interpretar o dialogo corretamente; o agente nao adiciona vies/heuristicas para substituir essa interpretacao.
