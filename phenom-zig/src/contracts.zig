@@ -61,6 +61,13 @@ pub const ActiveContract = struct {
     }
 };
 
+pub const OperationalContractRequest = struct {
+    requires_inspection: bool,
+    requires_mutation: bool,
+    requires_runtime_validation: bool,
+    requires_browser_diagnostics: bool,
+};
+
 pub const all_tools = [_]ToolSpec{
     .{ .name = "collect_evidence", .visibility = .model_visible },
     .{ .name = "search_session", .visibility = .model_visible },
@@ -83,7 +90,7 @@ pub const all_tools = [_]ToolSpec{
     .{ .name = "date", .visibility = .internal_context },
     .{ .name = "get_session_context", .visibility = .internal_context },
     .{ .name = "list_session_files", .visibility = .internal_context },
-    .{ .name = "set_operational_contract", .visibility = .internal_context },
+    .{ .name = "set_operational_contract", .visibility = .model_visible },
     .{ .name = "build_task_context", .visibility = .internal_context },
     .{ .name = "get_context", .visibility = .internal_context },
     .{ .name = "get_minimal_context", .visibility = .internal_context },
@@ -124,7 +131,22 @@ pub const contract_specs = [_]ContractSpec{
     .{
         .name = .collect_evidence,
         .endpoint = "collect_evidence",
-        .allowed_tools = &.{ "collect_evidence", "search_session" },
+        .allowed_tools = &.{ "set_operational_contract", "collect_evidence", "search_session" },
+    },
+    .{
+        .name = .mutate_file,
+        .endpoint = "set_operational_contract",
+        .allowed_tools = &.{ "set_operational_contract", "collect_evidence", "search_session" },
+    },
+    .{
+        .name = .validate_work,
+        .endpoint = "set_operational_contract",
+        .allowed_tools = &.{ "set_operational_contract", "collect_evidence", "search_session" },
+    },
+    .{
+        .name = .inspect_runtime,
+        .endpoint = "set_operational_contract",
+        .allowed_tools = &.{ "set_operational_contract", "collect_evidence", "search_session" },
     },
 };
 
@@ -134,6 +156,16 @@ pub const strategy_specs = [_]StrategySpec{
     .{ .contract = .collect_evidence, .strategy = .lexical, .max_budget_bytes = 6000 },
     .{ .contract = .collect_evidence, .strategy = .symbol, .max_budget_bytes = 6000 },
     .{ .contract = .collect_evidence, .strategy = .diagnostic, .max_budget_bytes = 6000 },
+    .{ .contract = .mutate_file, .strategy = .auto, .max_budget_bytes = 3800 },
+    .{ .contract = .mutate_file, .strategy = .path, .max_budget_bytes = 3800 },
+    .{ .contract = .mutate_file, .strategy = .lexical, .max_budget_bytes = 6000 },
+    .{ .contract = .mutate_file, .strategy = .symbol, .max_budget_bytes = 6000 },
+    .{ .contract = .mutate_file, .strategy = .diagnostic, .max_budget_bytes = 6000 },
+    .{ .contract = .validate_work, .strategy = .auto, .max_budget_bytes = 3800 },
+    .{ .contract = .validate_work, .strategy = .path, .max_budget_bytes = 3800 },
+    .{ .contract = .validate_work, .strategy = .lexical, .max_budget_bytes = 6000 },
+    .{ .contract = .validate_work, .strategy = .symbol, .max_budget_bytes = 6000 },
+    .{ .contract = .validate_work, .strategy = .diagnostic, .max_budget_bytes = 6000 },
     .{ .contract = .news, .strategy = .news_table, .max_budget_bytes = 24000 },
     .{ .contract = .inspect_runtime, .strategy = .document_summary, .max_budget_bytes = 24000 },
 };
@@ -177,6 +209,13 @@ pub fn activeContract(name: ContractName) ?ActiveContract {
     return null;
 }
 
+pub fn selectOperationalContract(request: OperationalContractRequest) ContractName {
+    if (request.requires_mutation) return .mutate_file;
+    if (request.requires_runtime_validation) return .validate_work;
+    if (request.requires_browser_diagnostics) return .inspect_runtime;
+    return .collect_evidence;
+}
+
 pub fn compactModelVisibleTools(allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -193,6 +232,7 @@ pub fn compactModelVisibleTools(allocator: std.mem.Allocator) ![]u8 {
 test "tool manifest keeps internal context tools hidden from model surface" {
     try std.testing.expect(isModelVisible("collect_evidence"));
     try std.testing.expect(isModelVisible("search_session"));
+    try std.testing.expect(isModelVisible("set_operational_contract"));
     try std.testing.expect(!isModelVisible("apply_patch"));
     try std.testing.expect(isInternalContextTool("apply_patch"));
     try std.testing.expect(!isModelVisible("grep_file"));
@@ -222,6 +262,7 @@ test "collect evidence accepts bounded strategies without expanding tool surface
 test "active collect evidence contract comes from manifest allowlist" {
     const active = activeContract(.collect_evidence) orelse return error.MissingContract;
     try std.testing.expectEqualStrings(manifest_version, active.version);
+    try std.testing.expect(active.allows("set_operational_contract"));
     try std.testing.expect(active.allows("collect_evidence"));
     try std.testing.expect(active.allows("search_session"));
     try std.testing.expect(!active.allows("content"));
@@ -233,9 +274,25 @@ test "compact model visible tools excludes internal collectors" {
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "collect_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "search_session") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "set_operational_contract") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "set_operational_contract") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "apply_patch") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "run_tests") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "grep_file") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "rag_search") == null);
+}
+
+test "operational contract selection keeps future mutation tools hidden" {
+    const selected = selectOperationalContract(.{
+        .requires_inspection = true,
+        .requires_mutation = true,
+        .requires_runtime_validation = true,
+        .requires_browser_diagnostics = false,
+    });
+    try std.testing.expectEqual(ContractName.mutate_file, selected);
+    const active = activeContract(selected) orelse return error.MissingContract;
+    try std.testing.expect(active.allows("set_operational_contract"));
+    try std.testing.expect(active.allows("collect_evidence"));
+    try std.testing.expect(active.allows("search_session"));
+    try std.testing.expect(!active.allows("apply_patch"));
+    try std.testing.expect(strategyAllowed(selected, .path));
 }

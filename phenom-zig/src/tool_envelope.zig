@@ -187,6 +187,42 @@ test "announced session search is accepted" {
     try std.testing.expectEqualStrings("groundedness citations", envelope.call.?.terms.?);
 }
 
+test "set operational contract is accepted as model-visible controller tool" {
+    const active = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
+    const output =
+        \\<tool_call>
+        \\<function=set_operational_contract>
+        \\<parameter=requiresInspection>true</parameter>
+        \\<parameter=requiresMutation>false</parameter>
+        \\<parameter=requiresRuntimeValidation>false</parameter>
+        \\<parameter=requiresBrowserDiagnostics>false</parameter>
+        \\<parameter=reason>Need evidence before final answer.</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.accepted, envelope.state);
+    try std.testing.expect(envelope.call != null);
+    try std.testing.expectEqualStrings("set_operational_contract", envelope.raw_name);
+    try std.testing.expectEqual(true, envelope.call.?.requires_inspection.?);
+}
+
+test "mutation contract still rejects mutation executor until advertised" {
+    const active = contracts.activeContract(.mutate_file) orelse return error.MissingContract;
+    const output =
+        \\<tool_call>
+        \\<function=apply_patch>
+        \\<parameter=path>README.md</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.rejected, envelope.state);
+    try std.testing.expectEqual(RejectionReason.tool_not_advertised, envelope.rejection_reason.?);
+}
+
 test "invalid strategy is a rejected envelope" {
     const active = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
     const output =

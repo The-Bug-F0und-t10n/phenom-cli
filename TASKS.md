@@ -9290,7 +9290,7 @@ Validacao executada:
 
 ## T282 - Portar `set_operational_contract` como contrato model-visible pequeno
 
-Status: pending-urgent.
+Status: done.
 
 Prioridade: urgente.
 
@@ -9322,6 +9322,42 @@ Criterio de aceite:
 - Modelo consegue declarar contrato.
 - Executor nao roda tool fora do contrato ativo.
 - SQLite mostra contrato selecionado e allowlist efetiva.
+
+Implementacao concluida:
+
+- `set_operational_contract` passou a ser model-visible no manifesto Zig.
+- Parser XML aceita `requiresInspection`, `requiresMutation`, `requiresRuntimeValidation`, `requiresBrowserDiagnostics` e `reason`, com ownership proprio.
+- O tool envelope aceita `set_operational_contract` e rejeita executores futuros ainda nao anunciados, como `apply_patch`.
+- O tool loop registra `contract_selected`, altera o contrato ativo do turno e audita `allowed_tools`.
+- Apos selecionar contrato, o schema enviado ao modelo deixa de anunciar `set_operational_contract`, evitando repeticao/loop.
+- Mutation/validation continuam bloqueados ate T285/T286.
+
+Revisao baixo nivel Zig:
+
+- Campos textuais novos sao duplicados no parser e liberados em `ToolCall.deinit`.
+- `ToolLoopState` guarda somente slices estaticos de `contracts.ActiveContract`, sem ownership pendurado.
+- `set_operational_contract` consome budget de iteracao e tem dedupe para repeticao no mesmo turno.
+- `renderAllowedTools` usa `ArrayList` com `errdefer`.
+- Nenhum raw tool output e enviado ao modelo; somente audit/body destilado.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/contracts.zig` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/tool_call.zig` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/tool_envelope.zig` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 169 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `sh tools/check_alignment_tasks.sh` -> passou.
+
+Smoke real executado:
+
+- `timeout 45s ./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 500 --session contract-282d --prompt 'Declare set_operational_contract com requiresInspection=true, requiresMutation=false, requiresRuntimeValidation=false, requiresBrowserDiagnostics=false e reason="teste de contrato". Depois responda exatamente: PHENOM_CONTRACT_282D' --expect-contains PHENOM_CONTRACT_282D --show-expect-status --fail-on-model-error --no-color` -> passou.
+- SQLite `contract-282d`: `contract_selected=1`, `contract_duplicate=0`, `tool_rejected=0`, `model_error=0`, `expectation_passed=1`.
+
+Observacao de smoke:
+
+- Uma tentativa anterior expôs loop por repeticao de `set_operational_contract`; a causa raiz foi corrigida removendo `set_operational_contract` do schema apos selecao do contrato ativo.
 
 ## T283 - Evoluir `collect_evidence` para contrato rico sem heuristica
 

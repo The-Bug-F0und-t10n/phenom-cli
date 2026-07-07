@@ -9,11 +9,17 @@ pub const ToolCall = struct {
     start_line: usize = 1,
     max_lines: usize = 12,
     compact: bool = false,
+    requires_inspection: ?bool = null,
+    requires_mutation: ?bool = null,
+    requires_runtime_validation: ?bool = null,
+    requires_browser_diagnostics: ?bool = null,
+    reason: ?[]const u8 = null,
 
     pub fn deinit(self: ToolCall, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         if (self.path) |path| allocator.free(path);
         if (self.terms) |terms| allocator.free(terms);
+        if (self.reason) |reason| allocator.free(reason);
     }
 };
 
@@ -29,6 +35,7 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
     const name = std.mem.trim(u8, body[name_start .. name_start + name_end], " \r\n\t");
     const path = normalizeOptionalPath(parseParameter(body, "path"));
     const terms = normalizeOptionalText(parseParameter(body, "terms"));
+    const reason = normalizeOptionalText(parseParameter(body, "reason"));
     const strategy = try parseStrategyParameter(body);
 
     return .{
@@ -39,6 +46,11 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
         .start_line = parseIntParameter(body, "start_line") orelse 1,
         .max_lines = parseIntParameter(body, "max_lines") orelse 12,
         .compact = parseBoolParameter(body, "compact") orelse false,
+        .requires_inspection = parseBoolParameter(body, "requiresInspection"),
+        .requires_mutation = parseBoolParameter(body, "requiresMutation"),
+        .requires_runtime_validation = parseBoolParameter(body, "requiresRuntimeValidation"),
+        .requires_browser_diagnostics = parseBoolParameter(body, "requiresBrowserDiagnostics"),
+        .reason = if (reason) |value| try allocator.dupe(u8, value) else null,
     };
 }
 
@@ -219,4 +231,28 @@ test "collect evidence parses compact flag" {
     defer call.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("collect_evidence", call.name);
     try std.testing.expect(call.compact);
+}
+
+test "parses set operational contract fields and owns reason" {
+    var output = try std.testing.allocator.dupe(u8,
+        \\<tool_call>
+        \\<function=set_operational_contract>
+        \\<parameter=requiresInspection>true</parameter>
+        \\<parameter=requiresMutation>true</parameter>
+        \\<parameter=requiresRuntimeValidation>false</parameter>
+        \\<parameter=requiresBrowserDiagnostics>false</parameter>
+        \\<parameter=reason>Need focused evidence before a patch.</parameter>
+        \\</function>
+        \\</tool_call>
+    );
+    defer std.testing.allocator.free(output);
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    output[120] = 'X';
+    try std.testing.expectEqualStrings("set_operational_contract", call.name);
+    try std.testing.expectEqual(true, call.requires_inspection.?);
+    try std.testing.expectEqual(true, call.requires_mutation.?);
+    try std.testing.expectEqual(false, call.requires_runtime_validation.?);
+    try std.testing.expectEqual(false, call.requires_browser_diagnostics.?);
+    try std.testing.expectEqualStrings("Need focused evidence before a patch.", call.reason.?);
 }

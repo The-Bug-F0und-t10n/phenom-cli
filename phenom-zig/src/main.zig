@@ -360,7 +360,7 @@ fn buildInitialModelContext(
 
     return try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
-        .contracts = if (include_collect_evidence_schema) collectEvidenceToolSchema() else "",
+        .contracts = if (include_collect_evidence_schema) collectEvidenceToolSchema(true) else "",
         .evidence = &[_]model_context.EvidenceBlock{},
         .dialogue = dialogue_blocks,
         .memory = persistent.memory.items,
@@ -395,8 +395,9 @@ fn runToolLoopIterations(
     ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
     first_sink: *StreamSink,
 ) !bool {
-    const active_contract = currentActiveContract();
-    var maybe_envelope = tool_envelope.parseFirst(allocator, model_output, active_contract) catch |err| {
+    var state = ToolLoopState.init(allocator);
+    defer state.deinit();
+    var maybe_envelope = tool_envelope.parseFirst(allocator, model_output, state.active_contract) catch |err| {
         try db.recordEvent(config.session, "tool_envelope_error", @errorName(err));
         return true;
     };
@@ -404,8 +405,6 @@ fn runToolLoopIterations(
 
     var tool_iterations: usize = 0;
     var repairs: usize = 0;
-    var state = ToolLoopState.init(allocator);
-    defer state.deinit();
     while (maybe_envelope) |envelope_value| {
         var envelope = envelope_value;
         defer envelope.deinit(allocator);
@@ -445,7 +444,7 @@ fn runToolLoopIterations(
             .final_answer => return true,
             .stopped => return true,
             .tool_call => |next_call| {
-                maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, active_contract, next_call);
+                maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
                 continue;
             },
         }
@@ -468,9 +467,12 @@ fn runOneToolLoopStep(
     tool_iterations: *usize,
     repairs: *usize,
 ) !ToolLoopNext {
-    if (!gate.isAllowed(call.name, &.{ "collect_evidence", "search_session" })) {
+    if (!gate.isAllowed(call.name, state.active_contract.allowed_tools)) {
         try db.recordEvent(config.session, "tool_rejected", call.name);
         return .stopped;
+    }
+    if (std.mem.eql(u8, call.name, "set_operational_contract")) {
+        return try runSetOperationalContractStep(allocator, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
     }
     if (std.mem.eql(u8, call.name, "search_session")) {
         return try runSearchSessionStep(allocator, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
@@ -503,7 +505,7 @@ fn runOneToolLoopStep(
         try events.emit(.{ .progress_update = "repairing tool call: collect_evidence requires path" });
         const repair_context = try model_context.renderModelTurnContext(allocator, .{
             .task = prompt,
-            .contracts = collectEvidenceToolSchema(),
+            .contracts = collectEvidenceToolSchema(!state.contract_selected),
             .obligations = &.{
                 "A collect_evidence call must include <parameter=path>relative/file</parameter>.",
                 "Do not answer with prose until evidence is collected or you decide evidence is unnecessary.",
@@ -512,7 +514,7 @@ fn runOneToolLoopStep(
         });
         defer allocator.free(repair_context);
         try db.recordEvent(config.session, "model_context", repair_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
     }
 
     if (state.hasExecutedArgs(path, call.terms, strategy, call.start_line, call.max_lines)) {
@@ -536,11 +538,12 @@ fn runOneToolLoopStep(
             prompt,
             &state.context,
             null,
+            !state.contract_selected,
             "The requested evidence was already collected in this turn. Answer now using the evidence above. Do not call tools again.",
         );
         defer allocator.free(duplicate_context);
         try db.recordEvent(config.session, "model_context", duplicate_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
     }
 
     if (tool_iterations.* >= max_tool_emergency_iterations or !state.hasBudgetForMoreEvidence()) {
@@ -572,11 +575,12 @@ fn runOneToolLoopStep(
             prompt,
             &state.context,
             null,
+            !state.contract_selected,
             "collect_evidence encountered an error. Answer the current user request directly.",
         );
         defer allocator.free(follow_context);
         try db.recordEvent(config.session, "model_context", follow_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
     };
     defer result.deinit(allocator);
 
@@ -601,6 +605,7 @@ fn runOneToolLoopStep(
         prompt,
         &state.context,
         null,
+        !state.contract_selected,
         if (state.shouldAllowMoreEvidence())
             "Answer using only cited evidence above. Cite E# for workspace claims and S# for session claims. Do not add capabilities, files, tools, or architecture not present in evidence. If a different evidence range is strictly required and budget remains, emit one collect_evidence or search_session call. Do not request the same file/range/session terms again."
         else
@@ -609,7 +614,113 @@ fn runOneToolLoopStep(
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
 
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+fn runSetOperationalContractStep(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    call: *const tool_call.ToolCall,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    tool_iterations: *usize,
+) !ToolLoopNext {
+    if (tool_iterations.* >= max_tool_emergency_iterations) {
+        try db.recordEvent(config.session, "tool_loop_stop", "contract budget exhausted");
+        return .stopped;
+    }
+    tool_iterations.* += 1;
+
+    if (state.contract_selected) {
+        if (state.duplicate_contract_repairs >= max_duplicate_tool_repairs) {
+            try db.recordEvent(config.session, "tool_loop_stop", "duplicate set_operational_contract repeated after repair");
+            return .stopped;
+        }
+        state.duplicate_contract_repairs += 1;
+        try db.recordEvent(config.session, "contract_duplicate", "set_operational_contract");
+        const duplicate_context = try model_context.renderModelTurnContext(allocator, .{
+            .task = prompt,
+            .contracts = collectEvidenceToolSchema(false),
+            .obligations = &.{
+                "The operational contract was already selected in this turn.",
+                "Do not call set_operational_contract again unless a later tool result changes the operational need.",
+            },
+            .grounding = groundingRules(),
+            .next_action = "Continue inside the existing contract. Call collect_evidence/search_session if evidence is needed, otherwise answer the user now.",
+        });
+        defer allocator.free(duplicate_context);
+        try db.recordEvent(config.session, "model_context", duplicate_context);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    }
+
+    if (call.requires_inspection == null or
+        call.requires_mutation == null or
+        call.requires_runtime_validation == null or
+        call.requires_browser_diagnostics == null)
+    {
+        try db.recordEvent(config.session, "tool_repair", "set_operational_contract missing required booleans");
+        const repair_context = try model_context.renderModelTurnContext(allocator, .{
+            .task = prompt,
+            .contracts = collectEvidenceToolSchema(true),
+            .obligations = &.{
+                "set_operational_contract requires requiresInspection, requiresMutation, requiresRuntimeValidation, and requiresBrowserDiagnostics.",
+            },
+            .next_action = "Emit one corrected set_operational_contract call with all required boolean fields, or call collect_evidence if inspection is enough.",
+        });
+        defer allocator.free(repair_context);
+        try db.recordEvent(config.session, "model_context", repair_context);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    }
+
+    const request = contracts.OperationalContractRequest{
+        .requires_inspection = call.requires_inspection.?,
+        .requires_mutation = call.requires_mutation.?,
+        .requires_runtime_validation = call.requires_runtime_validation.?,
+        .requires_browser_diagnostics = call.requires_browser_diagnostics.?,
+    };
+    const selected_name = contracts.selectOperationalContract(request);
+    const selected = contracts.activeContract(selected_name) orelse return error.MissingContract;
+    state.active_contract = selected;
+    state.contract_selected = true;
+
+    const allowed = try renderAllowedTools(allocator, selected.allowed_tools);
+    defer allocator.free(allowed);
+    const audit_body = try std.fmt.allocPrint(
+        allocator,
+        "contract={s} requiresInspection={} requiresMutation={} requiresRuntimeValidation={} requiresBrowserDiagnostics={} allowed_tools={s} reason={s}",
+        .{
+            @tagName(selected.name),
+            request.requires_inspection,
+            request.requires_mutation,
+            request.requires_runtime_validation,
+            request.requires_browser_diagnostics,
+            allowed,
+            call.reason orelse "",
+        },
+    );
+    defer allocator.free(audit_body);
+    try db.recordEvent(config.session, "contract_selected", audit_body);
+    try events.emit(.{ .tool_start = .{ .name = "set_operational_contract", .detail = @tagName(selected.name) } });
+    try events.emit(.{ .tool_result = .{ .name = "set_operational_contract", .output = audit_body } });
+
+    const follow_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = collectEvidenceToolSchema(false),
+        .obligations = &.{
+            "The operational contract is now active for this turn.",
+            "Only advertised tools may be called. Future mutation/validation executors remain blocked until their contracts are implemented.",
+        },
+        .grounding = groundingRules(),
+        .next_action = "Proceed inside the active contract. If workspace evidence is needed, call collect_evidence with model-chosen terms/path. Do not call mutation tools unless they are advertised.",
+    });
+    defer allocator.free(follow_context);
+    try db.recordEvent(config.session, "model_context", follow_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
 }
 
 fn runSearchSessionStep(
@@ -633,11 +744,12 @@ fn runSearchSessionStep(
             prompt,
             &state.context,
             null,
+            !state.contract_selected,
             "Emit one corrected search_session tool call with <parameter=terms>describing what prior session fact you need</parameter>, or answer using current evidence only.",
         );
         defer allocator.free(repair_context);
         try db.recordEvent(config.session, "model_context", repair_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
     }
     if (state.hasSessionSearch(terms)) {
         try db.recordEvent(config.session, "session_context_duplicate", terms);
@@ -646,11 +758,12 @@ fn runSearchSessionStep(
             prompt,
             &state.context,
             null,
+            !state.contract_selected,
             "The requested session search was already performed in this turn. Answer using existing E#/S# evidence, or state what remains unknown.",
         );
         defer allocator.free(duplicate_context);
         try db.recordEvent(config.session, "model_context", duplicate_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
     }
     if (tool_iterations.* >= max_tool_emergency_iterations or !state.hasBudgetForMoreEvidence()) {
         try db.recordEvent(config.session, "tool_loop_stop", "session/evidence budget exhausted");
@@ -675,11 +788,22 @@ fn runSearchSessionStep(
         prompt,
         &state.context,
         result.text,
+        !state.contract_selected,
         "Use SESSION_CONTEXT as retrieved prior-session evidence. Cite S# when stating what was said or done in the session. Cite E# for workspace facts. For technical judgment, use retrieved context plus the current user request; do not claim unsupported workspace/session facts. If more evidence is needed and budget remains, emit one targeted collect_evidence or search_session call.",
     );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+fn renderAllowedTools(allocator: std.mem.Allocator, allowed_tools: []const []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (allowed_tools, 0..) |tool, idx| {
+        if (idx > 0) try out.appendSlice(allocator, ",");
+        try out.appendSlice(allocator, tool);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn streamDeferredToolLoopTurn(
@@ -692,6 +816,7 @@ fn streamDeferredToolLoopTurn(
     db: *audit.AuditDb,
     ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
     aggregate_sink: *StreamSink,
+    active_contract: contracts.ActiveContract,
 ) !ToolLoopNext {
     if (ui_ptr) |active_ui| try active_ui.showStatus("Thinking");
     var follow_sink = StreamSink{
@@ -711,7 +836,7 @@ fn streamDeferredToolLoopTurn(
     try client.streamInference(.{ .user_prompt = prompt, .model_context = follow_context }, &follow_sink);
     try follow_sink.flush();
 
-    var envelope = (tool_envelope.parseFirst(allocator, follow_sink.raw_visible.items, currentActiveContract()) catch |err| {
+    var envelope = (tool_envelope.parseFirst(allocator, follow_sink.raw_visible.items, active_contract) catch |err| {
         try db.recordEvent(config.session, "tool_envelope_error", @errorName(err));
         return .stopped;
     }) orelse {
@@ -791,12 +916,16 @@ fn hasKnownTextExtension(path: []const u8) bool {
 const ToolLoopState = struct {
     context: working_context.WorkingContext,
     session_searches: std.ArrayList([]u8),
+    active_contract: contracts.ActiveContract,
     duplicate_repairs: usize = 0,
+    contract_selected: bool = false,
+    duplicate_contract_repairs: usize = 0,
 
     fn init(allocator: std.mem.Allocator) ToolLoopState {
         return .{
             .context = working_context.WorkingContext.init(allocator),
             .session_searches = std.ArrayList([]u8).empty,
+            .active_contract = currentActiveContract(),
         };
     }
 
@@ -865,6 +994,7 @@ fn renderCollectedEvidenceContext(
     prompt: []const u8,
     context: *const working_context.WorkingContext,
     session_text: ?[]const u8,
+    include_contract_tool: bool,
     next_action: []const u8,
 ) ![]u8 {
     const evidence_blocks = try context.renderEvidenceBlocks(allocator);
@@ -873,7 +1003,7 @@ fn renderCollectedEvidenceContext(
     defer allocator.free(session_blocks);
     return model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
-        .contracts = collectEvidenceToolSchema(),
+        .contracts = collectEvidenceToolSchema(include_contract_tool),
         .evidence = evidence_blocks,
         .session = session_blocks,
         .obligations = &.{
@@ -884,12 +1014,43 @@ fn renderCollectedEvidenceContext(
     });
 }
 
-fn collectEvidenceToolSchema() []const u8 {
+fn collectEvidenceToolSchema(include_contract_tool: bool) []const u8 {
+    if (include_contract_tool) return
+    \\[TOOLS v1]
+    \\set_operational_contract(requiresInspection, requiresMutation, requiresRuntimeValidation, requiresBrowserDiagnostics, reason?)
+    \\collect_evidence(path?, terms?, strategy=auto|path|lexical|symbol|diagnostic, start_line=1, max_lines=12, compact=false)
+    \\search_session(terms)
+    \\The current workspace files are available through this tool.
+    \\Use set_operational_contract when the request needs inspection, mutation, validation, or runtime/browser diagnostics. This declares controller gates; it does not expose internal tools by itself.
+    \\Recent dialogue may be provided for continuity. Exact prior-session facts are available through search_session with model-chosen terms.
+    \\Before making claims about the current project, repository, source code, files, implementation, or prior conversation, emit the relevant tool call and wait for evidence.
+    \\Use terms to express your search intent. Use strategy=symbol when looking for a named function/type/constant. Use strategy=diagnostic with path for Zig syntax diagnostics. Use strategy=path only with path. Set compact=true only when prior evidence can be reduced to anchors.
+    \\Format contract:
+    \\<tool_call><function=set_operational_contract><parameter=requiresInspection>true</parameter><parameter=requiresMutation>false</parameter><parameter=requiresRuntimeValidation>false</parameter><parameter=requiresBrowserDiagnostics>false</parameter><parameter=reason>short reason</parameter></function></tool_call>
+    \\Format with path:
+    \\<tool_call>
+    \\<function=collect_evidence>
+    \\<parameter=path>relative/path</parameter>
+    \\<parameter=strategy>path</parameter>
+    \\<parameter=start_line>1</parameter>
+    \\<parameter=max_lines>12</parameter>
+    \\</function>
+    \\</tool_call>
+    \\Format ranked:
+    \\<tool_call><function=collect_evidence><parameter=strategy>auto</parameter><parameter=terms>what to find</parameter></function></tool_call>
+    \\Format symbol:
+    \\<tool_call><function=collect_evidence><parameter=strategy>symbol</parameter><parameter=terms>symbol or identifier to find</parameter></function></tool_call>
+    \\Format diagnostic:
+    \\<tool_call><function=collect_evidence><parameter=path>relative/file.zig</parameter><parameter=strategy>diagnostic</parameter></function></tool_call>
+    \\Format session:
+    \\<tool_call><function=search_session><parameter=terms>what prior conversation fact to find</parameter></function></tool_call>
+    ;
     return
     \\[TOOLS v1]
     \\collect_evidence(path?, terms?, strategy=auto|path|lexical|symbol|diagnostic, start_line=1, max_lines=12, compact=false)
     \\search_session(terms)
     \\The current workspace files are available through this tool.
+    \\The operational contract is already active for this turn. Do not call set_operational_contract again.
     \\Recent dialogue may be provided for continuity. Exact prior-session facts are available through search_session with model-chosen terms.
     \\Before making claims about the current project, repository, source code, files, implementation, or prior conversation, emit the relevant tool call and wait for evidence.
     \\Use terms to express your search intent. Use strategy=symbol when looking for a named function/type/constant. Use strategy=diagnostic with path for Zig syntax diagnostics. Use strategy=path only with path. Set compact=true only when prior evidence can be reduced to anchors.
@@ -1232,15 +1393,17 @@ test "model context env parser is opt in only" {
 }
 
 test "tool loop schema is compact and offered without linguistic gating" {
-    const schema = collectEvidenceToolSchema();
+    const schema = collectEvidenceToolSchema(true);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "set_operational_contract") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "requiresRuntimeValidation") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "collect_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=auto") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "lexical") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "symbol") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "semantic") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "diagnostic") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "runtime") == null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "diff") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=runtime") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=diff") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "current workspace files are available") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "Recent dialogue may be provided") != null);
@@ -1248,6 +1411,9 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "Before making claims about the current project") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "apply_patch") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "grep_file") == null);
+    const post_contract_schema = collectEvidenceToolSchema(false);
+    try std.testing.expect(std.mem.indexOf(u8, post_contract_schema, "set_operational_contract(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, post_contract_schema, "Do not call set_operational_contract again") != null);
 
     var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
     defer db.close();
@@ -1401,6 +1567,7 @@ test "duplicate evidence context keeps evidence and tool schema" {
         "responda",
         &state.context,
         null,
+        true,
         "Answer now. Do not call tools again.",
     );
     defer std.testing.allocator.free(rendered);
@@ -1409,8 +1576,25 @@ test "duplicate evidence context keeps evidence and tool schema" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "README.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[TOOLS v1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "set_operational_contract") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Use only collected evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Do not call tools again") != null);
+}
+
+test "tool loop state starts with model-visible operational contract gate" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+    try std.testing.expectEqual(contracts.ContractName.collect_evidence, state.active_contract.name);
+    try std.testing.expect(state.active_contract.allows("set_operational_contract"));
+    try std.testing.expect(state.active_contract.allows("collect_evidence"));
+    try std.testing.expect(!state.active_contract.allows("apply_patch"));
+}
+
+test "allowed tools render compact audit list" {
+    const active = contracts.activeContract(.mutate_file) orelse return error.MissingContract;
+    const rendered = try renderAllowedTools(std.testing.allocator, active.allowed_tools);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings("set_operational_contract,collect_evidence,search_session", rendered);
 }
 
 test "collected evidence context renders compact anchors without memory skills or old full text" {
@@ -1423,6 +1607,7 @@ test "collected evidence context renders compact anchors without memory skills o
         "responda",
         &state.context,
         null,
+        true,
         "Answer from compact anchors.",
     );
     defer std.testing.allocator.free(rendered);
@@ -1441,6 +1626,7 @@ test "collected context can include temporary session evidence without memory" {
         "o que combinamos?",
         &state.context,
         "[SESSION_EVIDENCE]\n- S1 score=10 turn_start: combinamos groundedness\n",
+        true,
         "Answer with S# citations.",
     );
     defer std.testing.allocator.free(rendered);
