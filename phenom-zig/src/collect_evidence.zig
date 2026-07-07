@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const contracts = @import("contracts.zig");
+const diagnostic_runner = @import("diagnostic_runner.zig");
 const evidence = @import("evidence.zig");
 const evidence_ranker = @import("evidence_ranker.zig");
 const micro_context = @import("micro_context.zig");
@@ -39,8 +40,59 @@ pub const Result = struct {
 pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: Args) !Result {
     if (args.budget_bytes == 0) return error.InvalidEvidenceBudget;
     const strategy = contracts.resolveCollectEvidenceStrategy(args.strategy) orelse return error.InvalidStrategy;
+    if (strategy == .diagnostic) return executeDiagnostic(allocator, args);
     if (strategy == .path or args.path != null) return executePath(allocator, args, strategy);
     return executeRanked(allocator, io, args, strategy);
+}
+
+fn executeDiagnostic(allocator: std.mem.Allocator, args: Args) !Result {
+    const path = args.path orelse return error.MissingPath;
+    const diagnostic = try diagnostic_runner.run(allocator, path, args.budget_bytes);
+    defer diagnostic.deinit(allocator);
+
+    var packet = evidence.EvidencePacket.init(allocator);
+    defer packet.deinit();
+    const entry = try cloneEvidenceEntry(allocator, diagnostic.entry);
+    try packet.add(entry);
+
+    const evidence_text = try packet.render(allocator);
+    errdefer allocator.free(evidence_text);
+    const micro_context_text = try allocator.dupe(u8, "");
+    errdefer allocator.free(micro_context_text);
+    const tool_event_audit_text = try allocator.dupe(u8, diagnostic.audit_text);
+    errdefer allocator.free(tool_event_audit_text);
+    const context_id = try std.fmt.allocPrint(allocator, "diag_{x}", .{diagnostic.entry.hash});
+    errdefer allocator.free(context_id);
+
+    return .{
+        .strategy = .diagnostic,
+        .context_id = context_id,
+        .evidence_text = evidence_text,
+        .micro_context_text = micro_context_text,
+        .tool_event_audit_text = tool_event_audit_text,
+        .raw_bytes_read = diagnostic.raw_bytes,
+        .model_bytes = evidence_text.len,
+        .quality_score = if (diagnostic.blocking_count == 0) 92 else 95,
+        .range_count = 1,
+    };
+}
+
+fn cloneEvidenceEntry(allocator: std.mem.Allocator, entry: evidence.EvidenceEntry) !evidence.EvidenceEntry {
+    const source = try allocator.dupe(u8, entry.source);
+    errdefer allocator.free(source);
+    const kind = try allocator.dupe(u8, entry.kind);
+    errdefer allocator.free(kind);
+    const range = try allocator.dupe(u8, entry.range);
+    errdefer allocator.free(range);
+    const excerpt = try allocator.dupe(u8, entry.excerpt);
+    errdefer allocator.free(excerpt);
+    return .{
+        .source = source,
+        .kind = kind,
+        .range = range,
+        .hash = entry.hash,
+        .excerpt = excerpt,
+    };
 }
 
 fn executePath(allocator: std.mem.Allocator, args: Args, strategy: contracts.StrategyName) !Result {
@@ -233,7 +285,7 @@ test "collect evidence ranked lexical uses rg candidates and audit without raw r
 }
 
 test "collect evidence rejects inactive strategies instead of falling back" {
-    const strategies = [_]contracts.StrategyName{ .semantic, .diagnostic, .runtime, .diff };
+    const strategies = [_]contracts.StrategyName{ .semantic, .runtime, .diff };
     for (strategies) |strategy| {
         try std.testing.expectError(error.InvalidStrategy, execute(std.testing.allocator, std.testing.io, .{
             .task = "collect_evidence tool_event diff error",
@@ -241,6 +293,27 @@ test "collect evidence rejects inactive strategies instead of falling back" {
             .budget_bytes = 6000,
         }));
     }
+}
+
+test "collect evidence diagnostic strategy returns syntax evidence" {
+    const path = "collect_diagnostic_bad.zig";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = "pub fn broken( {\n",
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    const result = try execute(std.testing.allocator, std.testing.io, .{
+        .path = path,
+        .strategy = .diagnostic,
+        .budget_bytes = 4096,
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(contracts.StrategyName.diagnostic, result.strategy);
+    try std.testing.expect(result.quality_score >= 90);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "[DIAGNOSTIC]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "severity=blocking") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "strategy=diagnostic") != null);
 }
 
 test "collect evidence symbol strategy uses structural symbols" {

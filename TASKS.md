@@ -8917,3 +8917,106 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 720 --session symbol-277 --prompt 'Use collect_evidence com strategy symbol para encontrar AppendOnlyRenderer. Depois responda onde esse símbolo está definido e termine exatamente com: PHENOM_SYMBOL_277' --expect-contains PHENOM_SYMBOL_277 --show-expect-status --fail-on-model-error` -> passou; modelo chamou `collect_evidence: symbol`, evidencia apontou `src/render.zig`, resposta correta.
 - `sqlite3 .phenom-zig/phenom.db "select 'raw_marker', count(*) ...; select 'symbol_source', count(*) ...; select 'render_evidence', count(*) ...; select 'duplicate', count(*) ...; select 'tool_error', count(*) ...;"` -> retornou `raw_marker=0`, `symbol_source=4`, `render_evidence=1`, `duplicate=1`, `tool_error=0`.
+
+## T278 - Ativar estrategia `diagnostic` com parse Zig local
+
+Status: implementado nesta etapa.
+
+Motivacao: T276 e T277 fecharam duas bases deterministicas do micro-contexto (`fts_bm25` e `symbol`). A proxima dor real do audit e das tasks antigas e diagnostico objetivo como evidencia, sem transformar validacao em erro generico de infraestrutura e sem reintroduzir LSP/auto-install antes de haver fronteira madura. Esta task ativa `collect_evidence(strategy="diagnostic")` de forma deliberadamente pequena: parse sintatico Zig local, com severidade e EvidencePacket.
+
+Evidencias analisadas:
+
+- `doc/AGENTE_AI_BAIXO_CONSUMO_TOKENS_AUDIT.md` 3.9 e 6.5 pedem validacao/LSP como evidencia, com severidade e efeito claro.
+- `TASKS.md` T081, T082, T209 e T217 pedem diagnosticos classificados, acionaveis e reproduziveis.
+- `TASKS.md` T277 deixou `diagnostic` pendente ate existir executor real.
+- `phenom-zig/src/contracts.zig` ja tinha enum/roadmap para `.diagnostic`, mas a estrategia estava inativa.
+- `phenom-zig/src/tools.zig` ja materializa arquivo com sandbox, hash e path/range owns; isso evita diagnostico sobre contexto stale.
+
+Alvo final:
+
+1. `diagnostic` passa a ser estrategia real de `collect_evidence`.
+2. O modelo continua vendo apenas o contrato `collect_evidence`, nao `zig.Ast`, LSP ou comandos internos.
+3. Diagnostico retorna evidencia objetiva com severidade.
+4. Parse limpo tambem vira evidencia positiva (`status=ok parser=zig errors=0`).
+5. Falha da tool continua separada de falha de modelo/infraestrutura.
+6. Nenhum raw context vaza para o modelo.
+7. Nenhuma heuristica linguistica hardcoded e adicionada.
+
+Teste primeiro:
+
+- `diagnostic_runner` retorna `severity=blocking` para Zig com erro de parse.
+- `diagnostic_runner` retorna `severity=info status=ok` para Zig valido.
+- `collect_evidence(strategy=diagnostic, path=...)` renderiza `[DIAGNOSTIC]` dentro de `[EVIDENCE]`.
+- `contracts` aceita `.diagnostic` somente agora que existe executor real.
+- `main` anuncia `diagnostic` no schema compacto.
+- Smoke real com modelo usa `collect_evidence: diagnostic`, cita E1 e finaliza.
+
+Implementacao:
+
+- Criar `phenom-zig/src/diagnostic_runner.zig`.
+- Usar `tools.readFileRange` para ler arquivo com sandbox/hash/budget antes do parse.
+- Aceitar apenas `.zig` nesta etapa.
+- Parsear com `std.zig.Ast.parse`.
+- Renderizar:
+  - `[DIAGNOSTIC]`;
+  - `severity=blocking path=... line=... column=... parser=zig message=...` para erros;
+  - `severity=info status=ok parser=zig errors=0` para parse limpo.
+- Criar `EvidenceEntry(kind="diagnostic", range="L1-*")`.
+- Auditar tool event com `strategy=diagnostic`, `parser=zig`, `raw_bytes` e `blocking`.
+- Integrar `executeDiagnostic` em `collect_evidence`.
+- Ativar `.diagnostic` em `contracts.strategy_specs`.
+- Atualizar schema model-visible para `auto|path|lexical|symbol|diagnostic`.
+- Atribuir qualidade alta para diagnostico sintatico limpo ou bloqueante, porque ambos respondem diretamente a perguntas de sintaxe e devem encerrar a coleta quando suficiente.
+
+Revisao baixo nivel realizada:
+
+- Ownership: `diagnostic_runner.Result` owns `EvidenceEntry` e `audit_text`; `deinit` libera ambos.
+- Ownership: `EvidenceEntry` e construido com alocacoes nomeadas e `errdefer` por campo, evitando vazamento se uma alocacao intermediaria falhar.
+- Ownership: `collect_evidence.executeDiagnostic` clona a entry antes de inserir no `EvidencePacket`, evitando double-free quando `diagnostic.deinit` roda.
+- Failure path: `evidence_text`, `micro_context_text`, `tool_event_audit_text` e `context_id` usam `errdefer`.
+- Bounds: leitura de diagnostico limita arquivo a 256 KiB e o renderer respeita `budget_bytes`.
+- Stale/hash: o hash vem de `tools.readFileRange`, nao do parser nem de contexto antigo.
+- Segurança: path passa pelas regras existentes de `tools.readFileRange`; sem leitura absoluta, traversal, hidden path ou sensitive path.
+- Regra de negocio: nao houve stopwords, preferencia por source/docs/test, nem inferencia de intencao no agente.
+- Contrato: nenhuma nova tool model-visible foi criada.
+
+Criterio de aceite:
+
+- `zig test src/diagnostic_runner.zig -lc -lsqlite3` passa.
+- `zig test src/collect_evidence.zig -lc -lsqlite3` passa.
+- `zig test src/contracts.zig -lc` passa.
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real natural de sintaxe Zig passa com marcador final.
+- SQLite mostra `strategy=diagnostic`, `[DIAGNOSTIC]`, `raw_marker=0`, `tool_error=0`, `expectation_passed=1`.
+
+Pendencias deliberadas:
+
+- Isso nao e LSP completo.
+- Isso nao typechecka Zig.
+- Isso nao valida TypeScript/JavaScript.
+- Isso nao executa `zig build` nem testes.
+- Proxima frente de diagnostico deve portar validacao TS/JS calibrada e/ou LSP externo somente quando houver politica clara de severidade, ruido, latencia e ambiente.
+
+Implementado:
+
+- `phenom-zig/src/diagnostic_runner.zig`: runner sintatico Zig com EvidenceEntry, audit e testes.
+- `phenom-zig/src/collect_evidence.zig`: rota `strategy=diagnostic`, clone seguro de evidence entry e qualidade alta para resultado sintatico objetivo.
+- `phenom-zig/src/contracts.zig`: `.diagnostic` ativo em `collect_evidence`.
+- `phenom-zig/src/main.zig`: schema compacto anuncia `diagnostic`.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/diagnostic_runner.zig -lc -lsqlite3` -> passou; 12 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc -lsqlite3` -> passou; 46 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/contracts.zig -lc` -> passou; 5 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 159 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 1200 --session diagnostic-278e --prompt 'Verifique a sintaxe Zig do arquivo src/main.zig usando evidencia do projeto. Depois responda se ha erro de sintaxe evidenciado e termine exatamente com: PHENOM_DIAGNOSTIC_278E' --expect-contains PHENOM_DIAGNOSTIC_278E --show-expect-status --fail-on-model-error --no-color` -> passou; modelo chamou `collect_evidence: diagnostic`, evidencia mostrou `status=ok parser=zig errors=0`, resposta citou E1 e finalizou.
+- `sqlite3 .phenom-zig/phenom.db "select 'diagnostic_tool', count(*) ...; select 'diagnostic_evidence', count(*) ...; select 'raw_marker', count(*) ...; select 'tool_error', count(*) ...; select 'expectation_passed', count(*) ...;"` -> retornou `diagnostic_tool=1`, `diagnostic_evidence=1`, `raw_marker=0`, `tool_error=0`, `expectation_passed=1`.
+
+Observacao de teste real:
+
+- Prompts artificiais que mandam literalmente "emita exatamente esta tool call" dentro do `user_prompt` induzem repeticao da mesma chamada em inferencias seguintes, porque o agente reenvia o pedido original junto do contexto operacional. O smoke aceito usa uma query natural de usuario e prova o fluxo real: modelo escolhe o contrato, agente executa, modelo responde com evidencia.
