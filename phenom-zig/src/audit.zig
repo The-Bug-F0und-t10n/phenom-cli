@@ -16,6 +16,18 @@ pub const AuditEvent = struct {
     }
 };
 
+pub const SessionSearchHit = struct {
+    kind: []u8,
+    body: []u8,
+    score: f64,
+    created_at_unix_s: ?i64 = null,
+
+    pub fn deinit(self: *SessionSearchHit, allocator: std.mem.Allocator) void {
+        allocator.free(self.kind);
+        allocator.free(self.body);
+    }
+};
+
 pub const AuditDb = struct {
     allocator: std.mem.Allocator,
     db: ?*c.sqlite3,
@@ -48,6 +60,7 @@ pub const AuditDb = struct {
             \\);
             \\create index if not exists input_history_line_id_idx on input_history(line, id);
         );
+        try audit.ensureSessionFts();
         return audit;
     }
 
@@ -89,6 +102,35 @@ pub const AuditDb = struct {
         if (c.sqlite3_bind_text(stmt, 3, z_body.ptr, @as(c_int, @intCast(body.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteStepFailed;
+    }
+
+    fn ensureSessionFts(self: *AuditDb) !void {
+        try self.exec(
+            \\create virtual table if not exists events_fts using fts5(
+            \\  session,
+            \\  kind,
+            \\  body,
+            \\  created_at,
+            \\  content='events',
+            \\  content_rowid='id',
+            \\  tokenize='unicode61'
+            \\);
+            \\create trigger if not exists events_ai after insert on events begin
+            \\  insert into events_fts(rowid, session, kind, body, created_at)
+            \\  values (new.id, new.session, new.kind, new.body, new.created_at);
+            \\end;
+            \\create trigger if not exists events_ad after delete on events begin
+            \\  insert into events_fts(events_fts, rowid, session, kind, body, created_at)
+            \\  values('delete', old.id, old.session, old.kind, old.body, old.created_at);
+            \\end;
+            \\create trigger if not exists events_au after update on events begin
+            \\  insert into events_fts(events_fts, rowid, session, kind, body, created_at)
+            \\  values('delete', old.id, old.session, old.kind, old.body, old.created_at);
+            \\  insert into events_fts(rowid, session, kind, body, created_at)
+            \\  values (new.id, new.session, new.kind, new.body, new.created_at);
+            \\end;
+        );
+        try self.exec("insert into events_fts(events_fts) values('rebuild');");
     }
 
     pub fn recordToolEventSummary(self: *AuditDb, session: []const u8, event: tool_event.ToolEvent) !void {
@@ -260,6 +302,69 @@ pub const AuditDb = struct {
 
         return events;
     }
+
+    pub fn searchSessionEventsFts(
+        self: *AuditDb,
+        allocator: std.mem.Allocator,
+        session: []const u8,
+        terms: []const u8,
+        current_prompt: []const u8,
+        limit: usize,
+    ) !std.ArrayList(SessionSearchHit) {
+        if (limit > std.math.maxInt(c_int)) return error.EventLimitTooLarge;
+        const query = try buildFtsQuery(allocator, terms);
+        defer allocator.free(query);
+
+        var hits = std.ArrayList(SessionSearchHit).empty;
+        errdefer freeSessionSearchHits(allocator, &hits);
+        if (query.len == 0) return hits;
+
+        const sql =
+            \\select e.kind, e.body, -bm25(events_fts) as rank_score, cast(strftime('%s', e.created_at) as integer)
+            \\from events_fts
+            \\join events e on e.id = events_fts.rowid
+            \\where events_fts match ?1
+            \\  and e.session = ?2
+            \\  and e.body <> ?3
+            \\  and e.kind in ('turn_start', 'assistant_delta', 'tool_start', 'working_context_add', 'tool_duplicate', 'turn_done')
+            \\order by rank_score desc, e.id desc
+            \\limit ?4
+        ;
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        const z_query = try self.allocator.dupeZ(u8, query);
+        defer self.allocator.free(z_query);
+        const z_session = try self.allocator.dupeZ(u8, session);
+        defer self.allocator.free(z_session);
+        const z_prompt = try self.allocator.dupeZ(u8, current_prompt);
+        defer self.allocator.free(z_prompt);
+
+        if (c.sqlite3_bind_text(stmt, 1, z_query.ptr, @as(c_int, @intCast(query.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_text(stmt, 2, z_session.ptr, @as(c_int, @intCast(session.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_text(stmt, 3, z_prompt.ptr, @as(c_int, @intCast(current_prompt.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_int(stmt, 4, @as(c_int, @intCast(limit))) != c.SQLITE_OK) return error.SqliteBindFailed;
+
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStepFailed;
+
+            const kind = try dupeColumnText(allocator, stmt, 0);
+            errdefer allocator.free(kind);
+            const body = try dupeColumnText(allocator, stmt, 1);
+            errdefer allocator.free(body);
+            const score = c.sqlite3_column_double(stmt, 2);
+            const created_at_unix_s = if (c.sqlite3_column_type(stmt, 3) == c.SQLITE_NULL) null else @as(i64, @intCast(c.sqlite3_column_int64(stmt, 3)));
+            try hits.append(allocator, .{ .kind = kind, .body = body, .score = score, .created_at_unix_s = created_at_unix_s });
+        }
+
+        return hits;
+    }
 };
 
 pub fn freeHistoryLines(allocator: std.mem.Allocator, lines: *std.ArrayList([]u8)) void {
@@ -270,6 +375,32 @@ pub fn freeHistoryLines(allocator: std.mem.Allocator, lines: *std.ArrayList([]u8
 pub fn freeAuditEvents(allocator: std.mem.Allocator, events: *std.ArrayList(AuditEvent)) void {
     for (events.items) |*event| event.deinit(allocator);
     events.deinit(allocator);
+}
+
+pub fn freeSessionSearchHits(allocator: std.mem.Allocator, hits: *std.ArrayList(SessionSearchHit)) void {
+    for (hits.items) |*hit| hit.deinit(allocator);
+    hits.deinit(allocator);
+}
+
+fn buildFtsQuery(allocator: std.mem.Allocator, terms: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var it = std.mem.tokenizeAny(u8, terms, " \t\r\n\"'`()[]{}<>:;,!?/\\|+=*&^%$#@~");
+    var first = true;
+    while (it.next()) |raw| {
+        const token = std.mem.trim(u8, raw, ".-_");
+        if (token.len == 0) continue;
+        if (!first) try out.appendSlice(allocator, " OR ");
+        first = false;
+        try out.appendSlice(allocator, "body:");
+        try out.append(allocator, '"');
+        for (token) |byte| {
+            if (byte == '"') try out.append(allocator, '"');
+            try out.append(allocator, byte);
+        }
+        try out.appendSlice(allocator, "\"*");
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn dupeColumnText(allocator: std.mem.Allocator, stmt: ?*c.sqlite3_stmt, column: c_int) ![]u8 {
@@ -356,6 +487,40 @@ test "recent session events keep newest events in chronological order" {
     try std.testing.expectEqual(@as(usize, 2), events.items.len);
     try std.testing.expectEqualStrings("middle", events.items[0].body);
     try std.testing.expectEqualStrings("new", events.items[1].body);
+}
+
+test "session fts searches body by session and excludes current prompt" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordEvent("s1", "turn_start", "renderer append-only deve preservar copia direta");
+    try db.recordEvent("s1", "assistant_delta", "acordo registrado sobre renderer append-only");
+    try db.recordEvent("s1", "turn_start", "renderer append-only pergunta atual");
+    try db.recordEvent("s2", "assistant_delta", "renderer append-only outra sessao");
+    try db.recordEvent("s1", "model_context", "renderer append-only raw operational wrapper");
+    try db.recordEvent("s1", "turn_start", "body sem termo alvo");
+
+    var hits = try db.searchSessionEventsFts(std.testing.allocator, "s1", "renderer append-only", "renderer append-only pergunta atual", 10);
+    defer freeSessionSearchHits(std.testing.allocator, &hits);
+
+    try std.testing.expectEqual(@as(usize, 2), hits.items.len);
+    for (hits.items) |hit| {
+        try std.testing.expect(std.mem.indexOf(u8, hit.body, "pergunta atual") == null);
+        try std.testing.expect(std.mem.indexOf(u8, hit.body, "outra sessao") == null);
+        try std.testing.expect(!std.mem.eql(u8, hit.kind, "model_context"));
+    }
+}
+
+test "session fts does not match operational kind metadata" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordEvent("s1", "turn_start", "conteudo neutro");
+
+    var hits = try db.searchSessionEventsFts(std.testing.allocator, "s1", "turn_start", "prompt atual", 10);
+    defer freeSessionSearchHits(std.testing.allocator, &hits);
+
+    try std.testing.expectEqual(@as(usize, 0), hits.items.len);
 }
 
 test "input history trims to newest 200 distinct lines" {

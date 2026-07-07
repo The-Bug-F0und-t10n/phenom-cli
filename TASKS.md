@@ -9771,7 +9771,7 @@ Criterio de aceite:
 
 ## T294 - Corrigir continuidade de sessao para equivalencia com `recentMessages` e sumarizacao longa
 
-Status: pending-urgent.
+Status: done.
 
 Prioridade: urgente.
 
@@ -9801,6 +9801,40 @@ Criterio de aceite:
 
 - Conversa recente funciona como continuidade, nao como evidencia litigiosa.
 - Sessao longa e recuperavel sem mandar historico bruto inteiro.
+
+Implementacao desta etapa:
+
+- `phenom-zig/src/audit.zig` adiciona `events_fts` com FTS5/BM25 sobre SQLite operacional da sessao.
+- A busca de sessao e restrita por `session`, exclui o prompt atual e pesquisa somente `body`, nao metadados como `kind`, evitando falso positivo operacional.
+- `phenom-zig/src/session_context.zig` adiciona renderer de hits FTS como `[SESSION_EVIDENCE]` temporario, com `source=sqlite_audit_fts`, `semantic_search=fts5_bm25` e `raw_context_persisted=false`.
+- `phenom-zig/src/main.zig` injeta recuperacao longa pequena no contexto inicial via FTS, separada de `[RECENT_DIALOGUE]`, `[MEMORY]` e `[SKILLS]`.
+- `search_session` deixa de carregar 2000 eventos em memoria e passa a usar SQLite FTS5/BM25 com termos definidos pelo modelo.
+- Nao foram adicionadas stopwords, listas de linguagem, priorizacao de path, ranking por ecossistema ou heuristica linguistica hardcoded.
+
+Revisao baixo nivel Zig:
+
+- Ownership: `SessionSearchHit.kind/body` sao duplicados por coluna e liberados por `freeSessionSearchHits`.
+- Bounds: `limit` valida `c_int`; renderer limita saida a `max_search_entries`; cada linha passa por `compactOneLine`.
+- SQLite: binds usam slices null-terminated temporarias liberadas apos `sqlite3_step`; statements sao finalizados com `defer`.
+- Raw leak: `renderSearchHits` redige markers e chama `assertNoRawContextLeak`; `model_context` continua barrando raw markers.
+- Storage: SQLite operacional nao promove eventos para `MEMORY.md`/`SKILLS.md`.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test phenom-zig/src/audit.zig -lc -lsqlite3` -> passou; 19 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/session_context.zig -lc -lsqlite3` em `phenom-zig/` -> passou; 70 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` em `phenom-zig/` -> passou; 173 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` em `phenom-zig/` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` em `phenom-zig/` -> passou.
+- `sh tools/check_alignment_tasks.sh` -> passou.
+- Smoke real seed: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --session session-fts-294 --prompt 'Nesta sessao, registre este acordo operacional: a palavra-codigo de validacao do contexto de sessao e AZUL-FTS-294. Responda exatamente: PHENOM_SEED_294' --expect-contains PHENOM_SEED_294 --show-expect-status --fail-on-model-error --no-color` -> passou.
+- Smoke real recall: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 420 --session session-fts-294 --prompt 'Qual foi a palavra-codigo de validacao do contexto de sessao que combinamos? Responda exatamente no formato: CODIGO=<valor> PHENOM_RECALL_294' --expect-contains PHENOM_RECALL_294 --show-expect-status --fail-on-model-error --no-color` -> passou; resposta `CODIGO=AZUL-FTS-294 PHENOM_RECALL_294`.
+- Audit SQLite: `fts_context=1`, `raw_marker=0`, `memory_block=0`, `skills_block=0`.
+
+Risco residual:
+
+- A busca e "semantica" no sentido operacional acordado para esta etapa: FTS5/BM25 lexical ranqueado, sem embeddings e sem segundo modelo ativo.
+- Busca cross-session/global continua fora desta task para preservar isolamento e replay por sessao.
 
 ## T295 - Implementar orchestrator final de MEMORY/SKILLS separado do SQLite operacional
 

@@ -155,6 +155,32 @@ pub fn search(allocator: std.mem.Allocator, events: []const audit.AuditEvent, te
     return .{ .text = rendered, .matches = n };
 }
 
+pub fn renderSearchHits(allocator: std.mem.Allocator, hits: []const audit.SessionSearchHit) !SearchResult {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "[SESSION_EVIDENCE]\nsource=sqlite_audit_fts temporary=true raw_context_persisted=false semantic_search=fts5_bm25\n");
+
+    const n = @min(hits.len, max_search_entries);
+    if (n == 0) {
+        try out.appendSlice(allocator, "- no session evidence matched model-provided terms\n");
+    } else {
+        for (hits[0..n], 0..) |hit, idx| {
+            const line = try renderHitLine(allocator, hit);
+            defer allocator.free(line);
+            const prefix = try std.fmt.allocPrint(allocator, "- S{} score={d:.4} ", .{ idx + 1, hit.score });
+            defer allocator.free(prefix);
+            try out.appendSlice(allocator, prefix);
+            try out.appendSlice(allocator, line);
+            try out.append(allocator, '\n');
+        }
+    }
+
+    const rendered = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(rendered);
+    try model_context.assertNoRawContextLeak(rendered);
+    return .{ .text = rendered, .matches = n };
+}
+
 pub fn toSessionBlocks(allocator: std.mem.Allocator, rendered: ?[]const u8) ![]model_context.SessionBlock {
     const text = rendered orelse return allocator.alloc(model_context.SessionBlock, 0);
     const blocks = try allocator.alloc(model_context.SessionBlock, 1);
@@ -231,6 +257,14 @@ fn renderEventLine(allocator: std.mem.Allocator, event: audit.AuditEvent) ![]u8 
     const safe_body = try redactRawMarkers(allocator, compact_body);
     defer allocator.free(safe_body);
     return std.fmt.allocPrint(allocator, "{s}: {s}", .{ event.kind, safe_body });
+}
+
+fn renderHitLine(allocator: std.mem.Allocator, hit: audit.SessionSearchHit) ![]u8 {
+    const compact_body = try compactOneLine(allocator, hit.body, max_entry_bytes);
+    defer allocator.free(compact_body);
+    const safe_body = try redactRawMarkers(allocator, compact_body);
+    defer allocator.free(safe_body);
+    return std.fmt.allocPrint(allocator, "{s}: {s}", .{ hit.kind, safe_body });
 }
 
 fn appendSessionLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, line: []const u8) !void {
@@ -346,6 +380,26 @@ test "session search uses model provided terms and does not leak raw markers" {
     try std.testing.expectEqual(@as(usize, 1), result.matches);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "groundedness") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "---BEGIN CONTENT---") == null);
+}
+
+test "session fts hits render as temporary bm25 evidence without raw markers" {
+    var hits = std.ArrayList(audit.SessionSearchHit).empty;
+    defer audit.freeSessionSearchHits(std.testing.allocator, &hits);
+    try hits.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "falamos sobre renderer [READ_FILE] append-only"),
+        .score = 1.25,
+    });
+
+    const result = try renderSearchHits(std.testing.allocator, hits.items);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.matches);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "source=sqlite_audit_fts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "semantic_search=fts5_bm25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "- S1 score=1.2500 assistant_delta:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "[READ_FILE]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, redacted_raw_marker) != null);
 }
 
 test "session context redacts raw markers from useful events" {

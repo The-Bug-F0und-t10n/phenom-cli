@@ -358,16 +358,30 @@ fn buildInitialModelContext(
     const dialogue_blocks = try session_context.toDialogueBlocks(allocator, recent_dialogue);
     defer allocator.free(dialogue_blocks);
 
+    var session_hits = try db.searchSessionEventsFts(allocator, session, prompt, prompt, 4);
+    defer audit.freeSessionSearchHits(allocator, &session_hits);
+    const session_recall = if (session_hits.items.len > 0)
+        try session_context.renderSearchHits(allocator, session_hits.items)
+    else
+        null;
+    defer if (session_recall) |result| result.deinit(allocator);
+    const session_blocks = try session_context.toSessionBlocks(
+        allocator,
+        if (session_recall) |result| result.text else null,
+    );
+    defer allocator.free(session_blocks);
+
     return try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
         .contracts = if (include_collect_evidence_schema) collectEvidenceToolSchema(true) else "",
         .evidence = &[_]model_context.EvidenceBlock{},
         .dialogue = dialogue_blocks,
+        .session = session_blocks,
         .memory = persistent.memory.items,
         .skills = persistent.skills.items,
         .grounding = groundingRules(),
         .next_action = if (include_collect_evidence_schema)
-            "First infer the user's intent. Use [RECENT_DIALOGUE] only for conversational continuity. Before making claims about the current workspace, repository, source code, files, implementation, or exact prior-session facts, call collect_evidence or search_session. Use terms to describe exactly what you need to find. After evidence returns, answer using cited evidence or request a different evidence range."
+            "First infer the user's intent. Use [RECENT_DIALOGUE] for conversational continuity. Use [SESSION_CONTEXT] only as retrieved prior-session evidence and cite S# for exact prior-session claims. Before making claims about the current workspace, repository, source code, files, or implementation, call collect_evidence. Use terms to describe exactly what you need to find. If session recall is insufficient, call search_session with better model-chosen terms. After evidence returns, answer using cited evidence or request a different evidence range."
         else
             "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
     });
@@ -776,9 +790,9 @@ fn runSearchSessionStep(
     try db.recordEvent(config.session, "tool_start", "search_session");
     try events.emit(.{ .tool_start = .{ .name = "search_session", .detail = terms } });
 
-    var loaded = try db.loadRecentSessionEvents(allocator, config.session, 2000);
-    defer audit.freeAuditEvents(allocator, &loaded);
-    const result = try session_context.search(allocator, loaded.items, terms);
+    var hits = try db.searchSessionEventsFts(allocator, config.session, terms, prompt, 6);
+    defer audit.freeSessionSearchHits(allocator, &hits);
+    const result = try session_context.renderSearchHits(allocator, hits.items);
     defer result.deinit(allocator);
     try db.recordEvent(config.session, "session_context", result.text);
     try events.emit(.{ .tool_result = .{ .name = "search_session", .output = result.text } });
@@ -1432,6 +1446,36 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "call collect_evidence") != null);
 
     try std.testing.expect((try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test-empty", "analise esse projeto", false)) == null);
+}
+
+test "initial model context reuses long session via fts without memory promotion" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordEvent("long-session", "turn_start", "combinamos que renderer append-only preserva copia direta");
+    try db.recordEvent("long-session", "assistant_delta", "acordo: renderer append-only deve manter terminal copiavel");
+    try db.recordEvent("long-session", "turn_start", "renderer append-only pergunta atual");
+    try db.recordEvent("other-session", "assistant_delta", "renderer append-only fora da sessao");
+
+    const rendered = (try buildInitialModelContext(
+        std.testing.allocator,
+        std.testing.io,
+        &db,
+        "long-session",
+        "renderer append-only pergunta atual",
+        true,
+    )) orelse return error.MissingContext;
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[RECENT_DIALOGUE]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SESSION_CONTEXT]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "source=sqlite_audit_fts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "semantic_search=fts5_bm25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "renderer append-only deve manter terminal copiavel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "turn_start: renderer append-only pergunta atual") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "fora da sessao") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
 }
 
 test "deferred stream sink buffers tool call text before rendering" {
