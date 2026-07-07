@@ -4484,6 +4484,7 @@ Complexidade restante:
 
 - Teste criado antes ou no mesmo patch, falhando sem a feature quando aplicavel.
 - Secao `Passos de implementacao` presente e especifica o suficiente para guiar o patch.
+- Secao `Alinhamento AUDIT/TASKS/phenom-cli-ts` presente. Sem essa secao, a task fica bloqueada, mesmo que tenha teste e codigo.
 - Implementacao pequena e localizada.
 - `TASKS.md` atualizado com status e notas.
 - Testes relevantes executados e registrados.
@@ -4494,6 +4495,32 @@ Complexidade restante:
 - Sempre que a feature depender de servidor/modelo real, criar ou registrar teste real opt-in separado da suite offline.
 - Nunca considerar `127.0.0.1:11434` como prova offline; host real ativo precisa ser passado por parametro e validado em comando real separado.
 - Teste real de servidor/modelo deve falhar com exit code nao-zero quando houver erro de conexao/protocolo/modelo; erro real nao pode parecer sucesso de infraestrutura.
+
+### Secao obrigatoria de alinhamento por task
+
+Motivacao: `alinhamento.md` mostrou que a maior fonte atual de regressao nao e sintaxe Zig, e sim quebra de contrato com `AUDIT`, `TASKS.md` e `../phenom-cli-ts`. Portanto, toda task nova ou pendente que for executada precisa conter exatamente este bloco antes da implementacao:
+
+```md
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada:
+- Falha apontada no AUDIT/TASKS:
+- O que sera preservado do TS:
+- O que sera corrigido no Zig:
+- O que nao sera portado agora e por que:
+- Invariantes afetadas:
+- Teste unitario obrigatorio:
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop:
+- Revisao baixo nivel Zig antes do commit:
+```
+
+Regra operacional:
+
+- Tasks historicas ja implementadas continuam como devlog.
+- Tasks pendentes antigas sem esse bloco nao podem ser executadas ate receberem esse complemento.
+- Tasks urgentes T281-T290 abaixo sobem acima das demais tasks pendentes porque corrigem desalinhamentos estruturais entre `phenom-zig`, `AUDIT` e `phenom-cli-ts`.
+- Se a task portar comportamento ja existente no TS, a referencia TS precisa ser arquivo/linha ou funcao concreta, nao memoria do agente.
+- Se nao houver equivalente TS, a task deve declarar explicitamente: `Nao existe referencia TS direta`.
 
 ## T223 - Corrigir smoke real do `phenom-zig` para provar inferencia visivel
 
@@ -9212,3 +9239,342 @@ Pendencias deliberadas:
 - Ainda nao ha resumo semantico longo de sessao; esta task corrige a separacao contratual do historico recente.
 - `search_session` ainda usa busca textual simples sobre audit events; FTS/BM25 de sessao pode entrar depois sem mudar o contrato.
 - A resposta tecnica final ainda depende do modelo interpretar o dialogo corretamente; o agente nao adiciona vies/heuristicas para substituir essa interpretacao.
+
+## Fase 21 - Realinhamento urgente com AUDIT e phenom-cli-ts
+
+Prioridade: urgente/bloqueante.
+
+Motivacao: `alinhamento.md` concluiu que o `phenom-zig` corrigiu base tecnica importante, mas ficou estreito demais em comparacao ao produto provado no `phenom-cli-ts`. Estas tasks sobem acima das demais pendencias porque evitam nova quebra contratual da regra de negocio: o Zig deve portar acertos do TS por contrato, corrigindo as falhas do AUDIT, e nao recriar fluxos por memoria do agente.
+
+## T281 - Tornar `alinhamento.md` gate obrigatorio de task executavel
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: sem um gate documentado, novas inferencias podem voltar a implementar por aproximacao, sem consultar `AUDIT` e `../phenom-cli-ts`.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: nao existe referencia TS direta; esta e uma regra de processo derivada de `alinhamento.md`.
+- Falha apontada no AUDIT/TASKS: controller e prompts cresceram por camadas sem contrato tipado e auditavel; tasks antigas podem ser executadas sem checar a referencia correta.
+- O que sera preservado do TS: comportamento provado deve ser tratado como marco de referencia.
+- O que sera corrigido no Zig: toda task executavel precisa citar o equivalente TS ou declarar ausencia dele.
+- O que nao sera portado agora e por que: nenhuma feature runtime; task documental/processual.
+- Invariantes afetadas: todas as sete invariantes, por prevenir regressao de processo.
+- Teste unitario obrigatorio: check textual simples que falhe se task nova urgente nao tiver bloco `Alinhamento AUDIT/TASKS/phenom-cli-ts`.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: nao aplicavel.
+- Revisao baixo nivel Zig antes do commit: nao aplicavel; docs/processo.
+
+Passos de implementacao:
+
+1. Criar script/check leve para validar secoes obrigatorias em tasks `pending-urgent`.
+2. Fazer o check procurar os nove campos obrigatorios do bloco de alinhamento.
+3. Adicionar comando de validacao documental ou registrar como criterio manual se ainda nao houver runner de docs.
+4. Rodar o check em T281-T290.
+
+Criterio de aceite:
+
+- Tasks urgentes sem bloco de alinhamento falham no check.
+- Tasks historicas implementadas nao sao reescritas retroativamente.
+
+## T282 - Portar `set_operational_contract` como contrato model-visible pequeno
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: o Zig tem gate pequeno, mas perdeu o acerto do TS em que o modelo pode declarar contrato operacional antes de abrir mutation/validation/runtime. Sem isso, a proxima expansao de tool surface vira lista solta ou prompt improvisado.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/agent-control/intent-tool-contract.ts`; `../phenom-cli-ts/src/agent.ts` em `operationalContractToolDefinition`, `getTurnToolDefinitions` e instrucoes de `set_operational_contract`.
+- Falha apontada no AUDIT/TASKS: fronteira entre contrato operacional e tool avulsa ainda nao cristalina; falta contrato de execucao auditavel.
+- O que sera preservado do TS: `set_operational_contract` como declaracao model-visible de intencao operacional.
+- O que sera corrigido no Zig: contrato deve ser pequeno, tipado e auditado; nao deve abrir tools internas por prompt livre.
+- O que nao sera portado agora e por que: mutation/validation completas ficam para T285/T286; esta task so declara e registra contrato ativo.
+- Invariantes afetadas: 1, 6, 7.
+- Teste unitario obrigatorio: parser aceita `set_operational_contract`; contrato ativo muda tool surface permitida; tool fora do contrato e rejeitada.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, modelo declara contrato e depois chama apenas tool permitida.
+- Revisao baixo nivel Zig antes do commit: ownership de strings de contrato, enum bounds, estado por turno sem ponteiro pendurado.
+
+Passos de implementacao:
+
+1. Ler o contrato TS e registrar campos minimos aceitos no Zig.
+2. Adicionar contrato model-visible em `contracts.zig` sem expor mutation ainda.
+3. Estender `tool_call.zig` para parsear `set_operational_contract`.
+4. Guardar contrato ativo no estado do tool loop por turno.
+5. Auditar `contract_selected`, `allowed_tools` e motivo de rejeicao.
+6. Testar que contrato nao persiste indevidamente entre turnos.
+
+Criterio de aceite:
+
+- Modelo consegue declarar contrato.
+- Executor nao roda tool fora do contrato ativo.
+- SQLite mostra contrato selecionado e allowlist efetiva.
+
+## T283 - Evoluir `collect_evidence` para contrato rico sem heuristica
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: `alinhamento.md` mostrou que o Zig depende demais de `terms`, enquanto o TS aceitava `task`, `need`, `targetFiles`, `scopeRoot`, `stage` e `selectedCandidates`. Isso limita a exploracao guiada pelo modelo e aumenta falso positivo.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/tools/registrars/context-tools.ts`, funcao `executeCollectEvidence`.
+- Falha apontada no AUDIT/TASKS: `collect_evidence` deve representar bem estrategias internas e esconder `build_task_context`; naming/contrato ainda ruidoso.
+- O que sera preservado do TS: parametros ricos de intencao model-driven e refinamento por candidatos.
+- O que sera corrigido no Zig: manter executor baixo nivel, sem stopwords, sem preferencias source/docs/test, sem path hardcoded.
+- O que nao sera portado agora e por que: RAG semantic embeddings nao entram; decisao atual e usar `rg`, FTS5/BM25, AST/LSP/contratos.
+- Invariantes afetadas: 1, 2, 5, 7.
+- Teste unitario obrigatorio: `collect_evidence` com `targetFiles`, `scopeRoot`, `need`, `stage=candidates`, `selectedCandidates` gera evidencia sem raw leak.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, pergunta ambigua deve coletar candidatos, refinar e responder com E#.
+- Revisao baixo nivel Zig antes do commit: ownership dos novos campos, limites de arrays/strings, budget, sem double-free nos candidates.
+
+Passos de implementacao:
+
+1. Mapear parametros TS para struct Zig minima.
+2. Estender parser XML para parametros repetidos/listas de forma controlada.
+3. Implementar `stage=candidates` retornando candidatos destilados, nao full snippets.
+4. Implementar `stage=minimum`/`selectedCandidates` materializando ranges escolhidos.
+5. Integrar `need` como texto model-provided auditado, nao heuristica do agente.
+6. Preservar path/scopeRoot concreto quando fornecido pelo modelo.
+
+Criterio de aceite:
+
+- O modelo pode explorar em duas etapas sem contexto bruto.
+- O agente nao inventa termos nem troca intencao.
+- Audit registra parametros pedidos e estrategia executada.
+
+## T284 - Criar `EvidencePacket v1` tipado e estavel
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: o Zig tem EvidencePacket funcional, mas o contrato model-visible ainda e texto simples. AUDIT pede schema estavel com anchors, findings, obligations, nextActions, stalePaths e confidence.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/tools/registrars/context-tools.ts` renderizadores `renderDistilledEvidence`, `renderMinimumEvidence`, `renderEvidencePack`.
+- Falha apontada no AUDIT/TASKS: `EVIDENCE_DISTILLED` deveria ter schema estavel.
+- O que sera preservado do TS: saida destilada com escopo, achados, snippets, candidatos e next action.
+- O que sera corrigido no Zig: tipo interno forte antes do renderer textual.
+- O que nao sera portado agora e por que: formato textual exato do TS nao sera copiado; Zig deve ter schema Phenom v1.
+- Invariantes afetadas: 2, 5, 6, 7.
+- Teste unitario obrigatorio: packet serializa/renderiza sem raw markers e com campos estaveis.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, modelo cita E# e nao extrapola campo ausente.
+- Revisao baixo nivel Zig antes do commit: ownership de listas internas, `errdefer` por campo, limites de excerpt.
+
+Passos de implementacao:
+
+1. Definir structs `Finding`, `Anchor`, `Obligation`, `NextAction`, `EvidencePacketV1`.
+2. Adaptar `collect_evidence` para preencher v1.
+3. Renderizar texto compacto mantendo compatibilidade com `[EVIDENCE]`.
+4. Auditar `packet_version=v1`.
+5. Testar anti-raw e budget por campo.
+
+Criterio de aceite:
+
+- Toda evidencia enviada ao modelo vem de packet v1.
+- Packet permite replay/auditoria sem depender de parsing fragil de texto livre.
+
+## T285 - Implementar contrato de mutacao com `apply_patch` e micro-context stale validation
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: sem mutation, `phenom-zig` nao e agente coder final. Sem stale validation, mutation violaria uma das invariantes centrais.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/tools/micro-context.ts`; tools de mutation em `../phenom-cli-ts/src/tools.ts`; instrucoes de `apply_patch` em `../phenom-cli-ts/src/agent.ts`.
+- Falha apontada no AUDIT/TASKS: patch em codigo nao pode aplicar sobre contexto stale.
+- O que sera preservado do TS: `contextId/contextSha256`, path/range validation e repair claro.
+- O que sera corrigido no Zig: patch engine pequeno, com validação de micro-contexto antes de alterar arquivo.
+- O que nao sera portado agora e por que: delete/write/create full suite pode vir depois; prioridade e patch seguro.
+- Invariantes afetadas: 1, 2, 5, 6, 7.
+- Teste unitario obrigatorio: patch com contexto fresco aplica; contexto stale rejeita; path mismatch rejeita; range mismatch rejeita.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, modelo coleta evidencia, aplica patch pequeno e validation/audit mostram sucesso.
+- Revisao baixo nivel Zig antes do commit: atomicidade de escrita, backup/rollback, bounds de replace, fsync quando aplicavel, sem path traversal.
+
+Passos de implementacao:
+
+1. Portar somente `apply_patch` minimo como contrato `mutate_file`.
+2. Exigir contexto fresco quando chamada trouxer `context_id`/`sha`.
+3. Rejeitar contexto stale com erro tipado e repair.
+4. Registrar raw diff internamente e evidencia destilada ao modelo.
+5. Integrar gate via `set_operational_contract`.
+
+Criterio de aceite:
+
+- Nenhum patch com contexto stale aplica.
+- Falha de patch nao parece falha do modelo.
+
+## T286 - Implementar contrato de validacao e diagnostico operacional
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: T278 adicionou diagnostico Zig local, mas o produto precisa separar validacao real, diagnostico, runtime e falha de infraestrutura.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/agent-control/validation-policy.ts`, `validation-evidence.ts`, `lsp-diagnostics.ts`, `run_validation`.
+- Falha apontada no AUDIT/TASKS: falha de modelo nao pode parecer falha de infraestrutura; validation deve virar evidencia.
+- O que sera preservado do TS: policy de validacao e evidencia de erro acionavel.
+- O que sera corrigido no Zig: contrato menor e tipado, sem instalar ferramentas automaticamente.
+- O que nao sera portado agora e por que: LSP multi-linguagem completo fica posterior; primeiro validation contract e taxonomia.
+- Invariantes afetadas: 2, 5, 6, 7.
+- Teste unitario obrigatorio: validation ok/fail/infra_error geram classes distintas.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, mutation deve pedir ou receber validation antes de final quando contrato exigir.
+- Revisao baixo nivel Zig antes do commit: subprocess timeout, stdout/stderr limits, exit code, ownership de buffers.
+
+Passos de implementacao:
+
+1. Criar `validate_work` no manifesto.
+2. Implementar executor com comando configurado ou diagnostico local inicial.
+3. Converter resultado em EvidencePacket v1.
+4. Adicionar erro tipado `validation_failed` vs `validation_infra_error`.
+5. Auditar comando, exit code, bytes, duracao.
+
+Criterio de aceite:
+
+- Validacao falha nao e apresentada como erro de modelo.
+- Resultado de validacao pode ser citado como evidencia.
+
+## T287 - Implementar taxonomia de erros e replay SQLite de turno
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: SQLite existe, mas `alinhamento.md` apontou que replay deterministico e classificacao de erro ainda sao parciais.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/agent-control/operational-run-store.ts`, `error-parser.ts`, `run-tool-loop.ts`.
+- Falha apontada no AUDIT/TASKS: cada turno deve ser auditado/reproduzido; falha de modelo nao pode parecer infra.
+- O que sera preservado do TS: operational run store, fases e eventos de tool.
+- O que sera corrigido no Zig: SQLite como fonte unica operacional, com evento tipado e replay textual.
+- O que nao sera portado agora e por que: UI completa de inspector pode vir depois; primeiro schema/eventos.
+- Invariantes afetadas: 1, 2, 3, 6, 7.
+- Teste unitario obrigatorio: turno com tool aceita/rejeitada/erro/final replaya mesmos eventos.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, smoke deve consultar SQLite e verificar taxonomia.
+- Revisao baixo nivel Zig antes do commit: schema migration idempotente, bind sqlite correto, lifetime de strings, sem SQL string ad hoc para dados.
+
+Passos de implementacao:
+
+1. Definir enum de erro: `model_protocol`, `tool_contract`, `tool_runtime`, `infrastructure`, `insufficient_evidence`, `validation_failed`.
+2. Registrar modelo/backend/host/config relevantes por turno.
+3. Registrar tools anunciadas, contrato ativo, tool calls, outputs internos e contexto enviado.
+4. Criar comando/função de replay deterministico.
+5. Testar migration em banco existente.
+
+Criterio de aceite:
+
+- Um turno pode ser reconstruido sem depender do terminal.
+- Erros aparecem com classe objetiva.
+
+## T288 - Implementar ContextProfile antes de news/document/runtime
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: o usuario definiu que micro-contexto minimo nao serve para news, PDFs, logs e leituras massivas. Sem `ContextProfile`, o agente aplicara `code_micro` a tudo e violara regra de negocio.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: news em `../phenom-cli-ts/src/news/*`; contexto em `context-tools.ts`; decisao documentada em `TASKS.md` sobre perfis.
+- Falha apontada no AUDIT/TASKS: contexto minimo nao e regra universal; news precisa catalogo e dossie.
+- O que sera preservado do TS: news/document/runtime operam com stores e renderers proprios.
+- O que sera corrigido no Zig: profile explicito antes de executor.
+- O que nao sera portado agora e por que: news completa fica T289; esta task cria infraestrutura de perfil.
+- Invariantes afetadas: 2, 3, 4, 7.
+- Teste unitario obrigatorio: `code_micro`, `news_table`, `document_summary`, `runtime` geram budgets e blocos distintos.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: nao obrigatorio se for infra offline.
+- Revisao baixo nivel Zig antes do commit: enums fechados, budget bounds, sem default silencioso perigoso.
+
+Passos de implementacao:
+
+1. Criar enum `ContextProfile`.
+2. Ligar profile ao `ModelTurnContext`.
+3. Impedir que `news_table` use `collect_evidence` de codigo.
+4. Definir budgets por profile.
+5. Auditar profile por turno.
+
+Criterio de aceite:
+
+- Profile errado falha explicitamente.
+- News/document/runtime nao usam micro-contexto de codigo por acidente.
+
+## T289 - Portar News com catalogo operacional de fontes e sem prompt improvisado
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: `alinhamento.md` marca news como declarado sem executor. A invariante 4 exige que News nao dependa de prompt improvisado.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/news/*`, `../phenom-cli-ts/src/tools/registrars/news-tools.ts`.
+- Falha apontada no AUDIT/TASKS: News precisa catalogo persistente, preferencias, cache, deduplicacao e ranking.
+- O que sera preservado do TS: fluxo operacional de fontes, preferencias e newspaper/dossie.
+- O que sera corrigido no Zig: SQLite/catalogo operacional em vez de muitos arquivos soltos.
+- O que nao sera portado agora e por que: fetch publico/TLS pode exigir adapter C/lib externa; primeiro schema/cache e fontes locais.
+- Invariantes afetadas: 2, 3, 4, 6, 7.
+- Teste unitario obrigatorio: fontes cadastradas alimentam briefing; fonte inexistente nao e inventada; output e dossie.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim quando houver chamada ao modelo; antes disso, smoke offline de briefing.
+- Revisao baixo nivel Zig antes do commit: SQLite schema, URL bounds, cache expiry, sem rede sem timeout.
+
+Passos de implementacao:
+
+1. Criar tabelas de fontes/preferencias/cache.
+2. Implementar contrato `news` com strategy `news_table`.
+3. Gerar dossie estruturado para o modelo/renderer.
+4. Bloquear fontes nao cadastradas.
+5. Auditar fontes usadas e timestamps.
+
+Criterio de aceite:
+
+- News responde apenas a partir de fontes operacionais cadastradas.
+- MEMORY/SKILLS nao recebem catalogo de news.
+
+## T290 - Criar suite real de alinhamento e confiabilidade
+
+Status: pending-urgent.
+
+Prioridade: urgente.
+
+Motivacao: smokes com marcador final podem dar falso positivo. A suite precisa provar comportamento de agente, nao so conclusao textual.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Referencia TS consultada: `../phenom-cli-ts/src/tests/real/*`, `../phenom-cli-ts/src/tests/integration/*`.
+- Falha apontada no AUDIT/TASKS: testes reais devem separar capacidade do modelo, infraestrutura do agente e comportamento esperado.
+- O que sera preservado do TS: testes reais opt-in por fluxo.
+- O que sera corrigido no Zig: cada smoke consulta SQLite e valida tool surface/context/evidence, nao apenas marcador.
+- O que nao sera portado agora e por que: suite inteira TS nao sera copiada; serao criados cenarios equivalentes em Zig.
+- Invariantes afetadas: todas.
+- Teste unitario obrigatorio: runner falha quando audit esperado nao aparece.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, esta task e a suite real.
+- Revisao baixo nivel Zig antes do commit: comandos nao destrutivos, paths temporarios isolados, cleanup, exit code correto.
+
+Passos de implementacao:
+
+1. Criar harness real opt-in para `phenom-zig`.
+2. Cada cenario deve validar SQLite: tools anunciadas, calls, evidencia, raw_marker, erro tipado, resposta.
+3. Criar cenarios: tool gate, raw leak, MEMORY/SKILLS, session continuity, collect_evidence refinement, patch stale, validation failure, news profile.
+4. Separar falha de modelo de falha de infraestrutura no relatorio.
+5. Registrar comandos em TASKS ao implementar cada cenario.
+
+Criterio de aceite:
+
+- Suite falha se marcador final passar mas evidencia estiver errada.
+- Suite produz relatorio auditavel por turno.
