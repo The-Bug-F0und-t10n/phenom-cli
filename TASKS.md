@@ -8725,3 +8725,99 @@ Validacao executada:
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --session session-context-275 --prompt 'Nesta sessão, registre o seguinte acordo operacional: o renderer do Phenom deve ser append-only e preservar copia direta do terminal. Responda exatamente: PHENOM_SESSION_SEED_275' --expect-contains PHENOM_SESSION_SEED_275 --show-expect-status --fail-on-model-error` -> passou.
 - `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 520 --session session-context-275 --prompt 'Qual foi o acordo operacional que combinamos sobre o renderer do Phenom nesta sessão? Responda com uma frase e termine exatamente com: PHENOM_SESSION_RECALL_275' --expect-contains PHENOM_SESSION_RECALL_275 --show-expect-status --fail-on-model-error` -> passou; modelo recuperou o acordo.
 - `sqlite3 .phenom-zig/phenom.db "select 'raw_marker', count(*) ...; select 'session_context', count(*) ...; select 'memory_from_session', count(*) ...; select 'skills_from_session', count(*) ...;"` -> retornou `raw_marker=0`, `session_context=2`, `memory_from_session=0`, `skills_from_session=0`.
+
+## T276 - Adicionar FTS5/BM25 interno ao ranking de evidencia
+
+Status: implementado nesta etapa.
+
+Motivacao: a discussao sobre embeddings concluiu que o produto nao deve exigir dois modelos ativos. O caminho correto para o core e manter um unico modelo de chat e fortalecer recuperacao com ferramentas deterministicas: `rg`, SQLite FTS5/BM25, AST/LSP e contratos. Esta task implementa a primeira parte dessa frente: FTS5/BM25 interno como fonte de candidatos para `collect_evidence`, sem ativar embeddings e sem anunciar estrategia nova ao modelo.
+
+Evidencias analisadas:
+
+- `phenom-zig/src/evidence_ranker.zig` ja usava `rg` para termos estruturados e `keyword_discovery` para termos naturais, mas perguntas ambiguas podiam cair em arquivos genericamente populares.
+- Smoke real `fts-bm25-276` mostrou que `keyword_discovery` encheu o budget antes de FTS, retornando `contracts.zig`, `evidence.zig`, `micro_context.zig` e `model_context.zig`, sem `render.zig` util.
+- Smoke real `fts-bm25-276b` mostrou FTS ativo, mas com query `OR` ampla e score BM25 isolado; arquivos com termos comuns ainda venciam.
+- Smoke real `fts-bm25-276c` apos scoring por cobertura trouxe `src/render.zig` para a evidencia e o modelo respondeu corretamente sobre markdown/diff.
+
+Alvo final:
+
+1. `collect_evidence(auto|lexical)` usa FTS5/BM25 como fonte interna, guiada por `terms` definidos pelo modelo.
+2. FTS nao vira prova final; os candidatos sao materializados em arquivo/range/hash via fluxo existente.
+3. Nenhum embedding/modelo secundario e necessario.
+4. Nenhuma heuristica linguistica hardcoded: sem stopwords, sem preferencia por source/docs/test, sem lista fixa de arquivos.
+5. Audit mostra `fts_available`, `fts_indexed_files` e `source=fts_bm25`.
+6. `rg` continua sendo a primeira fase para termos estruturados; FTS melhora recall de termos naturais/ambiguos.
+
+Teste primeiro:
+
+- `fts_ranker` indexa workspace em SQLite FTS5 e retorna candidatos sem raw output.
+- Query builder preserva termos do modelo sem stopwords.
+- Parser de linha do melhor match nao quebra termos por causa de letras `O`/`R`.
+- Score de candidato prefere cobertura de mais termos do modelo.
+- `evidence_ranker` audita `fts_available` e `fts_indexed_files`.
+- `collect_evidence` continua renderizando somente `[EVIDENCE]` destilada.
+- `main` segue com tool loop, contratos e zero raw leak.
+
+Implementacao:
+
+- Criar `phenom-zig/src/fts_ranker.zig`.
+- Usar SQLite in-memory com FTS5:
+  - `create virtual table chunks using fts5(path unindexed, body, tokenize='unicode61')`.
+  - Indexar arquivos text/code permitidos ate limites conservadores.
+  - Ignorar `.git`, `zig-cache`, `zig-out`, `node_modules`, `.phenom-*` e `bin`.
+- Criar query FTS com termos model-provided.
+- Pontuar candidatos por:
+  - cobertura de termos encontrados no corpo;
+  - BM25 como reforco/desempate;
+  - sem stopword/lista linguistica.
+- Integrar FTS em `evidence_ranker.zig`:
+  - fase 1: `rg` para termos estruturados;
+  - fase 2: FTS5/BM25;
+  - fase 3: keyword discovery por `rg -c`;
+  - fase 4: path;
+  - fase 5: overview estrutural.
+- Manter `semantic`, `symbol`, `diagnostic`, `runtime` e `diff` inativos ate executor real.
+
+Revisao baixo nivel realizada:
+
+- C string: `sqlite3_exec` usa `dupeZ`, nao slice cru.
+- Ownership: `fts_ranker.Result` owns candidates e libera paths em `deinit`.
+- Failure path: `rank` usa `errdefer` para limpar candidatos se query/index falhar.
+- Bounds: indexacao limita `max_indexed_files` e `max_file_bytes`.
+- Raw leak: FTS retorna apenas path/line/score; evidência final continua sendo lida por `tools.readFileRange` e passa pelo pipeline de budget/hash.
+- Regra de negocio: FTS nao escolhe resposta, so candidatos; modelo continua sendo o analista.
+- Regra de negocio: nenhum novo contrato model-visible foi adicionado.
+
+Criterio de aceite:
+
+- `zig test src/fts_ranker.zig -lc -lsqlite3` passa.
+- `zig test src/evidence_ranker.zig -lc -lsqlite3` passa.
+- `zig test src/collect_evidence.zig -lc -lsqlite3` passa.
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real ambigue de markdown/diff encontra `src/render.zig`.
+- SQLite mostra `raw_marker=0`, `fts_marker>0`, `render_evidence>0`, `tool_error=0`.
+
+Pendencias deliberadas:
+
+- AST/symbol real ainda nao foi implementado nesta task. Proxima frente deve criar executor `symbol` interno com parsing leve/ctags-like ou Tree-sitter/LSP conforme viabilidade.
+- LSP/diagnostic real ainda nao foi implementado nesta task. Deve entrar como estrategia `diagnostic` com severidade e evidencia objetiva.
+- FTS e in-memory por chamada nesta etapa; persistir indice no SQLite operacional fica para quando houver invalidacao por hash/mtime bem definida.
+- `semantic` continua inativo porque sem embedding nao deve fingir busca semantica neural.
+
+Implementado:
+
+- `phenom-zig/src/fts_ranker.zig`: ranking FTS5/BM25 in-memory com query model-driven, score por cobertura e BM25, bounds e testes.
+- `phenom-zig/src/evidence_ranker.zig`: nova fonte `fts_bm25`, auditoria FTS e ordem de fases ajustada.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/fts_ranker.zig -lc -lsqlite3` -> passou; 4 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/evidence_ranker.zig -lc -lsqlite3` -> passou; 17 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc -lsqlite3` -> passou; 38 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 152 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 760 --session fts-bm25-276c --prompt 'No código deste projeto, onde fica a parte que renderiza markdown e diff no output? Responda com evidências e termine exatamente com: PHENOM_FTS_276C' --expect-contains PHENOM_FTS_276C --show-expect-status --fail-on-model-error` -> passou; evidencia incluiu `src/render.zig` e resposta final correta.
+- `sqlite3 .phenom-zig/phenom.db "select 'raw_marker', count(*) ...; select 'fts_marker', count(*) ...; select 'render_evidence', count(*) ...; select 'tool_error', count(*) ...;"` -> retornou `raw_marker=0`, `fts_marker=1`, `render_evidence=1`, `tool_error=0`.

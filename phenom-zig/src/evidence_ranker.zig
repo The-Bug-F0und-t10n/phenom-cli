@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const contracts = @import("contracts.zig");
+const fts_ranker = @import("fts_ranker.zig");
 
 const c = @cImport({
     @cInclude("dirent.h");
@@ -9,6 +10,7 @@ const c = @cImport({
 pub const CandidateSource = enum {
     prompt_path,
     rg,
+    fts_bm25,
     fallback_scan,
     workspace_overview,
     keyword_discovery,
@@ -42,6 +44,8 @@ pub const RankingResult = struct {
     audit_text: []u8,
     rg_invocations: usize,
     rg_available: bool,
+    fts_available: bool,
+    fts_indexed_files: usize,
 
     pub fn deinit(self: *RankingResult, allocator: std.mem.Allocator) void {
         for (self.candidates.items) |candidate| candidate.deinit(allocator);
@@ -91,6 +95,8 @@ pub fn rankForPrompt(
 
     var rg_invocations: usize = 0;
     var rg_available = true;
+    var fts_available = true;
+    var fts_indexed_files: usize = 0;
 
     // Phase 1: per-term rg for structured terms only (paths, code symbols, camelCase, etc.)
     for (terms.items.items) |term| {
@@ -106,17 +112,29 @@ pub fn rankForPrompt(
         rg_invocations += 1;
     }
 
-    // Phase 2: batch file discovery via plain keywords (single rg -l call for all NL-like words)
+    // Phase 2: SQLite FTS5/BM25 over current workspace, using model-provided terms only.
+    if (candidates.items.len < budget.max_candidates and (strategy == .auto or strategy == .lexical) and prompt.len > 0) {
+        const fts_result = collectFtsCandidates(allocator, io, &candidates, prompt, budget) catch |err| switch (err) {
+            error.SqliteOpenFailed, error.SqliteExecFailed, error.SqlitePrepareFailed, error.SqliteBindFailed, error.SqliteStepFailed => blk: {
+                fts_available = false;
+                break :blk null;
+            },
+            else => return err,
+        };
+        if (fts_result) |indexed| fts_indexed_files = indexed;
+    }
+
+    // Phase 3: batch file discovery via plain keywords (single rg -l call for all NL-like words)
     if (candidates.items.len < budget.max_candidates and strategy == .auto) {
         try discoverFilesByKeywords(allocator, io, &candidates, terms.items.items, budget);
     }
 
-    // Phase 3: path candidates from prompt text
+    // Phase 4: path candidates from prompt text
     if (candidates.items.len == 0) {
         try addPromptPathCandidates(allocator, &candidates, prompt, strategy, budget);
     }
 
-    // Phase 4: workspace overview fallback
+    // Phase 5: workspace overview fallback
     if (candidates.items.len == 0 and strategy == .auto) {
         try addWorkspaceOverviewCandidates(allocator, io, &candidates, budget);
     }
@@ -127,13 +145,15 @@ pub fn rankForPrompt(
     sortCandidates(merged.items);
     trimCandidates(allocator, &merged, budget.max_ranges);
 
-    const audit = try renderAudit(allocator, merged.items, terms.items.items, strategy, rg_invocations, rg_available);
+    const audit = try renderAudit(allocator, merged.items, terms.items.items, strategy, rg_invocations, rg_available, fts_available, fts_indexed_files);
     errdefer allocator.free(audit);
     return .{
         .candidates = merged,
         .audit_text = audit,
         .rg_invocations = rg_invocations,
         .rg_available = rg_available,
+        .fts_available = fts_available,
+        .fts_indexed_files = fts_indexed_files,
     };
 }
 
@@ -346,6 +366,33 @@ fn addPromptPathCandidates(
     }
 }
 
+fn collectFtsCandidates(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    out: *std.ArrayList(EvidenceCandidate),
+    terms: []const u8,
+    budget: RankBudget,
+) !usize {
+    var ranked = try fts_ranker.rank(allocator, io, terms, budget.max_candidates);
+    defer ranked.deinit(allocator);
+    for (ranked.candidates.items) |candidate| {
+        if (out.items.len >= budget.max_candidates) break;
+        if (skipPath(candidate.path)) continue;
+        const start = if (candidate.line > budget.window_before) candidate.line - budget.window_before else 1;
+        const reasons = try std.fmt.allocPrint(allocator, "fts5_bm25,indexed_files={}", .{ranked.indexed_files});
+        errdefer allocator.free(reasons);
+        try out.append(allocator, .{
+            .path = try allocator.dupe(u8, candidate.path),
+            .start_line = start,
+            .end_line = @min(candidate.line + budget.window_after, start + budget.max_lines_per_range - 1),
+            .score = candidate.score,
+            .source = .fts_bm25,
+            .reasons = reasons,
+        });
+    }
+    return ranked.indexed_files;
+}
+
 fn addWorkspaceOverviewCandidates(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -527,13 +574,15 @@ fn renderAudit(
     strategy: contracts.StrategyName,
     rg_invocations: usize,
     rg_available: bool,
+    fts_available: bool,
+    fts_indexed_files: usize,
 ) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     const header = try std.fmt.allocPrint(
         allocator,
-        "[CANDIDATE_RANKING]\nstrategy={s}\nrg_invocations={}\nrg_available={}\nterms={}\n",
-        .{ @tagName(strategy), rg_invocations, rg_available, terms.len },
+        "[CANDIDATE_RANKING]\nstrategy={s}\nrg_invocations={}\nrg_available={}\nfts_available={}\nfts_indexed_files={}\nterms={}\n",
+        .{ @tagName(strategy), rg_invocations, rg_available, fts_available, fts_indexed_files, terms.len },
     );
     defer allocator.free(header);
     try out.appendSlice(allocator, header);
@@ -728,7 +777,17 @@ test "auto ranking discovers files via plain keywords when no structured terms e
     defer ranked.deinit(std.testing.allocator);
     try std.testing.expect(ranked.candidates.items.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "keyword_discovery") != null or
+        std.mem.indexOf(u8, ranked.audit_text, "fts5_bm25") != null or
         std.mem.indexOf(u8, ranked.audit_text, "workspace_overview") != null);
+}
+
+test "ranking can use sqlite fts bm25 without semantic model" {
+    var ranked = try rankForPrompt(std.testing.allocator, std.testing.io, "renderer markdown diff", .lexical, .{ .max_ranges = 4 });
+    defer ranked.deinit(std.testing.allocator);
+    try std.testing.expect(ranked.candidates.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "fts_available=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "fts_indexed_files=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "---BEGIN CONTENT---") == null);
 }
 
 test "term extraction keeps structured symbols and plain keywords" {
