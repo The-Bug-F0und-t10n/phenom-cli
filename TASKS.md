@@ -9248,7 +9248,7 @@ Motivacao: `alinhamento.md` concluiu que o `phenom-zig` corrigiu base tecnica im
 
 ## T281 - Tornar `alinhamento.md` gate obrigatorio de task executavel
 
-Status: pending-urgent.
+Status: done.
 
 Prioridade: urgente.
 
@@ -9277,6 +9277,16 @@ Criterio de aceite:
 
 - Tasks urgentes sem bloco de alinhamento falham no check.
 - Tasks historicas implementadas nao sao reescritas retroativamente.
+
+Implementacao concluida:
+
+- Criado `tools/check_alignment_tasks.sh`.
+- O check valida `T281`-`T301`, prioridade urgente, bloco `Alinhamento AUDIT/TASKS/phenom-cli-ts` e os campos obrigatorios.
+- O check tambem valida a matriz de cobertura do `alinhamento.md`.
+
+Validacao executada:
+
+- `sh tools/check_alignment_tasks.sh` -> passou.
 
 ## T282 - Portar `set_operational_contract` como contrato model-visible pequeno
 
@@ -9617,7 +9627,7 @@ Cobertura `alinhamento.md` -> `TASKS.md`:
 
 ## T291 - Criar gate executavel de cobertura total do `alinhamento.md`
 
-Status: pending-urgent.
+Status: done.
 
 Prioridade: urgente.
 
@@ -9646,6 +9656,16 @@ Criterio de aceite:
 
 - O check falha se um eixo do `alinhamento.md` nao estiver mapeado.
 - O check falha se uma task urgente nova nao declarar impacto nos criterios finais de alinhamento.
+
+Implementacao concluida:
+
+- Criado gate executavel para cobertura total do `alinhamento.md`.
+- O check exige presenca de `A0`-`A11`, mapa por eixo, problemas novos, acertos preservados e criterio final de alinhamento.
+- O check exige que todas as tasks urgentes `T281`-`T301` tenham status urgente valido e campos obrigatorios.
+
+Validacao executada:
+
+- `sh tools/check_alignment_tasks.sh` -> passou.
 
 ## T292 - Provar TUI/render com regressao visual ampla e restore completo
 
