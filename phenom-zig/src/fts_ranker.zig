@@ -4,6 +4,8 @@ const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
+const workspace_inventory = @import("workspace_inventory.zig");
+
 const max_indexed_files: usize = 512;
 const max_file_bytes: usize = 96 * 1024;
 
@@ -66,10 +68,10 @@ fn exec(allocator: std.mem.Allocator, db: ?*c.sqlite3, sql: []const u8) !void {
 
 fn indexWorkspace(allocator: std.mem.Allocator, io: std.Io, db: ?*c.sqlite3) !usize {
     const root = std.Io.Dir.cwd();
-    var cwd = try root.openDir(io, ".", .{ .iterate = true });
+    var cwd = try root.openDir(io, ".", .{});
     defer cwd.close(io);
-    var walker = try cwd.walk(allocator);
-    defer walker.deinit();
+    var inventory = try workspace_inventory.collect(allocator, io, max_indexed_files * 4);
+    defer inventory.deinit(allocator);
 
     var stmt: ?*c.sqlite3_stmt = null;
     const sql = "insert into chunks(path, body) values (?1, ?2)";
@@ -77,14 +79,12 @@ fn indexWorkspace(allocator: std.mem.Allocator, io: std.Io, db: ?*c.sqlite3) !us
     defer _ = c.sqlite3_finalize(stmt);
 
     var indexed: usize = 0;
-    while (try walker.next(io)) |entry| {
+    for (inventory.paths.items) |path| {
         if (indexed >= max_indexed_files) break;
-        if (entry.kind != .file) continue;
-        if (skipPath(entry.path)) continue;
-        if (!looksLikeTextCode(entry.path)) continue;
-        const content = cwd.readFileAlloc(io, entry.path, allocator, .limited(max_file_bytes)) catch continue;
+        const content = cwd.readFileAlloc(io, path, allocator, .limited(max_file_bytes)) catch continue;
         defer allocator.free(content);
-        try insertChunk(allocator, stmt, entry.path, content);
+        if (!workspace_inventory.isTextBytes(content)) continue;
+        try insertChunk(allocator, stmt, path, content);
         indexed += 1;
     }
     return indexed;
@@ -234,35 +234,6 @@ fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
         if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
     }
     return null;
-}
-
-fn skipPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, ".git") or
-        std.mem.eql(u8, path, "zig-cache") or
-        std.mem.eql(u8, path, "zig-out") or
-        std.mem.eql(u8, path, "node_modules") or
-        std.mem.eql(u8, path, "bin") or
-        std.mem.eql(u8, path, ".phenom-zig") or
-        std.mem.eql(u8, path, ".phenom-context") or
-        std.mem.eql(u8, path, ".phenom-sessions") or
-        std.mem.indexOf(u8, path, ".git/") != null or
-        std.mem.indexOf(u8, path, "zig-cache/") != null or
-        std.mem.indexOf(u8, path, "zig-out/") != null or
-        std.mem.indexOf(u8, path, "node_modules/") != null or
-        std.mem.indexOf(u8, path, ".phenom-zig/") != null or
-        std.mem.indexOf(u8, path, ".phenom-context/") != null or
-        std.mem.indexOf(u8, path, ".phenom-sessions/") != null or
-        std.mem.indexOf(u8, path, "/bin/") != null or
-        std.mem.startsWith(u8, path, "bin/");
-}
-
-fn looksLikeTextCode(path: []const u8) bool {
-    return std.mem.endsWith(u8, path, ".zig") or
-        std.mem.endsWith(u8, path, ".ts") or
-        std.mem.endsWith(u8, path, ".js") or
-        std.mem.endsWith(u8, path, ".md") or
-        std.mem.endsWith(u8, path, ".json") or
-        std.mem.endsWith(u8, path, ".toml");
 }
 
 test "fts bm25 ranks workspace files without raw output" {

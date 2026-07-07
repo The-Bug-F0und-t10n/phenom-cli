@@ -9020,3 +9020,107 @@ Validacao executada:
 Observacao de teste real:
 
 - Prompts artificiais que mandam literalmente "emita exatamente esta tool call" dentro do `user_prompt` induzem repeticao da mesma chamada em inferencias seguintes, porque o agente reenvia o pedido original junto do contexto operacional. O smoke aceito usa uma query natural de usuario e prova o fluxo real: modelo escolhe o contrato, agente executa, modelo responde com evidencia.
+
+## T279 - Remover vies de ecossistema no inventario de evidencia
+
+Status: implementado nesta etapa.
+
+Motivacao: revisao do usuario apontou regressao real de regra de negocio: `skipPath` e `looksLikeSource` estavam codificando nomes de ecossistema (`node_modules`, `zig-cache`, `zig-out`, `bin`) e whitelist de linguagem (`.zig`, `.ts`, `.js`). Isso viola a visao do projeto: o agente deve operar em qualquer workspace e qualquer linguagem; quem define intencao e o modelo, e o agente deve executar coleta objetiva sem enviesar o universo de arquivos por stack.
+
+Evidencias analisadas:
+
+- `phenom-zig/src/symbol_ranker.zig` filtrava inventario com `looksLikeSource(path)` limitado a Zig/TS/JS.
+- `phenom-zig/src/fts_ranker.zig` indexava apenas `.zig`, `.ts`, `.js`, `.md`, `.json`, `.toml`.
+- `phenom-zig/src/evidence_ranker.zig` usava globs/exclusoes com nomes fixos de ecossistema e repetia `looksLikeTextCode`.
+- `TASKS.md` ja registrava a regra de negocio: sem stopwords, sem preferencia source/docs/test e sem heuristica linguistica hardcoded.
+- T276/T277 melhoraram FTS/symbol, mas ainda carregavam filtro de inventario enviesado. Esta task substitui essa parte.
+
+Alvo final:
+
+1. Inventario de workspace fica centralizado e generico.
+2. Nenhum coletor decide que uma linguagem especifica e "source" por extensao.
+3. Nenhum coletor exclui diretórios de ecossistema por nome.
+4. Arquivo entra por fonte de verdade do projeto (`git ls-files`) ou por prova de conteudo textual UTF-8.
+5. Storage operacional do Phenom continua fora do contexto operacional.
+6. FTS/BM25 e overview usam o mesmo inventario.
+7. `symbol` nao filtra inventario por linguagem; apenas os parsers disponiveis extraem simbolos quando reconhecem sintaxe.
+
+Teste primeiro:
+
+- `workspace_inventory` aceita paths de qualquer extensao/language-like path.
+- `workspace_inventory` nao rejeita `node_modules/...` nem `zig-cache/...` por nome.
+- `workspace_inventory` rejeita traversal e storage operacional Phenom.
+- Classificacao texto/binario e por bytes UTF-8, nao por extensao.
+- `fts_ranker`, `symbol_ranker`, `evidence_ranker`, `collect_evidence` e `main` continuam passando.
+
+Implementacao:
+
+- Criar `phenom-zig/src/workspace_inventory.zig`.
+- Inventario:
+  - primeiro `git ls-files -z` para arquivos tracked;
+  - depois `git ls-files -o --exclude-standard -z` somente se houver capacidade;
+  - fallback por walk quando git nao esta disponivel.
+- Ordenar paths por profundidade, tamanho e ordem lexicografica antes de aplicar limite.
+- Validar path com regra estrutural:
+  - nao absoluto;
+  - sem NUL;
+  - sem `.`/`..`;
+  - sem storage operacional Phenom.
+- Validar conteudo textual por bytes:
+  - rejeita NUL;
+  - exige UTF-8 valido.
+- Trocar `fts_ranker` para indexar inventario comum e validar conteudo, sem lista de extensoes.
+- Trocar `symbol_ranker` para usar inventario comum e remover `looksLikeSource`.
+- Trocar fallback/overview de `evidence_ranker` para inventario comum.
+- Remover globs hardcoded de `rg`; `rg` fica responsavel por respeitar regras naturais do projeto e o inventario valida paths retornados.
+- Trocar `looksLikePath` para criterio generico: slash ou ponto interno, sem extensoes fixas.
+
+Revisao baixo nivel realizada:
+
+- Ownership: `workspace_inventory.Result` owns todos os paths e libera em `deinit`.
+- Ownership: falhas em `collectGit`/`collectWalk` usam `errdefer` para liberar paths ja coletados.
+- Bounds: stdout de git limitado, probe de arquivo limitado e coleta fallback limitada por multiplicador.
+- Failure path: se `git ls-files -o` estourar limite por muitos untracked, tracked files permanecem utilizaveis.
+- Conteudo: FTS e fallback leem arquivo com limite e descartam bytes nao UTF-8 antes de indexar.
+- Regra de negocio: nao ha whitelist de linguagens no inventario.
+- Regra de negocio: nao ha blacklist de diretorios de ecossistema no inventario.
+- Regra de negocio: storage operacional Phenom nao compete com evidencia do workspace.
+
+Criterio de aceite:
+
+- `rg` em `phenom-zig/src` nao encontra mais `skipPath`, `looksLikeSource`, `looksLikeTextCode` nem glob `!{.git,...}`.
+- Ocorrencias de `node_modules`/`zig-cache` em `phenom-zig/src` existem apenas em testes que provam que esses nomes nao sao bloqueados.
+- `zig test src/workspace_inventory.zig -lc -lsqlite3` passa.
+- `zig test src/fts_ranker.zig -lc -lsqlite3` passa.
+- `zig test src/symbol_ranker.zig -lc -lsqlite3` passa.
+- `zig test src/evidence_ranker.zig -lc -lsqlite3` passa.
+- `zig test src/collect_evidence.zig -lc -lsqlite3` passa.
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+
+Pendencias deliberadas:
+
+- `symbol` ainda so extrai simbolos para sintaxes com parser implementado hoje. Isso nao e mais filtro de inventario; e limite real de executor. Proximas linguagens devem entrar adicionando parser real ou LSP/AST, nao whitelist de extensao.
+- `diagnostic` continua Zig-only pela T278, explicitamente como estrategia limitada de parse Zig local.
+- Smoke real `inventory-279` provou tool loop/audit, mas a evidencia para pergunta de markdown ainda nao foi ideal. Isso fica como frente separada de groundedness/ranking, nao deve ser corrigido com blacklist/whitelist.
+
+Implementado:
+
+- `phenom-zig/src/workspace_inventory.zig`: inventario generico tracked-first, fallback textual por conteudo, path policy e testes.
+- `phenom-zig/src/fts_ranker.zig`: FTS passa a usar inventario comum e conteudo UTF-8.
+- `phenom-zig/src/symbol_ranker.zig`: remove gate `looksLikeSource`; inventario nao escolhe linguagem.
+- `phenom-zig/src/evidence_ranker.zig`: remove `skipPath`, remove globs hardcoded, remove `looksLikeTextCode`, overview/fallback usam inventario comum.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/workspace_inventory.zig -lc -lsqlite3` -> passou; 2 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/fts_ranker.zig -lc -lsqlite3` -> passou; 6 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/symbol_ranker.zig -lc -lsqlite3` -> passou; 4 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/evidence_ranker.zig -lc -lsqlite3` -> passou; 21 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc -lsqlite3` -> passou; 48 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 161 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 900 --session inventory-279 --prompt 'No codigo deste projeto, onde fica a parte que renderiza markdown no output? Use evidencia e termine exatamente com: PHENOM_INVENTORY_279' --expect-contains PHENOM_INVENTORY_279 --show-expect-status --fail-on-model-error --no-color` -> passou; tool loop executou e finalizou.
+- `sqlite3 .phenom-zig/phenom.db "select 'tool_event', count(*) ...; select 'raw_marker', count(*) ...; select 'tool_error', count(*) ...; select 'expectation_passed', count(*) ...;"` -> retornou `tool_event=1`, `raw_marker=0`, `tool_error=0`, `expectation_passed=1`.

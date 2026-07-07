@@ -3,10 +3,7 @@ const std = @import("std");
 const contracts = @import("contracts.zig");
 const fts_ranker = @import("fts_ranker.zig");
 const symbol_ranker = @import("symbol_ranker.zig");
-
-const c = @cImport({
-    @cInclude("dirent.h");
-});
+const workspace_inventory = @import("workspace_inventory.zig");
 
 pub const CandidateSource = enum {
     prompt_path,
@@ -205,8 +202,6 @@ fn collectRgCandidates(
         "never",
         "--max-count",
         "24",
-        "--glob",
-        "!{.git,zig-cache,zig-out,node_modules,bin}/**",
         term,
         ".",
     };
@@ -244,7 +239,7 @@ fn parseRgLine(
     const third_rel = std.mem.indexOfScalar(u8, line[second + 1 ..], ':') orelse return;
     const third = second + 1 + third_rel;
     const raw_path = normalizeRgPath(line[0..first]);
-    if (skipPath(raw_path)) return;
+    if (!workspace_inventory.isWorkspacePath(raw_path)) return;
     const line_no = std.fmt.parseInt(usize, line[first + 1 .. second], 10) catch return;
     const text = line[third + 1 ..];
     const start = if (line_no > budget.window_before) line_no - budget.window_before else 1;
@@ -272,24 +267,22 @@ fn collectFallbackCandidates(
 ) !void {
     _ = strategy;
     const root = std.Io.Dir.cwd();
-    var cwd = try root.openDir(io, ".", .{ .iterate = true });
+    var cwd = try root.openDir(io, ".", .{});
     defer cwd.close(io);
-    var walker = try cwd.walk(allocator);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
+    var inventory = try workspace_inventory.collect(allocator, io, budget.max_candidates * 32);
+    defer inventory.deinit(allocator);
+    for (inventory.paths.items) |path| {
         if (out.items.len >= budget.max_candidates) break;
-        if (entry.kind != .file) continue;
-        if (skipPath(entry.path)) continue;
-        if (!looksLikeTextCode(entry.path)) continue;
-        const content = cwd.readFileAlloc(io, entry.path, allocator, .limited(64 * 1024)) catch continue;
+        const content = cwd.readFileAlloc(io, path, allocator, .limited(64 * 1024)) catch continue;
         defer allocator.free(content);
+        if (!workspace_inventory.isTextBytes(content)) continue;
         if (std.mem.indexOf(u8, content, term)) |idx| {
             const line_no = lineNumberAt(content, idx);
             const start = if (line_no > budget.window_before) line_no - budget.window_before else 1;
             const reasons = try allocator.dupe(u8, "fallback_scan,exact_term_match");
             errdefer allocator.free(reasons);
             try out.append(allocator, .{
-                .path = try allocator.dupe(u8, entry.path),
+                .path = try allocator.dupe(u8, path),
                 .start_line = start,
                 .end_line = @min(line_no + budget.window_after, start + budget.max_lines_per_range - 1),
                 .score = 35,
@@ -320,8 +313,6 @@ fn discoverFilesByKeywords(
     try argv.append(allocator, "-c");
     try argv.append(allocator, "--color");
     try argv.append(allocator, "never");
-    try argv.append(allocator, "--glob");
-    try argv.append(allocator, "!{.git,zig-cache,zig-out,node_modules,bin}/**");
     for (term_slice) |term| {
         if (isStructuredSearchTerm(term)) continue;
         try argv.append(allocator, "-e");
@@ -348,8 +339,7 @@ fn discoverFilesByKeywords(
         const path = normalizeRgPath(std.mem.trim(u8, line[0..colon], " \t\r\n"));
         const count = std.fmt.parseInt(usize, line[colon + 1 ..], 10) catch continue;
         if (count == 0) continue;
-        if (skipPath(path)) continue;
-        if (!looksLikeTextCode(path)) continue;
+        if (!workspace_inventory.isWorkspacePath(path)) continue;
         if (out.items.len >= budget.max_candidates) break;
         const score: i32 = 40 + @as(i32, @intCast(@min(count * 3, 15)));
         const reasons = try std.fmt.allocPrint(allocator, "keyword_discovery,plain_keyword_match,count={}", .{count});
@@ -375,7 +365,7 @@ fn addPromptPathCandidates(
     _ = strategy;
     var it = std.mem.tokenizeAny(u8, prompt, " \t\r\n\"'`()[]{}<>:;,");
     while (it.next()) |raw| {
-        if (!looksLikePath(raw) or skipPath(raw)) continue;
+        if (!looksLikePath(raw) or !workspace_inventory.isWorkspacePath(raw)) continue;
         const reasons = try allocator.dupe(u8, "prompt_path_match");
         errdefer allocator.free(reasons);
         try out.append(allocator, .{
@@ -400,7 +390,7 @@ fn collectFtsCandidates(
     defer ranked.deinit(allocator);
     for (ranked.candidates.items) |candidate| {
         if (out.items.len >= budget.max_candidates) break;
-        if (skipPath(candidate.path)) continue;
+        if (!workspace_inventory.isWorkspacePath(candidate.path)) continue;
         const start = if (candidate.line > budget.window_before) candidate.line - budget.window_before else 1;
         const reasons = try std.fmt.allocPrint(allocator, "fts5_bm25,indexed_files={}", .{ranked.indexed_files});
         errdefer allocator.free(reasons);
@@ -432,7 +422,7 @@ fn collectSymbolCandidates(
     defer ranked.deinit(allocator);
     for (ranked.candidates.items) |candidate| {
         if (out.items.len >= budget.max_candidates) break;
-        if (skipPath(candidate.path)) continue;
+        if (!workspace_inventory.isWorkspacePath(candidate.path)) continue;
         const reasons = try std.fmt.allocPrint(allocator, "symbol_ast,symbol={s},indexed_files={},symbols={}", .{ candidate.symbol, ranked.indexed_files, ranked.symbol_count });
         errdefer allocator.free(reasons);
         const owned_path = try allocator.dupe(u8, candidate.path);
@@ -455,18 +445,12 @@ fn addWorkspaceOverviewCandidates(
     out: *std.ArrayList(EvidenceCandidate),
     budget: RankBudget,
 ) !void {
-    _ = io;
-    var paths = std.ArrayList([]u8).empty;
-    defer {
-        for (paths.items) |path| allocator.free(path);
-        paths.deinit(allocator);
-    }
+    var inventory = try workspace_inventory.collect(allocator, io, budget.max_candidates * 8);
+    defer inventory.deinit(allocator);
+    sortOverviewPaths(inventory.paths.items);
 
-    try collectOverviewPathsC(allocator, &paths, budget.max_candidates * 8);
-    sortOverviewPaths(paths.items);
-
-    const limit = @min(paths.items.len, budget.max_candidates);
-    for (paths.items[0..limit]) |path| {
+    const limit = @min(inventory.paths.items.len, budget.max_candidates);
+    for (inventory.paths.items[0..limit]) |path| {
         const reasons = try allocator.dupe(u8, "workspace_overview_structure");
         errdefer allocator.free(reasons);
         try out.append(allocator, .{
@@ -477,53 +461,6 @@ fn addWorkspaceOverviewCandidates(
             .source = .workspace_overview,
             .reasons = reasons,
         });
-    }
-}
-
-fn collectOverviewPathsC(allocator: std.mem.Allocator, paths: *std.ArrayList([]u8), max_paths: usize) !void {
-    var stack = std.ArrayList([]u8).empty;
-    defer {
-        for (stack.items) |path| allocator.free(path);
-        stack.deinit(allocator);
-    }
-    try stack.append(allocator, try allocator.dupe(u8, "."));
-
-    var index: usize = 0;
-    while (index < stack.items.len and paths.items.len < max_paths) : (index += 1) {
-        const dir_path = stack.items[index];
-        const z_dir = try allocator.dupeZ(u8, dir_path);
-        defer allocator.free(z_dir);
-        const dir = c.opendir(z_dir.ptr) orelse continue;
-        defer _ = c.closedir(dir);
-
-        while (paths.items.len < max_paths) {
-            const entry = c.readdir(dir) orelse break;
-            const name = std.mem.sliceTo(entry.*.d_name[0..], 0);
-            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-
-            const child = if (std.mem.eql(u8, dir_path, "."))
-                try allocator.dupe(u8, name)
-            else
-                try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, name });
-            errdefer allocator.free(child);
-
-            if (skipPath(child)) {
-                allocator.free(child);
-                continue;
-            }
-
-            switch (entry.*.d_type) {
-                c.DT_DIR => try stack.append(allocator, child),
-                c.DT_REG => {
-                    if (looksLikeTextCode(child)) {
-                        try paths.append(allocator, child);
-                    } else {
-                        allocator.free(child);
-                    }
-                },
-                else => allocator.free(child),
-            }
-        }
     }
 }
 
@@ -606,7 +543,6 @@ fn scoreMatch(path: []const u8, text: []const u8, term: []const u8, strategy: co
     var score: i32 = 20;
     if (containsIgnoreCase(text, term)) score += 35;
     if (containsIgnoreCase(path, term)) score += 22;
-    if (skipPath(path)) score -= 80;
     return score;
 }
 
@@ -699,40 +635,10 @@ fn normalizeRgPath(path: []const u8) []const u8 {
     return path;
 }
 
-fn skipPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, ".git") or
-        std.mem.eql(u8, path, "zig-cache") or
-        std.mem.eql(u8, path, "zig-out") or
-        std.mem.eql(u8, path, "node_modules") or
-        std.mem.eql(u8, path, "bin") or
-        std.mem.eql(u8, path, ".phenom-zig") or
-        std.mem.eql(u8, path, ".phenom-context") or
-        std.mem.eql(u8, path, ".phenom-sessions") or
-        std.mem.indexOf(u8, path, ".git/") != null or
-        std.mem.indexOf(u8, path, "zig-cache/") != null or
-        std.mem.indexOf(u8, path, "zig-out/") != null or
-        std.mem.indexOf(u8, path, "node_modules/") != null or
-        std.mem.indexOf(u8, path, ".phenom-zig/") != null or
-        std.mem.indexOf(u8, path, ".phenom-context/") != null or
-        std.mem.indexOf(u8, path, ".phenom-sessions/") != null or
-        std.mem.indexOf(u8, path, "/bin/") != null or
-        std.mem.startsWith(u8, path, "bin/");
-}
-
 fn looksLikePath(text: []const u8) bool {
-    return std.mem.indexOfScalar(u8, text, '/') != null or
-        std.mem.endsWith(u8, text, ".zig") or
-        std.mem.endsWith(u8, text, ".ts") or
-        std.mem.endsWith(u8, text, ".md");
-}
-
-fn looksLikeTextCode(path: []const u8) bool {
-    return std.mem.endsWith(u8, path, ".zig") or
-        std.mem.endsWith(u8, path, ".ts") or
-        std.mem.endsWith(u8, path, ".js") or
-        std.mem.endsWith(u8, path, ".md") or
-        std.mem.endsWith(u8, path, ".json") or
-        std.mem.endsWith(u8, path, ".toml");
+    if (std.mem.indexOfScalar(u8, text, '/') != null) return true;
+    const dot = std.mem.lastIndexOfScalar(u8, text, '.') orelse return false;
+    return dot > 0 and dot + 1 < text.len;
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
