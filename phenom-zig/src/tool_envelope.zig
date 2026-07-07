@@ -170,6 +170,23 @@ test "tool not announced is rejected before execution" {
     try std.testing.expectEqualStrings("content", envelope.raw_name);
 }
 
+test "announced session search is accepted" {
+    const active = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
+    const output =
+        \\<tool_call>
+        \\<function=search_session>
+        \\<parameter=terms>groundedness citations</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.accepted, envelope.state);
+    try std.testing.expect(envelope.call != null);
+    try std.testing.expectEqualStrings("search_session", envelope.raw_name);
+    try std.testing.expectEqualStrings("groundedness citations", envelope.call.?.terms.?);
+}
+
 test "invalid strategy is a rejected envelope" {
     const active = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
     const output =

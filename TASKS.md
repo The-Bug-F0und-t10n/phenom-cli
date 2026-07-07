@@ -8601,3 +8601,127 @@ Validacao executada:
 - `sqlite3 .phenom-zig/phenom.db "select kind, count(*) from events where session='working-context-274b' and kind in ('tool_start','tool_error','working_context_add','working_context_compact','working_context_duplicate','model_context','evidence') group by kind order by kind;"` -> retornou `evidence=1`, `model_context=2`, `tool_start=1`, `working_context_add=1`, nenhum `tool_error`.
 - `sqlite3 .phenom-zig/phenom.db "select length(body) from events where session='working-context-274b' and kind='model_context' order by id;"` -> retornou `1390` e `14183`, provando follow-up limitado apos teto de evidencia ativa.
 - `sqlite3 .phenom-zig/phenom.db "select 'raw_marker', count(*) ...; select 'memory_block', count(*) ...; select 'skills_block', count(*) ...; select 'truncated', count(*) ...;"` -> retornou `raw_marker=0`, `memory_block=0`, `skills_block=0`, `truncated=1`.
+
+## T275 - Adicionar contexto operacional de sessao e busca guiada pelo modelo
+
+Status: implementado nesta etapa.
+
+Motivacao: apos T274, o agente tinha contexto de evidencias do turno, mas o modelo ainda nao tinha acesso confiavel a conversas anteriores da mesma sessao. Isso degradava fidelidade em perguntas como "o que combinamos antes?", porque dependeria de memoria invisivel do backend ou de reenviar historico bruto. A regra de negocio exige replay auditavel: SQLite e storage operacional, MEMORY/SKILLS sao contexto persistente textual separado, e o modelo deve escolher a intencao de busca.
+
+Evidencias analisadas:
+
+- `doc/AGENTE_AI_BAIXO_CONSUMO_TOKENS_AUDIT.md` aponta conflitos de fontes de memoria, session brain e contexto operacional competindo com `.MEMORY.md`.
+- T274 define que working evidence pode existir no SQLite/audit para replay, mas nao vira MEMORY/SKILLS.
+- `phenom-zig/src/audit.zig` ja armazenava eventos de sessao no SQLite, mas `loadSessionEvents(... limit ...)` lia os eventos mais antigos quando a sessao crescia.
+- `phenom-zig/src/main.zig` auditava `model_context`, `turn_start`, `assistant_delta`, `tool_start`, `working_context_add` e `turn_done`, que sao suficientes para contexto operacional destilado.
+
+Alvo final:
+
+1. Conversa anterior deve entrar no modelo como `[SESSION_CONTEXT]`, temporaria e auditavel.
+2. O modelo pode chamar `search_session(terms)` quando precisar procurar fato anterior em uma sessao grande.
+3. `terms` vem do modelo; o agente nao extrai intencao do prompt do usuario e nao usa heuristica linguistica hardcoded.
+4. SQLite continua sendo storage operacional/replay, nao MEMORY/SKILLS.
+5. Contexto bruto e markers internos nunca vazam para o modelo.
+6. Backend local continua semanticamente stateless; a fonte de verdade e prompt renderizado + SQLite audit.
+
+Teste primeiro:
+
+- `session_context` renderiza contexto recente sem incluir o prompt atual.
+- `session_context.search` usa somente termos fornecidos pelo modelo.
+- `session_context.search` ignora eventos raw-heavy como `model_context`.
+- `session_context` redige markers proibidos em eventos uteis antigos antes de renderizar.
+- `model_context` renderiza `[SESSION_CONTEXT]` separado de `[MEMORY]` e `[SKILLS]`.
+- `tool_envelope` aceita `search_session` somente porque o contrato ativo anunciou a tool.
+- `main` prova que contexto coletado pode conter evidencia de sessao temporaria sem promover memoria persistente.
+- `audit` prova que leitura recente de sessao pega os eventos mais novos e preserva ordem cronologica.
+
+Implementacao:
+
+- Criar `phenom-zig/src/session_context.zig`.
+- Definir `SearchResult` owned com `text` e `matches`.
+- Implementar `renderRecent`:
+  - carrega eventos uteis recentes;
+  - exclui `turn_start` igual ao prompt atual;
+  - compacta cada evento para uma linha curta;
+  - valida anti-raw antes de retornar.
+- Implementar `search`:
+  - percorre eventos auditados;
+  - pontua apenas por termos fornecidos pelo modelo;
+  - ordena por score e recencia;
+  - retorna `[SESSION_EVIDENCE]` com ids `S#`;
+  - nao usa stopwords, preferencias de arquivo, source/docs/test ou inferencia do prompt original.
+- Adicionar `SessionBlock` em `model_context.zig`.
+- Adicionar `[GROUNDING]` com regras compactas:
+  - claims de workspace citam `E#`;
+  - claims de sessao citam `S#`;
+  - sem evidencia, declarar que nao esta evidenciado.
+- Adicionar `search_session` ao contrato ativo executavel.
+- Roteamento em `main.zig`:
+  - `buildInitialModelContext` injeta sessao recente quando houver;
+  - `runOneToolLoopStep` executa `search_session`;
+  - busca repetida com os mesmos termos e deduplicada no turno;
+  - resultado de busca entra em follow-up como contexto temporario.
+- Adicionar `loadRecentSessionEvents` em `audit.zig` para sessoes longas.
+
+Passos de implementacao:
+
+1. Criar testes unitarios de `session_context.zig`.
+2. Adicionar `SessionBlock` e teste de separacao MEMORY/SKILLS em `model_context.zig`.
+3. Expor `search_session` no contrato ativo e teste de allowlist.
+4. Aceitar `search_session` no envelope model-visible.
+5. Integrar `buildInitialModelContext` com SQLite audit recente.
+6. Integrar `runSearchSessionStep` ao tool loop.
+7. Corrigir leitura recente de SQLite para nao usar eventos antigos em sessoes longas.
+8. Redigir markers brutos em contexto de sessao antes do prompt.
+9. Rodar unitarios, build release e smoke real de recuperacao de sessao.
+10. Consultar SQLite para provar `[SESSION_CONTEXT]`, zero raw leak e zero promocao para MEMORY/SKILLS.
+
+Revisao baixo nivel realizada:
+
+- Ownership: `SearchResult.text` e owned e liberado por `deinit`.
+- Ownership: `ToolLoopState.session_searches` duplica `terms`; `rememberSessionSearch` usa `errdefer` para nao vazar se `append` falhar.
+- Stale pointer: `SessionBlock` aponta para texto vivo durante `renderModelTurnContext`; o texto so e liberado apos render.
+- Bounds: cada item de sessao e limitado por `max_entry_bytes`; resultado retorna no maximo `max_search_entries`.
+- Raw leak: `model_context.assertNoRawContextLeak` roda no render recente e na busca.
+- Raw leak: eventos `model_context` nao entram em busca; markers proibidos em eventos uteis sao redigidos.
+- Long session: `loadRecentSessionEvents` busca os ultimos N eventos e reordena cronologicamente.
+- Regra de negocio: nenhuma memoria operacional e promovida para `[MEMORY]`/`[SKILLS]`.
+- Regra de negocio: a busca de sessao nao usa heuristica linguistica hardcoded; o modelo fornece `terms`.
+
+Criterio de aceite:
+
+- `zig test src/session_context.zig -lc -lsqlite3` passa.
+- `zig test src/audit.zig -lc -lsqlite3` passa.
+- `zig test src/main.zig -lc -lsqlite3` passa.
+- `zig build test` passa.
+- `zig build -Doptimize=ReleaseFast` passa.
+- Smoke real em dois turnos recupera acordo anterior da sessao sem reenviar historico bruto.
+- SQLite mostra `[SESSION_CONTEXT]` em `model_context`.
+- SQLite mostra `raw_marker=0` em `model_context`.
+- SQLite mostra que o fato de sessao nao virou `[MEMORY]` nem `[SKILLS]`.
+
+Pendencias deliberadas:
+
+- Busca "semantica" aqui significa busca operacional guiada pela intencao semantica emitida pelo modelo em `terms`. Nao foi adicionado embedding local, LSH ou vetor no SQLite nesta task, porque isso exigiria nova dependencia/infra e ainda precisaria de uma politica de budget propria.
+- Validador semantico de todas as claims finais ainda nao existe. A task adiciona regras de groundedness e evidencia `S#`/`E#`, mas nao bloqueia automaticamente uma frase final sem citacao.
+- Cross-session global search fica pendente; esta etapa limita recuperacao ao `session` atual para manter replay e isolamento.
+
+Implementado:
+
+- `phenom-zig/src/session_context.zig`: novo modulo para contexto operacional temporario de sessao.
+- `phenom-zig/src/model_context.zig`: `[SESSION_CONTEXT]` e `[GROUNDING]`.
+- `phenom-zig/src/contracts.zig`: `search_session` model-visible e permitido no contrato ativo.
+- `phenom-zig/src/tool_envelope.zig`: teste de envelope aceito para `search_session`.
+- `phenom-zig/src/main.zig`: injecao de contexto recente, schema, roteamento, dedupe e follow-up de `search_session`.
+- `phenom-zig/src/audit.zig`: `loadRecentSessionEvents`.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/session_context.zig -lc -lsqlite3` -> passou; 49 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/audit.zig -lc -lsqlite3` -> passou; 17 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 147 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --session session-context-275 --prompt 'Nesta sessão, registre o seguinte acordo operacional: o renderer do Phenom deve ser append-only e preservar copia direta do terminal. Responda exatamente: PHENOM_SESSION_SEED_275' --expect-contains PHENOM_SESSION_SEED_275 --show-expect-status --fail-on-model-error` -> passou.
+- `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 520 --session session-context-275 --prompt 'Qual foi o acordo operacional que combinamos sobre o renderer do Phenom nesta sessão? Responda com uma frase e termine exatamente com: PHENOM_SESSION_RECALL_275' --expect-contains PHENOM_SESSION_RECALL_275 --show-expect-status --fail-on-model-error` -> passou; modelo recuperou o acordo.
+- `sqlite3 .phenom-zig/phenom.db "select 'raw_marker', count(*) ...; select 'session_context', count(*) ...; select 'memory_from_session', count(*) ...; select 'skills_from_session', count(*) ...;"` -> retornou `raw_marker=0`, `session_context=2`, `memory_from_session=0`, `skills_from_session=0`.

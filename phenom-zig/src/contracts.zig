@@ -63,6 +63,7 @@ pub const ActiveContract = struct {
 
 pub const all_tools = [_]ToolSpec{
     .{ .name = "collect_evidence", .visibility = .model_visible },
+    .{ .name = "search_session", .visibility = .model_visible },
     .{ .name = "read_file", .visibility = .internal_context },
     .{ .name = "path_exists", .visibility = .internal_context },
     .{ .name = "list_dir", .visibility = .internal_context },
@@ -123,7 +124,7 @@ pub const contract_specs = [_]ContractSpec{
     .{
         .name = .collect_evidence,
         .endpoint = "collect_evidence",
-        .allowed_tools = &.{"collect_evidence"},
+        .allowed_tools = &.{ "collect_evidence", "search_session" },
     },
 };
 
@@ -189,6 +190,7 @@ pub fn compactModelVisibleTools(allocator: std.mem.Allocator) ![]u8 {
 
 test "tool manifest keeps internal context tools hidden from model surface" {
     try std.testing.expect(isModelVisible("collect_evidence"));
+    try std.testing.expect(isModelVisible("search_session"));
     try std.testing.expect(!isModelVisible("apply_patch"));
     try std.testing.expect(isInternalContextTool("apply_patch"));
     try std.testing.expect(!isModelVisible("grep_file"));
@@ -218,6 +220,7 @@ test "active collect evidence contract comes from manifest allowlist" {
     const active = activeContract(.collect_evidence) orelse return error.MissingContract;
     try std.testing.expectEqualStrings(manifest_version, active.version);
     try std.testing.expect(active.allows("collect_evidence"));
+    try std.testing.expect(active.allows("search_session"));
     try std.testing.expect(!active.allows("content"));
     try std.testing.expect(!active.allows("grep_file"));
 }
@@ -226,6 +229,7 @@ test "compact model visible tools excludes internal collectors" {
     const rendered = try compactModelVisibleTools(std.testing.allocator);
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "set_operational_contract") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "apply_patch") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "run_tests") == null);

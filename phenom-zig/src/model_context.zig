@@ -9,15 +9,21 @@ pub const EvidenceBlock = struct {
     text: []const u8,
 };
 
+pub const SessionBlock = struct {
+    text: []const u8,
+};
+
 pub const ModelTurnContext = struct {
     task: []const u8,
     mode: []const u8 = "code_micro",
     budget: []const u8 = "small",
     contracts: []const u8 = "",
     evidence: []const EvidenceBlock = &.{},
+    session: []const SessionBlock = &.{},
     memory: []const []const u8 = &.{},
     skills: []const []const u8 = &.{},
     obligations: []const []const u8 = &.{},
+    grounding: []const []const u8 = &.{},
     next_action: []const u8 = "",
 };
 
@@ -60,6 +66,16 @@ pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContex
         }
     }
 
+    if (ctx.session.len > 0) {
+        try out.appendSlice(allocator, "\n[SESSION_CONTEXT]\n");
+        for (ctx.session, 0..) |entry, i| {
+            const label = try std.fmt.allocPrint(allocator, "S{}:\n", .{i + 1});
+            defer allocator.free(label);
+            try out.appendSlice(allocator, label);
+            try appendEvidenceText(&out, allocator, entry.text);
+        }
+    }
+
     if (ctx.obligations.len > 0) {
         try out.appendSlice(allocator, "\n[OBLIGATIONS]\n");
         for (ctx.obligations, 0..) |item, i| {
@@ -67,6 +83,11 @@ pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContex
             defer allocator.free(line);
             try out.appendSlice(allocator, line);
         }
+    }
+
+    if (ctx.grounding.len > 0) {
+        try out.appendSlice(allocator, "\n[GROUNDING]\n");
+        try appendList(&out, allocator, ctx.grounding);
     }
 
     if (ctx.next_action.len > 0) {
@@ -163,6 +184,24 @@ test "model context renders evidence obligations and next action" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "src/main.zig L1-L2") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "O1: validate syntax") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[NEXT_ACTION]") != null);
+}
+
+test "model context renders temporary session context separately from memory" {
+    const session_blocks = [_]SessionBlock{.{ .text = "turn_start: lembre do renderer append-only" }};
+    const grounding = [_][]const u8{"Claims about session history must cite S#."};
+    const rendered = try renderModelTurnContext(std.testing.allocator, .{
+        .task = "continuar",
+        .session = &session_blocks,
+        .grounding = &grounding,
+    });
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SESSION_CONTEXT]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "S1:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "renderer append-only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[GROUNDING]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
 }
 
 test "model context includes memory and skills only when explicitly provided" {

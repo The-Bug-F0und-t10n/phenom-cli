@@ -214,6 +214,52 @@ pub const AuditDb = struct {
 
         return events;
     }
+
+    pub fn loadRecentSessionEvents(self: *AuditDb, allocator: std.mem.Allocator, session: []const u8, limit: usize) !std.ArrayList(AuditEvent) {
+        if (limit > std.math.maxInt(c_int)) return error.EventLimitTooLarge;
+
+        const sql =
+            \\select kind, body, cast(strftime('%s', created_at) as integer)
+            \\from (
+            \\  select id, kind, body, created_at
+            \\  from events
+            \\  where session = ?1
+            \\  order by id desc
+            \\  limit ?2
+            \\)
+            \\order by id asc
+        ;
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        const z_session = try self.allocator.dupeZ(u8, session);
+        defer self.allocator.free(z_session);
+
+        if (c.sqlite3_bind_text(stmt, 1, z_session.ptr, @as(c_int, @intCast(session.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_int(stmt, 2, @as(c_int, @intCast(limit))) != c.SQLITE_OK) return error.SqliteBindFailed;
+
+        var events = std.ArrayList(AuditEvent).empty;
+        errdefer freeAuditEvents(allocator, &events);
+
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStepFailed;
+
+            const kind = try dupeColumnText(allocator, stmt, 0);
+            errdefer allocator.free(kind);
+            const body = try dupeColumnText(allocator, stmt, 1);
+            errdefer allocator.free(body);
+            const created_at_unix_s = if (c.sqlite3_column_type(stmt, 2) == c.SQLITE_NULL) null else @as(i64, @intCast(c.sqlite3_column_int64(stmt, 2)));
+            try events.append(allocator, .{ .kind = kind, .body = body, .created_at_unix_s = created_at_unix_s });
+        }
+
+        return events;
+    }
 };
 
 pub fn freeHistoryLines(allocator: std.mem.Allocator, lines: *std.ArrayList([]u8)) void {
@@ -294,6 +340,22 @@ test "tool event audit summary stores metadata without raw output" {
     try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "raw_bytes=") != null);
     try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "raw_hash=") != null);
     try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "SECRET_RAW_TAIL") == null);
+}
+
+test "recent session events keep newest events in chronological order" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordEvent("s1", "turn_start", "old");
+    try db.recordEvent("s1", "assistant_delta", "middle");
+    try db.recordEvent("s1", "turn_start", "new");
+
+    var events = try db.loadRecentSessionEvents(std.testing.allocator, "s1", 2);
+    defer freeAuditEvents(std.testing.allocator, &events);
+
+    try std.testing.expectEqual(@as(usize, 2), events.items.len);
+    try std.testing.expectEqualStrings("middle", events.items[0].body);
+    try std.testing.expectEqualStrings("new", events.items[1].body);
 }
 
 test "input history trims to newest 200 distinct lines" {
