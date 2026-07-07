@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
     const real_model = b.option([]const u8, "real-model", "Real model name for smoke test") orelse "phenom:latest";
     const real_prompt = b.option([]const u8, "real-prompt", "Real prompt for smoke test") orelse "Complete: PHENOM_REAL_7319";
     const real_expect = b.option([]const u8, "real-expect", "Expected visible text for smoke test") orelse "PHENOM_REAL_7319";
+    const real_session = b.option([]const u8, "real-session", "Session id for multi-turn real smoke test") orelse "real-session-smoke-294";
 
     const real_smoke_cmd = b.addRunArtifact(exe);
     real_smoke_cmd.step.dependOn(b.getInstallStep());
@@ -66,6 +67,59 @@ pub fn build(b: *std.Build) void {
 
     const real_smoke_step = b.step("real-smoke", "Opt-in real backend smoke test. Requires active HOST:PORT.");
     real_smoke_step.dependOn(&real_smoke_cmd.step);
+
+    const real_session_seed_cmd = b.addRunArtifact(exe);
+    real_session_seed_cmd.step.dependOn(b.getInstallStep());
+    real_session_seed_cmd.addArgs(&.{
+        "chat",
+        "--backend",
+        real_backend,
+        "--host",
+        real_host,
+        "--model",
+        real_model,
+        "--session",
+        real_session,
+        "--prompt",
+        "Nesta sessao, registre este acordo operacional: a palavra-codigo de validacao do contexto de sessao e AZUL-FTS-294. Responda exatamente: PHENOM_SESSION_SEED_294",
+        "--max-tokens",
+        "260",
+        "--thinking",
+        "off",
+        "--expect-contains",
+        "PHENOM_SESSION_SEED_294",
+        "--show-expect-status",
+        "--fail-on-model-error",
+        "--no-color",
+    });
+
+    const real_session_recall_cmd = b.addRunArtifact(exe);
+    real_session_recall_cmd.step.dependOn(&real_session_seed_cmd.step);
+    real_session_recall_cmd.addArgs(&.{
+        "chat",
+        "--backend",
+        real_backend,
+        "--host",
+        real_host,
+        "--model",
+        real_model,
+        "--session",
+        real_session,
+        "--prompt",
+        "Qual foi a palavra-codigo de validacao do contexto de sessao que combinamos? Responda exatamente no formato: CODIGO=<valor> PHENOM_SESSION_RECALL_294",
+        "--max-tokens",
+        "420",
+        "--thinking",
+        "off",
+        "--expect-contains",
+        "CODIGO=AZUL-FTS-294 PHENOM_SESSION_RECALL_294",
+        "--show-expect-status",
+        "--fail-on-model-error",
+        "--no-color",
+    });
+
+    const real_session_smoke_step = b.step("real-session-smoke", "Opt-in two-turn session context smoke test. Requires active HOST:PORT.");
+    real_session_smoke_step.dependOn(&real_session_recall_cmd.step);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

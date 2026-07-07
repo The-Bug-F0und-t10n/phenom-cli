@@ -9829,6 +9829,10 @@ Validacao executada:
 - `sh tools/check_alignment_tasks.sh` -> passou.
 - Smoke real seed: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 260 --session session-fts-294 --prompt 'Nesta sessao, registre este acordo operacional: a palavra-codigo de validacao do contexto de sessao e AZUL-FTS-294. Responda exatamente: PHENOM_SEED_294' --expect-contains PHENOM_SEED_294 --show-expect-status --fail-on-model-error --no-color` -> passou.
 - Smoke real recall: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 420 --session session-fts-294 --prompt 'Qual foi a palavra-codigo de validacao do contexto de sessao que combinamos? Responda exatamente no formato: CODIGO=<valor> PHENOM_RECALL_294' --expect-contains PHENOM_RECALL_294 --show-expect-status --fail-on-model-error --no-color` -> passou; resposta `CODIGO=AZUL-FTS-294 PHENOM_RECALL_294`.
+- `phenom-zig/build.zig` adiciona `real-session-smoke`, um smoke opt-in reproduzivel de dois turnos que grava a palavra-codigo na sessao e valida recuperacao no segundo turno com `--expect-contains`.
+- `phenom-zig/README.md` documenta `real-session-smoke` como validacao real de contexto de sessao.
+- Smoke real reproduzivel: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-session-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest -Dreal-session=real-session-smoke-294b` -> passou; segundo turno respondeu `CODIGO=AZUL-FTS-294 PHENOM_SESSION_RECALL_294`.
+- Audit SQLite do target `real-session-smoke-294b`: `fts_context=1`, `raw_marker=0`, `memory_block=0`, `skills_block=0`.
 - Audit SQLite: `fts_context=1`, `raw_marker=0`, `memory_block=0`, `skills_block=0`.
 
 Risco residual:

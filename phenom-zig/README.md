@@ -40,9 +40,11 @@ Teste real de backend nao faz parte da suite offline e exige servidor ativo. Exe
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build run -- chat --backend ollama --host HOST:PORT --model MODEL --prompt "ola" --max-tokens 64 --thinking auto
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build run -- chat --backend llamacpp --host HOST:PORT --model MODEL --prompt "ola" --max-tokens 64 --thinking auto
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build real-session-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
 ```
 
 `real-smoke` usa um token sentinela (`PHENOM_REAL_7319`) por padrao e falha se a resposta visivel nao contiver o texto esperado. Em ambientes com sandbox de rede, o mesmo comando pode falhar antes de chegar ao servidor; nesse caso, valide o transporte com `curl` e rode o smoke com rede liberada.
+`real-session-smoke` executa dois turnos reais na mesma sessao: primeiro grava uma palavra-codigo no SQLite operacional, depois exige que o modelo recupere essa palavra-codigo via contexto de sessao.
 
 Regra de validacao:
 
@@ -51,6 +53,7 @@ Regra de validacao:
 - Features que dependem de servidor/modelo devem ter teste real opt-in separado da suite offline.
 - A suite offline nunca deve depender de `127.0.0.1`, Ollama, llama.cpp, rede ou modelo real.
 - `real-smoke` usa `--fail-on-model-error` e `--expect-contains`; se o backend nao conectar, falhar ou nao gerar a saida esperada, o comando retorna exit code nao-zero.
+- `real-session-smoke` usa as mesmas garantias e falha se a recuperacao do segundo turno nao contiver a palavra-codigo esperada.
 
 Notas de arquitetura:
 
