@@ -9840,6 +9840,21 @@ Risco residual:
 - A busca e "semantica" no sentido operacional acordado para esta etapa: FTS5/BM25 lexical ranqueado, sem embeddings e sem segundo modelo ativo.
 - Busca cross-session/global continua fora desta task para preservar isolamento e replay por sessao.
 
+Correcao posterior de continuidade curta:
+
+- Log real mostrou regressao: apos o agente responder "Sou um modelo da Google", o usuario perguntou apenas "da google?" e o modelo tratou como pergunta isolada.
+- Causa raiz: `[RECENT_DIALOGUE]` existia como bloco textual auditavel, mas o HTTP enviava esse bloco como uma mensagem `user` de contexto, nao como chat history real com roles `user`/`assistant`.
+- `phenom-zig/src/http.zig` agora aceita `dialogue` em `InferenceInput` e serializa mensagens recentes como roles reais para Ollama e llama.cpp.
+- `phenom-zig/src/main.zig` monta `dialogue` a partir do SQLite operacional e passa para o backend no turno real.
+- `phenom-zig/src/session_context.zig` corrige a exclusao do prompt atual: agora remove somente o `turn_start` atual mais recente, sem apagar turnos antigos com o mesmo texto.
+- `phenom-zig/build.zig` adiciona `real-dialogue-smoke`, smoke opt-in de dois turnos para follow-up ambiguo curto.
+- `phenom-zig/README.md` documenta `real-dialogue-smoke`.
+- Unitarios: `session_context` prova prompt repetido antigo preservado; `main` prova roles recentes; `http` prova serializacao de roles antes do prompt atual.
+- Smoke real manual: sessao `continuity-google-301`; turno 1 respondeu `Sou um modelo da Google.`; turno 2 `da google? ...` respondeu `Sim, PHENOM_CONTINUIDADE_301`.
+- Audit SQLite da sessao `continuity-google-301`: `recent_dialogue=2`, `raw_marker=0`, `memory_block=0`, `skills_block=0`.
+- Smoke real reproduzivel: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-dialogue-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest -Dreal-dialogue-session=real-dialogue-smoke-301c` -> passou; segundo turno `da google?` respondeu `Sim`.
+- Audit SQLite da sessao `real-dialogue-smoke-301c`: `recent_dialogue=2`, `raw_marker=0`, `memory_block=0`, `skills_block=0`.
+
 ## T295 - Implementar orchestrator final de MEMORY/SKILLS separado do SQLite operacional
 
 Status: pending-urgent.

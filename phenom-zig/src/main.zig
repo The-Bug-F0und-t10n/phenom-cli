@@ -253,10 +253,15 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         );
         defer if (model_context_text) |text| allocator.free(text);
         if (model_context_text) |text| try db.recordEvent(config.session, "model_context", text);
+        var dialogue_events = try db.loadRecentSessionEvents(allocator, config.session, 240);
+        defer audit.freeAuditEvents(allocator, &dialogue_events);
+        var dialogue_messages = try buildRecentChatMessages(allocator, dialogue_events.items, prompt);
+        defer freeChatMessages(allocator, &dialogue_messages);
 
         const inference_input = http.InferenceInput{
             .user_prompt = prompt,
             .model_context = model_context_text,
+            .dialogue = dialogue_messages.items,
         };
         client.streamInference(inference_input, &sink) catch |err| {
             const endpoint = client.endpointSummary(allocator) catch "unknown-endpoint";
@@ -1224,6 +1229,77 @@ fn loadHistoryFromDb(allocator: std.mem.Allocator, db: *audit.AuditDb, ui: anyty
     try ui.editor.loadHistoryNewestFirst(lines.items);
 }
 
+const max_chat_history_messages: usize = 8;
+const max_chat_message_bytes: usize = 1200;
+const chat_truncated_marker = " [TRUNCATED]";
+
+fn buildRecentChatMessages(allocator: std.mem.Allocator, events: []const audit.AuditEvent, current_prompt: []const u8) !std.ArrayList(http.ChatMessage) {
+    var messages = std.ArrayList(http.ChatMessage).empty;
+    errdefer freeChatMessages(allocator, &messages);
+    const current_prompt_index = latestCurrentPromptIndex(events, current_prompt);
+
+    for (events, 0..) |event, idx| {
+        if (std.mem.eql(u8, event.kind, "turn_start")) {
+            if (current_prompt_index != null and idx == current_prompt_index.?) continue;
+            try appendChatHistoryMessage(allocator, &messages, .user, event.body);
+        } else if (std.mem.eql(u8, event.kind, "assistant_delta")) {
+            try appendChatHistoryMessage(allocator, &messages, .assistant, event.body);
+        }
+        while (messages.items.len > max_chat_history_messages) {
+            allocator.free(messages.orderedRemove(0).content);
+        }
+    }
+
+    return messages;
+}
+
+fn appendChatHistoryMessage(allocator: std.mem.Allocator, messages: *std.ArrayList(http.ChatMessage), role: http.ChatRole, text: []const u8) !void {
+    if (text.len == 0) return;
+    const safe = try session_context.compactDialogueMessage(allocator, text);
+    errdefer allocator.free(safe);
+    if (safe.len == 0) {
+        allocator.free(safe);
+        return;
+    }
+    if (role == .assistant and messages.items.len > 0 and messages.items[messages.items.len - 1].role == .assistant) {
+        const old = messages.items[messages.items.len - 1].content;
+        const merged = try mergeChatContent(allocator, old, safe);
+        allocator.free(old);
+        allocator.free(safe);
+        messages.items[messages.items.len - 1].content = merged;
+        return;
+    }
+    try messages.append(allocator, .{ .role = role, .content = safe });
+}
+
+fn mergeChatContent(allocator: std.mem.Allocator, old: []const u8, extra: []const u8) ![]u8 {
+    if (old.len >= max_chat_message_bytes or std.mem.endsWith(u8, old, chat_truncated_marker)) return allocator.dupe(u8, old);
+    const remaining = max_chat_message_bytes - old.len;
+    const take = @min(remaining, extra.len);
+    const truncated = take < extra.len;
+    const marker_len = if (truncated) chat_truncated_marker.len else 0;
+    const merged = try allocator.alloc(u8, old.len + take + marker_len);
+    @memcpy(merged[0..old.len], old);
+    if (take > 0) @memcpy(merged[old.len .. old.len + take], extra[0..take]);
+    if (truncated) @memcpy(merged[old.len + take ..], chat_truncated_marker);
+    return merged;
+}
+
+fn freeChatMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(http.ChatMessage)) void {
+    for (messages.items) |message| allocator.free(message.content);
+    messages.deinit(allocator);
+}
+
+fn latestCurrentPromptIndex(events: []const audit.AuditEvent, current_prompt: []const u8) ?usize {
+    var i = events.len;
+    while (i > 0) {
+        i -= 1;
+        const event = events[i];
+        if (std.mem.eql(u8, event.kind, "turn_start") and std.mem.eql(u8, event.body, current_prompt)) return i;
+    }
+    return null;
+}
+
 const StreamSink = struct {
     allocator: std.mem.Allocator,
     events: *ui_events.EventBus,
@@ -1476,6 +1552,55 @@ test "initial model context reuses long session via fts without memory promotion
     try std.testing.expect(std.mem.indexOf(u8, rendered, "fora da sessao") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
+}
+
+test "recent chat messages preserve roles and exclude only current prompt event" {
+    var events = std.ArrayList(audit.AuditEvent).empty;
+    defer audit.freeAuditEvents(std.testing.allocator, &events);
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "ola"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "Ola!"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "qual e meu nome?"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "Voce aparece como ashirak."),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "ola"),
+    });
+
+    var messages = try buildRecentChatMessages(std.testing.allocator, events.items, "ola");
+    defer freeChatMessages(std.testing.allocator, &messages);
+
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expectEqual(http.ChatRole.user, messages.items[0].role);
+    try std.testing.expectEqualStrings("ola", messages.items[0].content);
+    try std.testing.expectEqual(http.ChatRole.assistant, messages.items[1].role);
+    try std.testing.expectEqualStrings("Ola!", messages.items[1].content);
+    try std.testing.expectEqual(http.ChatRole.user, messages.items[2].role);
+    try std.testing.expectEqualStrings("qual e meu nome?", messages.items[2].content);
+    try std.testing.expectEqual(http.ChatRole.assistant, messages.items[3].role);
+    try std.testing.expectEqualStrings("Voce aparece como ashirak.", messages.items[3].content);
+}
+
+test "recent chat assistant merge is bounded" {
+    const old = try std.testing.allocator.alloc(u8, max_chat_message_bytes - 2);
+    defer std.testing.allocator.free(old);
+    @memset(old, 'a');
+    const merged = try mergeChatContent(std.testing.allocator, old, "bbbb");
+    defer std.testing.allocator.free(merged);
+
+    try std.testing.expect(merged.len <= max_chat_message_bytes + chat_truncated_marker.len);
+    try std.testing.expect(std.mem.endsWith(u8, merged, chat_truncated_marker));
 }
 
 test "deferred stream sink buffers tool call text before rendering" {

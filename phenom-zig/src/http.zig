@@ -120,30 +120,14 @@ pub const LocalModelClient = struct {
         defer self.allocator.free(escaped_model);
 
         return switch (self.backend) {
-            .ollama => if (escaped_context) |context| try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"model\":\"{s}\",\"stream\":true,\"messages\":[{{\"role\":\"system\",\"content\":\"Responda de forma direta, curta e no idioma do usuario. Nao mostre raciocinio.\"}},{{\"role\":\"user\",\"content\":\"{s}\"}},{{\"role\":\"user\",\"content\":\"{s}\"}}],\"options\":{{\"temperature\":0.2,\"num_predict\":{}}}}}",
-                .{ escaped_model, context, escaped_prompt, self.max_tokens },
-            ) else try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"model\":\"{s}\",\"stream\":true,\"messages\":[{{\"role\":\"system\",\"content\":\"Responda de forma direta, curta e no idioma do usuario. Nao mostre raciocinio.\"}},{{\"role\":\"user\",\"content\":\"{s}\"}}],\"options\":{{\"temperature\":0.2,\"num_predict\":{}}}}}",
-                .{ escaped_model, escaped_prompt, self.max_tokens },
-            ),
+            .ollama => try self.buildOllamaBody(escaped_model, escaped_context, escaped_prompt, input.dialogue),
             .llamacpp => blk: {
                 const resolved_thinking = resolveThinking(self.thinking, input.user_prompt);
                 const generation_prefix = if (resolved_thinking == .on)
                     "<think>\n"
                 else
                     "<think>\n\n</think>\n\n";
-                const chat_prompt = if (input.model_context) |context| try std.fmt.allocPrint(
-                    self.allocator,
-                    "<|im_start|>system\nResponda de forma direta, curta e no idioma do usuario. Quando thinking estiver habilitado, use o bloco <think> somente para raciocinio interno e finalize com resposta visivel fora dele.<|im_end|>\n<|im_start|>user\n{s}<|im_end|>\n<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n{s}",
-                    .{ context, input.user_prompt, generation_prefix },
-                ) else try std.fmt.allocPrint(
-                    self.allocator,
-                    "<|im_start|>system\nResponda de forma direta, curta e no idioma do usuario. Quando thinking estiver habilitado, use o bloco <think> somente para raciocinio interno e finalize com resposta visivel fora dele.<|im_end|>\n<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n{s}",
-                    .{ input.user_prompt, generation_prefix },
-                );
+                const chat_prompt = try self.buildLlamaCppPrompt(input, generation_prefix);
                 defer self.allocator.free(chat_prompt);
                 const escaped_chat_prompt = try jsonEscape(self.allocator, chat_prompt);
                 defer self.allocator.free(escaped_chat_prompt);
@@ -155,11 +139,66 @@ pub const LocalModelClient = struct {
             },
         };
     }
+
+    fn buildOllamaBody(self: *LocalModelClient, escaped_model: []const u8, escaped_context: ?[]const u8, escaped_prompt: []const u8, dialogue: []const ChatMessage) ![]u8 {
+        var messages = std.ArrayList(u8).empty;
+        defer messages.deinit(self.allocator);
+        try messages.appendSlice(self.allocator, "{\"role\":\"system\",\"content\":\"Responda de forma direta, curta e no idioma do usuario. Nao mostre raciocinio.\"}");
+        if (escaped_context) |context| {
+            try messages.appendSlice(self.allocator, ",{\"role\":\"user\",\"content\":\"");
+            try messages.appendSlice(self.allocator, context);
+            try messages.appendSlice(self.allocator, "\"}");
+        }
+        for (dialogue) |message| {
+            const escaped = try jsonEscape(self.allocator, message.content);
+            defer self.allocator.free(escaped);
+            try messages.appendSlice(self.allocator, ",{\"role\":\"");
+            try messages.appendSlice(self.allocator, chatRoleName(message.role));
+            try messages.appendSlice(self.allocator, "\",\"content\":\"");
+            try messages.appendSlice(self.allocator, escaped);
+            try messages.appendSlice(self.allocator, "\"}");
+        }
+        try messages.appendSlice(self.allocator, ",{\"role\":\"user\",\"content\":\"");
+        try messages.appendSlice(self.allocator, escaped_prompt);
+        try messages.appendSlice(self.allocator, "\"}");
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"model\":\"{s}\",\"stream\":true,\"messages\":[{s}],\"options\":{{\"temperature\":0.2,\"num_predict\":{}}}}}",
+            .{ escaped_model, messages.items, self.max_tokens },
+        );
+    }
+
+    fn buildLlamaCppPrompt(self: *LocalModelClient, input: InferenceInput, generation_prefix: []const u8) ![]u8 {
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "<|im_start|>system\nResponda de forma direta, curta e no idioma do usuario. Quando thinking estiver habilitado, use o bloco <think> somente para raciocinio interno e finalize com resposta visivel fora dele.<|im_end|>\n");
+        if (input.model_context) |context| {
+            try appendChatMessage(&out, self.allocator, .user, context);
+        }
+        for (input.dialogue) |message| {
+            try appendChatMessage(&out, self.allocator, message.role, message.content);
+        }
+        try appendChatMessage(&out, self.allocator, .user, input.user_prompt);
+        try out.appendSlice(self.allocator, "<|im_start|>assistant\n");
+        try out.appendSlice(self.allocator, generation_prefix);
+        return out.toOwnedSlice(self.allocator);
+    }
+};
+
+pub const ChatRole = enum {
+    user,
+    assistant,
+};
+
+pub const ChatMessage = struct {
+    role: ChatRole,
+    content: []const u8,
 };
 
 pub const InferenceInput = struct {
     user_prompt: []const u8,
     model_context: ?[]const u8 = null,
+    dialogue: []const ChatMessage = &.{},
 };
 
 pub const ProbeResult = struct {
@@ -326,6 +365,21 @@ fn looksComplex(prompt: []const u8) bool {
         if (std.mem.indexOf(u8, prompt, needle) != null) return true;
     }
     return false;
+}
+
+fn appendChatMessage(out: *std.ArrayList(u8), allocator: std.mem.Allocator, role: ChatRole, content: []const u8) !void {
+    try out.appendSlice(allocator, "<|im_start|>");
+    try out.appendSlice(allocator, chatRoleName(role));
+    try out.append(allocator, '\n');
+    try out.appendSlice(allocator, content);
+    try out.appendSlice(allocator, "<|im_end|>\n");
+}
+
+fn chatRoleName(role: ChatRole) []const u8 {
+    return switch (role) {
+        .user => "user",
+        .assistant => "assistant",
+    };
 }
 
 const ParsedHost = struct {
@@ -741,6 +795,36 @@ test "ollama body can include model context as separate user message" {
     try std.testing.expect(context_idx < user_idx);
 }
 
+test "ollama body includes recent dialogue as real chat roles" {
+    var client = LocalModelClient{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1:11434",
+        .backend = .ollama,
+        .model = "phenom:latest",
+        .max_tokens = 64,
+        .thinking = .off,
+    };
+    const dialogue = [_]ChatMessage{
+        .{ .role = .user, .content = "qual e meu nome?" },
+        .{ .role = .assistant, .content = "Voce aparece como ashirak." },
+    };
+    const body = try client.buildBodyForInput(.{
+        .user_prompt = "e agora?",
+        .model_context = "[TURN_CONTEXT v1]\n",
+        .dialogue = &dialogue,
+    });
+    defer std.testing.allocator.free(body);
+
+    const context_idx = std.mem.indexOf(u8, body, "[TURN_CONTEXT v1]") orelse return error.MissingContext;
+    const prior_user_idx = std.mem.indexOf(u8, body, "qual e meu nome?") orelse return error.MissingPriorUser;
+    const prior_assistant_idx = std.mem.indexOf(u8, body, "Voce aparece como ashirak.") orelse return error.MissingPriorAssistant;
+    const current_idx = std.mem.indexOf(u8, body, "e agora?") orelse return error.MissingPrompt;
+    try std.testing.expect(context_idx < prior_user_idx);
+    try std.testing.expect(prior_user_idx < prior_assistant_idx);
+    try std.testing.expect(prior_assistant_idx < current_idx);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"assistant\"") != null);
+}
+
 test "llamacpp body can include model context before user request" {
     var client = LocalModelClient{
         .allocator = std.testing.allocator,
@@ -760,6 +844,35 @@ test "llamacpp body can include model context before user request" {
     const user_idx = std.mem.indexOf(u8, body, "corrija") orelse return error.MissingPrompt;
     try std.testing.expect(context_idx < user_idx);
     try std.testing.expect(std.mem.indexOf(u8, body, "<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n") != null);
+}
+
+test "llamacpp body includes recent dialogue before current user request" {
+    var client = LocalModelClient{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1:11434",
+        .backend = .llamacpp,
+        .model = "phenom:latest",
+        .max_tokens = 64,
+        .thinking = .off,
+    };
+    const dialogue = [_]ChatMessage{
+        .{ .role = .user, .content = "qual e meu nome?" },
+        .{ .role = .assistant, .content = "Voce aparece como ashirak." },
+    };
+    const body = try client.buildBodyForInput(.{
+        .user_prompt = "da google?",
+        .model_context = "[TURN_CONTEXT v1]\\n",
+        .dialogue = &dialogue,
+    });
+    defer std.testing.allocator.free(body);
+
+    const context_idx = std.mem.indexOf(u8, body, "[TURN_CONTEXT v1]") orelse return error.MissingContext;
+    const prior_user_idx = std.mem.indexOf(u8, body, "qual e meu nome?") orelse return error.MissingPriorUser;
+    const prior_assistant_idx = std.mem.indexOf(u8, body, "Voce aparece como ashirak.") orelse return error.MissingPriorAssistant;
+    const current_idx = std.mem.indexOf(u8, body, "da google?") orelse return error.MissingPrompt;
+    try std.testing.expect(context_idx < prior_user_idx);
+    try std.testing.expect(prior_user_idx < prior_assistant_idx);
+    try std.testing.expect(prior_assistant_idx < current_idx);
 }
 
 test "thinking auto resolves simple prompt off and code prompt on" {

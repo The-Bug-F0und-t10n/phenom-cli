@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) void {
     const real_prompt = b.option([]const u8, "real-prompt", "Real prompt for smoke test") orelse "Complete: PHENOM_REAL_7319";
     const real_expect = b.option([]const u8, "real-expect", "Expected visible text for smoke test") orelse "PHENOM_REAL_7319";
     const real_session = b.option([]const u8, "real-session", "Session id for multi-turn real smoke test") orelse "real-session-smoke-294";
+    const real_dialogue_session = b.option([]const u8, "real-dialogue-session", "Session id for dialogue continuity real smoke test") orelse "real-dialogue-smoke-301";
 
     const real_smoke_cmd = b.addRunArtifact(exe);
     real_smoke_cmd.step.dependOn(b.getInstallStep());
@@ -120,6 +121,59 @@ pub fn build(b: *std.Build) void {
 
     const real_session_smoke_step = b.step("real-session-smoke", "Opt-in two-turn session context smoke test. Requires active HOST:PORT.");
     real_session_smoke_step.dependOn(&real_session_recall_cmd.step);
+
+    const real_dialogue_seed_cmd = b.addRunArtifact(exe);
+    real_dialogue_seed_cmd.step.dependOn(b.getInstallStep());
+    real_dialogue_seed_cmd.addArgs(&.{
+        "chat",
+        "--backend",
+        real_backend,
+        "--host",
+        real_host,
+        "--model",
+        real_model,
+        "--session",
+        real_dialogue_session,
+        "--prompt",
+        "Responda exatamente: Sou um modelo da Google.",
+        "--max-tokens",
+        "160",
+        "--thinking",
+        "off",
+        "--expect-contains",
+        "Sou um modelo da Google.",
+        "--show-expect-status",
+        "--fail-on-model-error",
+        "--no-color",
+    });
+
+    const real_dialogue_followup_cmd = b.addRunArtifact(exe);
+    real_dialogue_followup_cmd.step.dependOn(&real_dialogue_seed_cmd.step);
+    real_dialogue_followup_cmd.addArgs(&.{
+        "chat",
+        "--backend",
+        real_backend,
+        "--host",
+        real_host,
+        "--model",
+        real_model,
+        "--session",
+        real_dialogue_session,
+        "--prompt",
+        "da google? Responda somente sim ou nao, considerando sua resposta anterior.",
+        "--max-tokens",
+        "220",
+        "--thinking",
+        "off",
+        "--expect-contains",
+        "Sim",
+        "--show-expect-status",
+        "--fail-on-model-error",
+        "--no-color",
+    });
+
+    const real_dialogue_smoke_step = b.step("real-dialogue-smoke", "Opt-in two-turn recent dialogue continuity smoke test. Requires active HOST:PORT.");
+    real_dialogue_smoke_step.dependOn(&real_dialogue_followup_cmd.step);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

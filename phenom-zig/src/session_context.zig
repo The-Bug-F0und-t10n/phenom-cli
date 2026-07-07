@@ -26,7 +26,7 @@ const Candidate = struct {
     score: usize,
 };
 
-const DialogueRole = enum {
+pub const DialogueRole = enum {
     user,
     assistant,
 };
@@ -71,10 +71,11 @@ pub fn renderRecent(allocator: std.mem.Allocator, events: []const audit.AuditEve
 pub fn renderRecentDialogue(allocator: std.mem.Allocator, events: []const audit.AuditEvent, current_prompt: []const u8) !?[]u8 {
     var entries = std.ArrayList(DialogueEntry).empty;
     errdefer freeDialogueEntries(allocator, &entries);
+    const current_prompt_index = latestCurrentPromptIndex(events, current_prompt);
 
-    for (events) |event| {
+    for (events, 0..) |event, idx| {
         if (std.mem.eql(u8, event.kind, "turn_start")) {
-            if (std.mem.eql(u8, event.body, current_prompt)) continue;
+            if (current_prompt_index != null and idx == current_prompt_index.?) continue;
             try appendDialogueEntry(allocator, &entries, .user, event.body);
         } else if (std.mem.eql(u8, event.kind, "assistant_delta")) {
             try appendDialogueEntry(allocator, &entries, .assistant, event.body);
@@ -110,6 +111,15 @@ pub fn renderRecentDialogue(allocator: std.mem.Allocator, events: []const audit.
     try model_context.assertNoRawContextLeak(rendered);
     freeDialogueEntries(allocator, &entries);
     return rendered;
+}
+
+pub fn compactDialogueMessage(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const compact_body = try compactOneLine(allocator, text, max_dialogue_entry_bytes);
+    defer allocator.free(compact_body);
+    const safe_body = try redactRawMarkers(allocator, compact_body);
+    errdefer allocator.free(safe_body);
+    try model_context.assertNoRawContextLeak(safe_body);
+    return safe_body;
 }
 
 pub fn search(allocator: std.mem.Allocator, events: []const audit.AuditEvent, terms: []const u8) !SearchResult {
@@ -240,6 +250,16 @@ fn freeDialogueEntries(allocator: std.mem.Allocator, entries: *std.ArrayList(Dia
     entries.deinit(allocator);
 }
 
+fn latestCurrentPromptIndex(events: []const audit.AuditEvent, current_prompt: []const u8) ?usize {
+    var i = events.len;
+    while (i > 0) {
+        i -= 1;
+        const event = events[i];
+        if (std.mem.eql(u8, event.kind, "turn_start") and std.mem.eql(u8, event.body, current_prompt)) return i;
+    }
+    return null;
+}
+
 fn scoreEvent(event: audit.AuditEvent, terms: []const u8) usize {
     var score: usize = 0;
     var it = std.mem.tokenizeAny(u8, terms, " \t\r\n\"'`()[]{}<>:;,");
@@ -304,6 +324,18 @@ fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
         if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
     }
     return null;
+}
+
+fn countNeedle(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0) return 0;
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start <= haystack.len) {
+        const idx = std.mem.indexOf(u8, haystack[start..], needle) orelse break;
+        count += 1;
+        start += idx + needle.len;
+    }
+    return count;
 }
 
 fn redactRawMarkers(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -448,6 +480,29 @@ test "recent dialogue preserves roles groups assistant deltas and excludes curre
     try std.testing.expect(std.mem.indexOf(u8, rendered, "assistant: primeira resposta") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "tool_start") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "pedido atual") == null);
+}
+
+test "recent dialogue excludes only latest current prompt occurrence" {
+    var events = std.ArrayList(audit.AuditEvent).empty;
+    defer audit.freeAuditEvents(std.testing.allocator, &events);
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "ola"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "resposta anterior"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "ola"),
+    });
+
+    const rendered = (try renderRecentDialogue(std.testing.allocator, events.items, "ola")) orelse return error.MissingDialogue;
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "user: ola") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "assistant: resposta anterior") != null);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(rendered, "user: ola"));
 }
 
 test "recent dialogue redacts raw markers" {
