@@ -9806,18 +9806,18 @@ Criterio de aceite:
 
 Status de completude em 2026-07-08:
 
-- Entregue: historico recente por roles reais, FTS5/BM25 em SQLite, `search_session(scope=current|all, session?)`, S# com `session=`, dedupe preservando ultimo `[SESSION_EVIDENCE]`, separacao de MEMORY/SKILLS e contexto operacional.
-- Nao entregue integralmente: garantia operacional de que o modelo sempre vai acionar `search_session` quando perguntar sobre assunto anterior e o dialogo recente estiver contaminado por respostas antigas incorretas.
-- Provado nesta etapa: smoke real reproduzivel com servidor ativo para o caso "eu estava falando sobre o que com voce?" na sessao `default`; o modelo recuperou `Matheus` e nao caiu em "nao tenho acesso ao historico".
+- Entregue: historico recente por roles reais, trilha `recent_user_topics`, FTS5/BM25 em SQLite, `search_session(scope=current|all, session?)`, S# com `session=`, contexto de turno nos hits de sessao, dedupe preservando ultimo `[SESSION_EVIDENCE]`, separacao de MEMORY/SKILLS e contexto operacional.
+- Nao entregue integralmente: sumarizacao longa de sessao e suite opt-in ampla para conversas longas/multissessao.
+- Provado nesta etapa: smoke real reproduzivel com servidor ativo para o caso "eu estava falando sobre o que com voce?" na sessao `default`; o modelo recuperou `Matheus` e nao caiu em "nao tenho acesso ao historico". Smoke real posterior com "entao por que voce nao pontuou isso nos assuntos..." acionou `search_session`, recebeu contexto de turno e respondeu usando o assunto de Mateus/Matheus.
 - Falta para 100%: completar sumarizacao longa de sessao e consolidar smokes de conversas longas/multissessao como suite opt-in antes de marcar a feature inteira como `done`.
-- Risco residual: a correcao remove contaminacao de turnos com `status=expectation_failed`/`status=model_error`, mas a garantia ampla de continuidade operacional ainda depende da cobertura dos smokes restantes.
+- Risco residual: existe um guard de reparo textual para negativa explicita de historico enquanto nao houver canal tipado de recusa/necessidade-de-contexto no protocolo do modelo; a garantia ampla de continuidade operacional ainda depende da cobertura dos smokes restantes.
 
 Implementacao desta etapa:
 
 - `phenom-zig/src/audit.zig` adiciona `events_fts` com FTS5/BM25 sobre SQLite operacional da sessao.
 - A busca de sessao e restrita por `session`, exclui o prompt atual e pesquisa somente `body`, nao metadados como `kind`, evitando falso positivo operacional.
 - `phenom-zig/src/session_context.zig` adiciona renderer de hits FTS como `[SESSION_EVIDENCE]` temporario, com `source=sqlite_audit_fts`, `semantic_search=fts5_bm25` e `raw_context_persisted=false`.
-- `phenom-zig/src/main.zig` injeta recuperacao longa pequena no contexto inicial via FTS, separada de `[RECENT_DIALOGUE]`, `[MEMORY]` e `[SKILLS]`.
+- `phenom-zig/src/main.zig` nao executa mais FTS inicial baseada no prompt do usuario; `[SESSION_CONTEXT]` pesquisavel entra por `search_session` guiado pelo modelo, enquanto `[RECENT_DIALOGUE]` carrega apenas continuidade e trilha compacta de topicos.
 - `search_session` deixa de carregar 2000 eventos em memoria e passa a usar SQLite FTS5/BM25 com termos definidos pelo modelo.
 - Correcao posterior: `search_session` agora aceita `scope=current|all` e `session?`, permitindo recuperacao operacional de qualquer sessao ativa/inativa gravada no SQLite quando o modelo pedir explicitamente.
 - Hits de sessao agora carregam `session=` no S#, para o modelo diferenciar evidencia da sessao atual, outra sessao especifica ou busca global.
@@ -9913,6 +9913,29 @@ Correcao posterior de contaminacao por turno falho:
 - Smoke real manual: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 900 --session default --prompt 'eu estava falando sobre o que com voce?' --expect-contains Matheus --show-expect-status --fail-on-model-error --no-color` -> passou; resposta recuperou `Matheus` e tambem citou outro assunto recente da sessao.
 - Instalacao local: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-release ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-release-cache install-local -Doptimize=ReleaseFast` -> passou.
 - Smoke real pelo binario instalado: `phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 900 --session default --prompt 'eu estava falando sobre o que com voce?' --expect-contains Matheus --show-expect-status --fail-on-model-error --no-color` -> passou.
+
+Correcao posterior de uso pratico dos assuntos da sessao:
+
+- Log real mostrou que o modelo conseguia "lembrar" palavras como Matheus, mas nao usava a sessao de forma util: respondia que nao havia evidencia/contexto mesmo com `recent_user_topics` e conversa anterior disponiveis.
+- Causa raiz 1: `loadRecentSessionEvents(..., 240)` carregava eventos brutos, entao centenas de `assistant_thinking_delta` expulsavam `turn_start` antigos e a lista de assuntos sumia.
+- Causa raiz 2: `buildInitialModelContext` ainda fazia FTS/BM25 inicial com o prompt bruto do usuario. Em prompt ambiguo, isso virava `prompt -> agente adivinha -> contexto ruim`, contrariando o fluxo definido: `prompt -> modelo define intencao -> agente executa contrato`.
+- Causa raiz 3: hits de `search_session` eram eventos soltos; o modelo recebia palavra encontrada, mas nao a unidade de conversa/assunto.
+- `phenom-zig/src/audit.zig`: `loadRecentSessionEvents` agora filtra apenas eventos uteis para contexto conversacional (`turn_start`, `assistant_delta`, tools/evidencias compactas e `turn_done`), ignorando thinking/model_context.
+- `phenom-zig/src/audit.zig`: cada `SessionSearchHit` agora carrega `event_id` e `turn_events`, do `turn_start` anterior ate antes do proximo `turn_start`, limitado e sem prompt atual.
+- `phenom-zig/src/session_context.zig`: `renderSearchHits` renderiza `unit=turn_context`, agrupa deltas tokenizados de `assistant_delta`, deduplica turns repetidos e mostra user/assistant/turn_done como unidade S#.
+- `phenom-zig/src/session_context.zig`: `recent_user_topics` aparece antes dos ultimos turnos no `[RECENT_DIALOGUE]`, para preservar mapa de assuntos sem promover para MEMORY/SKILLS.
+- `phenom-zig/src/main.zig`: remove FTS inicial baseada no prompt; `[SESSION_CONTEXT]` pesquisavel entra somente quando o modelo chama `search_session`.
+- `phenom-zig/src/main.zig`: adiciona guard de contrato para negativa explicita de historico/evidencia quando ha `recent_user_topics` e nenhuma `search_session` foi executada; nesse caso, o controlador faz uma segunda inferencia pedindo uma tool call `search_session` com termos escolhidos pelo modelo. Comentario `ponytail` marca o limite: substituir por canal tipado quando o protocolo do modelo suportar.
+- Revisao baixo nivel: `SessionSearchHit` agora possui `turn_events` owned e libera com `freeAuditEvents`; render de thread usa buffers owned e libera via `freeThreadEntries`; SQL usa binds parametrizados e statements finalizados com `defer`.
+- Unitarios: `recent session events ignore thinking noise for dialogue context`, `session fts hit carries whole turn context`, `session fts renderer merges tokenized assistant deltas inside turn context`, `initial model context does not run prompt based session fts`, `session recall denial repair requires topics and denial`.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/audit.zig -lc -lsqlite3` -> passou; 22 testes.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/session_context.zig -lc -lsqlite3` -> passou; 78 testes.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 190 testes.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-local-cache-6 test` -> passou.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-release ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-release-cache-6 -Doptimize=ReleaseFast` -> passou.
+- Smoke real manual: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 1600 --session default --prompt 'entao por que voce nao pontuou isso nos assuntos que voce lembra anteriormente?' --fail-on-model-error --no-color` -> passou no comportamento: controlador acionou `search_session`, evidencia veio como `unit=turn_context`, deltas antigos foram agrupados e a resposta usou o assunto de Mateus/Matheus.
+- Instalacao local: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-release ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-release-cache-6 install-local -Doptimize=ReleaseFast` -> passou.
+- Smoke real pelo binario instalado: `phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 1600 --session default --prompt 'entao por que voce nao pontuou isso nos assuntos que voce lembra anteriormente?' --fail-on-model-error --no-color` -> passou; acionou `search_session` e respondeu usando o assunto Mateus/Matheus.
 
 ## T295 - Implementar orchestrator final de MEMORY/SKILLS separado do SQLite operacional
 

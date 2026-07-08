@@ -17,16 +17,19 @@ pub const AuditEvent = struct {
 };
 
 pub const SessionSearchHit = struct {
+    event_id: i64,
     session: []u8,
     kind: []u8,
     body: []u8,
     score: f64,
     created_at_unix_s: ?i64 = null,
+    turn_events: std.ArrayList(AuditEvent) = .empty,
 
     pub fn deinit(self: *SessionSearchHit, allocator: std.mem.Allocator) void {
         allocator.free(self.session);
         allocator.free(self.kind);
         allocator.free(self.body);
+        freeAuditEvents(allocator, &self.turn_events);
     }
 };
 
@@ -268,6 +271,8 @@ pub const AuditDb = struct {
             \\  select id, kind, body, created_at
             \\  from events
             \\  where session = ?1
+            \\    and kind in ('turn_start', 'assistant_delta', 'tool_start', 'working_context_add', 'tool_duplicate', 'turn_done')
+            \\    and not (kind = 'tool_start' and body like 'search_session%')
             \\  order by id desc
             \\  limit ?2
             \\)
@@ -343,7 +348,7 @@ pub const AuditDb = struct {
         if (query.len == 0) return hits;
 
         const sql =
-            \\select e.session, e.kind, e.body, -bm25(events_fts) as rank_score, cast(strftime('%s', e.created_at) as integer)
+            \\select e.id, e.session, e.kind, e.body, -bm25(events_fts) as rank_score, cast(strftime('%s', e.created_at) as integer)
             \\from events_fts
             \\join events e on e.id = events_fts.rowid
             \\where events_fts match ?1
@@ -381,18 +386,96 @@ pub const AuditDb = struct {
             if (rc == c.SQLITE_DONE) break;
             if (rc != c.SQLITE_ROW) return error.SqliteStepFailed;
 
-            const hit_session = try dupeColumnText(allocator, stmt, 0);
+            const event_id = c.sqlite3_column_int64(stmt, 0);
+            const hit_session = try dupeColumnText(allocator, stmt, 1);
             errdefer allocator.free(hit_session);
-            const kind = try dupeColumnText(allocator, stmt, 1);
+            const kind = try dupeColumnText(allocator, stmt, 2);
             errdefer allocator.free(kind);
-            const body = try dupeColumnText(allocator, stmt, 2);
+            const body = try dupeColumnText(allocator, stmt, 3);
             errdefer allocator.free(body);
-            const score = c.sqlite3_column_double(stmt, 3);
-            const created_at_unix_s = if (c.sqlite3_column_type(stmt, 4) == c.SQLITE_NULL) null else @as(i64, @intCast(c.sqlite3_column_int64(stmt, 4)));
-            try hits.append(allocator, .{ .session = hit_session, .kind = kind, .body = body, .score = score, .created_at_unix_s = created_at_unix_s });
+            const score = c.sqlite3_column_double(stmt, 4);
+            const created_at_unix_s = if (c.sqlite3_column_type(stmt, 5) == c.SQLITE_NULL) null else @as(i64, @intCast(c.sqlite3_column_int64(stmt, 5)));
+            var turn_events = try self.loadSessionTurnEvents(allocator, hit_session, event_id, current_prompt, 12);
+            errdefer freeAuditEvents(allocator, &turn_events);
+            try hits.append(allocator, .{
+                .event_id = event_id,
+                .session = hit_session,
+                .kind = kind,
+                .body = body,
+                .score = score,
+                .created_at_unix_s = created_at_unix_s,
+                .turn_events = turn_events,
+            });
         }
 
         return hits;
+    }
+
+    fn loadSessionTurnEvents(
+        self: *AuditDb,
+        allocator: std.mem.Allocator,
+        session: []const u8,
+        event_id: i64,
+        current_prompt: []const u8,
+        limit: usize,
+    ) !std.ArrayList(AuditEvent) {
+        if (limit > std.math.maxInt(c_int)) return error.EventLimitTooLarge;
+        const sql =
+            \\with start_bound(start_id) as (
+            \\  select coalesce(
+            \\    (select max(id) from events where session = ?1 and id <= ?2 and kind = 'turn_start'),
+            \\    ?2
+            \\  )
+            \\),
+            \\end_bound(end_id) as (
+            \\  select coalesce(
+            \\    (select min(id) from events, start_bound where session = ?1 and id > start_id and kind = 'turn_start'),
+            \\    9223372036854775807
+            \\  )
+            \\)
+            \\select kind, body, cast(strftime('%s', created_at) as integer)
+            \\from events, start_bound, end_bound
+            \\where session = ?1
+            \\  and id >= start_id
+            \\  and id < end_id
+            \\  and body <> ?3
+            \\  and kind in ('turn_start', 'assistant_delta', 'tool_start', 'working_context_add', 'tool_duplicate', 'turn_done')
+            \\  and not (kind = 'tool_start' and body like 'search_session%')
+            \\order by id asc
+            \\limit ?4
+        ;
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        const z_session = try self.allocator.dupeZ(u8, session);
+        defer self.allocator.free(z_session);
+        const z_prompt = try self.allocator.dupeZ(u8, current_prompt);
+        defer self.allocator.free(z_prompt);
+
+        if (c.sqlite3_bind_text(stmt, 1, z_session.ptr, @as(c_int, @intCast(session.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_int64(stmt, 2, event_id) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_text(stmt, 3, z_prompt.ptr, @as(c_int, @intCast(current_prompt.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_int(stmt, 4, @as(c_int, @intCast(limit))) != c.SQLITE_OK) return error.SqliteBindFailed;
+
+        var events = std.ArrayList(AuditEvent).empty;
+        errdefer freeAuditEvents(allocator, &events);
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStepFailed;
+
+            const kind = try dupeColumnText(allocator, stmt, 0);
+            errdefer allocator.free(kind);
+            const body = try dupeColumnText(allocator, stmt, 1);
+            errdefer allocator.free(body);
+            const created_at_unix_s = if (c.sqlite3_column_type(stmt, 2) == c.SQLITE_NULL) null else @as(i64, @intCast(c.sqlite3_column_int64(stmt, 2)));
+            try events.append(allocator, .{ .kind = kind, .body = body, .created_at_unix_s = created_at_unix_s });
+        }
+        return events;
     }
 };
 
@@ -518,6 +601,25 @@ test "recent session events keep newest events in chronological order" {
     try std.testing.expectEqualStrings("new", events.items[1].body);
 }
 
+test "recent session events ignore thinking noise for dialogue context" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordEvent("s1", "turn_start", "assunto antigo importante");
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try db.recordEvent("s1", "assistant_thinking_delta", "token de pensamento");
+    }
+    try db.recordEvent("s1", "assistant_delta", "resposta final");
+
+    var events = try db.loadRecentSessionEvents(std.testing.allocator, "s1", 2);
+    defer freeAuditEvents(std.testing.allocator, &events);
+
+    try std.testing.expectEqual(@as(usize, 2), events.items.len);
+    try std.testing.expectEqualStrings("turn_start", events.items[0].kind);
+    try std.testing.expectEqualStrings("assistant_delta", events.items[1].kind);
+}
+
 test "session fts searches body by session and excludes current prompt" {
     var db = try AuditDb.open(std.testing.allocator, ":memory:");
     defer db.close();
@@ -538,7 +640,33 @@ test "session fts searches body by session and excludes current prompt" {
         try std.testing.expect(std.mem.indexOf(u8, hit.body, "pergunta atual") == null);
         try std.testing.expect(std.mem.indexOf(u8, hit.body, "outra sessao") == null);
         try std.testing.expect(!std.mem.eql(u8, hit.kind, "model_context"));
+        try std.testing.expect(hit.turn_events.items.len > 0);
     }
+}
+
+test "session fts hit carries whole turn context" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordEvent("s1", "turn_start", "qual a matematica perfeita de Matheus 1 na biblia");
+    try db.recordEvent("s1", "assistant_delta", "falamos sobre Mateus 1 e genealogia de Jesus");
+    try db.recordEvent("s1", "turn_done", "status=ok elapsed_ms=1000");
+    try db.recordEvent("s1", "turn_start", "pergunta atual");
+
+    var hits = try db.searchSessionEventsFts(std.testing.allocator, "s1", "Matheus genealogia", "pergunta atual", 10);
+    defer freeSessionSearchHits(std.testing.allocator, &hits);
+
+    try std.testing.expect(hits.items.len >= 1);
+    try std.testing.expect(hits.items[0].event_id > 0);
+    try std.testing.expectEqualStrings("turn_start", hits.items[0].turn_events.items[0].kind);
+    var saw_assistant = false;
+    for (hits.items[0].turn_events.items) |event| {
+        if (std.mem.eql(u8, event.kind, "assistant_delta") and std.mem.indexOf(u8, event.body, "genealogia") != null) {
+            saw_assistant = true;
+        }
+        try std.testing.expect(std.mem.indexOf(u8, event.body, "pergunta atual") == null);
+    }
+    try std.testing.expect(saw_assistant);
 }
 
 test "session fts does not match operational kind metadata" {

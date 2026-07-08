@@ -288,7 +288,11 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
                 if (config.fail_on_model_error) return err;
                 break :blk true;
             };
-            if (!handled_by_tool_loop) try sink.flushDeferredVisible();
+            const handled_after_repair = if (!handled_by_tool_loop and shouldRepairSessionRecallDenial(model_context_text, sink.raw_visible.items))
+                try repairSessionRecallDenial(allocator, io, config, prompt, model_context_text, &client, &events, &db, ui_ptr, &sink)
+            else
+                handled_by_tool_loop;
+            if (!handled_after_repair) try sink.flushDeferredVisible();
         }
         if (sink.visible_bytes == 0) {
             try events.emit(.{ .progress_update = "model emitted no visible final answer; reasoning was suppressed or generation ended inside <think>" });
@@ -338,6 +342,97 @@ fn recordAndEmitTurnDone(
     try events.emit(.{ .turn_done = .{ .elapsed_ms = elapsed_ms } });
 }
 
+fn shouldRepairSessionRecallDenial(model_context_text: ?[]const u8, visible: []const u8) bool {
+    const context = model_context_text orelse return false;
+    if (std.mem.indexOf(u8, context, "recent_user_topics:") == null) return false;
+    if (std.mem.indexOf(u8, visible, "<tool_call>") != null) return false;
+    return containsSessionDenial(visible);
+}
+
+fn containsSessionDenial(text: []const u8) bool {
+    // ponytail: surface contract guard; replace with a typed refusal channel when the model protocol exposes one.
+    const markers = [_][]const u8{
+        "Não tenho evidência",
+        "Nao tenho evidencia",
+        "Não tenho acesso",
+        "Nao tenho acesso",
+        "não há contexto",
+        "nao ha contexto",
+        "no evidence",
+        "no context",
+        "don't have access",
+        "do not have access",
+    };
+    for (markers) |marker| {
+        if (indexOfAsciiIgnoreCase(text, marker) != null) return true;
+    }
+    return false;
+}
+
+fn indexOfAsciiIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
+fn repairSessionRecallDenial(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: cli.Config,
+    prompt: []const u8,
+    model_context_text: ?[]const u8,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+) !bool {
+    const base_context = model_context_text orelse return false;
+    try db.recordEvent(config.session, "tool_repair", "session recall denial without search_session");
+    const repair_context = try std.fmt.allocPrint(
+        allocator,
+        "{s}\n\n[CONTRACT_REPAIR]\nThe previous draft denied session context while [RECENT_DIALOGUE] includes recent_user_topics. Do not answer yet. Emit exactly one search_session tool call with model-chosen terms that describe the prior conversation topic needed to answer the user. Use scope=current first; use scope=all only if current session evidence is insufficient.\n",
+        .{base_context},
+    );
+    defer allocator.free(repair_context);
+    try db.recordEvent(config.session, "model_context", repair_context);
+
+    if (ui_ptr) |active_ui| try active_ui.showStatus("Thinking");
+    var repair_sink = StreamSink{
+        .allocator = allocator,
+        .events = events,
+        .db = db,
+        .session = config.session,
+        .ui = ui_ptr,
+        .filter = reasoning_filter.ReasoningFilter.init(allocator, http.resolveThinking(config.thinking, prompt) == .on),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = true,
+        .trim_visible_leading_whitespace = false,
+    };
+    defer repair_sink.deinit();
+
+    const empty_dialogue: []const http.ChatMessage = &.{};
+    try client.streamInference(.{
+        .user_prompt = prompt,
+        .model_context = repair_context,
+        .dialogue = empty_dialogue,
+    }, &repair_sink);
+    try repair_sink.flush();
+
+    const handled = try runToolLoopIterations(allocator, io, config, prompt, repair_sink.raw_visible.items, client, events, db, ui_ptr, aggregate_sink);
+    if (handled) return true;
+
+    aggregate_sink.raw_visible.clearRetainingCapacity();
+    try aggregate_sink.raw_visible.appendSlice(allocator, repair_sink.raw_visible.items);
+    return false;
+}
+
 fn buildInitialModelContext(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -363,17 +458,7 @@ fn buildInitialModelContext(
     const dialogue_blocks = try session_context.toDialogueBlocks(allocator, recent_dialogue);
     defer allocator.free(dialogue_blocks);
 
-    var session_hits = try db.searchSessionEventsFts(allocator, session, prompt, prompt, 4);
-    defer audit.freeSessionSearchHits(allocator, &session_hits);
-    const session_recall = if (session_hits.items.len > 0)
-        try session_context.renderSearchHits(allocator, session_hits.items)
-    else
-        null;
-    defer if (session_recall) |result| result.deinit(allocator);
-    const session_blocks = try session_context.toSessionBlocks(
-        allocator,
-        if (session_recall) |result| result.text else null,
-    );
+    const session_blocks = try session_context.toSessionBlocks(allocator, null);
     defer allocator.free(session_blocks);
 
     return try model_context.renderModelTurnContext(allocator, .{
@@ -1620,7 +1705,19 @@ test "search session scope is model selected without linguistic inference" {
     try std.testing.expectEqualStrings("scope=all session= terms=w-90 bootstrap", key);
 }
 
-test "initial model context reuses long session via fts without memory promotion" {
+test "session recall denial repair requires topics and denial" {
+    const context =
+        \\[RECENT_DIALOGUE]
+        \\source=sqlite_audit temporary=true raw_context_persisted=false not_evidence=true
+        \\recent_user_topics:
+        \\- T1: qual a matematica perfeita de Matheus 1
+    ;
+    try std.testing.expect(shouldRepairSessionRecallDenial(context, "Não tenho evidência sobre isso."));
+    try std.testing.expect(!shouldRepairSessionRecallDenial(context, "Falamos sobre Matheus 1 e Bootstrap."));
+    try std.testing.expect(!shouldRepairSessionRecallDenial(null, "Não tenho evidência sobre isso."));
+}
+
+test "initial model context does not run prompt based session fts" {
     var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
     defer db.close();
 
@@ -1640,9 +1737,9 @@ test "initial model context reuses long session via fts without memory promotion
     defer std.testing.allocator.free(rendered);
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[RECENT_DIALOGUE]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SESSION_CONTEXT]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "source=sqlite_audit_fts") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "semantic_search=fts5_bm25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "source=sqlite_audit_fts") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "semantic_search=fts5_bm25") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "- S1") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "renderer append-only deve manter terminal copiavel") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "turn_start: renderer append-only pergunta atual") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "fora da sessao") == null);

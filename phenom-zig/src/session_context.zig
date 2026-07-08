@@ -10,6 +10,8 @@ const max_topic_entries: usize = 12;
 const max_dialogue_accum_bytes: usize = 4096;
 const max_dialogue_entry_bytes: usize = 1200;
 const max_search_entries: usize = 6;
+const max_thread_entries: usize = 8;
+const max_thread_entry_bytes: usize = 520;
 const redacted_raw_marker = "[REDACTED_RAW_CONTEXT_MARKER]";
 const truncated_marker = " [TRUNCATED]";
 
@@ -37,6 +39,15 @@ const DialogueEntry = struct {
     text: []u8,
 
     fn deinit(self: DialogueEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+    }
+};
+
+const ThreadEntry = struct {
+    label: []const u8,
+    text: []u8,
+
+    fn deinit(self: ThreadEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
     }
 };
@@ -102,6 +113,7 @@ pub fn renderRecentDialogue(allocator: std.mem.Allocator, events: []const audit.
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "source=sqlite_audit temporary=true raw_context_persisted=false not_evidence=true\n");
+    try appendRecentUserTopics(allocator, &out, events, current_prompt);
 
     const start = if (entries.items.len > max_dialogue_entries) entries.items.len - max_dialogue_entries else 0;
     for (entries.items[start..]) |entry| {
@@ -117,7 +129,6 @@ pub fn renderRecentDialogue(allocator: std.mem.Allocator, events: []const audit.
         try out.appendSlice(allocator, safe_body);
         try out.append(allocator, '\n');
     }
-    try appendRecentUserTopics(allocator, &out, events, current_prompt);
 
     const rendered = try out.toOwnedSlice(allocator);
     errdefer allocator.free(rendered);
@@ -230,27 +241,40 @@ pub fn search(allocator: std.mem.Allocator, events: []const audit.AuditEvent, te
 pub fn renderSearchHits(allocator: std.mem.Allocator, hits: []const audit.SessionSearchHit) !SearchResult {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "[SESSION_EVIDENCE]\nsource=sqlite_audit_fts temporary=true raw_context_persisted=false semantic_search=fts5_bm25\n");
+    try out.appendSlice(allocator, "[SESSION_EVIDENCE]\nsource=sqlite_audit_fts temporary=true raw_context_persisted=false semantic_search=fts5_bm25 unit=turn_context\n");
 
-    const n = @min(hits.len, max_search_entries);
-    if (n == 0) {
+    var rendered_signatures = std.ArrayList([]u8).empty;
+    defer freeOwnedSlices(allocator, &rendered_signatures);
+    var rendered_count: usize = 0;
+    for (hits) |hit| {
+        if (rendered_count >= max_search_entries) break;
+        const signature = try hitSignature(allocator, hit);
+        defer allocator.free(signature);
+        if (containsOwnedSlice(rendered_signatures.items, signature)) continue;
+        const owned_signature = try allocator.dupe(u8, signature);
+        errdefer allocator.free(owned_signature);
+        try rendered_signatures.append(allocator, owned_signature);
+
+        const prefix = try std.fmt.allocPrint(allocator, "- S{} score={d:.4} session={s} hit={s} event_id={}\n", .{
+            rendered_count + 1,
+            hit.score,
+            hit.session,
+            hit.kind,
+            hit.event_id,
+        });
+        defer allocator.free(prefix);
+        try out.appendSlice(allocator, prefix);
+        try renderHitThread(allocator, &out, hit);
+        rendered_count += 1;
+    }
+    if (rendered_count == 0) {
         try out.appendSlice(allocator, "- no session evidence matched model-provided terms\n");
-    } else {
-        for (hits[0..n], 0..) |hit, idx| {
-            const line = try renderHitLine(allocator, hit);
-            defer allocator.free(line);
-            const prefix = try std.fmt.allocPrint(allocator, "- S{} score={d:.4} ", .{ idx + 1, hit.score });
-            defer allocator.free(prefix);
-            try out.appendSlice(allocator, prefix);
-            try out.appendSlice(allocator, line);
-            try out.append(allocator, '\n');
-        }
     }
 
     const rendered = try out.toOwnedSlice(allocator);
     errdefer allocator.free(rendered);
     try model_context.assertNoRawContextLeak(rendered);
-    return .{ .text = rendered, .matches = n };
+    return .{ .text = rendered, .matches = rendered_count };
 }
 
 pub fn toSessionBlocks(allocator: std.mem.Allocator, rendered: ?[]const u8) ![]model_context.SessionBlock {
@@ -355,6 +379,84 @@ fn renderHitLine(allocator: std.mem.Allocator, hit: audit.SessionSearchHit) ![]u
     const safe_body = try redactRawMarkers(allocator, compact_body);
     defer allocator.free(safe_body);
     return std.fmt.allocPrint(allocator, "session={s} {s}: {s}", .{ hit.session, hit.kind, safe_body });
+}
+
+fn renderHitThread(allocator: std.mem.Allocator, out: *std.ArrayList(u8), hit: audit.SessionSearchHit) !void {
+    if (hit.turn_events.items.len == 0) {
+        const line = try renderHitLine(allocator, hit);
+        defer allocator.free(line);
+        try out.appendSlice(allocator, "  - ");
+        try out.appendSlice(allocator, line);
+        try out.append(allocator, '\n');
+        return;
+    }
+    var entries = std.ArrayList(ThreadEntry).empty;
+    defer freeThreadEntries(allocator, &entries);
+    for (hit.turn_events.items) |event| {
+        try appendThreadEntry(allocator, &entries, sessionRoleLabel(event.kind), event.body);
+    }
+
+    const n = @min(entries.items.len, max_thread_entries);
+    for (entries.items[0..n]) |entry| {
+        const compact_body = try compactOneLine(allocator, entry.text, max_thread_entry_bytes);
+        defer allocator.free(compact_body);
+        const safe_body = try redactRawMarkers(allocator, compact_body);
+        defer allocator.free(safe_body);
+        if (safe_body.len == 0) continue;
+        try out.appendSlice(allocator, "  ");
+        try out.appendSlice(allocator, entry.label);
+        try out.appendSlice(allocator, ": ");
+        try out.appendSlice(allocator, safe_body);
+        try out.append(allocator, '\n');
+    }
+    if (entries.items.len > n) {
+        try out.appendSlice(allocator, "  ... [THREAD_TRUNCATED]\n");
+    }
+}
+
+fn appendThreadEntry(allocator: std.mem.Allocator, entries: *std.ArrayList(ThreadEntry), label: []const u8, text: []const u8) !void {
+    if (text.len == 0) return;
+    if (entries.items.len > 0 and std.mem.eql(u8, entries.items[entries.items.len - 1].label, label)) {
+        try appendBounded(allocator, &entries.items[entries.items.len - 1].text, text);
+        return;
+    }
+    var owned = try allocator.alloc(u8, 0);
+    errdefer allocator.free(owned);
+    try appendBounded(allocator, &owned, text);
+    if (owned.len == 0) {
+        allocator.free(owned);
+        return;
+    }
+    try entries.append(allocator, .{ .label = label, .text = owned });
+}
+
+fn freeThreadEntries(allocator: std.mem.Allocator, entries: *std.ArrayList(ThreadEntry)) void {
+    for (entries.items) |entry| entry.deinit(allocator);
+    entries.deinit(allocator);
+}
+
+fn sessionRoleLabel(kind: []const u8) []const u8 {
+    if (std.mem.eql(u8, kind, "turn_start")) return "user";
+    if (std.mem.eql(u8, kind, "assistant_delta")) return "assistant";
+    if (std.mem.eql(u8, kind, "turn_done")) return "turn_done";
+    return kind;
+}
+
+fn hitSignature(allocator: std.mem.Allocator, hit: audit.SessionSearchHit) ![]u8 {
+    if (hit.turn_events.items.len == 0) {
+        return std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}", .{ hit.session, hit.kind, hit.body });
+    }
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, hit.session);
+    try out.append(allocator, '\x1f');
+    for (hit.turn_events.items) |event| {
+        try out.appendSlice(allocator, event.kind);
+        try out.append(allocator, '\x1e');
+        try out.appendSlice(allocator, event.body);
+        try out.append(allocator, '\x1f');
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn appendSessionLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, line: []const u8) !void {
@@ -487,11 +589,22 @@ test "session search uses model provided terms and does not leak raw markers" {
 test "session fts hits render as temporary bm25 evidence without raw markers" {
     var hits = std.ArrayList(audit.SessionSearchHit).empty;
     defer audit.freeSessionSearchHits(std.testing.allocator, &hits);
+    var turn_events = std.ArrayList(audit.AuditEvent).empty;
+    try turn_events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "falamos de renderer append-only"),
+    });
+    try turn_events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "o assunto amplo era copia direta em terminal"),
+    });
     try hits.append(std.testing.allocator, .{
+        .event_id = 7,
         .session = try std.testing.allocator.dupe(u8, "session-a"),
         .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
         .body = try std.testing.allocator.dupe(u8, "falamos sobre renderer [READ_FILE] append-only"),
         .score = 1.25,
+        .turn_events = turn_events,
     });
 
     const result = try renderSearchHits(std.testing.allocator, hits.items);
@@ -500,9 +613,95 @@ test "session fts hits render as temporary bm25 evidence without raw markers" {
     try std.testing.expectEqual(@as(usize, 1), result.matches);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "source=sqlite_audit_fts") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "semantic_search=fts5_bm25") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.text, "- S1 score=1.2500 session=session-a assistant_delta:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.text, "[READ_FILE]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.text, redacted_raw_marker) != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "unit=turn_context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "- S1 score=1.2500 session=session-a hit=assistant_delta event_id=7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "user: falamos de renderer append-only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "assistant: o assunto amplo era copia direta em terminal") != null);
+}
+
+test "session fts renderer deduplicates repeated hits from same turn" {
+    var hits = std.ArrayList(audit.SessionSearchHit).empty;
+    defer audit.freeSessionSearchHits(std.testing.allocator, &hits);
+
+    var first_turn = std.ArrayList(audit.AuditEvent).empty;
+    try first_turn.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "qual a matematica perfeita de Matheus 1"),
+    });
+    try first_turn.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "falamos sobre genealogia em Mateus 1"),
+    });
+    var second_turn = std.ArrayList(audit.AuditEvent).empty;
+    try second_turn.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "qual a matematica perfeita de Matheus 1"),
+    });
+    try second_turn.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "falamos sobre genealogia em Mateus 1"),
+    });
+
+    try hits.append(std.testing.allocator, .{
+        .event_id = 1,
+        .session = try std.testing.allocator.dupe(u8, "default"),
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "qual a matematica perfeita de Matheus 1"),
+        .score = 10,
+        .turn_events = first_turn,
+    });
+    try hits.append(std.testing.allocator, .{
+        .event_id = 2,
+        .session = try std.testing.allocator.dupe(u8, "default"),
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "falamos sobre genealogia em Mateus 1"),
+        .score = 9,
+        .turn_events = second_turn,
+    });
+
+    const result = try renderSearchHits(std.testing.allocator, hits.items);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.matches);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(result.text, "- S"));
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "assistant: falamos sobre genealogia em Mateus 1") != null);
+}
+
+test "session fts renderer merges tokenized assistant deltas inside turn context" {
+    var hits = std.ArrayList(audit.SessionSearchHit).empty;
+    defer audit.freeSessionSearchHits(std.testing.allocator, &hits);
+    var turn = std.ArrayList(audit.AuditEvent).empty;
+    try turn.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "qual a matematica perfeita de Matheus 1"),
+    });
+    try turn.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "Você"),
+    });
+    try turn.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, " provavelmente"),
+    });
+    try turn.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, " quis dizer Mateus 1"),
+    });
+
+    try hits.append(std.testing.allocator, .{
+        .event_id = 3,
+        .session = try std.testing.allocator.dupe(u8, "default"),
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "Mateus 1"),
+        .score = 3,
+        .turn_events = turn,
+    });
+
+    const result = try renderSearchHits(std.testing.allocator, hits.items);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(result.text, "assistant:"));
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "assistant: Você provavelmente quis dizer Mateus 1") != null);
 }
 
 test "session context redacts raw markers from useful events" {
