@@ -19,9 +19,9 @@ Motivacao:
 
 Regra preservada: as tasks existentes continuam validas como requisitos de produto e criterios de aceite. Qualquer port do TS deve ser tratado como migracao seletiva de comportamento, nao copia estrutural.
 
-Decisao revisada em 2026-07-04: antes de assumir Rust como base final, sera implementado um spike rapido em Zig + C. A motivacao e filosofica e operacional: controle maior do runtime, arquitetura 100% pertencente ao Phenom, menor dependencia de crates/frameworks, terminal previsivel e possibilidade de otimizar as primitivas necessarias. Rust continua como referencia comparativa, mas o alvo preferencial passa a ser Zig + C se o spike provar renderer, HTTP local streaming, SQLite, gate, evidencia, snapshots e build release.
+Decisao atual revisada em 2026-07-08: o Phenom em Zig + C nao deve mais ser tratado como spike, MVP ou prototipo. Esta arvore e o produto final em fase de construcao. A motivacao e filosofica e operacional: controle maior do runtime, arquitetura 100% pertencente ao Phenom, menor dependencia de crates/frameworks, terminal previsivel e possibilidade de otimizar as primitivas necessarias. Rust continua como referencia comparativa, mas o alvo atual de produto e Zig + C.
 
-Regra do spike Zig + C:
+Regra do produto Zig + C:
 
 - Core em Zig.
 - Interop C para primitivas maduras, especialmente SQLite e futuramente TLS/HTTP publico/tree-sitter quando necessario.
@@ -46,6 +46,8 @@ Principios obrigatorios:
 - O modelo deve escolher usando contratos e ferramentas anunciadas.
 - O controller pode validar protocolo, seguranca, estado, consistencia, memoria e parada.
 - O projeto deve respeitar limitacoes do modelo pequeno com contexto compacto, evidencia destilada e reparo operacional, sem reduzir desnecessariamente sua autonomia.
+- Status de task deve ser honesto: `done` so pode ser usado quando a feature cumprir 100% do objetivo descrito, com testes e smokes pertinentes. Implementacao parcial deve ser marcada como `partial`, `pending-urgent` ou `blocked`, explicando quais partes foram entregues, quantas partes faltam e o que impede considerar a feature plenamente utilizavel.
+- Mensagem final de task nao pode dizer "corrigido", "pronto" ou "implementado" sem separar: comportamento provado, comportamento parcial, smoke real executado, smoke real pendente e riscos residuais.
 
 ## Invariantes de confiabilidade para uso real
 
@@ -9248,7 +9250,7 @@ Motivacao: `alinhamento.md` concluiu que o `phenom-zig` corrigiu base tecnica im
 
 ## T281 - Tornar `alinhamento.md` gate obrigatorio de task executavel
 
-Status: done.
+Status: partial.
 
 Prioridade: urgente.
 
@@ -9802,6 +9804,14 @@ Criterio de aceite:
 - Conversa recente funciona como continuidade, nao como evidencia litigiosa.
 - Sessao longa e recuperavel sem mandar historico bruto inteiro.
 
+Status de completude em 2026-07-08:
+
+- Entregue: historico recente por roles reais, FTS5/BM25 em SQLite, `search_session(scope=current|all, session?)`, S# com `session=`, dedupe preservando ultimo `[SESSION_EVIDENCE]`, separacao de MEMORY/SKILLS e contexto operacional.
+- Nao entregue integralmente: garantia operacional de que o modelo sempre vai acionar `search_session` quando perguntar sobre assunto anterior e o dialogo recente estiver contaminado por respostas antigas incorretas.
+- Provado nesta etapa: smoke real reproduzivel com servidor ativo para o caso "eu estava falando sobre o que com voce?" na sessao `default`; o modelo recuperou `Matheus` e nao caiu em "nao tenho acesso ao historico".
+- Falta para 100%: completar sumarizacao longa de sessao e consolidar smokes de conversas longas/multissessao como suite opt-in antes de marcar a feature inteira como `done`.
+- Risco residual: a correcao remove contaminacao de turnos com `status=expectation_failed`/`status=model_error`, mas a garantia ampla de continuidade operacional ainda depende da cobertura dos smokes restantes.
+
 Implementacao desta etapa:
 
 - `phenom-zig/src/audit.zig` adiciona `events_fts` com FTS5/BM25 sobre SQLite operacional da sessao.
@@ -9886,6 +9896,23 @@ Correcao posterior de duplicata em `search_session`:
 - Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` em `phenom-zig/` -> passou.
 - Validacao: `sh tools/check_alignment_tasks.sh` -> passou.
 - Smoke real tentado com a pergunta do log (`eu estava falando sobre o que com voce?`) na sessao `default`, mas o servidor `192.168.1.122:11434` falhou com `ConnectFailed` depois de `2m16s`; `curl --max-time 5 http://192.168.1.122:11434/` retornou timeout. Resultado real fica pendente por infraestrutura, nao por falha de teste/unit/build.
+
+Correcao posterior de contaminacao por turno falho:
+
+- Log real mostrou que o modelo continuava respondendo "Nao tenho acesso ao historico" mesmo quando `[SESSION_CONTEXT]` ja continha evidencia correta de `Matheus 1`.
+- Causa raiz: respostas de turnos encerrados com `turn_done status=expectation_failed` ainda entravam em `[RECENT_DIALOGUE]` e no chat history real como mensagens `assistant`, contaminando a proxima inferencia.
+- `phenom-zig/src/session_context.zig` agora remove do dialogo recente o turno inteiro quando `turn_done` tem `status=expectation_failed` ou `status=model_error`.
+- `phenom-zig/src/main.zig` aplica o mesmo criterio ao chat history real enviado ao backend e tambem ignora deltas pertencentes ao `turn_start` atual.
+- Revisao baixo nivel: truncamento libera slices owned antes de reduzir `ArrayList`; nao ha ponteiro emprestado novo; criterio usa status auditavel, nao heuristica linguistica.
+- Unitarios: `recent dialogue excludes failed turn assistant output by audit status` e `recent chat messages exclude failed assistant turns by audit status`.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/session_context.zig -lc -lsqlite3` -> passou; 74 testes.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 185 testes.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-local-cache test` -> passou.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-release ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-release-cache -Doptimize=ReleaseFast` -> passou.
+- Validacao: `sh ../tools/check_alignment_tasks.sh` -> passou.
+- Smoke real manual: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 900 --session default --prompt 'eu estava falando sobre o que com voce?' --expect-contains Matheus --show-expect-status --fail-on-model-error --no-color` -> passou; resposta recuperou `Matheus` e tambem citou outro assunto recente da sessao.
+- Instalacao local: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-release ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-release-cache install-local -Doptimize=ReleaseFast` -> passou.
+- Smoke real pelo binario instalado: `phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 900 --session default --prompt 'eu estava falando sobre o que com voce?' --expect-contains Matheus --show-expect-status --fail-on-model-error --no-color` -> passou.
 
 ## T295 - Implementar orchestrator final de MEMORY/SKILLS separado do SQLite operacional
 

@@ -1,22 +1,27 @@
-# phenom-zig spike
+# phenom-zig
 
-MVP baixo nivel do Phenom em Zig + C.
+Produto Phenom em Zig + C: agente de CLI/TUI para codigo, sessao operacional, tool loop auditavel e contexto destilado.
 
-Escopo do spike:
+Estado atual:
 
-1. CLI `chat` minimo.
-2. Renderer append-only.
+1. CLI `chat`, `probe`, `snapshot`, `version` e `help`.
+2. Renderer append-only com thinking, markdown, code blocks, diff e eventos de tools.
 3. Streaming HTTP local para Ollama e llama.cpp.
-4. SQLite audit via `sqlite3` C.
-5. Tool gate fake.
-6. `read_file_range`.
-7. `EvidencePacket`.
-8. Snapshot de terminal.
-9. Build release.
+4. SQLite audit operacional via `sqlite3` C.
+5. Tool gate com allowlist por contrato.
+6. `collect_evidence`, `search_session`, micro-contexto e EvidencePacket.
+7. Recuperacao de sessao por SQLite FTS5/BM25 com `scope=current|all` e `session?`.
+8. Snapshot de terminal e build release.
+
+Estado que ainda nao deve ser tratado como completo:
+
+- Nem todas as ferramentas do `phenom-cli-ts` foram portadas.
+- Mutation, validation, runtime/browser, memory writer final e news ainda dependem de tasks proprias.
+- Smokes reais dependem de servidor Ollama/llama.cpp ativo e nao fazem parte da suite offline.
 
 Dependencias do sistema:
 
-- Zig 0.16.0 ou compatível.
+- Zig 0.16.0 ou compativel.
 - `sqlite3` e headers de desenvolvimento (`libsqlite3-dev` em Debian/Ubuntu).
 
 Comandos offline esperados:
@@ -24,7 +29,7 @@ Comandos offline esperados:
 ```sh
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build run -- chat --offline --session spike --prompt "responda somente: ok"
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build run -- chat --offline --session dev --prompt "responda somente: ok"
 ```
 
 Probe de backend sem inferencia:
@@ -34,7 +39,7 @@ ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build run -- probe --backend llamacpp --
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build run -- probe --backend ollama --host HOST:PORT
 ```
 
-Teste real de backend nao faz parte da suite offline e exige servidor ativo. Exemplos:
+Testes reais de backend exigem servidor ativo:
 
 ```sh
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build run -- chat --backend ollama --host HOST:PORT --model MODEL --prompt "ola" --max-tokens 64 --thinking auto
@@ -44,25 +49,19 @@ ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build real-session-smoke -Dreal-backend=
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build real-dialogue-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
 ```
 
-`real-smoke` usa um token sentinela (`PHENOM_REAL_7319`) por padrao e falha se a resposta visivel nao contiver o texto esperado. Em ambientes com sandbox de rede, o mesmo comando pode falhar antes de chegar ao servidor; nesse caso, valide o transporte com `curl` e rode o smoke com rede liberada.
-`real-session-smoke` executa dois turnos reais na mesma sessao: primeiro grava uma palavra-codigo no SQLite operacional, depois exige que o modelo recupere essa palavra-codigo via contexto de sessao.
-`real-dialogue-smoke` executa dois turnos reais para validar continuidade conversacional curta via chat history real; o segundo turno pede um exemplo mais robusto sem repetir o tema.
-
 Regra de validacao:
 
-- Toda task deve declarar se cumpre 100% do objetivo ou se e micro-base/parcial.
-- Toda task deve listar complexidade restante quando nao cobrir 100%.
+- Toda task deve declarar se cumpre 100% do objetivo ou se e parcial.
+- Toda task parcial deve listar partes entregues, partes faltantes e risco residual.
 - Features que dependem de servidor/modelo devem ter teste real opt-in separado da suite offline.
 - A suite offline nunca deve depender de `127.0.0.1`, Ollama, llama.cpp, rede ou modelo real.
-- `real-smoke` usa `--fail-on-model-error` e `--expect-contains`; se o backend nao conectar, falhar ou nao gerar a saida esperada, o comando retorna exit code nao-zero.
-- `real-session-smoke` usa as mesmas garantias e falha se a recuperacao do segundo turno nao contiver a palavra-codigo esperada.
-- `real-dialogue-smoke` falha se o segundo turno nao mantiver o tema do exemplo anterior.
+- Smokes reais usam `--fail-on-model-error` e `--expect-contains`; se o backend nao conectar, falhar ou nao gerar a saida esperada, o comando retorna exit code nao-zero.
 
 Notas de arquitetura:
 
 - O renderer e append-only por padrao; nao usa alternate screen.
 - O audit operacional vai para SQLite, nao para MEMORY/SKILLS.
-- O HTTP e propositalmente limitado a HTTP local sem TLS para o MVP.
+- HTTP atual e local-first, sem TLS, voltado a Ollama e llama.cpp.
 - O HTTP usa sockets C (`socket`, `connect`, `read`, `write`); IPv4 literal conecta direto por `sockaddr_in` e nomes de host usam fallback `getaddrinfo`.
 - Ollama usa `/api/chat`.
 - llama.cpp usa `/completion`.
@@ -74,8 +73,7 @@ Notas de arquitetura:
 - Deltas de streaming decodificam escapes JSON como `\n`.
 - O renderer classifica blocos `<think>...</think>` mesmo quando as tags chegam quebradas entre chunks.
 - Se o stream trouxer apenas `</think>` porque `<think>` veio do prompt/template, o conteudo anterior e tratado como thinking, nao como resposta final.
-- `--max-tokens` limita a geracao no MVP; default atual: 512.
+- `--max-tokens` limita a geracao; default atual: 512.
 - Se o modelo terminar dentro de `<think>` sem resposta final visivel, o CLI mostra um status explicito em vez de finalizar em branco.
-- O gate fake existe para provar a fronteira parser/controller/executor antes de tools reais.
-- Tool loop offline inicial parseia `<tool_call>`, valida allowlist, executa `read_file_range` e gera `EvidencePacket` + `MicroContext`.
+- Tool loop parseia `<tool_call>`, valida allowlist, executa contrato permitido e gera evidencia/micro-contexto auditavel.
 - Nenhum teste offline assume que `127.0.0.1:11434` esta ativo; host real deve ser provado por comando real separado.

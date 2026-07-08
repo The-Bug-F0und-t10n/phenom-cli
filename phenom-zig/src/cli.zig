@@ -125,7 +125,8 @@ pub fn parseArgsWithBase(base: Config, args: []const []const u8) !Config {
 
 pub fn printUsage(writer: anytype) !void {
     try writer.writeAll(
-        \\phenom-zig spike
+        \\phenom-zig
+        \\  Produto Phenom em Zig + C para agente CLI/TUI, tool loop e contexto auditavel.
         \\
         \\commands:
         \\  chat [--prompt TEXT] [--session ID] [--offline]

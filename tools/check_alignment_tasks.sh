@@ -41,7 +41,7 @@ require_task_status() {
   task=$1
   block=$(task_block "$task")
   [ -n "$block" ] || fail "missing task: $task"
-  printf '%s\n' "$block" | grep -Eq '^Status: (pending-urgent|in-progress|done|completed)\.$' ||
+  printf '%s\n' "$block" | grep -Eq '^Status: (pending-urgent|in-progress|partial|done|completed)\.$' ||
     fail "$task has invalid urgent status"
   printf '%s\n' "$block" | grep -Fq 'Prioridade: urgente.' ||
     fail "$task missing urgent priority"

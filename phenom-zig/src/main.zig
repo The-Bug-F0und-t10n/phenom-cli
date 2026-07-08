@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
 
     switch (config.command) {
         .help => try cli.printUsage(fd_writer.FdWriter{ .fd = 1 }),
-        .version => try (fd_writer.FdWriter{ .fd = 1 }).print("phenom-zig spike 0.1.0\n", .{}),
+        .version => try (fd_writer.FdWriter{ .fd = 1 }).print("phenom-zig 0.2.0-dev\n", .{}),
         .chat => try runChat(allocator, init.io, config),
         .probe => try runProbe(allocator, config),
         .snapshot => try runSnapshot(),
@@ -1096,6 +1096,7 @@ fn collectEvidenceToolSchema(include_contract_tool: bool) []const u8 {
     \\The current workspace files are available through this tool.
     \\Use set_operational_contract when the request needs inspection, mutation, validation, or runtime/browser diagnostics. This declares controller gates; it does not expose internal tools by itself.
     \\Recent dialogue may be provided for continuity. Exact prior-session facts are available through search_session with model-chosen terms. Use scope=all when the fact may be in another active or inactive session; use session only when you know the session id.
+    \\Never answer that you lack conversation history while search_session is available and the user asks about prior conversation. First call search_session with model-chosen terms; use scope=all when current session evidence is insufficient.
     \\Before making claims about the current project, repository, source code, files, implementation, or prior conversation, emit the relevant tool call and wait for evidence.
     \\Use terms to express your search intent. Use strategy=symbol when looking for a named function/type/constant. Use strategy=diagnostic with path for Zig syntax diagnostics. Use strategy=path only with path. Set compact=true only when prior evidence can be reduced to anchors.
     \\Format contract:
@@ -1127,6 +1128,7 @@ fn collectEvidenceToolSchema(include_contract_tool: bool) []const u8 {
     \\The current workspace files are available through this tool.
     \\The operational contract is already active for this turn. Do not call set_operational_contract again.
     \\Recent dialogue may be provided for continuity. Exact prior-session facts are available through search_session with model-chosen terms. Use scope=all when the fact may be in another active or inactive session; use session only when you know the session id.
+    \\Never answer that you lack conversation history while search_session is available and the user asks about prior conversation. First call search_session with model-chosen terms; use scope=all when current session evidence is insufficient.
     \\Before making claims about the current project, repository, source code, files, implementation, or prior conversation, emit the relevant tool call and wait for evidence.
     \\Use terms to express your search intent. Use strategy=symbol when looking for a named function/type/constant. Use strategy=diagnostic with path for Zig syntax diagnostics. Use strategy=path only with path. Set compact=true only when prior evidence can be reduced to anchors.
     \\Format with path:
@@ -1155,6 +1157,7 @@ fn groundingRules() []const []const u8 {
     return &.{
         "Workspace/source-code claims must cite E# evidence from [EVIDENCE].",
         "Use [RECENT_DIALOGUE] for continuity only; exact claims about what was said or done in prior conversation must cite S# evidence from [SESSION_CONTEXT].",
+        "Do not answer that conversation history is unavailable while search_session is available; call search_session first when prior conversation context is required.",
         "If no E#/S# supports a workspace or exact prior-session claim, say that claim is not evidenced in the provided context.",
     };
 }
@@ -1295,13 +1298,24 @@ fn buildRecentChatMessages(allocator: std.mem.Allocator, events: []const audit.A
     var messages = std.ArrayList(http.ChatMessage).empty;
     errdefer freeChatMessages(allocator, &messages);
     const current_prompt_index = latestCurrentPromptIndex(events, current_prompt);
+    var turn_messages_start: usize = 0;
+    var skip_current_turn = false;
 
     for (events, 0..) |event, idx| {
         if (std.mem.eql(u8, event.kind, "turn_start")) {
-            if (current_prompt_index != null and idx == current_prompt_index.?) continue;
+            turn_messages_start = messages.items.len;
+            skip_current_turn = current_prompt_index != null and idx == current_prompt_index.?;
+            if (skip_current_turn) continue;
             try appendChatHistoryMessage(allocator, &messages, .user, event.body);
         } else if (std.mem.eql(u8, event.kind, "assistant_delta")) {
+            if (skip_current_turn) continue;
             try appendChatHistoryMessage(allocator, &messages, .assistant, event.body);
+        } else if (std.mem.eql(u8, event.kind, "turn_done")) {
+            if (session_context.isFailedTurnDone(event.body)) {
+                truncateChatMessages(allocator, &messages, turn_messages_start);
+            }
+            turn_messages_start = messages.items.len;
+            skip_current_turn = false;
         }
         while (messages.items.len > max_chat_history_messages) {
             allocator.free(messages.orderedRemove(0).content);
@@ -1346,6 +1360,14 @@ fn mergeChatContent(allocator: std.mem.Allocator, old: []const u8, extra: []cons
 fn freeChatMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(http.ChatMessage)) void {
     for (messages.items) |message| allocator.free(message.content);
     messages.deinit(allocator);
+}
+
+fn truncateChatMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(http.ChatMessage), new_len: usize) void {
+    var i = new_len;
+    while (i < messages.items.len) : (i += 1) {
+        allocator.free(messages.items[i].content);
+    }
+    messages.shrinkRetainingCapacity(new_len);
 }
 
 fn latestCurrentPromptIndex(events: []const audit.AuditEvent, current_prompt: []const u8) ?usize {
@@ -1558,6 +1580,7 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "scope=all") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "Recent dialogue may be provided") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "Exact prior-session facts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "Never answer that you lack conversation history") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "Before making claims about the current project") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "apply_patch") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "grep_file") == null);
@@ -1663,6 +1686,44 @@ test "recent chat messages preserve roles and exclude only current prompt event"
     try std.testing.expectEqualStrings("qual e meu nome?", messages.items[2].content);
     try std.testing.expectEqual(http.ChatRole.assistant, messages.items[3].role);
     try std.testing.expectEqualStrings("Voce aparece como ashirak.", messages.items[3].content);
+}
+
+test "recent chat messages exclude failed assistant turns by audit status" {
+    var events = std.ArrayList(audit.AuditEvent).empty;
+    defer audit.freeAuditEvents(std.testing.allocator, &events);
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "qual a matematica perfeita de Matheus 1 na biblia"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "falamos sobre Mateus 1"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_done"),
+        .body = try std.testing.allocator.dupe(u8, "status=ok elapsed_ms=1000"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "eu estava falando sobre o que com voce?"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "Nao tenho acesso ao historico."),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_done"),
+        .body = try std.testing.allocator.dupe(u8, "status=expectation_failed elapsed_ms=8000"),
+    });
+
+    var messages = try buildRecentChatMessages(std.testing.allocator, events.items, "eu estava falando sobre o que com voce?");
+    defer freeChatMessages(std.testing.allocator, &messages);
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqual(http.ChatRole.user, messages.items[0].role);
+    try std.testing.expectEqualStrings("qual a matematica perfeita de Matheus 1 na biblia", messages.items[0].content);
+    try std.testing.expectEqual(http.ChatRole.assistant, messages.items[1].role);
+    try std.testing.expectEqualStrings("falamos sobre Mateus 1", messages.items[1].content);
 }
 
 test "recent chat assistant merge is bounded" {
@@ -1916,6 +1977,8 @@ test "grounding rules separate dialogue continuity from exact session evidence" 
     try std.testing.expect(std.mem.indexOf(u8, rules[1], "[RECENT_DIALOGUE]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rules[1], "continuity") != null);
     try std.testing.expect(std.mem.indexOf(u8, rules[1], "S#") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[2], "search_session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[2], "history is unavailable") != null);
 }
 
 const EventRecorder = struct {

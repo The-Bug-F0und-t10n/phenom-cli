@@ -6,6 +6,7 @@ const model_context = @import("model_context.zig");
 const max_entry_bytes: usize = 360;
 const max_recent_entries: usize = 6;
 const max_dialogue_entries: usize = 8;
+const max_topic_entries: usize = 12;
 const max_dialogue_accum_bytes: usize = 4096;
 const max_dialogue_entry_bytes: usize = 1200;
 const max_search_entries: usize = 6;
@@ -72,13 +73,24 @@ pub fn renderRecentDialogue(allocator: std.mem.Allocator, events: []const audit.
     var entries = std.ArrayList(DialogueEntry).empty;
     errdefer freeDialogueEntries(allocator, &entries);
     const current_prompt_index = latestCurrentPromptIndex(events, current_prompt);
+    var turn_entries_start: usize = 0;
+    var skip_current_turn = false;
 
     for (events, 0..) |event, idx| {
         if (std.mem.eql(u8, event.kind, "turn_start")) {
-            if (current_prompt_index != null and idx == current_prompt_index.?) continue;
+            turn_entries_start = entries.items.len;
+            skip_current_turn = current_prompt_index != null and idx == current_prompt_index.?;
+            if (skip_current_turn) continue;
             try appendDialogueEntry(allocator, &entries, .user, event.body);
         } else if (std.mem.eql(u8, event.kind, "assistant_delta")) {
+            if (skip_current_turn) continue;
             try appendDialogueEntry(allocator, &entries, .assistant, event.body);
+        } else if (std.mem.eql(u8, event.kind, "turn_done")) {
+            if (isFailedTurnDone(event.body)) {
+                truncateDialogueEntries(allocator, &entries, turn_entries_start);
+            }
+            turn_entries_start = entries.items.len;
+            skip_current_turn = false;
         }
     }
 
@@ -105,12 +117,62 @@ pub fn renderRecentDialogue(allocator: std.mem.Allocator, events: []const audit.
         try out.appendSlice(allocator, safe_body);
         try out.append(allocator, '\n');
     }
+    try appendRecentUserTopics(allocator, &out, events, current_prompt);
 
     const rendered = try out.toOwnedSlice(allocator);
     errdefer allocator.free(rendered);
     try model_context.assertNoRawContextLeak(rendered);
     freeDialogueEntries(allocator, &entries);
     return rendered;
+}
+
+fn appendRecentUserTopics(allocator: std.mem.Allocator, out: *std.ArrayList(u8), events: []const audit.AuditEvent, current_prompt: []const u8) !void {
+    var topics = std.ArrayList([]u8).empty;
+    defer freeOwnedSlices(allocator, &topics);
+
+    var i = events.len;
+    while (i > 0 and topics.items.len < max_topic_entries) {
+        i -= 1;
+        const event = events[i];
+        if (!std.mem.eql(u8, event.kind, "turn_start")) continue;
+        if (std.mem.eql(u8, event.body, current_prompt)) continue;
+        const compact_body = try compactOneLine(allocator, event.body, max_entry_bytes);
+        defer allocator.free(compact_body);
+        const safe_body = try redactRawMarkers(allocator, compact_body);
+        defer allocator.free(safe_body);
+        if (safe_body.len == 0) continue;
+        if (containsOwnedSlice(topics.items, safe_body)) continue;
+        const owned = try allocator.dupe(u8, safe_body);
+        errdefer allocator.free(owned);
+        try topics.append(allocator, owned);
+    }
+
+    if (topics.items.len == 0) return;
+    try out.appendSlice(allocator, "recent_user_topics:\n");
+    for (topics.items, 0..) |topic, idx| {
+        const prefix = try std.fmt.allocPrint(allocator, "- T{}: ", .{idx + 1});
+        defer allocator.free(prefix);
+        try out.appendSlice(allocator, prefix);
+        try out.appendSlice(allocator, topic);
+        try out.append(allocator, '\n');
+    }
+}
+
+fn containsOwnedSlice(items: []const []u8, needle: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item, needle)) return true;
+    }
+    return false;
+}
+
+fn freeOwnedSlices(allocator: std.mem.Allocator, items: *std.ArrayList([]u8)) void {
+    for (items.items) |item| allocator.free(item);
+    items.deinit(allocator);
+}
+
+pub fn isFailedTurnDone(body: []const u8) bool {
+    return std.mem.indexOf(u8, body, "status=expectation_failed") != null or
+        std.mem.indexOf(u8, body, "status=model_error") != null;
 }
 
 pub fn compactDialogueMessage(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -248,6 +310,14 @@ fn appendBounded(allocator: std.mem.Allocator, target: *[]u8, extra: []const u8)
 fn freeDialogueEntries(allocator: std.mem.Allocator, entries: *std.ArrayList(DialogueEntry)) void {
     for (entries.items) |entry| entry.deinit(allocator);
     entries.deinit(allocator);
+}
+
+fn truncateDialogueEntries(allocator: std.mem.Allocator, entries: *std.ArrayList(DialogueEntry), new_len: usize) void {
+    var i = new_len;
+    while (i < entries.items.len) : (i += 1) {
+        entries.items[i].deinit(allocator);
+    }
+    entries.shrinkRetainingCapacity(new_len);
 }
 
 fn latestCurrentPromptIndex(events: []const audit.AuditEvent, current_prompt: []const u8) ?usize {
@@ -481,6 +551,81 @@ test "recent dialogue preserves roles groups assistant deltas and excludes curre
     try std.testing.expect(std.mem.indexOf(u8, rendered, "assistant: primeira resposta") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "tool_start") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "pedido atual") == null);
+}
+
+test "recent dialogue includes compact user topic trail beyond visible dialogue window" {
+    var events = std.ArrayList(audit.AuditEvent).empty;
+    defer audit.freeAuditEvents(std.testing.allocator, &events);
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "qual a matematica perfeita de Matheus 1 na biblia"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "falamos sobre Mateus 1"),
+    });
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const prompt = try std.fmt.allocPrint(std.testing.allocator, "turno curto {}", .{i});
+        try events.append(std.testing.allocator, .{
+            .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+            .body = prompt,
+        });
+        try events.append(std.testing.allocator, .{
+            .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+            .body = try std.testing.allocator.dupe(u8, "ok"),
+        });
+    }
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "eu estava falando sobre o que com voce?"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "Nao tenho acesso ao historico."),
+    });
+
+    const rendered = (try renderRecentDialogue(std.testing.allocator, events.items, "eu estava falando sobre o que com voce?")) orelse return error.MissingDialogue;
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "recent_user_topics:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Matheus 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "user: qual a matematica perfeita") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "T") != null);
+}
+
+test "recent dialogue excludes failed turn assistant output by audit status" {
+    var events = std.ArrayList(audit.AuditEvent).empty;
+    defer audit.freeAuditEvents(std.testing.allocator, &events);
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "qual a matematica perfeita de Matheus 1 na biblia"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "falamos sobre Mateus 1"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_done"),
+        .body = try std.testing.allocator.dupe(u8, "status=ok elapsed_ms=1000"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "eu estava falando sobre o que com voce?"),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "Nao tenho acesso ao historico."),
+    });
+    try events.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_done"),
+        .body = try std.testing.allocator.dupe(u8, "status=expectation_failed elapsed_ms=8000"),
+    });
+
+    const rendered = (try renderRecentDialogue(std.testing.allocator, events.items, "eu estava falando sobre o que com voce?")) orelse return error.MissingDialogue;
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "falamos sobre Mateus 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Nao tenho acesso") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "recent_user_topics:") != null);
 }
 
 test "recent dialogue excludes only latest current prompt occurrence" {
