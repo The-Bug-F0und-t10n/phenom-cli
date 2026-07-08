@@ -792,7 +792,7 @@ fn runSearchSessionStep(
             allocator,
             prompt,
             &state.context,
-            null,
+            state.last_session_context,
             !state.contract_selected,
             "The requested session search was already performed in this turn. Answer using existing E#/S# evidence, or state what remains unknown.",
         );
@@ -823,6 +823,7 @@ fn runSearchSessionStep(
     defer result.deinit(allocator);
     try db.recordEvent(config.session, "session_context", result.text);
     try events.emit(.{ .tool_result = .{ .name = "search_session", .output = result.text } });
+    try state.rememberSessionContext(result.text);
 
     const follow_context = try renderCollectedEvidenceContext(
         allocator,
@@ -979,6 +980,7 @@ fn hasKnownTextExtension(path: []const u8) bool {
 const ToolLoopState = struct {
     context: working_context.WorkingContext,
     session_searches: std.ArrayList([]u8),
+    last_session_context: ?[]u8 = null,
     active_contract: contracts.ActiveContract,
     duplicate_repairs: usize = 0,
     contract_selected: bool = false,
@@ -995,6 +997,7 @@ const ToolLoopState = struct {
     fn deinit(self: *ToolLoopState) void {
         for (self.session_searches.items) |terms| self.context.allocator.free(terms);
         self.session_searches.deinit(self.context.allocator);
+        if (self.last_session_context) |text| self.context.allocator.free(text);
         self.context.deinit();
     }
 
@@ -1049,6 +1052,13 @@ const ToolLoopState = struct {
         const owned = try self.context.allocator.dupe(u8, terms);
         errdefer self.context.allocator.free(owned);
         try self.session_searches.append(self.context.allocator, owned);
+    }
+
+    fn rememberSessionContext(self: *ToolLoopState, text: []const u8) !void {
+        const owned = try self.context.allocator.dupe(u8, text);
+        errdefer self.context.allocator.free(owned);
+        if (self.last_session_context) |old| self.context.allocator.free(old);
+        self.last_session_context = owned;
     }
 };
 
@@ -1762,6 +1772,37 @@ test "tool loop state detects duplicate collect evidence calls and preserves evi
     try std.testing.expect(state.hasExecutedArgs(call.path, call.terms, strategy, call.start_line, call.max_lines));
     try std.testing.expectEqual(@as(usize, 1), state.context.entries.items.len);
     try std.testing.expect(std.mem.indexOf(u8, state.context.entries.items[0].evidence_text, "README.md") != null);
+}
+
+test "tool loop state keeps session evidence for duplicate search repair" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+    const key = "scope=all session= terms=matematica perfeita Mateus 1 biblia";
+    const session_text =
+        \\[SESSION_EVIDENCE]
+        \\source=sqlite_audit_fts temporary=true raw_context_persisted=false semantic_search=fts5_bm25
+        \\- S1 score=27.4210 session=default turn_start: qual a matematica perfeita de Matheus 1 na biblia
+    ;
+
+    try state.rememberSessionSearch(key);
+    try state.rememberSessionContext(session_text);
+    try std.testing.expect(state.hasSessionSearch(key));
+    try std.testing.expect(state.last_session_context != null);
+
+    const rendered = try renderCollectedEvidenceContext(
+        std.testing.allocator,
+        "eu estava falando sobre o que com voce?",
+        &state.context,
+        state.last_session_context,
+        true,
+        "The requested session search was already performed in this turn. Answer using existing E#/S# evidence.",
+    );
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SESSION_CONTEXT]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "S1:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Matheus 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "already performed") != null);
 }
 
 test "structured prompt path repair extracts only one explicit path" {

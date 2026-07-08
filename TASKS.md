@@ -9874,6 +9874,19 @@ Correcao posterior de linearidade do chat:
 - Smoke real reproduzivel: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build real-dialogue-smoke -Dreal-backend=llamacpp -Dreal-host=192.168.1.122:11434 -Dreal-model=phenom:latest -Dreal-dialogue-session=real-dialogue-smoke-302` -> passou; segundo turno manteve `calcular_media`.
 - Audit SQLite da sessao `real-dialogue-smoke-302`: `recent_dialogue=2`, `raw_marker=0`, `memory_block=0`, `skills_block=0`.
 
+Correcao posterior de duplicata em `search_session`:
+
+- Log real mostrou regressao: o modelo chamou `search_session` duas vezes com os mesmos termos, recebeu evidencia correta na primeira chamada, mas no ramo de duplicata o agente renderizou `SESSION_CONTEXT` vazio e instruiu "Answer using existing E#/S# evidence".
+- Causa raiz: `ToolLoopState` guardava apenas as chaves de busca em `session_searches`, nao o ultimo texto `[SESSION_EVIDENCE]`. A segunda inferencia via duplicata nao recebia S# nenhum e o modelo concluiu que nao tinha historico.
+- `phenom-zig/src/main.zig` agora guarda `last_session_context` owned no estado do turno e reenvia esse texto em `session_context_duplicate`.
+- A memoria e liberada em `ToolLoopState.deinit`; nova evidencia de sessao substitui a anterior com ownership claro.
+- Teste unitario novo: `tool loop state keeps session evidence for duplicate search repair` prova que duplicata preserva `[SESSION_CONTEXT]`, S# e conteudo recuperado.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` em `phenom-zig/` -> passou; 182 testes.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test` em `phenom-zig/` -> passou.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` em `phenom-zig/` -> passou.
+- Validacao: `sh tools/check_alignment_tasks.sh` -> passou.
+- Smoke real tentado com a pergunta do log (`eu estava falando sobre o que com voce?`) na sessao `default`, mas o servidor `192.168.1.122:11434` falhou com `ConnectFailed` depois de `2m16s`; `curl --max-time 5 http://192.168.1.122:11434/` retornou timeout. Resultado real fica pendente por infraestrutura, nao por falha de teste/unit/build.
+
 ## T295 - Implementar orchestrator final de MEMORY/SKILLS separado do SQLite operacional
 
 Status: pending-urgent.
