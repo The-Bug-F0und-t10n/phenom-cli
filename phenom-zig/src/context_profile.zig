@@ -57,6 +57,7 @@ pub fn sessionRecallSchema() []const u8 {
         \\[TOOLS v1]
         \\search_session(terms, scope=current|all, session?)
         \\This profile is active because prior-session recall may be required. Your first output in this profile must be exactly one search_session tool call, not prose. SESSION_FOCUS is not evidence; use it only to choose terms from your current reasoning.
+        \\terms must be content-bearing retrieval keys: names, entities, symbols, file paths, error strings, decisions, or exact topic words from SESSION_FOCUS/current reasoning. Do not use vague meta words like "previous conversation" as the main terms.
         \\Format current session:
         \\<tool_call><function=search_session><parameter=terms>prior fact to recover</parameter><parameter=scope>current</parameter></function></tool_call>
         \\Format all sessions:
@@ -72,6 +73,7 @@ pub fn codeEvidenceSchema() []const u8 {
         \\search_session(terms, scope=current|all, session?)
         \\The model decides search intent. The controller only executes announced contracts and returns evidence. SESSION_FOCUS is not evidence; use it only to choose whether search_session is needed.
         \\Any claim about prior conversation/session content must call search_session first and cite returned S# evidence. Do not answer that session history is unavailable while search_session is advertised.
+        \\For search_session terms, send content-bearing retrieval keys from your reasoning or SESSION_FOCUS: names, entities, symbols, file paths, error strings, decisions, or exact topic words. Avoid generic meta-query terms as the main query.
         \\Format contract:
         \\<tool_call><function=set_operational_contract><parameter=requiresInspection>true</parameter><parameter=requiresMutation>false</parameter><parameter=requiresRuntimeValidation>false</parameter><parameter=requiresBrowserDiagnostics>false</parameter><parameter=reason>short reason</parameter></function></tool_call>
         \\Format evidence:
@@ -89,6 +91,7 @@ pub fn activeContractSchema() []const u8 {
         \\collect_evidence(path?, terms?, strategy=auto|path|lexical|symbol|diagnostic, start_line=1, max_lines=12, compact=false)
         \\search_session(terms, scope=current|all, session?)
         \\The operational contract is active. Do not call set_operational_contract again.
+        \\For search_session terms, use content-bearing retrieval keys from SESSION_FOCUS/current reasoning; avoid generic meta-query terms as the main query.
         \\Format evidence:
         \\<tool_call><function=collect_evidence><parameter=strategy>auto</parameter><parameter=terms>what to find</parameter></function></tool_call>
         \\Format session:
@@ -106,10 +109,12 @@ test "schemas are state scoped" {
     try std.testing.expect(std.mem.indexOf(u8, recall, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, recall, "collect_evidence") == null);
     try std.testing.expect(std.mem.indexOf(u8, recall, "set_operational_contract") == null);
+    try std.testing.expect(std.mem.indexOf(u8, recall, "content-bearing retrieval keys") != null);
 
     const evidence = toolSchema(.code_evidence, .initial);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "collect_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "set_operational_contract") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "Avoid generic meta-query terms") != null);
 
     try std.testing.expectEqualStrings("", toolSchema(.code_evidence, .after_collect_evidence));
     try std.testing.expectEqualStrings("", toolSchema(.session_recall, .after_search_session));

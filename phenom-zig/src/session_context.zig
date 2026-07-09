@@ -264,6 +264,24 @@ pub fn renderFallbackSessionFocusFromEvents(allocator: std.mem.Allocator, events
     return rendered;
 }
 
+pub fn mergeSessionFocus(allocator: std.mem.Allocator, stored: ?[]const u8, fallback: ?[]const u8) !?[]u8 {
+    if (stored == null and fallback == null) return null;
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    if (stored) |text| {
+        try out.appendSlice(allocator, text);
+        if (!std.mem.endsWith(u8, text, "\n")) try out.append(allocator, '\n');
+    }
+    if (fallback) |text| {
+        try out.appendSlice(allocator, text);
+        if (!std.mem.endsWith(u8, text, "\n")) try out.append(allocator, '\n');
+    }
+    const rendered = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(rendered);
+    try model_context.assertNoRawContextLeak(rendered);
+    return rendered;
+}
+
 pub fn compactDialogueMessage(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     const compact_body = try compactOneLine(allocator, text, max_dialogue_entry_bytes);
     defer allocator.free(compact_body);
@@ -326,6 +344,7 @@ pub fn renderSearchHits(allocator: std.mem.Allocator, hits: []const audit.Sessio
     var rendered_count: usize = 0;
     for (hits) |hit| {
         if (rendered_count >= max_search_entries) break;
+        if (isFailedSearchHit(hit)) continue;
         const signature = try hitSignature(allocator, hit);
         defer allocator.free(signature);
         if (containsOwnedSlice(rendered_signatures.items, signature)) continue;
@@ -353,6 +372,13 @@ pub fn renderSearchHits(allocator: std.mem.Allocator, hits: []const audit.Sessio
     errdefer allocator.free(rendered);
     try model_context.assertNoRawContextLeak(rendered);
     return .{ .text = rendered, .matches = rendered_count };
+}
+
+fn isFailedSearchHit(hit: audit.SessionSearchHit) bool {
+    for (hit.turn_events.items) |event| {
+        if (std.mem.eql(u8, event.kind, "turn_done") and isFailedTurnDone(event.body)) return true;
+    }
+    return false;
 }
 
 pub fn toSessionBlocks(allocator: std.mem.Allocator, rendered: ?[]const u8) ![]model_context.SessionBlock {
@@ -861,6 +887,75 @@ test "session focus renders confirmed summaries and skips low confidence rows" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "operational_summary=true") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Matheus 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "negativa ruim") == null);
+}
+
+test "session focus merge keeps stored focus and legacy topics" {
+    const merged = (try mergeSessionFocus(
+        std.testing.allocator,
+        "source=sqlite_session_focus temporary=true raw_context_persisted=false operational_summary=true not_evidence=true\n- F1 quality=confirmed\n  topic: projeto atual\n",
+        "source=sqlite_audit_turn_starts temporary=true raw_context_persisted=false operational_summary=true not_evidence=true legacy_fallback=true\n- F1 quality=legacy flags=answered=unknown\n  topic: Mateus 1\n",
+    )) orelse return error.MissingFocus;
+    defer std.testing.allocator.free(merged);
+
+    try std.testing.expect(std.mem.indexOf(u8, merged, "topic: projeto atual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "topic: Mateus 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "raw_context_persisted=false") != null);
+}
+
+test "session search hits skip failed turn contexts by metadata" {
+    var hits = std.ArrayList(audit.SessionSearchHit).empty;
+    defer audit.freeSessionSearchHits(std.testing.allocator, &hits);
+
+    var failed_turn = std.ArrayList(audit.AuditEvent).empty;
+    try failed_turn.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "pergunta de memoria"),
+    });
+    try failed_turn.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "resposta operacional ruim"),
+    });
+    try failed_turn.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_done"),
+        .body = try std.testing.allocator.dupe(u8, "status=ok low_confidence=true refusal=true"),
+    });
+    try hits.append(std.testing.allocator, .{
+        .event_id = 10,
+        .session = try std.testing.allocator.dupe(u8, "default"),
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "resposta operacional ruim"),
+        .score = 10,
+        .turn_events = failed_turn,
+    });
+
+    var confirmed_turn = std.ArrayList(audit.AuditEvent).empty;
+    try confirmed_turn.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_start"),
+        .body = try std.testing.allocator.dupe(u8, "Mateus 1"),
+    });
+    try confirmed_turn.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "falamos sobre Mateus 1"),
+    });
+    try confirmed_turn.append(std.testing.allocator, .{
+        .kind = try std.testing.allocator.dupe(u8, "turn_done"),
+        .body = try std.testing.allocator.dupe(u8, "status=ok low_confidence=false"),
+    });
+    try hits.append(std.testing.allocator, .{
+        .event_id = 20,
+        .session = try std.testing.allocator.dupe(u8, "default"),
+        .kind = try std.testing.allocator.dupe(u8, "assistant_delta"),
+        .body = try std.testing.allocator.dupe(u8, "falamos sobre Mateus 1"),
+        .score = 8,
+        .turn_events = confirmed_turn,
+    });
+
+    const rendered = try renderSearchHits(std.testing.allocator, hits.items);
+    defer rendered.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), rendered.matches);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.text, "resposta operacional ruim") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.text, "falamos sobre Mateus 1") != null);
 }
 
 test "recent dialogue excludes long topic trail; session focus owns recall map" {

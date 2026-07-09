@@ -10266,3 +10266,55 @@ Validacao executada:
 - `sha256sum zig-out/bin/phenom "$HOME/.local/bin/phenom"` -> ambos retornaram `3b54ba443a3adba0f60d09f41d816f42699bdb6f961cc931fd02fd6efc5b1ced`.
 - `./zig-out/bin/phenom version` e `"$HOME/.local/bin/phenom" version` -> ambos retornaram `phenom-zig 0.2.0-dev`.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-release ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-build-local-sync-install install-local -Doptimize=ReleaseFast` -> passou.
+
+## T303 - Corrigir recuperacao util de memoria de sessao no micro-contexto
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: o usuario mostrou log onde a pergunta ambigua `voce lembra do estavamos conversando ?` acionava `search_session`, mas o modelo recebia S# de tentativas antigas ruins e respondia que nao tinha contexto suficiente. A falha nao era simplesmente do modelo: o agente entregava um contexto operacional fraco.
+
+Causa raiz:
+
+- `SESSION_FOCUS` novo substituia o fallback de topicos legados quando existia qualquer linha em `session_focus`.
+- Como `session_focus` ainda era recente e raso, ele continha so prompts como `ola`, `ika`, `o que este projeto implementa?` e a propria pergunta de memoria, escondendo topicos antigos relevantes.
+- Apos `search_session`, o segundo passe do modelo recebia `SESSION_CONTEXT`, mas perdia `SESSION_FOCUS`; se a busca generica retornasse S# ruim, o modelo nao tinha mapa operacional para emitir uma busca mais especifica.
+- `search_session` renderizava turnos marcados por metadado como `low_confidence=true`/`refusal=true` quando eles apareciam em hits FTS. Isso deixava respostas ruins entrarem como evidencia de sessao.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Nao foi adicionada heuristica linguistica hardcoded.
+- O modelo continua escolhendo termos de busca; o controller so executa contratos e filtra por metadado operacional.
+- `SESSION_FOCUS` permanece `not_evidence=true`; claims exatos ainda precisam citar S#.
+- O micro-contexto continua temporario e nao vira memoria permanente do modelo.
+
+Implementacao:
+
+- `phenom-zig/src/session_context.zig`: adiciona merge entre foco armazenado e fallback compacto de turnos.
+- `phenom-zig/src/session_context.zig`: `renderSearchHits` descarta hits cujo turno tem `turn_done` com metadado de falha/baixa confianca/refusal.
+- `phenom-zig/src/main.zig`: `buildInitialModelContext` sempre combina `session_focus` com fallback de topicos legados.
+- `phenom-zig/src/main.zig`: contexto pos-`search_session` conserva `SESSION_FOCUS`, permitindo busca corretiva model-directed quando S# inicial e fraco.
+- `phenom-zig/src/context_profile.zig` e `phenom-zig/src/main.zig`: contrato model-visible de `search_session` agora explica que `terms` sao chaves de recuperacao especificas escolhidas pelo modelo: nomes, entidades, simbolos, paths, erros, decisoes ou topicos exatos do `SESSION_FOCUS`/raciocinio atual, nao a frase vaga do usuario.
+
+Limite residual:
+
+- Eventos muito antigos gravados antes de `turn_quality` podem nao ter metadado suficiente para classificacao automatica sem ler semantica do texto. A correcao evita novas contaminacoes por metadado e da ao modelo foco suficiente para busca corretiva.
+
+Criterio de aceite:
+
+- Pergunta ambigua de memoria recebe `SESSION_FOCUS` completo o bastante para o modelo escolher termos melhores.
+- `search_session` nao renderiza turnos marcados como baixa confianca/refusal.
+- O pos-busca preserva `SESSION_FOCUS` sem promover foco a evidencia.
+- Smoke real com a pergunta do log recupera assunto real da sessao.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/session_context.zig -lc -lsqlite3` -> passou; 83 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/context_profile.zig` -> passou; 2 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 204 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-session-memory-fix-3 test` -> passou.
+- Smoke real antes do ajuste pos-busca ainda falhou no comportamento: buscou `terms=estavamos conversando` e recuperou tentativas antigas ruins.
+- Smoke real final: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 1200 --session default --prompt 'voce lembra do estavamos conversando ?' --fail-on-model-error --no-color` -> passou no comportamento; modelo chamou `search_session` com `terms=matheus bíblia`, recuperou S# sobre `qual a matematica perfeita de Matheus 1 na biblia` e respondeu lembrando o assunto.
+- Smoke real posterior ao reforco de prompt respondeu corretamente por continuidade recente, sem nova tool call; portanto nao foi usado como prova de busca, apenas confirmou que o contexto registrado contem a nova instrucao de termos especificos.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-release ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-session-memory-release -Doptimize=ReleaseFast` -> passou.

@@ -461,12 +461,7 @@ fn buildInitialModelContext(
     var session_events = try db.loadRecentSessionEvents(allocator, session, 240);
     defer audit.freeAuditEvents(allocator, &session_events);
 
-    var focus_rows = try db.loadRecentSessionFocus(allocator, session, 16);
-    defer audit.freeSessionFocus(allocator, &focus_rows);
-    var focus_text = try session_context.renderSessionFocus(allocator, focus_rows.items);
-    if (focus_text == null) {
-        focus_text = try session_context.renderFallbackSessionFocusFromEvents(allocator, session_events.items, prompt);
-    }
+    const focus_text = try loadMergedSessionFocus(allocator, db, session, prompt, session_events.items);
     defer if (focus_text) |text| allocator.free(text);
     const focus_blocks = try session_context.toFocusBlocks(allocator, focus_text);
     defer allocator.free(focus_blocks);
@@ -494,12 +489,28 @@ fn buildInitialModelContext(
         .skills = persistent.skills.items,
         .grounding = groundingRules(),
         .next_action = if (enable_tool_loop and focus_text != null)
-            "SESSION_FOCUS is present. First emit exactly one context tool call before prose: use search_session for prior-session facts, or collect_evidence for workspace/source-code facts. The model chooses the tool and terms; the controller only executes it."
+            "SESSION_FOCUS is present. First emit exactly one context tool call before prose: use search_session for prior-session facts, or collect_evidence for workspace/source-code facts. For search_session, choose content-bearing terms from SESSION_FOCUS/current reasoning, not vague meta-query words. The controller only executes the model-chosen contract."
         else if (enable_tool_loop)
-            "Infer the user's intent. If the answer requires workspace/source-code facts, call collect_evidence with model-chosen terms or path. If the answer requires prior-session facts, call search_session with model-chosen terms before answering. Otherwise answer directly."
+            "Infer the user's intent. If workspace/source-code facts are needed, call collect_evidence with model-chosen terms/path. If prior-session facts are needed, call search_session with content-bearing model-chosen terms before answering. Otherwise answer directly."
         else
             "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
     });
+}
+
+fn loadMergedSessionFocus(
+    allocator: std.mem.Allocator,
+    db: *audit.AuditDb,
+    session: []const u8,
+    prompt: []const u8,
+    session_events: []const audit.AuditEvent,
+) !?[]u8 {
+    var focus_rows = try db.loadRecentSessionFocus(allocator, session, 16);
+    defer audit.freeSessionFocus(allocator, &focus_rows);
+    const stored_focus_text = try session_context.renderSessionFocus(allocator, focus_rows.items);
+    defer if (stored_focus_text) |text| allocator.free(text);
+    const fallback_focus_text = try session_context.renderFallbackSessionFocusFromEvents(allocator, session_events, prompt);
+    defer if (fallback_focus_text) |text| allocator.free(text);
+    return try session_context.mergeSessionFocus(allocator, stored_focus_text, fallback_focus_text);
 }
 
 const max_tool_emergency_iterations = 8;
@@ -670,6 +681,7 @@ fn runOneToolLoopStep(
             prompt,
             &state.context,
             null,
+            null,
             context_profile.toolSchema(.code_evidence, .after_collect_evidence),
             "The requested evidence was already collected in this turn. Answer now using the evidence above. Do not call tools again.",
         );
@@ -707,6 +719,7 @@ fn runOneToolLoopStep(
             prompt,
             &state.context,
             null,
+            null,
             context_profile.toolSchema(.code_evidence, .after_collect_evidence),
             "collect_evidence encountered an error. Answer the current user request directly.",
         );
@@ -736,6 +749,7 @@ fn runOneToolLoopStep(
         allocator,
         prompt,
         &state.context,
+        null,
         null,
         context_profile.toolSchema(.code_evidence, .after_collect_evidence),
         if (state.shouldAllowMoreEvidence())
@@ -876,6 +890,7 @@ fn runSearchSessionStep(
             prompt,
             &state.context,
             null,
+            null,
             context_profile.toolSchema(.session_recall, .active_contract),
             "Emit one corrected search_session tool call with <parameter=terms>describing what prior session fact you need</parameter>, or answer using current evidence only.",
         );
@@ -889,6 +904,7 @@ fn runSearchSessionStep(
             allocator,
             prompt,
             &state.context,
+            null,
             null,
             context_profile.toolSchema(.session_recall, .active_contract),
             "Emit one corrected search_session tool call with scope=current or scope=all, or provide a session id. Do not invent session facts.",
@@ -906,6 +922,7 @@ fn runSearchSessionStep(
             prompt,
             &state.context,
             state.last_session_context,
+            null,
             context_profile.toolSchema(.session_recall, .after_search_session),
             "The requested session search was already performed in this turn. Answer using existing E#/S# evidence, or state what remains unknown.",
         );
@@ -938,13 +955,19 @@ fn runSearchSessionStep(
     try events.emit(.{ .tool_result = .{ .name = "search_session", .output = result.text } });
     try state.rememberSessionContext(result.text);
 
+    var session_events = try db.loadRecentSessionEvents(allocator, config.session, 240);
+    defer audit.freeAuditEvents(allocator, &session_events);
+    const focus_text = try loadMergedSessionFocus(allocator, db, config.session, prompt, session_events.items);
+    defer if (focus_text) |text| allocator.free(text);
+
     const follow_context = try renderCollectedEvidenceContext(
         allocator,
         prompt,
         &state.context,
         result.text,
+        focus_text,
         context_profile.toolSchema(.session_recall, .after_search_session),
-        "Use SESSION_CONTEXT as retrieved prior-session evidence. Cite S# when stating what was said or done in a session; S# includes session ids when search crossed sessions. Cite E# for workspace facts. For technical judgment, use retrieved context plus the current user request; do not claim unsupported workspace/session facts. If more evidence is needed and budget remains, emit one targeted collect_evidence or search_session call.",
+        "Use SESSION_CONTEXT as retrieved prior-session evidence. SESSION_FOCUS is a routing map, not evidence; if retrieved S# is only a prior failed/irrelevant recall attempt, emit one more targeted search_session call using content-bearing terms from SESSION_FOCUS/current reasoning. Cite S# for session claims and E# for workspace claims. Do not claim unsupported facts.",
     );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
@@ -1180,6 +1203,7 @@ fn renderCollectedEvidenceContext(
     prompt: []const u8,
     context: *const working_context.WorkingContext,
     session_text: ?[]const u8,
+    focus_text: ?[]const u8,
     contracts_text: []const u8,
     next_action: []const u8,
 ) ![]u8 {
@@ -1187,10 +1211,13 @@ fn renderCollectedEvidenceContext(
     defer allocator.free(evidence_blocks);
     const session_blocks = try session_context.toSessionBlocks(allocator, session_text);
     defer allocator.free(session_blocks);
+    const focus_blocks = try session_context.toFocusBlocks(allocator, focus_text);
+    defer allocator.free(focus_blocks);
     return model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
         .contracts = contracts_text,
         .evidence = evidence_blocks,
+        .focus = focus_blocks,
         .session = session_blocks,
         .obligations = &.{
             "Use only collected evidence for claims about this workspace or prior session.",
@@ -1211,6 +1238,7 @@ fn groundingRules() []const []const u8 {
     return &.{
         "Workspace/source-code claims must cite E# evidence from [EVIDENCE].",
         "Use [RECENT_DIALOGUE] for continuity only; use [SESSION_FOCUS] only as a routing map. Exact claims about what was said or done in prior conversation must cite S# evidence from [SESSION_CONTEXT].",
+        "search_session terms are retrieval keys, not the user's vague wording; choose specific names, entities, symbols, paths, errors, decisions, or exact topic words visible in current reasoning/SESSION_FOCUS.",
         "Do not answer that conversation history is unavailable while search_session is available; call search_session first when prior conversation context is required.",
         "If no E#/S# supports a workspace or exact prior-session claim, say that claim is not evidenced in the provided context.",
     };
@@ -1673,6 +1701,8 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "context tool call before prose") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "use search_session for prior-session facts") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "collect_evidence for workspace/source-code facts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "content-bearing terms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "vague meta-query words") != null);
 
     try std.testing.expect((try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test-empty", "analise esse projeto", false)) == null);
 }
@@ -1732,6 +1762,42 @@ test "initial model context does not run prompt based session fts" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
     try std.testing.expect(rendered.len < 5000);
+}
+
+test "initial model context combines stored focus with legacy turn topics" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordEvent("mixed-focus", "turn_start", "qual a matematica perfeita de Matheus 1 na biblia");
+    try db.recordEvent("mixed-focus", "assistant_delta", "falamos sobre Mateus 1");
+    try db.recordEvent("mixed-focus", "turn_done", "status=ok elapsed_ms=1000");
+    try db.recordEvent("mixed-focus", "turn_start", "o que este projeto implementa?");
+    try db.recordEvent("mixed-focus", "assistant_delta", "projeto em Zig");
+    try db.recordEvent("mixed-focus", "turn_done", "status=ok elapsed_ms=1000");
+    try db.recordSessionFocus(
+        "mixed-focus",
+        "projeto Zig",
+        "user_prompt",
+        "o que este projeto implementa?",
+        "confirmed",
+        "answered=true low_confidence=false",
+    );
+
+    const rendered = (try buildInitialModelContext(
+        std.testing.allocator,
+        std.testing.io,
+        &db,
+        "mixed-focus",
+        "voce lembra do que estavamos conversando?",
+        true,
+    )) orelse return error.MissingContext;
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SESSION_FOCUS]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "topic: projeto Zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "topic: qual a matematica perfeita de Matheus 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "source=sqlite_audit_fts") == null);
+    try std.testing.expect(rendered.len < 6000);
 }
 
 test "recent chat messages preserve roles and exclude only current prompt event" {
@@ -1939,6 +2005,7 @@ test "tool loop state keeps session evidence for duplicate search repair" {
         "eu estava falando sobre o que com voce?",
         &state.context,
         state.last_session_context,
+        null,
         context_profile.toolSchema(.session_recall, .after_search_session),
         "The requested session search was already performed in this turn. Answer using existing E#/S# evidence.",
     );
@@ -1985,6 +2052,7 @@ test "duplicate evidence context keeps evidence and tool schema" {
         "responda",
         &state.context,
         null,
+        null,
         context_profile.toolSchema(.code_evidence, .after_collect_evidence),
         "Answer now. Do not call tools again.",
     );
@@ -2025,6 +2093,7 @@ test "collected evidence context renders compact anchors without memory skills o
         "responda",
         &state.context,
         null,
+        null,
         context_profile.toolSchema(.code_evidence, .after_collect_evidence),
         "Answer from compact anchors.",
     );
@@ -2044,6 +2113,7 @@ test "collected context can include temporary session evidence without memory" {
         "o que combinamos?",
         &state.context,
         "[SESSION_EVIDENCE]\n- S1 score=10 turn_start: combinamos groundedness\n",
+        null,
         context_profile.toolSchema(.session_recall, .after_search_session),
         "Answer with S# citations.",
     );
@@ -2056,13 +2126,35 @@ test "collected context can include temporary session evidence without memory" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Exact claims about what was said") != null);
 }
 
+test "session evidence context keeps focus map for corrective searches" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+    const rendered = try renderCollectedEvidenceContext(
+        std.testing.allocator,
+        "voce lembra do que estavamos conversando?",
+        &state.context,
+        "[SESSION_EVIDENCE]\n- S1 score=1 assistant: tentativa antiga sem assunto util\n",
+        "source=sqlite_session_focus temporary=true raw_context_persisted=false operational_summary=true not_evidence=true\n- F1 quality=confirmed\n  topic: Mateus 1\n",
+        context_profile.toolSchema(.session_recall, .after_search_session),
+        "Use SESSION_FOCUS for another search with content-bearing terms if S# is not useful.",
+    );
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SESSION_CONTEXT]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SESSION_FOCUS]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "topic: Mateus 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "not_evidence=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "content-bearing terms") != null);
+}
+
 test "grounding rules separate dialogue continuity from exact session evidence" {
     const rules = groundingRules();
     try std.testing.expect(std.mem.indexOf(u8, rules[1], "[RECENT_DIALOGUE]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rules[1], "continuity") != null);
     try std.testing.expect(std.mem.indexOf(u8, rules[1], "S#") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rules[2], "search_session") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rules[2], "history is unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[2], "retrieval keys") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[3], "search_session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[3], "history is unavailable") != null);
 }
 
 const EventRecorder = struct {
