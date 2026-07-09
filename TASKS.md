@@ -9292,7 +9292,7 @@ Validacao executada:
 
 ## T282 - Portar `set_operational_contract` como contrato model-visible pequeno
 
-Status: done.
+Status: pending-urgent.
 
 Prioridade: urgente.
 
@@ -9806,11 +9806,40 @@ Criterio de aceite:
 
 Status de completude em 2026-07-08:
 
-- Entregue: historico recente por roles reais, trilha `recent_user_topics`, FTS5/BM25 em SQLite, `search_session(scope=current|all, session?)`, S# com `session=`, contexto de turno nos hits de sessao, dedupe preservando ultimo `[SESSION_EVIDENCE]`, separacao de MEMORY/SKILLS e contexto operacional.
+- Entregue: historico recente por roles reais, `SESSION_FOCUS` operacional em SQLite, `turn_quality` auditavel, FTS5/BM25 em SQLite, `search_session(scope=current|all, session?)`, S# com `session=`, contexto de turno nos hits de sessao, dedupe preservando ultimo `[SESSION_EVIDENCE]`, separacao de MEMORY/SKILLS e contexto operacional.
 - Nao entregue integralmente: sumarizacao longa de sessao e suite opt-in ampla para conversas longas/multissessao.
 - Provado nesta etapa: smoke real reproduzivel com servidor ativo para o caso "eu estava falando sobre o que com voce?" na sessao `default`; o modelo recuperou `Matheus` e nao caiu em "nao tenho acesso ao historico". Smoke real posterior com "entao por que voce nao pontuou isso nos assuntos..." acionou `search_session`, recebeu contexto de turno e respondeu usando o assunto de Mateus/Matheus.
-- Falta para 100%: completar sumarizacao longa de sessao e consolidar smokes de conversas longas/multissessao como suite opt-in antes de marcar a feature inteira como `done`.
-- Risco residual: existe um guard de reparo textual para negativa explicita de historico enquanto nao houver canal tipado de recusa/necessidade-de-contexto no protocolo do modelo; a garantia ampla de continuidade operacional ainda depende da cobertura dos smokes restantes.
+- Falta para 100%: completar sumarizacao longa de sessao, consolidar smokes de conversas longas/multissessao como suite opt-in e executar smoke real da arquitetura por perfil provando que `session_recall` chama `search_session` no primeiro fluxo, sem repair textual, antes de marcar a feature inteira como `done`.
+- Risco residual: a garantia ampla de continuidade operacional ainda depende da cobertura dos smokes restantes.
+
+Atualizacao de arquitetura de contexto por perfil em 2026-07-08:
+
+- `phenom-zig/src/context_profile.zig` cria perfis `code_micro`, `session_recall`, `code_evidence` e `news_doc_log`, com schema model-visible por estado (`initial`, `active_contract`, `after_search_session`, `after_collect_evidence`).
+- A selecao de perfil usa estado operacional leve, nao heuristica de assunto: sem tool loop vira `code_micro`; com foco de sessao vira `session_recall`; com tool loop e sem foco vira `code_evidence`.
+- `session_recall` inicial anuncia somente `search_session`; `code_evidence` inicial anuncia `set_operational_contract`, `collect_evidence` e `search_session`; contextos pos-tool nao reenviam schema completo.
+- `phenom-zig/src/audit.zig` cria tabela `session_focus` com `topic`, `user_intent`, `useful_facts`, `quality` e `flags`, mantendo SQLite como storage operacional e nao como MEMORY/SKILLS.
+- `phenom-zig/src/main.zig` destila cada turno apos `turn_done` com flags objetivas: `answered`, `used_session_context`, `used_evidence`, `refusal`, `contradicted_context=false`, `low_confidence`.
+- `phenom-zig/src/session_context.zig` limita `RECENT_DIALOGUE` a continuidade curta e remove `recent_user_topics` desse bloco; topicos longos passam por `SESSION_FOCUS`.
+- Em `session_recall`, resposta sem `search_session`/`SESSION_CONTEXT` vira `quality=uncertain`, `contract_missing_context=true` e `low_confidence=true`; o repair textual `session recall denial without search_session` foi removido do fluxo.
+- Fallback para sessoes antigas usa apenas `turn_start` compacto como `SESSION_FOCUS legacy_fallback`, sem `assistant_delta` bruto como fonte confiavel.
+- Nao foram adicionadas stopwords, listas de linguagem, vies por path/ecossistema nem ranking semantico hardcoded.
+
+Revisao baixo nivel Zig desta atualizacao:
+
+- Ownership: `SessionFocus` duplica colunas SQLite e libera via `freeSessionFocus`; `TurnQuality` duplica `quality/flags` e libera no fechamento do turno.
+- SQLite: `session_focus` e `loadLatestTurnEvents` usam SQL parametrizado; statements finalizam com `defer`; limites validam `c_int`.
+- Bounds: `RECENT_DIALOGUE` foi reduzido para 4 mensagens e entradas de 600 bytes; `SESSION_FOCUS` compacta linhas e filtra `low_confidence=true`.
+- Raw leak: renderers novos passam por redacao/assert de raw markers; MEMORY/SKILLS continuam opt-in por arquivos persistentes.
+- Reparos: o repair textual de negativa foi removido; falhas viram qualidade auditavel por contrato operacional e nao segunda inferencia escondida.
+
+Validacao desta atualizacao:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/audit.zig -lc -lsqlite3` -> passou; 23 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/session_context.zig -lc -lsqlite3` -> passou; 80 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 194 testes.
+- Smoke real desta atualizacao: sessao `context-profile-smoke-297`; seed `PHENOM_PROFILE_SEED_297` passou; pergunta ambigua `eu estava falando sobre o que com voce?` acionou `search_session` no primeiro fluxo, retornou S# com `Mateus 1` e respondeu usando a evidencia.
+- Audit SQLite do smoke `context-profile-smoke-297`: `tool_repair=0`, `search_session=1`, `memory_block=0`, `skills_block=0`, `raw_marker=0`, `max_context_bytes=2478`.
+- Correcao de alinhamento apos revisao: removida a heuristica textual de negativa (`containsSessionDenial` e marcadores de frase); baixa confianca agora deriva de quebra objetiva do contrato `session_recall` quando falta `search_session`/`SESSION_CONTEXT`.
 
 Implementacao desta etapa:
 

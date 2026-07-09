@@ -33,6 +33,22 @@ pub const SessionSearchHit = struct {
     }
 };
 
+pub const SessionFocus = struct {
+    topic: []u8,
+    user_intent: []u8,
+    useful_facts: []u8,
+    quality: []u8,
+    flags: []u8,
+
+    pub fn deinit(self: *SessionFocus, allocator: std.mem.Allocator) void {
+        allocator.free(self.topic);
+        allocator.free(self.user_intent);
+        allocator.free(self.useful_facts);
+        allocator.free(self.quality);
+        allocator.free(self.flags);
+    }
+};
+
 pub const AuditDb = struct {
     allocator: std.mem.Allocator,
     db: ?*c.sqlite3,
@@ -64,6 +80,19 @@ pub const AuditDb = struct {
             \\  created_at text not null default current_timestamp
             \\);
             \\create index if not exists input_history_line_id_idx on input_history(line, id);
+        );
+        try audit.exec(
+            \\create table if not exists session_focus (
+            \\  id integer primary key autoincrement,
+            \\  session text not null,
+            \\  topic text not null,
+            \\  user_intent text not null,
+            \\  useful_facts text not null,
+            \\  quality text not null,
+            \\  flags text not null,
+            \\  created_at text not null default current_timestamp
+            \\);
+            \\create index if not exists session_focus_session_id_idx on session_focus(session, id);
         );
         try audit.ensureSessionFts();
         return audit;
@@ -176,6 +205,87 @@ pub const AuditDb = struct {
             \\  )
             \\);
         );
+    }
+
+    pub fn recordSessionFocus(
+        self: *AuditDb,
+        session: []const u8,
+        topic: []const u8,
+        user_intent: []const u8,
+        useful_facts: []const u8,
+        quality: []const u8,
+        flags: []const u8,
+    ) !void {
+        const sql =
+            \\insert into session_focus(session, topic, user_intent, useful_facts, quality, flags)
+            \\values (?1, ?2, ?3, ?4, ?5, ?6)
+        ;
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        try bindText(stmt, 1, session);
+        try bindText(stmt, 2, topic);
+        try bindText(stmt, 3, user_intent);
+        try bindText(stmt, 4, useful_facts);
+        try bindText(stmt, 5, quality);
+        try bindText(stmt, 6, flags);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteStepFailed;
+    }
+
+    pub fn loadRecentSessionFocus(self: *AuditDb, allocator: std.mem.Allocator, session: []const u8, limit: usize) !std.ArrayList(SessionFocus) {
+        if (limit > std.math.maxInt(c_int)) return error.EventLimitTooLarge;
+        const sql =
+            \\select topic, user_intent, useful_facts, quality, flags
+            \\from (
+            \\  select id, topic, user_intent, useful_facts, quality, flags
+            \\  from session_focus
+            \\  where session = ?1
+            \\  order by id desc
+            \\  limit ?2
+            \\)
+            \\order by id asc
+        ;
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        try bindText(stmt, 1, session);
+        if (c.sqlite3_bind_int(stmt, 2, @as(c_int, @intCast(limit))) != c.SQLITE_OK) return error.SqliteBindFailed;
+
+        var rows = std.ArrayList(SessionFocus).empty;
+        errdefer freeSessionFocus(allocator, &rows);
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStepFailed;
+
+            const topic = try dupeColumnText(allocator, stmt, 0);
+            errdefer allocator.free(topic);
+            const user_intent = try dupeColumnText(allocator, stmt, 1);
+            errdefer allocator.free(user_intent);
+            const useful_facts = try dupeColumnText(allocator, stmt, 2);
+            errdefer allocator.free(useful_facts);
+            const quality = try dupeColumnText(allocator, stmt, 3);
+            errdefer allocator.free(quality);
+            const flags = try dupeColumnText(allocator, stmt, 4);
+            errdefer allocator.free(flags);
+            try rows.append(allocator, .{
+                .topic = topic,
+                .user_intent = user_intent,
+                .useful_facts = useful_facts,
+                .quality = quality,
+                .flags = flags,
+            });
+        }
+        return rows;
     }
 
     pub fn loadInputHistoryNewestFirst(self: *AuditDb, allocator: std.mem.Allocator, limit: usize) !std.ArrayList([]u8) {
@@ -307,6 +417,46 @@ pub const AuditDb = struct {
             try events.append(allocator, .{ .kind = kind, .body = body, .created_at_unix_s = created_at_unix_s });
         }
 
+        return events;
+    }
+
+    pub fn loadLatestTurnEvents(self: *AuditDb, allocator: std.mem.Allocator, session: []const u8, limit: usize) !std.ArrayList(AuditEvent) {
+        if (limit > std.math.maxInt(c_int)) return error.EventLimitTooLarge;
+        const sql =
+            \\with start_bound(start_id) as (
+            \\  select coalesce((select max(id) from events where session = ?1 and kind = 'turn_start'), 0)
+            \\)
+            \\select kind, body, cast(strftime('%s', created_at) as integer)
+            \\from events, start_bound
+            \\where session = ?1
+            \\  and id >= start_id
+            \\order by id asc
+            \\limit ?2
+        ;
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        try bindText(stmt, 1, session);
+        if (c.sqlite3_bind_int(stmt, 2, @as(c_int, @intCast(limit))) != c.SQLITE_OK) return error.SqliteBindFailed;
+
+        var events = std.ArrayList(AuditEvent).empty;
+        errdefer freeAuditEvents(allocator, &events);
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStepFailed;
+
+            const kind = try dupeColumnText(allocator, stmt, 0);
+            errdefer allocator.free(kind);
+            const body = try dupeColumnText(allocator, stmt, 1);
+            errdefer allocator.free(body);
+            const created_at_unix_s = if (c.sqlite3_column_type(stmt, 2) == c.SQLITE_NULL) null else @as(i64, @intCast(c.sqlite3_column_int64(stmt, 2)));
+            try events.append(allocator, .{ .kind = kind, .body = body, .created_at_unix_s = created_at_unix_s });
+        }
         return events;
     }
 
@@ -494,6 +644,16 @@ pub fn freeSessionSearchHits(allocator: std.mem.Allocator, hits: *std.ArrayList(
     hits.deinit(allocator);
 }
 
+pub fn freeSessionFocus(allocator: std.mem.Allocator, rows: *std.ArrayList(SessionFocus)) void {
+    for (rows.items) |*row| row.deinit(allocator);
+    rows.deinit(allocator);
+}
+
+fn bindText(stmt: ?*c.sqlite3_stmt, index: c_int, text: []const u8) !void {
+    if (text.len > std.math.maxInt(c_int)) return error.SqliteTextTooLarge;
+    if (c.sqlite3_bind_text(stmt, index, text.ptr, @as(c_int, @intCast(text.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
+}
+
 fn buildFtsQuery(allocator: std.mem.Allocator, terms: []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -555,6 +715,36 @@ test "session events load in insertion order" {
     try std.testing.expectEqualStrings("ola", events.items[0].body);
     try std.testing.expectEqualStrings("assistant_delta", events.items[1].kind);
     try std.testing.expectEqualStrings("ok", events.items[1].body);
+}
+
+test "session focus stores compact operational turn summaries" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordSessionFocus(
+        "s1",
+        "Mateus 1 / matematica perfeita",
+        "user_prompt",
+        "perguntou qual a matematica perfeita de Matheus 1 na biblia",
+        "confirmed",
+        "answered=true used_session_context=false used_evidence=false refusal=false contradicted_context=false low_confidence=false",
+    );
+    try db.recordSessionFocus(
+        "s1",
+        "negativa ruim",
+        "user_prompt",
+        "nao tenho acesso",
+        "uncertain",
+        "answered=true used_session_context=false used_evidence=false refusal=true contradicted_context=false low_confidence=true",
+    );
+
+    var rows = try db.loadRecentSessionFocus(std.testing.allocator, "s1", 8);
+    defer freeSessionFocus(std.testing.allocator, &rows);
+
+    try std.testing.expectEqual(@as(usize, 2), rows.items.len);
+    try std.testing.expectEqualStrings("Mateus 1 / matematica perfeita", rows.items[0].topic);
+    try std.testing.expectEqualStrings("confirmed", rows.items[0].quality);
+    try std.testing.expect(std.mem.indexOf(u8, rows.items[1].flags, "low_confidence=true") != null);
 }
 
 test "tool event audit summary stores metadata without raw output" {

@@ -5,10 +5,10 @@ const model_context = @import("model_context.zig");
 
 const max_entry_bytes: usize = 360;
 const max_recent_entries: usize = 6;
-const max_dialogue_entries: usize = 8;
+const max_dialogue_entries: usize = 4;
 const max_topic_entries: usize = 12;
-const max_dialogue_accum_bytes: usize = 4096;
-const max_dialogue_entry_bytes: usize = 1200;
+const max_dialogue_accum_bytes: usize = 1600;
+const max_dialogue_entry_bytes: usize = 600;
 const max_search_entries: usize = 6;
 const max_thread_entries: usize = 8;
 const max_thread_entry_bytes: usize = 520;
@@ -112,8 +112,7 @@ pub fn renderRecentDialogue(allocator: std.mem.Allocator, events: []const audit.
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "source=sqlite_audit temporary=true raw_context_persisted=false not_evidence=true\n");
-    try appendRecentUserTopics(allocator, &out, events, current_prompt);
+    try out.appendSlice(allocator, "source=sqlite_audit temporary=true raw_context_persisted=false not_evidence=true continuity_only=true\n");
 
     const start = if (entries.items.len > max_dialogue_entries) entries.items.len - max_dialogue_entries else 0;
     for (entries.items[start..]) |entry| {
@@ -183,7 +182,86 @@ fn freeOwnedSlices(allocator: std.mem.Allocator, items: *std.ArrayList([]u8)) vo
 
 pub fn isFailedTurnDone(body: []const u8) bool {
     return std.mem.indexOf(u8, body, "status=expectation_failed") != null or
-        std.mem.indexOf(u8, body, "status=model_error") != null;
+        std.mem.indexOf(u8, body, "status=model_error") != null or
+        std.mem.indexOf(u8, body, "low_confidence=true") != null or
+        std.mem.indexOf(u8, body, "refusal=true") != null;
+}
+
+pub fn renderSessionFocus(allocator: std.mem.Allocator, focus_rows: []const audit.SessionFocus) !?[]u8 {
+    if (focus_rows.len == 0) return null;
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "source=sqlite_session_focus temporary=true raw_context_persisted=false operational_summary=true not_evidence=true\n");
+
+    const start = if (focus_rows.len > max_topic_entries) focus_rows.len - max_topic_entries else 0;
+    for (focus_rows[start..], 0..) |row, idx| {
+        if (std.mem.indexOf(u8, row.flags, "low_confidence=true") != null) continue;
+        const topic = try compactOneLine(allocator, row.topic, max_entry_bytes);
+        defer allocator.free(topic);
+        const facts = try compactOneLine(allocator, row.useful_facts, max_entry_bytes);
+        defer allocator.free(facts);
+        const safe_topic = try redactRawMarkers(allocator, topic);
+        defer allocator.free(safe_topic);
+        const safe_facts = try redactRawMarkers(allocator, facts);
+        defer allocator.free(safe_facts);
+        if (safe_topic.len == 0 and safe_facts.len == 0) continue;
+        const prefix = try std.fmt.allocPrint(allocator, "- F{} quality={s} flags={s}\n", .{ idx + 1, row.quality, row.flags });
+        defer allocator.free(prefix);
+        try out.appendSlice(allocator, prefix);
+        if (safe_topic.len > 0) {
+            try out.appendSlice(allocator, "  topic: ");
+            try out.appendSlice(allocator, safe_topic);
+            try out.append(allocator, '\n');
+        }
+        if (safe_facts.len > 0) {
+            try out.appendSlice(allocator, "  useful_facts: ");
+            try out.appendSlice(allocator, safe_facts);
+            try out.append(allocator, '\n');
+        }
+    }
+
+    if (out.items.len == "source=sqlite_session_focus temporary=true raw_context_persisted=false operational_summary=true not_evidence=true\n".len) {
+        out.deinit(allocator);
+        return null;
+    }
+    const rendered = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(rendered);
+    try model_context.assertNoRawContextLeak(rendered);
+    return rendered;
+}
+
+pub fn renderFallbackSessionFocusFromEvents(allocator: std.mem.Allocator, events: []const audit.AuditEvent, current_prompt: []const u8) !?[]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "source=sqlite_audit_turn_starts temporary=true raw_context_persisted=false operational_summary=true not_evidence=true legacy_fallback=true\n");
+
+    var count: usize = 0;
+    var i = events.len;
+    while (i > 0 and count < max_topic_entries) {
+        i -= 1;
+        const event = events[i];
+        if (!std.mem.eql(u8, event.kind, "turn_start")) continue;
+        if (std.mem.eql(u8, event.body, current_prompt)) continue;
+        const compact_body = try compactOneLine(allocator, event.body, max_entry_bytes);
+        defer allocator.free(compact_body);
+        const safe_body = try redactRawMarkers(allocator, compact_body);
+        defer allocator.free(safe_body);
+        if (safe_body.len == 0) continue;
+        const prefix = try std.fmt.allocPrint(allocator, "- F{} quality=legacy flags=answered=unknown\n  topic: ", .{count + 1});
+        defer allocator.free(prefix);
+        try out.appendSlice(allocator, prefix);
+        try out.appendSlice(allocator, safe_body);
+        try out.append(allocator, '\n');
+        count += 1;
+    }
+    if (count == 0) {
+        out.deinit(allocator);
+        return null;
+    }
+    const rendered = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(rendered);
+    try model_context.assertNoRawContextLeak(rendered);
+    return rendered;
 }
 
 pub fn compactDialogueMessage(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -287,6 +365,13 @@ pub fn toSessionBlocks(allocator: std.mem.Allocator, rendered: ?[]const u8) ![]m
 pub fn toDialogueBlocks(allocator: std.mem.Allocator, rendered: ?[]const u8) ![]model_context.DialogueBlock {
     const text = rendered orelse return allocator.alloc(model_context.DialogueBlock, 0);
     const blocks = try allocator.alloc(model_context.DialogueBlock, 1);
+    blocks[0] = .{ .text = text };
+    return blocks;
+}
+
+pub fn toFocusBlocks(allocator: std.mem.Allocator, rendered: ?[]const u8) ![]model_context.FocusBlock {
+    const text = rendered orelse return allocator.alloc(model_context.FocusBlock, 0);
+    const blocks = try allocator.alloc(model_context.FocusBlock, 1);
     blocks[0] = .{ .text = text };
     return blocks;
 }
@@ -752,7 +837,33 @@ test "recent dialogue preserves roles groups assistant deltas and excludes curre
     try std.testing.expect(std.mem.indexOf(u8, rendered, "pedido atual") == null);
 }
 
-test "recent dialogue includes compact user topic trail beyond visible dialogue window" {
+test "session focus renders confirmed summaries and skips low confidence rows" {
+    var rows = std.ArrayList(audit.SessionFocus).empty;
+    defer audit.freeSessionFocus(std.testing.allocator, &rows);
+    try rows.append(std.testing.allocator, .{
+        .topic = try std.testing.allocator.dupe(u8, "Mateus 1 / matematica perfeita"),
+        .user_intent = try std.testing.allocator.dupe(u8, "user_prompt"),
+        .useful_facts = try std.testing.allocator.dupe(u8, "perguntou sobre Matheus 1 na biblia"),
+        .quality = try std.testing.allocator.dupe(u8, "confirmed"),
+        .flags = try std.testing.allocator.dupe(u8, "answered=true low_confidence=false"),
+    });
+    try rows.append(std.testing.allocator, .{
+        .topic = try std.testing.allocator.dupe(u8, "negativa ruim"),
+        .user_intent = try std.testing.allocator.dupe(u8, "user_prompt"),
+        .useful_facts = try std.testing.allocator.dupe(u8, "nao tenho acesso"),
+        .quality = try std.testing.allocator.dupe(u8, "uncertain"),
+        .flags = try std.testing.allocator.dupe(u8, "answered=true refusal=true low_confidence=true"),
+    });
+
+    const rendered = (try renderSessionFocus(std.testing.allocator, rows.items)) orelse return error.MissingFocus;
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SESSION_FOCUS]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "operational_summary=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Matheus 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "negativa ruim") == null);
+}
+
+test "recent dialogue excludes long topic trail; session focus owns recall map" {
     var events = std.ArrayList(audit.AuditEvent).empty;
     defer audit.freeAuditEvents(std.testing.allocator, &events);
     try events.append(std.testing.allocator, .{
@@ -786,10 +897,9 @@ test "recent dialogue includes compact user topic trail beyond visible dialogue 
 
     const rendered = (try renderRecentDialogue(std.testing.allocator, events.items, "eu estava falando sobre o que com voce?")) orelse return error.MissingDialogue;
     defer std.testing.allocator.free(rendered);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "recent_user_topics:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Matheus 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "recent_user_topics:") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "user: qual a matematica perfeita") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "T") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "continuity_only=true") != null);
 }
 
 test "recent dialogue excludes failed turn assistant output by audit status" {
@@ -824,7 +934,7 @@ test "recent dialogue excludes failed turn assistant output by audit status" {
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "falamos sobre Mateus 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Nao tenho acesso") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "recent_user_topics:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "recent_user_topics:") == null);
 }
 
 test "recent dialogue excludes only latest current prompt occurrence" {

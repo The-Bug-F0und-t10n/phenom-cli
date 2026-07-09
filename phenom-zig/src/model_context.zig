@@ -17,12 +17,17 @@ pub const DialogueBlock = struct {
     text: []const u8,
 };
 
+pub const FocusBlock = struct {
+    text: []const u8,
+};
+
 pub const ModelTurnContext = struct {
     task: []const u8,
     mode: []const u8 = "code_micro",
     budget: []const u8 = "small",
     contracts: []const u8 = "",
     evidence: []const EvidenceBlock = &.{},
+    focus: []const FocusBlock = &.{},
     dialogue: []const DialogueBlock = &.{},
     session: []const SessionBlock = &.{},
     memory: []const []const u8 = &.{},
@@ -65,6 +70,16 @@ pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContex
         try out.appendSlice(allocator, "\n[EVIDENCE]\n");
         for (ctx.evidence, 0..) |entry, i| {
             const label = try std.fmt.allocPrint(allocator, "E{}:\n", .{i + 1});
+            defer allocator.free(label);
+            try out.appendSlice(allocator, label);
+            try appendEvidenceText(&out, allocator, entry.text);
+        }
+    }
+
+    if (ctx.focus.len > 0) {
+        try out.appendSlice(allocator, "\n[SESSION_FOCUS]\n");
+        for (ctx.focus, 0..) |entry, i| {
+            const label = try std.fmt.allocPrint(allocator, "F{}:\n", .{i + 1});
             defer allocator.free(label);
             try out.appendSlice(allocator, label);
             try appendEvidenceText(&out, allocator, entry.text);

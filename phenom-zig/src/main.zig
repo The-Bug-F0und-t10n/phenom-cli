@@ -3,6 +3,7 @@ const std = @import("std");
 const audit = @import("audit.zig");
 const cli = @import("cli.zig");
 const collect_evidence = @import("collect_evidence.zig");
+const context_profile = @import("context_profile.zig");
 const contracts = @import("contracts.zig");
 const config_file = @import("config_file.zig");
 const evidence = @import("evidence.zig");
@@ -219,6 +220,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         const response = offlineStubResponse();
         try events.emit(.{ .message_chunk = response });
         try db.recordEvent(config.session, "assistant_offline_stub", response);
+        try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, response);
     } else {
         var client = http.LocalModelClient{
             .allocator = allocator,
@@ -274,7 +276,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             defer allocator.free(message);
             try events.emit(.{ .progress_update = message });
             try db.recordEvent(config.session, "model_error", @errorName(err));
-            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "model_error");
+            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "model_error", prompt, sink.visible.items);
             if (config.fail_on_model_error) return err;
             return;
         };
@@ -288,11 +290,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
                 if (config.fail_on_model_error) return err;
                 break :blk true;
             };
-            const handled_after_repair = if (!handled_by_tool_loop and shouldRepairSessionRecallDenial(model_context_text, sink.raw_visible.items))
-                try repairSessionRecallDenial(allocator, io, config, prompt, model_context_text, &client, &events, &db, ui_ptr, &sink)
-            else
-                handled_by_tool_loop;
-            if (!handled_after_repair) try sink.flushDeferredVisible();
+            if (!handled_by_tool_loop) try sink.flushDeferredVisible();
         }
         if (sink.visible_bytes == 0) {
             try events.emit(.{ .progress_update = "model emitted no visible final answer; reasoning was suppressed or generation ended inside <think>" });
@@ -308,7 +306,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
                 defer allocator.free(message);
                 try events.emit(.{ .progress_update = message });
                 try db.recordEvent(config.session, "expectation_failed", expected);
-                try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "expectation_failed");
+                try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "expectation_failed", prompt, sink.visible.items);
                 return error.ExpectedVisibleOutputMissing;
             }
             try db.recordEvent(config.session, "expectation_passed", expected);
@@ -322,9 +320,8 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
                 try events.emit(.{ .progress_update = message });
             }
         }
+        try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, sink.visible.items);
     }
-
-    try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok");
 }
 
 fn recordAndEmitTurnDone(
@@ -334,103 +331,113 @@ fn recordAndEmitTurnDone(
     events: *ui_events.EventBus,
     turn_started_ms: i64,
     status: []const u8,
+    prompt: []const u8,
+    visible: []const u8,
 ) !void {
     const elapsed_ms = ui_events.elapsedMillisSince(turn_started_ms);
-    const body = try std.fmt.allocPrint(allocator, "status={s} elapsed_ms={}", .{ status, elapsed_ms });
+    const quality = try buildTurnQuality(allocator, db, session, status, visible);
+    defer quality.deinit(allocator);
+    const body = try std.fmt.allocPrint(allocator, "status={s} elapsed_ms={} quality={s} flags={s}", .{ status, elapsed_ms, quality.quality, quality.flags });
     defer allocator.free(body);
     try db.recordEvent(session, "turn_done", body);
+    try recordSessionFocusForTurn(allocator, db, session, prompt, quality.quality, quality.flags);
     try events.emit(.{ .turn_done = .{ .elapsed_ms = elapsed_ms } });
 }
 
-fn shouldRepairSessionRecallDenial(model_context_text: ?[]const u8, visible: []const u8) bool {
-    const context = model_context_text orelse return false;
-    if (std.mem.indexOf(u8, context, "recent_user_topics:") == null) return false;
-    if (std.mem.indexOf(u8, visible, "<tool_call>") != null) return false;
-    return containsSessionDenial(visible);
-}
+const TurnQuality = struct {
+    quality: []u8,
+    flags: []u8,
 
-fn containsSessionDenial(text: []const u8) bool {
-    // ponytail: surface contract guard; replace with a typed refusal channel when the model protocol exposes one.
-    const markers = [_][]const u8{
-        "Não tenho evidência",
-        "Nao tenho evidencia",
-        "Não tenho acesso",
-        "Nao tenho acesso",
-        "não há contexto",
-        "nao ha contexto",
-        "no evidence",
-        "no context",
-        "don't have access",
-        "do not have access",
-    };
-    for (markers) |marker| {
-        if (indexOfAsciiIgnoreCase(text, marker) != null) return true;
+    fn deinit(self: TurnQuality, allocator: std.mem.Allocator) void {
+        allocator.free(self.quality);
+        allocator.free(self.flags);
     }
-    return false;
-}
+};
 
-fn indexOfAsciiIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0) return 0;
-    if (needle.len > haystack.len) return null;
-    var i: usize = 0;
-    while (i <= haystack.len - needle.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
-    }
-    return null;
-}
-
-fn repairSessionRecallDenial(
+fn buildTurnQuality(
     allocator: std.mem.Allocator,
-    io: std.Io,
-    config: cli.Config,
-    prompt: []const u8,
-    model_context_text: ?[]const u8,
-    client: *http.LocalModelClient,
-    events: *ui_events.EventBus,
     db: *audit.AuditDb,
-    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
-    aggregate_sink: *StreamSink,
-) !bool {
-    const base_context = model_context_text orelse return false;
-    try db.recordEvent(config.session, "tool_repair", "session recall denial without search_session");
-    const repair_context = try std.fmt.allocPrint(
+    session: []const u8,
+    status: []const u8,
+    visible: []const u8,
+) !TurnQuality {
+    var turn_events = try db.loadLatestTurnEvents(allocator, session, 512);
+    defer audit.freeAuditEvents(allocator, &turn_events);
+
+    const answered = std.mem.trim(u8, visible, " \t\r\n").len > 0;
+    var used_session_context = false;
+    var used_evidence = false;
+    var session_recall_contract = false;
+    for (turn_events.items) |event| {
+        if (std.mem.eql(u8, event.kind, "session_context")) used_session_context = true;
+        if (std.mem.eql(u8, event.kind, "evidence")) used_evidence = true;
+        if (std.mem.eql(u8, event.kind, "tool_start") and std.mem.startsWith(u8, event.body, "search_session")) used_session_context = true;
+        if (std.mem.eql(u8, event.kind, "tool_start") and std.mem.startsWith(u8, event.body, "collect_evidence")) used_evidence = true;
+        if (std.mem.eql(u8, event.kind, "model_context") and std.mem.indexOf(u8, event.body, "mode: session_recall") != null) session_recall_contract = true;
+    }
+    const ok_status = std.mem.eql(u8, status, "ok");
+    const contract_missing_context = session_recall_contract and !used_session_context;
+    const low_confidence = !ok_status or !answered or contract_missing_context;
+    const quality: []const u8 = if (!ok_status or !answered)
+        "failed"
+    else if (low_confidence)
+        "uncertain"
+    else
+        "confirmed";
+    const flags = try std.fmt.allocPrint(
         allocator,
-        "{s}\n\n[CONTRACT_REPAIR]\nThe previous draft denied session context while [RECENT_DIALOGUE] includes recent_user_topics. Do not answer yet. Emit exactly one search_session tool call with model-chosen terms that describe the prior conversation topic needed to answer the user. Use scope=current first; use scope=all only if current session evidence is insufficient.\n",
-        .{base_context},
+        "answered={} used_session_context={} used_evidence={} refusal=false contradicted_context=false contract_missing_context={} low_confidence={}",
+        .{ answered, used_session_context, used_evidence, contract_missing_context, low_confidence },
     );
-    defer allocator.free(repair_context);
-    try db.recordEvent(config.session, "model_context", repair_context);
-
-    if (ui_ptr) |active_ui| try active_ui.showStatus("Thinking");
-    var repair_sink = StreamSink{
-        .allocator = allocator,
-        .events = events,
-        .db = db,
-        .session = config.session,
-        .ui = ui_ptr,
-        .filter = reasoning_filter.ReasoningFilter.init(allocator, http.resolveThinking(config.thinking, prompt) == .on),
-        .visible = std.ArrayList(u8).empty,
-        .visible_bytes = 0,
-        .thinking_bytes = 0,
-        .defer_visible = true,
-        .trim_visible_leading_whitespace = false,
+    errdefer allocator.free(flags);
+    return .{
+        .quality = try allocator.dupe(u8, quality),
+        .flags = flags,
     };
-    defer repair_sink.deinit();
+}
 
-    const empty_dialogue: []const http.ChatMessage = &.{};
-    try client.streamInference(.{
-        .user_prompt = prompt,
-        .model_context = repair_context,
-        .dialogue = empty_dialogue,
-    }, &repair_sink);
-    try repair_sink.flush();
+fn recordSessionFocusForTurn(
+    allocator: std.mem.Allocator,
+    db: *audit.AuditDb,
+    session: []const u8,
+    prompt: []const u8,
+    quality: []const u8,
+    flags: []const u8,
+) !void {
+    const topic = try compactOperationalText(allocator, prompt, 360);
+    defer allocator.free(topic);
+    if (topic.len == 0) return;
+    try db.recordSessionFocus(
+        session,
+        topic,
+        "user_prompt",
+        topic,
+        quality,
+        flags,
+    );
+}
 
-    const handled = try runToolLoopIterations(allocator, io, config, prompt, repair_sink.raw_visible.items, client, events, db, ui_ptr, aggregate_sink);
-    if (handled) return true;
-
-    aggregate_sink.raw_visible.clearRetainingCapacity();
-    try aggregate_sink.raw_visible.appendSlice(allocator, repair_sink.raw_visible.items);
-    return false;
+fn compactOperationalText(allocator: std.mem.Allocator, text: []const u8, max_bytes: usize) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var written: usize = 0;
+    var last_space = false;
+    for (text) |byte| {
+        if (written >= max_bytes) break;
+        const normalized: u8 = switch (byte) {
+            '\n', '\r', '\t' => ' ',
+            else => byte,
+        };
+        if (normalized == ' ') {
+            if (last_space) continue;
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+        try out.append(allocator, normalized);
+        written += 1;
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn buildInitialModelContext(
@@ -442,17 +449,27 @@ fn buildInitialModelContext(
     enable_tool_loop: bool,
 ) !?[]u8 {
     const include_persistent = modelContextEnabled();
-    const include_collect_evidence_schema = enable_tool_loop;
-    if (!include_persistent and !include_collect_evidence_schema) return null;
+    if (!include_persistent and !enable_tool_loop) return null;
 
     var persistent = persistent_context.Loaded.init(allocator);
     defer persistent.deinit();
     if (include_persistent) persistent = try persistent_context.loadFromCwd(allocator, io);
 
-    if (!include_collect_evidence_schema and persistent.memory.items.len == 0 and persistent.skills.items.len == 0) return null;
+    if (!enable_tool_loop and persistent.memory.items.len == 0 and persistent.skills.items.len == 0) return null;
 
     var session_events = try db.loadRecentSessionEvents(allocator, session, 240);
     defer audit.freeAuditEvents(allocator, &session_events);
+
+    var focus_rows = try db.loadRecentSessionFocus(allocator, session, 16);
+    defer audit.freeSessionFocus(allocator, &focus_rows);
+    var focus_text = try session_context.renderSessionFocus(allocator, focus_rows.items);
+    if (focus_text == null) {
+        focus_text = try session_context.renderFallbackSessionFocusFromEvents(allocator, session_events.items, prompt);
+    }
+    defer if (focus_text) |text| allocator.free(text);
+    const focus_blocks = try session_context.toFocusBlocks(allocator, focus_text);
+    defer allocator.free(focus_blocks);
+
     const recent_dialogue = try session_context.renderRecentDialogue(allocator, session_events.items, prompt);
     defer if (recent_dialogue) |text| allocator.free(text);
     const dialogue_blocks = try session_context.toDialogueBlocks(allocator, recent_dialogue);
@@ -460,18 +477,26 @@ fn buildInitialModelContext(
 
     const session_blocks = try session_context.toSessionBlocks(allocator, null);
     defer allocator.free(session_blocks);
+    const profile = context_profile.select(.{
+        .enable_tool_loop = enable_tool_loop,
+        .has_session_focus = focus_text != null,
+    });
 
     return try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
-        .contracts = if (include_collect_evidence_schema) collectEvidenceToolSchema(true) else "",
+        .mode = context_profile.modeName(profile),
+        .contracts = context_profile.toolSchema(profile, .initial),
         .evidence = &[_]model_context.EvidenceBlock{},
+        .focus = focus_blocks,
         .dialogue = dialogue_blocks,
         .session = session_blocks,
         .memory = persistent.memory.items,
         .skills = persistent.skills.items,
         .grounding = groundingRules(),
-        .next_action = if (include_collect_evidence_schema)
-            "First infer the user's intent. Use [RECENT_DIALOGUE] for conversational continuity. Use [SESSION_CONTEXT] only as retrieved prior-session evidence and cite S# for exact prior-session claims. Before making claims about the current workspace, repository, source code, files, or implementation, call collect_evidence. Use terms to describe exactly what you need to find. If session recall is insufficient, call search_session with better model-chosen terms and scope=current or scope=all. After evidence returns, answer using cited evidence or request a different evidence range."
+        .next_action = if (enable_tool_loop and profile == .session_recall)
+            "This is a session_recall turn. First emit exactly one search_session tool call with model-chosen terms from [SESSION_FOCUS] and the current task. Do not answer with prose before SESSION_CONTEXT returns. [SESSION_FOCUS] is not evidence."
+        else if (enable_tool_loop)
+            "Infer the user's intent. If the answer requires workspace/source-code facts, call collect_evidence with model-chosen terms or path. If the answer requires prior-session facts, call search_session with model-chosen terms. Otherwise answer directly."
         else
             "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
     });
@@ -609,7 +634,10 @@ fn runOneToolLoopStep(
         try events.emit(.{ .progress_update = "repairing tool call: collect_evidence requires path" });
         const repair_context = try model_context.renderModelTurnContext(allocator, .{
             .task = prompt,
-            .contracts = collectEvidenceToolSchema(!state.contract_selected),
+            .contracts = if (state.contract_selected)
+                context_profile.toolSchema(.code_evidence, .active_contract)
+            else
+                context_profile.toolSchema(.code_evidence, .initial),
             .obligations = &.{
                 "A collect_evidence call must include <parameter=path>relative/file</parameter>.",
                 "Do not answer with prose until evidence is collected or you decide evidence is unnecessary.",
@@ -642,7 +670,7 @@ fn runOneToolLoopStep(
             prompt,
             &state.context,
             null,
-            !state.contract_selected,
+            context_profile.toolSchema(.code_evidence, .after_collect_evidence),
             "The requested evidence was already collected in this turn. Answer now using the evidence above. Do not call tools again.",
         );
         defer allocator.free(duplicate_context);
@@ -679,7 +707,7 @@ fn runOneToolLoopStep(
             prompt,
             &state.context,
             null,
-            !state.contract_selected,
+            context_profile.toolSchema(.code_evidence, .after_collect_evidence),
             "collect_evidence encountered an error. Answer the current user request directly.",
         );
         defer allocator.free(follow_context);
@@ -709,7 +737,7 @@ fn runOneToolLoopStep(
         prompt,
         &state.context,
         null,
-        !state.contract_selected,
+        context_profile.toolSchema(.code_evidence, .after_collect_evidence),
         if (state.shouldAllowMoreEvidence())
             "Answer using only cited evidence above. Cite E# for workspace claims and S# for session claims. Do not add capabilities, files, tools, or architecture not present in evidence. If a different evidence range is strictly required and budget remains, emit one collect_evidence or search_session call. Do not request the same file/range/session terms again."
         else
@@ -749,7 +777,7 @@ fn runSetOperationalContractStep(
         try db.recordEvent(config.session, "contract_duplicate", "set_operational_contract");
         const duplicate_context = try model_context.renderModelTurnContext(allocator, .{
             .task = prompt,
-            .contracts = collectEvidenceToolSchema(false),
+            .contracts = context_profile.toolSchema(.code_evidence, .active_contract),
             .obligations = &.{
                 "The operational contract was already selected in this turn.",
                 "Do not call set_operational_contract again unless a later tool result changes the operational need.",
@@ -770,7 +798,7 @@ fn runSetOperationalContractStep(
         try db.recordEvent(config.session, "tool_repair", "set_operational_contract missing required booleans");
         const repair_context = try model_context.renderModelTurnContext(allocator, .{
             .task = prompt,
-            .contracts = collectEvidenceToolSchema(true),
+            .contracts = context_profile.toolSchema(.code_evidence, .initial),
             .obligations = &.{
                 "set_operational_contract requires requiresInspection, requiresMutation, requiresRuntimeValidation, and requiresBrowserDiagnostics.",
             },
@@ -814,7 +842,7 @@ fn runSetOperationalContractStep(
 
     const follow_context = try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
-        .contracts = collectEvidenceToolSchema(false),
+        .contracts = context_profile.toolSchema(.code_evidence, .active_contract),
         .obligations = &.{
             "The operational contract is now active for this turn.",
             "Only advertised tools may be called. Future mutation/validation executors remain blocked until their contracts are implemented.",
@@ -848,7 +876,7 @@ fn runSearchSessionStep(
             prompt,
             &state.context,
             null,
-            !state.contract_selected,
+            context_profile.toolSchema(.session_recall, .active_contract),
             "Emit one corrected search_session tool call with <parameter=terms>describing what prior session fact you need</parameter>, or answer using current evidence only.",
         );
         defer allocator.free(repair_context);
@@ -862,7 +890,7 @@ fn runSearchSessionStep(
             prompt,
             &state.context,
             null,
-            !state.contract_selected,
+            context_profile.toolSchema(.session_recall, .active_contract),
             "Emit one corrected search_session tool call with scope=current or scope=all, or provide a session id. Do not invent session facts.",
         );
         defer allocator.free(repair_context);
@@ -878,7 +906,7 @@ fn runSearchSessionStep(
             prompt,
             &state.context,
             state.last_session_context,
-            !state.contract_selected,
+            context_profile.toolSchema(.session_recall, .after_search_session),
             "The requested session search was already performed in this turn. Answer using existing E#/S# evidence, or state what remains unknown.",
         );
         defer allocator.free(duplicate_context);
@@ -915,7 +943,7 @@ fn runSearchSessionStep(
         prompt,
         &state.context,
         result.text,
-        !state.contract_selected,
+        context_profile.toolSchema(.session_recall, .after_search_session),
         "Use SESSION_CONTEXT as retrieved prior-session evidence. Cite S# when stating what was said or done in a session; S# includes session ids when search crossed sessions. Cite E# for workspace facts. For technical judgment, use retrieved context plus the current user request; do not claim unsupported workspace/session facts. If more evidence is needed and budget remains, emit one targeted collect_evidence or search_session call.",
     );
     defer allocator.free(follow_context);
@@ -1152,7 +1180,7 @@ fn renderCollectedEvidenceContext(
     prompt: []const u8,
     context: *const working_context.WorkingContext,
     session_text: ?[]const u8,
-    include_contract_tool: bool,
+    contracts_text: []const u8,
     next_action: []const u8,
 ) ![]u8 {
     const evidence_blocks = try context.renderEvidenceBlocks(allocator);
@@ -1161,7 +1189,7 @@ fn renderCollectedEvidenceContext(
     defer allocator.free(session_blocks);
     return model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
-        .contracts = collectEvidenceToolSchema(include_contract_tool),
+        .contracts = contracts_text,
         .evidence = evidence_blocks,
         .session = session_blocks,
         .obligations = &.{
@@ -1173,75 +1201,16 @@ fn renderCollectedEvidenceContext(
 }
 
 fn collectEvidenceToolSchema(include_contract_tool: bool) []const u8 {
-    if (include_contract_tool) return
-    \\[TOOLS v1]
-    \\set_operational_contract(requiresInspection, requiresMutation, requiresRuntimeValidation, requiresBrowserDiagnostics, reason?)
-    \\collect_evidence(path?, terms?, strategy=auto|path|lexical|symbol|diagnostic, start_line=1, max_lines=12, compact=false)
-    \\search_session(terms, scope=current|all, session?)
-    \\The current workspace files are available through this tool.
-    \\Use set_operational_contract when the request needs inspection, mutation, validation, or runtime/browser diagnostics. This declares controller gates; it does not expose internal tools by itself.
-    \\Recent dialogue may be provided for continuity. Exact prior-session facts are available through search_session with model-chosen terms. Use scope=all when the fact may be in another active or inactive session; use session only when you know the session id.
-    \\Never answer that you lack conversation history while search_session is available and the user asks about prior conversation. First call search_session with model-chosen terms; use scope=all when current session evidence is insufficient.
-    \\Before making claims about the current project, repository, source code, files, implementation, or prior conversation, emit the relevant tool call and wait for evidence.
-    \\Use terms to express your search intent. Use strategy=symbol when looking for a named function/type/constant. Use strategy=diagnostic with path for Zig syntax diagnostics. Use strategy=path only with path. Set compact=true only when prior evidence can be reduced to anchors.
-    \\Format contract:
-    \\<tool_call><function=set_operational_contract><parameter=requiresInspection>true</parameter><parameter=requiresMutation>false</parameter><parameter=requiresRuntimeValidation>false</parameter><parameter=requiresBrowserDiagnostics>false</parameter><parameter=reason>short reason</parameter></function></tool_call>
-    \\Format with path:
-    \\<tool_call>
-    \\<function=collect_evidence>
-    \\<parameter=path>relative/path</parameter>
-    \\<parameter=strategy>path</parameter>
-    \\<parameter=start_line>1</parameter>
-    \\<parameter=max_lines>12</parameter>
-    \\</function>
-    \\</tool_call>
-    \\Format ranked:
-    \\<tool_call><function=collect_evidence><parameter=strategy>auto</parameter><parameter=terms>what to find</parameter></function></tool_call>
-    \\Format symbol:
-    \\<tool_call><function=collect_evidence><parameter=strategy>symbol</parameter><parameter=terms>symbol or identifier to find</parameter></function></tool_call>
-    \\Format diagnostic:
-    \\<tool_call><function=collect_evidence><parameter=path>relative/file.zig</parameter><parameter=strategy>diagnostic</parameter></function></tool_call>
-    \\Format session:
-    \\<tool_call><function=search_session><parameter=terms>what prior conversation fact to find</parameter><parameter=scope>current</parameter></function></tool_call>
-    \\Format all sessions:
-    \\<tool_call><function=search_session><parameter=terms>what prior conversation fact to find</parameter><parameter=scope>all</parameter></function></tool_call>
-    ;
-    return
-    \\[TOOLS v1]
-    \\collect_evidence(path?, terms?, strategy=auto|path|lexical|symbol|diagnostic, start_line=1, max_lines=12, compact=false)
-    \\search_session(terms, scope=current|all, session?)
-    \\The current workspace files are available through this tool.
-    \\The operational contract is already active for this turn. Do not call set_operational_contract again.
-    \\Recent dialogue may be provided for continuity. Exact prior-session facts are available through search_session with model-chosen terms. Use scope=all when the fact may be in another active or inactive session; use session only when you know the session id.
-    \\Never answer that you lack conversation history while search_session is available and the user asks about prior conversation. First call search_session with model-chosen terms; use scope=all when current session evidence is insufficient.
-    \\Before making claims about the current project, repository, source code, files, implementation, or prior conversation, emit the relevant tool call and wait for evidence.
-    \\Use terms to express your search intent. Use strategy=symbol when looking for a named function/type/constant. Use strategy=diagnostic with path for Zig syntax diagnostics. Use strategy=path only with path. Set compact=true only when prior evidence can be reduced to anchors.
-    \\Format with path:
-    \\<tool_call>
-    \\<function=collect_evidence>
-    \\<parameter=path>relative/path</parameter>
-    \\<parameter=strategy>path</parameter>
-    \\<parameter=start_line>1</parameter>
-    \\<parameter=max_lines>12</parameter>
-    \\</function>
-    \\</tool_call>
-    \\Format ranked:
-    \\<tool_call><function=collect_evidence><parameter=strategy>auto</parameter><parameter=terms>what to find</parameter></function></tool_call>
-    \\Format symbol:
-    \\<tool_call><function=collect_evidence><parameter=strategy>symbol</parameter><parameter=terms>symbol or identifier to find</parameter></function></tool_call>
-    \\Format diagnostic:
-    \\<tool_call><function=collect_evidence><parameter=path>relative/file.zig</parameter><parameter=strategy>diagnostic</parameter></function></tool_call>
-    \\Format session:
-    \\<tool_call><function=search_session><parameter=terms>what prior conversation fact to find</parameter><parameter=scope>current</parameter></function></tool_call>
-    \\Format all sessions:
-    \\<tool_call><function=search_session><parameter=terms>what prior conversation fact to find</parameter><parameter=scope>all</parameter></function></tool_call>
-    ;
+    return if (include_contract_tool)
+        context_profile.toolSchema(.code_evidence, .initial)
+    else
+        context_profile.toolSchema(.code_evidence, .active_contract);
 }
 
 fn groundingRules() []const []const u8 {
     return &.{
         "Workspace/source-code claims must cite E# evidence from [EVIDENCE].",
-        "Use [RECENT_DIALOGUE] for continuity only; exact claims about what was said or done in prior conversation must cite S# evidence from [SESSION_CONTEXT].",
+        "Use [RECENT_DIALOGUE] for continuity only; use [SESSION_FOCUS] only as a routing map. Exact claims about what was said or done in prior conversation must cite S# evidence from [SESSION_CONTEXT].",
         "Do not answer that conversation history is unavailable while search_session is available; call search_session first when prior conversation context is required.",
         "If no E#/S# supports a workspace or exact prior-session claim, say that claim is not evidenced in the provided context.",
     };
@@ -1659,14 +1628,9 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "diagnostic") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=runtime") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=diff") == null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "current workspace files are available") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "scope=current|all") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "scope=all") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "Recent dialogue may be provided") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "Exact prior-session facts") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "Never answer that you lack conversation history") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "Before making claims about the current project") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "The model decides search intent") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "apply_patch") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "grep_file") == null);
     const post_contract_schema = collectEvidenceToolSchema(false);
@@ -1679,7 +1643,9 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try db.recordEvent("schema-test", "assistant_delta", "resposta anterior");
     const with_tools = (try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test", "ola tudo bem", true)) orelse return error.MissingContext;
     defer std.testing.allocator.free(with_tools);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "mode: session_recall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "[SESSION_FOCUS]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "collect_evidence") == null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[CONTRACTS]") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[RECENT_DIALOGUE]") != null);
@@ -1687,7 +1653,7 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "assistant: resposta anterior") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "S1:") == null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[GROUNDING]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "call collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "call search_session") != null);
 
     try std.testing.expect((try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test-empty", "analise esse projeto", false)) == null);
 }
@@ -1705,16 +1671,17 @@ test "search session scope is model selected without linguistic inference" {
     try std.testing.expectEqualStrings("scope=all session= terms=w-90 bootstrap", key);
 }
 
-test "session recall denial repair requires topics and denial" {
-    const context =
-        \\[RECENT_DIALOGUE]
-        \\source=sqlite_audit temporary=true raw_context_persisted=false not_evidence=true
-        \\recent_user_topics:
-        \\- T1: qual a matematica perfeita de Matheus 1
-    ;
-    try std.testing.expect(shouldRepairSessionRecallDenial(context, "Não tenho evidência sobre isso."));
-    try std.testing.expect(!shouldRepairSessionRecallDenial(context, "Falamos sobre Matheus 1 e Bootstrap."));
-    try std.testing.expect(!shouldRepairSessionRecallDenial(null, "Não tenho evidência sobre isso."));
+test "session recall missing search_session is turn quality without text heuristics" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+    try db.recordEvent("quality", "turn_start", "eu estava falando sobre o que?");
+    try db.recordEvent("quality", "model_context", "[TURN_CONTEXT v1]\nmode: session_recall\n");
+    const quality = try buildTurnQuality(std.testing.allocator, &db, "quality", "ok", "resposta qualquer");
+    defer quality.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("uncertain", quality.quality);
+    try std.testing.expect(std.mem.indexOf(u8, quality.flags, "refusal=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quality.flags, "contract_missing_context=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quality.flags, "low_confidence=true") != null);
 }
 
 test "initial model context does not run prompt based session fts" {
@@ -1745,6 +1712,7 @@ test "initial model context does not run prompt based session fts" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "fora da sessao") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
+    try std.testing.expect(rendered.len < 5000);
 }
 
 test "recent chat messages preserve roles and exclude only current prompt event" {
@@ -1952,7 +1920,7 @@ test "tool loop state keeps session evidence for duplicate search repair" {
         "eu estava falando sobre o que com voce?",
         &state.context,
         state.last_session_context,
-        true,
+        context_profile.toolSchema(.session_recall, .after_search_session),
         "The requested session search was already performed in this turn. Answer using existing E#/S# evidence.",
     );
     defer std.testing.allocator.free(rendered);
@@ -1998,16 +1966,16 @@ test "duplicate evidence context keeps evidence and tool schema" {
         "responda",
         &state.context,
         null,
-        true,
+        context_profile.toolSchema(.code_evidence, .after_collect_evidence),
         "Answer now. Do not call tools again.",
     );
     defer std.testing.allocator.free(rendered);
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[EVIDENCE]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "README.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[TOOLS v1]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "collect_evidence") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "set_operational_contract") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[TOOLS v1]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "collect_evidence(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "set_operational_contract") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Use only collected evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Do not call tools again") != null);
 }
@@ -2038,7 +2006,7 @@ test "collected evidence context renders compact anchors without memory skills o
         "responda",
         &state.context,
         null,
-        true,
+        context_profile.toolSchema(.code_evidence, .after_collect_evidence),
         "Answer from compact anchors.",
     );
     defer std.testing.allocator.free(rendered);
@@ -2057,7 +2025,7 @@ test "collected context can include temporary session evidence without memory" {
         "o que combinamos?",
         &state.context,
         "[SESSION_EVIDENCE]\n- S1 score=10 turn_start: combinamos groundedness\n",
-        true,
+        context_profile.toolSchema(.session_recall, .after_search_session),
         "Answer with S# citations.",
     );
     defer std.testing.allocator.free(rendered);
@@ -2066,7 +2034,7 @@ test "collected context can include temporary session evidence without memory" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "combinamos groundedness") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "exact claims about what was said") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Exact claims about what was said") != null);
 }
 
 test "grounding rules separate dialogue continuity from exact session evidence" {
