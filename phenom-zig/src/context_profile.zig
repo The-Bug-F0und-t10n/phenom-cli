@@ -16,12 +16,10 @@ pub const ContractState = enum {
 
 pub const SelectInput = struct {
     enable_tool_loop: bool,
-    has_session_focus: bool,
 };
 
 pub fn select(input: SelectInput) ContextProfile {
     if (!input.enable_tool_loop) return .code_micro;
-    if (input.has_session_focus) return .session_recall;
     return .code_evidence;
 }
 
@@ -72,7 +70,8 @@ pub fn codeEvidenceSchema() []const u8 {
         \\set_operational_contract(requiresInspection, requiresMutation, requiresRuntimeValidation, requiresBrowserDiagnostics, reason?)
         \\collect_evidence(path?, terms?, strategy=auto|path|lexical|symbol|diagnostic, start_line=1, max_lines=12, compact=false)
         \\search_session(terms, scope=current|all, session?)
-        \\The model decides search intent. The controller only executes announced contracts and returns evidence.
+        \\The model decides search intent. The controller only executes announced contracts and returns evidence. SESSION_FOCUS is not evidence; use it only to choose whether search_session is needed.
+        \\Any claim about prior conversation/session content must call search_session first and cite returned S# evidence. Do not answer that session history is unavailable while search_session is advertised.
         \\Format contract:
         \\<tool_call><function=set_operational_contract><parameter=requiresInspection>true</parameter><parameter=requiresMutation>false</parameter><parameter=requiresRuntimeValidation>false</parameter><parameter=requiresBrowserDiagnostics>false</parameter><parameter=reason>short reason</parameter></function></tool_call>
         \\Format evidence:
@@ -98,9 +97,8 @@ pub fn activeContractSchema() []const u8 {
 }
 
 test "profile selection uses operational state only" {
-    try std.testing.expectEqual(ContextProfile.code_micro, select(.{ .enable_tool_loop = false, .has_session_focus = true }));
-    try std.testing.expectEqual(ContextProfile.session_recall, select(.{ .enable_tool_loop = true, .has_session_focus = true }));
-    try std.testing.expectEqual(ContextProfile.code_evidence, select(.{ .enable_tool_loop = true, .has_session_focus = false }));
+    try std.testing.expectEqual(ContextProfile.code_micro, select(.{ .enable_tool_loop = false }));
+    try std.testing.expectEqual(ContextProfile.code_evidence, select(.{ .enable_tool_loop = true }));
 }
 
 test "schemas are state scoped" {

@@ -41,8 +41,20 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: Args) !Result {
     if (args.budget_bytes == 0) return error.InvalidEvidenceBudget;
     const strategy = contracts.resolveCollectEvidenceStrategy(args.strategy) orelse return error.InvalidStrategy;
     if (strategy == .diagnostic) return executeDiagnostic(allocator, args);
+    if (args.path) |path| {
+        if (isWorkspaceRootPath(path)) {
+            var ranked_args = args;
+            ranked_args.path = null;
+            ranked_args.strategy = if (strategy == .path) .auto else strategy;
+            return executeRanked(allocator, io, ranked_args, ranked_args.strategy);
+        }
+    }
     if (strategy == .path or args.path != null) return executePath(allocator, args, strategy);
     return executeRanked(allocator, io, args, strategy);
+}
+
+fn isWorkspaceRootPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, ".") or std.mem.eql(u8, path, "./");
 }
 
 fn executeDiagnostic(allocator: std.mem.Allocator, args: Args) !Result {
@@ -350,6 +362,20 @@ test "collect evidence auto without model terms uses structural overview" {
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.range_count > 0);
     try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "terms=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "workspace_overview") != null);
+}
+
+test "collect evidence workspace root path uses ranked overview not empty file" {
+    const result = try execute(std.testing.allocator, std.testing.io, .{
+        .path = ".",
+        .strategy = .path,
+        .budget_bytes = 6000,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(contracts.StrategyName.auto, result.strategy);
+    try std.testing.expect(result.range_count > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "- . L1-L1") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "workspace_overview") != null);
 }
 

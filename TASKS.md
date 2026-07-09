@@ -9773,7 +9773,7 @@ Criterio de aceite:
 
 ## T294 - Corrigir continuidade de sessao para equivalencia com `recentMessages` e sumarizacao longa
 
-Status: done.
+Status: partial.
 
 Prioridade: urgente.
 
@@ -9815,7 +9815,7 @@ Status de completude em 2026-07-08:
 Atualizacao de arquitetura de contexto por perfil em 2026-07-08:
 
 - `phenom-zig/src/context_profile.zig` cria perfis `code_micro`, `session_recall`, `code_evidence` e `news_doc_log`, com schema model-visible por estado (`initial`, `active_contract`, `after_search_session`, `after_collect_evidence`).
-- A selecao de perfil usa estado operacional leve, nao heuristica de assunto: sem tool loop vira `code_micro`; com foco de sessao vira `session_recall`; com tool loop e sem foco vira `code_evidence`.
+- A selecao de perfil usa estado operacional leve, nao heuristica de assunto: sem tool loop vira `code_micro`; com tool loop vira `code_evidence`. `SESSION_FOCUS` nao forca `session_recall`, porque isso prendeu perguntas de workspace em busca de sessao.
 - `session_recall` inicial anuncia somente `search_session`; `code_evidence` inicial anuncia `set_operational_contract`, `collect_evidence` e `search_session`; contextos pos-tool nao reenviam schema completo.
 - `phenom-zig/src/audit.zig` cria tabela `session_focus` com `topic`, `user_intent`, `useful_facts`, `quality` e `flags`, mantendo SQLite como storage operacional e nao como MEMORY/SKILLS.
 - `phenom-zig/src/main.zig` destila cada turno apos `turn_done` com flags objetivas: `answered`, `used_session_context`, `used_evidence`, `refusal`, `contradicted_context=false`, `low_confidence`.
@@ -9840,6 +9840,24 @@ Validacao desta atualizacao:
 - Smoke real desta atualizacao: sessao `context-profile-smoke-297`; seed `PHENOM_PROFILE_SEED_297` passou; pergunta ambigua `eu estava falando sobre o que com voce?` acionou `search_session` no primeiro fluxo, retornou S# com `Mateus 1` e respondeu usando a evidencia.
 - Audit SQLite do smoke `context-profile-smoke-297`: `tool_repair=0`, `search_session=1`, `memory_block=0`, `skills_block=0`, `raw_marker=0`, `max_context_bytes=2478`.
 - Correcao de alinhamento apos revisao: removida a heuristica textual de negativa (`containsSessionDenial` e marcadores de frase); baixa confianca agora deriva de quebra objetiva do contrato `session_recall` quando falta `search_session`/`SESSION_CONTEXT`.
+
+Atualizacao de correcao em 2026-07-09:
+
+- `phenom-zig/src/context_profile.zig`: perfil inicial com tool loop permanece `code_evidence`, expondo `collect_evidence` e `search_session`; `SESSION_FOCUS` vira mapa operacional para o modelo escolher a ferramenta, nao gatilho rigido de perfil.
+- `phenom-zig/src/main.zig`: `NEXT_ACTION` quando ha `SESSION_FOCUS` exige exatamente uma tool de contexto antes da prosa, escolhida pelo modelo: `search_session` para fatos de sessao ou `collect_evidence` para workspace/source-code.
+- `phenom-zig/src/collect_evidence.zig`: `path="."` e `path="./"` agora significam raiz do workspace e usam ranking/overview, evitando evidencia falsa `- . L1-L1`.
+- `phenom-zig/src/working_context.zig`: evidencia ativa model-visible foi limitada a 4 KiB por entrada; se o modelo precisar de mais, deve refinar via nova tool call, mantendo o micro-contexto pequeno.
+- Nao foram adicionadas heuristicas linguisticas, stopwords, listas de paths preferidos ou reparo textual oculto.
+
+Validacao da correcao em 2026-07-09:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 195 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc -lsqlite3` -> passou; 50 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/context_profile.zig` -> passou; 2 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-release ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-release-cache-flow-final-2 -Doptimize=ReleaseFast` -> passou.
+- Smoke real `agent-flow-audit-20260709f`: 4 turnos como usuario comum; pergunta de memoria chamou `search_session` e citou contexto S#; pergunta sobre cwd chamou `collect_evidence: .` e retornou README real.
+- Audit SQLite do smoke `agent-flow-audit-20260709f`: `turns=4`, `model_context_count=6`, `avg_context_bytes=3871`, `max_context_bytes=5278`, `search_session_calls=1`, `collect_evidence_calls=1`, `tool_repairs=0`, `low_confidence_turns=0`, `memory_block=0`, `skills_block=0`, `raw_marker=0`.
+- Risco residual honesto: o modelo ainda pode responder diretamente em pedidos genericos de ajuda sem tool, o que e aceitavel quando nao faz afirmacao de workspace ou sessao; a suite final de conversas longas/multissessao continua pendente para T294 ficar 100%.
 
 Implementacao desta etapa:
 

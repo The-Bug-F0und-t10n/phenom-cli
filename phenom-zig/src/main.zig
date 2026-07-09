@@ -479,7 +479,6 @@ fn buildInitialModelContext(
     defer allocator.free(session_blocks);
     const profile = context_profile.select(.{
         .enable_tool_loop = enable_tool_loop,
-        .has_session_focus = focus_text != null,
     });
 
     return try model_context.renderModelTurnContext(allocator, .{
@@ -493,10 +492,10 @@ fn buildInitialModelContext(
         .memory = persistent.memory.items,
         .skills = persistent.skills.items,
         .grounding = groundingRules(),
-        .next_action = if (enable_tool_loop and profile == .session_recall)
-            "This is a session_recall turn. First emit exactly one search_session tool call with model-chosen terms from [SESSION_FOCUS] and the current task. Do not answer with prose before SESSION_CONTEXT returns. [SESSION_FOCUS] is not evidence."
+        .next_action = if (enable_tool_loop and focus_text != null)
+            "SESSION_FOCUS is present. First emit exactly one context tool call before prose: use search_session for prior-session facts, or collect_evidence for workspace/source-code facts. The model chooses the tool and terms; the controller only executes it."
         else if (enable_tool_loop)
-            "Infer the user's intent. If the answer requires workspace/source-code facts, call collect_evidence with model-chosen terms or path. If the answer requires prior-session facts, call search_session with model-chosen terms. Otherwise answer directly."
+            "Infer the user's intent. If the answer requires workspace/source-code facts, call collect_evidence with model-chosen terms or path. If the answer requires prior-session facts, call search_session with model-chosen terms before answering. Otherwise answer directly."
         else
             "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
     });
@@ -1643,9 +1642,9 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try db.recordEvent("schema-test", "assistant_delta", "resposta anterior");
     const with_tools = (try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test", "ola tudo bem", true)) orelse return error.MissingContext;
     defer std.testing.allocator.free(with_tools);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "mode: session_recall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "mode: code_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[SESSION_FOCUS]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "collect_evidence") == null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "collect_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[CONTRACTS]") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[RECENT_DIALOGUE]") != null);
@@ -1653,7 +1652,9 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "assistant: resposta anterior") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "S1:") == null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[GROUNDING]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "call search_session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "context tool call before prose") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "use search_session for prior-session facts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "collect_evidence for workspace/source-code facts") != null);
 
     try std.testing.expect((try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test-empty", "analise esse projeto", false)) == null);
 }

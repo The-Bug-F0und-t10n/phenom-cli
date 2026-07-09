@@ -6,7 +6,7 @@ const model_context = @import("model_context.zig");
 pub const default_model_budget_limit: usize = 18 * 1024;
 const min_remaining_budget: usize = 2200;
 const max_anchor_bytes: usize = 260;
-const max_active_evidence_bytes: usize = 12 * 1024;
+const max_active_evidence_bytes: usize = 4 * 1024;
 
 pub const RememberArgs = struct {
     path: ?[]const u8 = null,
