@@ -10318,3 +10318,48 @@ Validacao executada:
 - Smoke real final: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 1200 --session default --prompt 'voce lembra do estavamos conversando ?' --fail-on-model-error --no-color` -> passou no comportamento; modelo chamou `search_session` com `terms=matheus bíblia`, recuperou S# sobre `qual a matematica perfeita de Matheus 1 na biblia` e respondeu lembrando o assunto.
 - Smoke real posterior ao reforco de prompt respondeu corretamente por continuidade recente, sem nova tool call; portanto nao foi usado como prova de busca, apenas confirmou que o contexto registrado contem a nova instrucao de termos especificos.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-release ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-session-memory-release -Doptimize=ReleaseFast` -> passou.
+
+## T304 - Separar intencao de busca e termos em `search_session`
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: o usuario apontou falha real no log: `search_session` estava usando `terms=assuntos topicos subtopicos conversand`, que e so a query do usuario reembalada. Isso nao representa intencao de pesquisa. Para o agente funcionar bem, o modelo precisa formular o que quer recuperar e so entao escolher chaves pesquisaveis, como uma lupa de navegador com plano operacional.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Nao foi adicionada heuristica hardcoded por assunto, linguagem, stack ou dominio.
+- O modelo continua sendo o cerebro da busca: ele define `intent` e `terms`.
+- O controller nao adivinha termos; ele executa o contrato, audita `intent` e usa apenas `terms` no FTS.
+- `SESSION_FOCUS` continua sendo mapa operacional `not_evidence=true`, nao fonte de claims finais.
+
+Implementacao:
+
+- `phenom-zig/src/tool_call.zig`: `ToolCall` ganhou `intent`, owned/deinit e parser XML.
+- `phenom-zig/src/context_profile.zig`: schema de `search_session` virou `search_session(intent?, terms, scope=current|all, session?)`.
+- `phenom-zig/src/context_profile.zig`: o contrato explica que `intent` e a evidencia que o modelo quer recuperar; `terms` sao apenas chaves especificas para esse intent.
+- `phenom-zig/src/main.zig`: `NEXT_ACTION` e grounding reforcam a separacao `intent -> retrieval keys`.
+- `phenom-zig/src/main.zig`: audit de `tool_start search_session` registra `intent=... terms=...`, mas dedupe e FTS continuam baseados em `terms`.
+- `phenom-zig/src/main.zig`: se o contexto inicial exige tool de contexto e o modelo responde prosa, o buffer e descartado e o agente emite um reparo de protocolo antes de mostrar a resposta ao usuario.
+- `phenom-zig/src/main.zig`: turnos futuros que ignorarem uma tool obrigatoria passam a ser `quality=uncertain` com `context_tool_missing=true low_confidence=true`, evitando contaminar `SESSION_FOCUS` confirmado.
+
+Limite residual:
+
+- Eventos antigos ja persistidos com respostas contaminadas podem continuar aparecendo ate serem superados por novos turnos com metadado correto. Nao foi feita migracao manual do banco local para evitar mutacao destrutiva de historico do usuario.
+
+Criterio de aceite:
+
+- `search_session` aceita e audita `intent`.
+- O prompt nao instrui o modelo a copiar a query do usuario como termos.
+- Se o modelo ignorar a obrigacao de tool, a prosa inicial nao e renderizada como resposta final.
+- Novas respostas sem tool obrigatoria nao entram como foco confirmado.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/tool_call.zig` -> passou; 16 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/context_profile.zig` -> passou; 2 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 207 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-session-intent-search-3 test` -> passou.
+- Smoke real: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 1600 --session default --prompt 'quais sao os assuntos por topicos e subtopicos que estavamos conversando' --fail-on-model-error --no-color` -> passou no fluxo: a prosa inicial foi reparada, `search_session` executou e os termos passaram a ser chaves de conteudo (`phenom`, `zig`, `c`, `llama`, `ollama`, `Mateus`/genealogia etc.), nao a query literal `assuntos topicos subtopicos`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-release ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-session-intent-release -Doptimize=ReleaseFast` -> passou.

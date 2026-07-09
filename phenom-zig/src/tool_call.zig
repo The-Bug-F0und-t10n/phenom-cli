@@ -6,6 +6,7 @@ pub const ToolCall = struct {
     path: ?[]const u8 = null,
     session: ?[]const u8 = null,
     scope: ?[]const u8 = null,
+    intent: ?[]const u8 = null,
     terms: ?[]const u8 = null,
     strategy: ?contracts.StrategyName = null,
     start_line: usize = 1,
@@ -22,6 +23,7 @@ pub const ToolCall = struct {
         if (self.path) |path| allocator.free(path);
         if (self.session) |session| allocator.free(session);
         if (self.scope) |scope| allocator.free(scope);
+        if (self.intent) |intent| allocator.free(intent);
         if (self.terms) |terms| allocator.free(terms);
         if (self.reason) |reason| allocator.free(reason);
     }
@@ -40,6 +42,7 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
     const path = normalizeOptionalPath(parseParameter(body, "path"));
     const session = normalizeOptionalText(parseParameter(body, "session"));
     const scope = normalizeOptionalText(parseParameter(body, "scope"));
+    const intent = normalizeOptionalText(parseParameter(body, "intent"));
     const terms = normalizeOptionalText(parseParameter(body, "terms"));
     const reason = normalizeOptionalText(parseParameter(body, "reason"));
     const strategy = try parseStrategyParameter(body);
@@ -49,6 +52,7 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
         .path = if (path) |value| try allocator.dupe(u8, value) else null,
         .session = if (session) |value| try allocator.dupe(u8, value) else null,
         .scope = if (scope) |value| try allocator.dupe(u8, value) else null,
+        .intent = if (intent) |value| try allocator.dupe(u8, value) else null,
         .terms = if (terms) |value| try allocator.dupe(u8, value) else null,
         .strategy = strategy,
         .start_line = parseIntParameter(body, "start_line") orelse 1,
@@ -229,6 +233,7 @@ test "search session parses model-selected scope and session" {
     var output = try std.testing.allocator.dupe(u8,
         \\<tool_call>
         \\<function=search_session>
+        \\<parameter=intent>recover prior layout decision</parameter>
         \\<parameter=terms>layout w-90 bootstrap</parameter>
         \\<parameter=scope>all</parameter>
         \\<parameter=session>old-session</parameter>
@@ -240,6 +245,7 @@ test "search session parses model-selected scope and session" {
     defer call.deinit(std.testing.allocator);
     output[80] = 'X';
     try std.testing.expectEqualStrings("search_session", call.name);
+    try std.testing.expectEqualStrings("recover prior layout decision", call.intent.?);
     try std.testing.expectEqualStrings("layout w-90 bootstrap", call.terms.?);
     try std.testing.expectEqualStrings("all", call.scope.?);
     try std.testing.expectEqualStrings("old-session", call.session.?);
