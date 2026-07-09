@@ -203,6 +203,14 @@ pub const InferenceInput = struct {
     dialogue: []const ChatMessage = &.{},
 };
 
+pub const TokenUsage = struct {
+    input: usize,
+    output: usize,
+    total: usize,
+    tokens_per_second: ?f64 = null,
+    final: bool = false,
+};
+
 pub const ProbeResult = struct {
     endpoint: []const u8,
     tcp_ok: bool,
@@ -569,7 +577,95 @@ fn processModelLine(allocator: std.mem.Allocator, raw_line: []const u8, sink: an
         defer allocator.free(decoded);
         try sink.onDelta(decoded);
     }
-    return jsonBoolTrueField(json_line, "stop") or jsonBoolTrueField(json_line, "done");
+    const done = jsonBoolTrueField(json_line, "stop") or jsonBoolTrueField(json_line, "done") or hasFinishReason(json_line);
+    if (extractTokenUsage(json_line, done)) |usage| try emitTokenUsage(sink, usage);
+    return done;
+}
+
+fn emitTokenUsage(sink: anytype, usage: TokenUsage) !void {
+    const Sink = @TypeOf(sink);
+    switch (@typeInfo(Sink)) {
+        .pointer => |ptr| {
+            if (@hasDecl(ptr.child, "onTokenUsage")) try sink.onTokenUsage(usage);
+        },
+        else => {
+            if (@hasDecl(Sink, "onTokenUsage")) try sink.onTokenUsage(usage);
+        },
+    }
+}
+
+fn extractTokenUsage(line: []const u8, final: bool) ?TokenUsage {
+    const input = extractJsonUsizeField(line, "prompt_eval_count") orelse
+        extractJsonUsizeField(line, "prompt_tokens") orelse
+        extractJsonUsizeField(line, "tokens_evaluated") orelse
+        extractJsonUsizeField(line, "n_prompt_tokens") orelse
+        extractJsonUsizeField(line, "prompt_n") orelse
+        return null;
+    const output = extractJsonUsizeField(line, "eval_count") orelse
+        extractJsonUsizeField(line, "completion_tokens") orelse
+        extractJsonUsizeField(line, "tokens_predicted") orelse
+        extractJsonUsizeField(line, "predicted_n") orelse
+        return null;
+    const total = std.math.add(usize, input, output) catch return null;
+    const tps = extractJsonF64Field(line, "predicted_per_second") orelse
+        tokensPerSecondFromEvalDuration(output, extractJsonU64Field(line, "eval_duration"));
+    return .{
+        .input = input,
+        .output = output,
+        .total = total,
+        .tokens_per_second = tps,
+        .final = final,
+    };
+}
+
+fn hasFinishReason(line: []const u8) bool {
+    const value = extractJsonStringField(line, "finish_reason") orelse return false;
+    return !std.mem.eql(u8, value, "null") and value.len > 0;
+}
+
+fn tokensPerSecondFromEvalDuration(output: usize, duration_ns: ?u64) ?f64 {
+    const ns = duration_ns orelse return null;
+    if (output == 0 or ns == 0) return null;
+    const seconds = @as(f64, @floatFromInt(ns)) / 1_000_000_000.0;
+    if (seconds <= 0) return null;
+    return @as(f64, @floatFromInt(output)) / seconds;
+}
+
+fn extractJsonUsizeField(line: []const u8, field: []const u8) ?usize {
+    const value = extractJsonU64Field(line, field) orelse return null;
+    return std.math.cast(usize, value);
+}
+
+fn extractJsonU64Field(line: []const u8, field: []const u8) ?u64 {
+    const number = extractJsonNumberSlice(line, field) orelse return null;
+    return std.fmt.parseInt(u64, number, 10) catch null;
+}
+
+fn extractJsonF64Field(line: []const u8, field: []const u8) ?f64 {
+    const number = extractJsonNumberSlice(line, field) orelse return null;
+    return std.fmt.parseFloat(f64, number) catch null;
+}
+
+fn extractJsonNumberSlice(line: []const u8, field: []const u8) ?[]const u8 {
+    var needle_buf: [64]u8 = undefined;
+    if (field.len + 3 > needle_buf.len) return null;
+    needle_buf[0] = '"';
+    @memcpy(needle_buf[1 .. 1 + field.len], field);
+    needle_buf[1 + field.len] = '"';
+    needle_buf[2 + field.len] = ':';
+    const needle = needle_buf[0 .. field.len + 3];
+
+    const start = std.mem.indexOf(u8, line, needle) orelse return null;
+    var i = start + needle.len;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    const value_start = i;
+    if (i < line.len and line[i] == '-') return null;
+    while (i < line.len) : (i += 1) {
+        const ch = line[i];
+        if (!std.ascii.isDigit(ch) and ch != '.') break;
+    }
+    if (i == value_start) return null;
+    return line[value_start..i];
 }
 
 fn extractJsonStringField(line: []const u8, field: []const u8) ?[]const u8 {
@@ -715,6 +811,62 @@ test "ollama done true ends stream without visible content" {
     var line_buffer = std.ArrayList(u8).empty;
     defer line_buffer.deinit(std.testing.allocator);
     try std.testing.expect(try feedLines(std.testing.allocator, &line_buffer, line, &ctx));
+}
+
+test "ollama final stream emits real token usage without estimates" {
+    const line = "{\"done\":true,\"prompt_eval_count\":10,\"eval_count\":20,\"eval_duration\":2000000000}\n";
+    const Ctx = struct {
+        usage: ?TokenUsage = null,
+        pub fn onDelta(_: *@This(), _: []const u8) !void {
+            return error.UnexpectedDelta;
+        }
+        pub fn onTokenUsage(self: *@This(), usage: TokenUsage) !void {
+            self.usage = usage;
+        }
+    };
+    var ctx = Ctx{};
+    var line_buffer = std.ArrayList(u8).empty;
+    defer line_buffer.deinit(std.testing.allocator);
+    try std.testing.expect(try feedLines(std.testing.allocator, &line_buffer, line, &ctx));
+    const usage = ctx.usage orelse return error.MissingTokenUsage;
+    try std.testing.expectEqual(@as(usize, 10), usage.input);
+    try std.testing.expectEqual(@as(usize, 20), usage.output);
+    try std.testing.expectEqual(@as(usize, 30), usage.total);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.0), usage.tokens_per_second orelse return error.MissingTps, 0.001);
+    try std.testing.expect(usage.final);
+}
+
+test "openai compatible usage emits real token usage" {
+    const line = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n";
+    const Ctx = struct {
+        usage: ?TokenUsage = null,
+        pub fn onDelta(_: *@This(), _: []const u8) !void {}
+        pub fn onTokenUsage(self: *@This(), usage: TokenUsage) !void {
+            self.usage = usage;
+        }
+    };
+    var ctx = Ctx{};
+    var line_buffer = std.ArrayList(u8).empty;
+    defer line_buffer.deinit(std.testing.allocator);
+    try std.testing.expect(try feedLines(std.testing.allocator, &line_buffer, line, &ctx));
+    const usage = ctx.usage orelse return error.MissingTokenUsage;
+    try std.testing.expectEqual(@as(usize, 3), usage.input);
+    try std.testing.expectEqual(@as(usize, 1), usage.output);
+    try std.testing.expectEqual(@as(usize, 4), usage.total);
+    try std.testing.expect(usage.tokens_per_second == null);
+    try std.testing.expect(usage.final);
+}
+
+test "token usage is absent when backend provides no real counters" {
+    try std.testing.expect(extractTokenUsage("{\"done\":true}", true) == null);
+    try std.testing.expect(extractTokenUsage("{\"done\":true,\"prompt_eval_count\":10}", true) == null);
+}
+
+test "token usage distinguishes streaming update from final counters" {
+    const update = extractTokenUsage("{\"content\":\"x\",\"tokens_evaluated\":8,\"tokens_predicted\":1}", false) orelse return error.MissingTokenUsage;
+    try std.testing.expect(!update.final);
+    const final = extractTokenUsage("{\"stop\":true,\"tokens_evaluated\":8,\"tokens_predicted\":2}", true) orelse return error.MissingTokenUsage;
+    try std.testing.expect(final.final);
 }
 
 test "json unescape decodes common escapes" {

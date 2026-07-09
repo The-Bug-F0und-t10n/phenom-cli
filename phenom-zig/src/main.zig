@@ -190,6 +190,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
     var db = try audit.AuditDb.open(allocator, ".phenom-zig/phenom.db");
     defer db.close();
 
+    if (ui_ptr) |active_ui| active_ui.clearTokenUsage();
     const turn_started_ms = ui_events.monotonicMillis();
     try db.recordEvent(config.session, "turn_start", prompt);
     try events.emit(.{ .user_message = prompt });
@@ -1455,6 +1456,23 @@ const StreamSink = struct {
 
     pub fn onDelta(ctx: *StreamSink, delta: []const u8) !void {
         try ctx.filter.feed(delta, ctx);
+    }
+
+    pub fn onTokenUsage(ctx: *StreamSink, usage: http.TokenUsage) !void {
+        try ctx.events.emit(.{ .token_update = .{
+            .total = usage.total,
+            .input = usage.input,
+            .output = usage.output,
+            .tokens_per_second = usage.tokens_per_second,
+        } });
+        if (ctx.ui) |ui| try ui.showTokenUsage(usage.input, usage.output, usage.total, usage.tokens_per_second);
+        if (!usage.final) return;
+        const body = if (usage.tokens_per_second) |tps|
+            try std.fmt.allocPrint(ctx.allocator, "input={} output={} total={} tokens_per_second={d:.2} exact=true final=true", .{ usage.input, usage.output, usage.total, tps })
+        else
+            try std.fmt.allocPrint(ctx.allocator, "input={} output={} total={} tokens_per_second=null exact=true final=true", .{ usage.input, usage.output, usage.total });
+        defer ctx.allocator.free(body);
+        try ctx.db.recordEvent(ctx.session, "token_usage", body);
     }
 
     pub fn flush(ctx: *StreamSink) !void {

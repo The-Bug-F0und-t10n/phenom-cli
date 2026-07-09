@@ -458,13 +458,13 @@ Problema no audit: o projeto tenta economizar tokens, mas nao mede tokens de sch
 
 Motivacao tecnica: sem metrica, uma feature "compacta" pode custar mais em reparos do que economiza em contexto.
 
-Alvo final: buckets de tokens por turno e economia estimada por estrategia.
+Alvo final: buckets de tokens reais por turno quando o backend/tokenizer fornecer contagem, e economia por bytes/chars quando token real nao estiver disponivel.
 
 Tasks que resolvem: T101, T110, T111, T112.
 
-Teste de prova: audit fake soma tokens por bucket e calcula economia de EvidencePacket contra arquivo completo.
+Teste de prova: audit soma tokens reais por bucket com tokenizer real/fake de teste e calcula economia por bytes/chars de EvidencePacket contra arquivo completo.
 
-Risco residual: contagem exata depende do backend/tokenizer; estimativa local deve ser marcada como estimativa quando `/tokenize` nao estiver disponivel.
+Risco residual: contagem de tokens depende do backend/tokenizer; quando `/tokenize` nao estiver disponivel, tokens ficam ausentes em vez de estimados.
 
 ### PR016 - Learning loop pode persistir padrao ruim
 
@@ -976,7 +976,7 @@ Esta matriz e obrigatoria. Ela complementa as secoes de cada task e deve guiar a
 
 ### T101 - Passos especificos
 
-1. Criar metricas por estrategia: chars/tokens input, entries, confidence, fallback.
+1. Criar metricas por estrategia: bytes/chars input, tokens reais quando o backend/tokenizer real fornecer, entries, confidence, fallback.
 2. Integrar no TurnAudit.
 3. Testar collect_evidence lexical vs RAG fallback.
 4. Nao usar tokenizer remoto em teste offline.
@@ -985,15 +985,15 @@ Esta matriz e obrigatoria. Ela complementa as secoes de cada task e deve guiar a
 ### T110 - Passos especificos
 
 1. Criar buckets: system, contracts, memory, skills, evidence, repairs, toolSchema.
-2. Usar contador local estimado e opcional `/tokenize` quando disponivel.
-3. Testar soma com contador fake.
+2. Usar somente contagem real: `/tokenize` real pre-envio ou contadores reais pos-inferencia do backend.
+3. Testar soma com tokenizer fake apenas como test double deterministico, nunca como estrategia runtime.
 4. Registrar por turno no audit.
 5. Nao bloquear execucao por medicao ausente.
 
 ### T111 - Passos especificos
 
 1. Para EvidenceEntry de file_slice, comparar tamanho do trecho com tamanho total conhecido.
-2. Testar economia estimada em arquivo fake 10000 chars.
+2. Testar economia por bytes/chars e, quando houver tokenizer real disponivel, por tokens reais.
 3. Registrar economia por estrategia.
 4. Nao exibir calculo detalhado ao modelo.
 5. Usar metrica para calibrar budgets.
@@ -2079,7 +2079,7 @@ Passos de implementacao:
    - `small`: entradas principais;
    - `focused`: permite mais evidencias, ainda sem bruto;
    - `large`: reservado para debug, nao padrao.
-3. Implementar `estimateEvidenceTokens(entry)` com estimativa simples local.
+3. Implementar medicao por bytes/chars e tokens somente quando houver tokenizer real disponivel.
 4. Implementar ranking:
    - blocking errors primeiro;
    - evidence citada por obligations;
@@ -2499,7 +2499,7 @@ Evidencia: auditoria pede tokens gastos por estrategia vs precisao da evidencia.
 
 Impacto: orienta baixo consumo com dados.
 
-Teste primeiro: collect_evidence registra chars/tokens aproximados por estrategia.
+Teste primeiro: collect_evidence registra bytes/chars por estrategia e tokens somente quando houver contador real.
 
 Implementacao: adicionar campos no audit.
 
@@ -2518,7 +2518,7 @@ Criterio de aceite: output final de audit mostra custo de lexical/RAG/AST/read_f
 
 ### T110 - Medir tokens de prompt/schema/memoria/evidencia/reparos
 
-Status: pending
+Status: partial
 
 Evidencia: auditoria lista essa metrica como insuficiente.
 
@@ -2539,6 +2539,14 @@ Passos de implementacao:
 
 Criterio de aceite: cada turno tem resumo `tokens.system`, `tokens.tools`, `tokens.memory`, `tokens.evidence`, `tokens.repairs`.
 
+Atualizacao parcial em 2026-07-09:
+
+- Entregue no Zig: parser de contadores reais do backend (`prompt_eval_count`/`eval_count`, `tokens_evaluated`/`tokens_predicted`, `usage.prompt_tokens`/`usage.completion_tokens`) sem fallback estimado.
+- Entregue no Zig: `token_update` absoluto atualiza a statusbar interativa com `in/out/tok/s`; o SQLite persiste somente o `token_usage` final para evitar spam por token.
+- Provado por smoke real `token-accounting-real-20260709b`: `token_usage|input=611 output=35 total=646 tokens_per_second=40.49 exact=true final=true`.
+- Nao entregue: buckets por bloco (`system`, `tools`, `memory`, `evidence`, `repairs`) ainda nao existem porque isso exige tokenizer real pre-envio por backend.
+- Regra mantida: nao ha estimativa de tokens. Se o backend nao fornecer contador real, nenhum token e registrado.
+
 ### T111 - Medir economia vs `read_file` completo
 
 Status: pending
@@ -2547,9 +2555,9 @@ Evidencia: objetivo do projeto e evitar ler projeto inteiro usando contexto sob 
 
 Impacto: comprova valor de collect_evidence/micro-contexto.
 
-Teste primeiro: EvidencePacket com snippet de 1000 chars contra arquivo 10000 chars registra economia aproximada.
+Teste primeiro: EvidencePacket com snippet de 1000 chars contra arquivo 10000 chars registra economia por bytes/chars; tokens entram somente com tokenizer real.
 
-Implementacao: estimar bytes/tokens poupados por anchor.
+Implementacao: medir bytes/chars poupados por anchor e adicionar tokens poupados apenas quando `/tokenize` real estiver integrado.
 
 Passos de implementacao:
 
@@ -2885,14 +2893,14 @@ Teste primeiro: budgets default diferem por perfil e truncam no lugar correto:
 - `mass_read`: resumo hierarquico e top evidencias.
 - `runtime_diagnostics`: erros/sinais priorizados por severidade.
 
-Implementacao: criar `ContextBudgetPolicy` por perfil com limites de itens, chars aproximados e prioridade de corte.
+Implementacao: criar `ContextBudgetPolicy` por perfil com limites de itens, bytes/chars e, quando disponivel, tokens reais por tokenizer do backend.
 
 Passos de implementacao:
 
 1. Criar teste para budget de cada perfil.
 2. Definir limites iniciais conservadores por perfil.
 3. Implementar truncamento deterministico por prioridade.
-4. Medir chars/tokens aproximados por bloco renderizado.
+4. Medir bytes/chars por bloco renderizado e tokens somente por tokenizer real.
 5. Registrar cortes no audit.
 6. Falhar teste se renderer ultrapassar budget sem justificativa.
 
@@ -3032,7 +3040,7 @@ Passos de implementacao:
 3. Implementar estrutura `NewsEventChunk`.
 4. Adicionar sintese compacta opcional com prompt pequeno e JSON estrito.
 5. Persistir chunks em tabela `news_analysis_chunks`.
-6. Registrar `batches`, `groups`, `chunks`, `llm_calls` e `tokens_estimated`.
+6. Registrar `batches`, `groups`, `chunks`, `llm_calls` e tokens reais quando disponiveis.
 
 Criterio de aceite: output de News e um dossie estruturado de eventos, nao micro-contexto.
 
@@ -3968,7 +3976,7 @@ Passos de implementacao:
 3. Renderizar contratos ativos compactos.
 4. Inserir MEMORY/SKILLS somente se persistidos/promovidos.
 5. Inserir EvidencePacket conforme perfil.
-6. Medir chars/tokens estimados por bloco em teste.
+6. Medir bytes/chars por bloco em teste; tokens somente via tokenizer real/fake de teste.
 
 Criterio de aceite: o prompt enviado ao modelo e pequeno, auditavel e nao inventa memoria inexistente.
 
@@ -6267,7 +6275,7 @@ Revisao baixo nivel obrigatoria antes do commit:
 - Tempo: `CLOCK_MONOTONIC` evita regressao por ajuste de relogio do sistema; fallback retorna `0s`.
 - Concorrencia: cronometro e renderer continuam dentro do mesmo `RendererEventSink`; quando ha TUI, o mutex existente protege a escrita.
 - Terminal: footer usa `paintCols()` e respeita resize para novos blocos; nao tenta reflowar transcript antigo.
-- Escopo: nao adiciona tokens/throughput ainda porque o event sink atual ignora `token_update`; deve entrar quando estatisticas reais estiverem conectadas.
+- Atualizacao 2026-07-09: tokens/throughput reais foram conectados depois via backend metrics; esta etapa visual continua sobre footer/elapsed.
 
 Criterio de aceite:
 
@@ -6412,7 +6420,7 @@ Revisao baixo nivel obrigatoria antes do commit:
 - Compatibilidade: `parseElapsedMs("ok")` retorna `null`; sessoes antigas nao quebram.
 - Tempo: usa `CLOCK_MONOTONIC` via helper existente; `elapsed_ms` e gravado como inteiro decimal.
 - Replay: `model_error` e `expectation_failed` deixam o turno aberto ate `turn_done`; sessoes antigas sem `turn_done` fecham no fallback de fim do replay.
-- Escopo: ainda nao persiste tokens/throughput porque `token_update` nao esta conectado ao backend real.
+- Atualizacao 2026-07-09: tokens/throughput reais agora sao persistidos como `token_usage` final quando o backend fornece contadores reais; sem estimativa.
 
 Criterio de aceite:
 
@@ -10030,8 +10038,8 @@ Alinhamento AUDIT/TASKS/phenom-cli-ts:
 - Referencia TS consultada: `../phenom-cli-ts/src/agent.ts` em `buildSystemPrompt`; `../phenom-cli-ts/src/use-cases/build-inference-messages.ts`.
 - Falha apontada no AUDIT/TASKS: system prompt inchado alucina modelo pequeno; contexto bruto ou estruturacao ruim consome janela rapidamente.
 - O que sera preservado do TS: prefixo estavel, contexto volatil fora do system prompt, sanitizacao de mensagens.
-- O que sera corrigido no Zig: `NEXT_ACTION` vira campo tipado de contrato; prompt/context bytes sao auditados; raw leak e budget viram falha objetiva.
-- O que nao sera portado agora e por que: contagem exata por tokenizer do backend pode vir depois; primeiro bytes/chars e budget conservador.
+- O que sera corrigido no Zig: `NEXT_ACTION` vira campo tipado de contrato; prompt/context bytes sao auditados; raw leak, budget e token usage real viram falha objetiva.
+- O que nao sera portado agora e por que: compactacao pre-envio por tokenizer real do backend ainda depende de integrar `/tokenize`; estimativa char/token nao sera usada.
 - Invariantes afetadas: 2, 3, 6, 7.
 - Teste unitario obrigatorio: renderer rejeita raw markers, mede bytes, falha em budget e renderiza `next_action` tipado.
 - Smoke real obrigatorio, se envolver modelo/servidor/tool loop: sim, SQLite deve registrar system/context bytes e prefix stability.
@@ -10049,6 +10057,13 @@ Criterio de aceite:
 
 - O modelo recebe contexto pequeno, tipado e auditavel.
 - O system prompt nao vira deposito de regras variaveis por fase.
+
+Atualizacao parcial em 2026-07-09:
+
+- Entregue: token accounting real pos-inferencia em `phenom-zig/src/http.zig`, `phenom-zig/src/main.zig` e `phenom-zig/src/tui.zig`.
+- Entregue: OpenAI-compatible/Ollama/llama.cpp counters reais sao parseados; updates streaming atualizam statusbar; somente evento final `token_usage` e persistido no SQLite.
+- Validacao: `zig test src/http.zig -lc`, `zig test src/tui.zig -lc`, `zig test src/main.zig -lc -lsqlite3`, build release e smoke real `token-accounting-real-20260709b`.
+- Ainda falta para 100%: tokenizer real pre-envio para compactacao no ponto exato e buckets por bloco do prompt/contexto.
 
 ## T297 - Expandir tool surface por contratos, nao por lista solta
 

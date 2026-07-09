@@ -591,6 +591,11 @@ pub fn TerminalUi(comptime Writer: type) type {
         attached: bool = false,
         last_status: ?[]const u8 = null,
         status_started_ms: i64 = 0,
+        token_input: usize = 0,
+        token_output: usize = 0,
+        token_total: usize = 0,
+        token_tps: ?f64 = null,
+        has_token_usage: bool = false,
         visualizer_mode: VisualizerMode = .idle,
         visualizer_tick: usize = 0,
         visualizer: MiniVisualizer,
@@ -692,6 +697,26 @@ pub fn TerminalUi(comptime Writer: type) type {
             try self.draw(.{ .status = status, .show_prompt = false, .preserve_cursor = true });
         }
 
+        pub fn clearTokenUsage(self: *Self) void {
+            self.token_input = 0;
+            self.token_output = 0;
+            self.token_total = 0;
+            self.token_tps = null;
+            self.has_token_usage = false;
+        }
+
+        pub fn showTokenUsage(self: *Self, input: usize, output: usize, total: usize, tokens_per_second: ?f64) !void {
+            self.token_input = input;
+            self.token_output = output;
+            self.token_total = total;
+            self.token_tps = tokens_per_second;
+            self.has_token_usage = true;
+            if (self.last_status) |status| {
+                self.visualizer_tick +%= 1;
+                try self.draw(.{ .status = status, .show_prompt = false, .preserve_cursor = true });
+            }
+        }
+
         pub fn pulseStatus(self: *Self) !void {
             if (self.last_status) |status| {
                 self.visualizer_tick +%= 1;
@@ -767,7 +792,7 @@ pub fn TerminalUi(comptime Writer: type) type {
             var out = std.ArrayList(u8).empty;
             defer out.deinit(self.allocator);
             const bw = fd_writer.BufferWriter{ .allocator = self.allocator, .list = &out };
-            var status_buf: [96]u8 = undefined;
+            var status_buf: [192]u8 = undefined;
             const status_text = if (opts.status) |status| self.formatStatus(status, &status_buf) else null;
             var visualizer_buf: [max_visualizer_cols * 4]u8 = undefined;
             var visualizer_text: ?[]const u8 = null;
@@ -805,13 +830,29 @@ pub fn TerminalUi(comptime Writer: type) type {
             try self.writer.writeAll(out.items);
         }
 
-        fn formatStatus(self: *Self, status: []const u8, buf: *[96]u8) []const u8 {
+        fn formatStatus(self: *Self, status: []const u8, buf: *[192]u8) []const u8 {
             if (!self.status_running.load(.acquire)) return status;
             if (std.mem.startsWith(u8, status, "Worked for")) return status;
             if (std.mem.indexOfScalar(u8, status, '(') != null) return status;
             const now = monotonicMs();
             const elapsed_ms: u64 = if (now > self.status_started_ms) @intCast(now - self.status_started_ms) else 0;
             const seconds = elapsed_ms / 1000;
+            if (self.has_token_usage) {
+                var in_buf: [24]u8 = undefined;
+                var out_buf: [24]u8 = undefined;
+                const in_text = formatTokenCount(&in_buf, self.token_input);
+                const out_text = formatTokenCount(&out_buf, self.token_output);
+                if (self.token_tps) |tps| {
+                    if (seconds < 60) {
+                        return std.fmt.bufPrint(buf, "{s} ({}s · ↓ {s} in · ↑ {s} out · {d:.1} tok/s · esc to interrupt)", .{ status, seconds, in_text, out_text, tps }) catch status;
+                    }
+                    return std.fmt.bufPrint(buf, "{s} ({}m {}s · ↓ {s} in · ↑ {s} out · {d:.1} tok/s · esc to interrupt)", .{ status, seconds / 60, seconds % 60, in_text, out_text, tps }) catch status;
+                }
+                if (seconds < 60) {
+                    return std.fmt.bufPrint(buf, "{s} ({}s · ↓ {s} in · ↑ {s} out · esc to interrupt)", .{ status, seconds, in_text, out_text }) catch status;
+                }
+                return std.fmt.bufPrint(buf, "{s} ({}m {}s · ↓ {s} in · ↑ {s} out · esc to interrupt)", .{ status, seconds / 60, seconds % 60, in_text, out_text }) catch status;
+            }
             if (seconds < 60) {
                 return std.fmt.bufPrint(buf, "{s} ({}s · esc to interrupt)", .{ status, seconds }) catch status;
             }
@@ -904,6 +945,18 @@ fn visualizerWidth(status: []const u8, width: usize) usize {
     const status_cols = @min(utf8Columns(status), width);
     if (width > status_cols + 1 + min_visual_cols) return width - status_cols - 1;
     return 0;
+}
+
+fn formatTokenCount(buf: *[24]u8, value: usize) []const u8 {
+    if (value < 1000) return std.fmt.bufPrint(buf, "{}", .{value}) catch "0";
+    const whole = value / 1000;
+    const frac = (value % 1000) / 100;
+    if (value < 10_000 and frac > 0) return std.fmt.bufPrint(buf, "{}.{}k", .{ whole, frac }) catch "0";
+    if (value < 1_000_000) return std.fmt.bufPrint(buf, "{}k", .{whole}) catch "0";
+    const m_whole = value / 1_000_000;
+    const m_frac = (value % 1_000_000) / 100_000;
+    if (m_frac > 0) return std.fmt.bufPrint(buf, "{}.{}m", .{ m_whole, m_frac }) catch "0";
+    return std.fmt.bufPrint(buf, "{}m", .{m_whole}) catch "0";
 }
 
 fn paintInputRow(writer: anytype, color: bool, prefix: []const u8, content: []const u8, width: usize) !void {
@@ -1064,6 +1117,29 @@ test "bottom bar snapshot matches prompt and status surface" {
         "> ola            \r\n" ++
         "                 ";
     try std.testing.expectEqualStrings(expected, buffer.items);
+}
+
+test "status bar formats real token usage without accumulating" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var ui = TerminalUi(@TypeOf(writer)).init(std.testing.allocator, writer, false);
+    defer ui.deinit();
+    ui.status_running.store(true, .release);
+    ui.status_started_ms = monotonicMs() - 3000;
+    try ui.showTokenUsage(3900, 12, 3912, 7.5);
+
+    var status_buf: [192]u8 = undefined;
+    const status = ui.formatStatus("Thinking", &status_buf);
+    try std.testing.expect(std.mem.indexOf(u8, status, "↓ 3.9k in") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "↑ 12 out") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "7.5 tok/s") != null);
+
+    try ui.showTokenUsage(4000, 13, 4013, null);
+    const updated = ui.formatStatus("Thinking", &status_buf);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "↓ 4k in") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "↑ 13 out") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "3.9k") == null);
 }
 
 test "prompt view wraps and keeps cursor in visible window" {
