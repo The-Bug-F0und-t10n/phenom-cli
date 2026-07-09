@@ -19,7 +19,7 @@ Motivacao:
 
 Regra preservada: as tasks existentes continuam validas como requisitos de produto e criterios de aceite. Qualquer port do TS deve ser tratado como migracao seletiva de comportamento, nao copia estrutural.
 
-Decisao atual revisada em 2026-07-08: o Phenom em Zig + C nao deve mais ser tratado como spike, MVP ou prototipo. Esta arvore e o produto final em fase de construcao. A motivacao e filosofica e operacional: controle maior do runtime, arquitetura 100% pertencente ao Phenom, menor dependencia de crates/frameworks, terminal previsivel e possibilidade de otimizar as primitivas necessarias. Rust continua como referencia comparativa, mas o alvo atual de produto e Zig + C.
+Decisao atual revisada em 2026-07-08: o Phenom em Zig + C e produto final em fase de construcao, nao uma prova rapida, base descartavel ou implementacao relaxada. Esta formulacao e regra operacional porque linguagem de baixa exigencia faz proximas inferencias tratarem o projeto com desleixo, sem validacao suficiente e fora do alinhamento global. A motivacao tecnica e filosofica: controle maior do runtime, arquitetura 100% pertencente ao Phenom, menor dependencia de crates/frameworks, terminal previsivel e possibilidade de otimizar as primitivas necessarias. Rust continua como referencia comparativa, mas o alvo atual de produto e Zig + C.
 
 Regra do produto Zig + C:
 
@@ -4325,19 +4325,19 @@ Passos de implementacao:
 
 Criterio de aceite: existe uma definicao objetiva de quando o Phenom Rust e confiavel para uso real.
 
-## Fase 20 - Spike Zig + C do Phenom final
+## Fase 20 - Produto Zig + C do Phenom final
 
-Esta fase registra a mudanca pratica de direcao: em vez de aceitar Rust como decisao final sem prova, criar um MVP em Zig + C para medir se a filosofia de controle total combina melhor com o Phenom.
+Esta fase registra a mudanca pratica de direcao: em vez de aceitar Rust como decisao final sem prova, criar a base inicial do produto em Zig + C para medir e consolidar se a filosofia de controle total combina melhor com o Phenom.
 
-### T221 - Implementar MVP `phenom-zig` com renderer, HTTP local, SQLite, gate e evidencia
+### T221 - Implementar base inicial `phenom-zig` com renderer, HTTP local, SQLite, gate e evidencia
 
 Status: implemented-verified
 
-Evidencia: o usuario definiu explicitamente o spike minimo: CLI chat, renderer append-only, streaming HTTP local para llama.cpp e Ollama, SQLite audit, tool gate fake, `read_file_range`, `EvidencePacket`, snapshot de terminal e build release.
+Evidencia: o usuario definiu explicitamente a base inicial necessaria: CLI chat, renderer append-only, streaming HTTP local para llama.cpp e Ollama, SQLite audit, tool gate fake, `read_file_range`, `EvidencePacket`, snapshot de terminal e build release.
 
 Impacto: transforma a discussao filosofica Zig+C vs Rust em prova tecnica local, pequena e reversivel.
 
-Teste primeiro: o spike inclui testes unitarios/snapshots para CLI args, renderer append-only, tool gate, EvidencePacket e parsing de deltas Ollama/llama.cpp. Verificado com Zig 0.16.0 baixado em `/tmp`, usando `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache`.
+Teste primeiro: a base inicial inclui testes unitarios/snapshots para CLI args, renderer append-only, tool gate, EvidencePacket e parsing de deltas Ollama/llama.cpp. Verificado com Zig 0.16.0 baixado em `/tmp`, usando `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache`.
 
 Implementacao: criar `phenom-zig/` isolado, sem tocar no core TS, usando Zig como core e `sqlite3` via C.
 
@@ -4350,8 +4350,8 @@ Passos de implementacao:
 5. Criar audit SQLite via `sqlite3` C em `.phenom-zig/phenom.db`.
 6. Criar gate fake e tool `read_file_range` com protecao contra path traversal.
 7. Criar `EvidencePacket` compacto para evidencia de arquivo.
-8. Adicionar `.gitignore` para build/runtime do spike.
-9. Documentar comandos esperados de teste, build release e chat no README do spike.
+8. Adicionar `.gitignore` para build/runtime do produto.
+9. Documentar comandos esperados de teste, build release e chat no README do produto.
 
 Criterio de aceite: `zig build test`, `zig build -Doptimize=ReleaseFast`, `zig build run -- snapshot` e `chat --offline` passam. Chat real contra Ollama/llama.cpp ainda deve ser executado quando houver servidor local ativo.
 
@@ -4360,7 +4360,7 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build test`
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build run -- snapshot`
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast`
-- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build run -- chat --offline --session spike --prompt "responda somente: ok"`
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build run -- chat --offline --session dev --prompt "responda somente: ok"`
 
 Resultado observado:
 
@@ -4368,18 +4368,18 @@ Resultado observado:
 - SQLite `.phenom-zig/phenom.db` registrou `turn_start`, `assistant` e `turn_done`.
 - Binario release gerado em `phenom-zig/zig-out/bin/phenom` com tamanho observado de 12 MB.
 - Ajuste posterior no streaming: deltas de llama.cpp/Ollama decodificam escapes JSON como `\n` e o renderer filtra `<think>...</think>` para nao vazar reasoning no transcript.
-- Ajuste posterior de regressao: filtro de reasoning agora e stateful e cobre tags `<think>`/`</think>` quebradas entre chunks; `--max-tokens` foi adicionado para limitar geracao no MVP.
+- Ajuste posterior de regressao: filtro de reasoning agora e stateful e cobre tags `<think>`/`</think>` quebradas entre chunks; `--max-tokens` foi adicionado para limitar geracao.
 - Ajuste posterior de protocolo: payload llama.cpp passou a seguir o `chat_template.jinja` Qwopus/Qwen fornecido pelo usuario, com `<|im_start|>system/user/assistant`, `<think>\n\n</think>\n\n` para `enable_thinking=false` e stop em `<|im_end|>`.
 - Ajuste posterior de thinking dinamico: CLI ganhou `--thinking auto|on|off`; `off` usa bloco de thinking vazio/fechado do template, `on` abre `<think>\n`, e `auto` liga thinking para prompts com sinais de codigo/debug/patch/tool/arquivo/tarefa longa.
 - Ajuste posterior de render: thinking deixou de ser apagado; agora e classificado e exibido em baixo destaque com bloco `thinking`, separado do output `assistant`. O filtro cobre tags quebradas entre chunks e tambem o caso em que apenas `</think>` aparece no stream porque `<think>` ja veio do prompt/template.
 
-### T222 - Criar base agente offline no spike Zig com tool call, tool loop e micro-contexto
+### T222 - Criar base agente offline no produto Zig com tool call, tool loop e micro-contexto
 
 Status: implemented-verified-micro-base
 
-Evidencia: as tasks primarias T196, T197, T200, T202, T204 e T214 exigem parser de tool call separado do executor, gate estrito, loop fake/offline, tools basicas de codigo, EvidencePacket/micro-contexto e separacao entre teste offline e teste real. O spike T221 tinha renderer, HTTP, SQLite, gate fake, `read_file_range` e EvidencePacket, mas ainda nao tinha tool call model-visible, tool loop nem micro-contexto testado.
+Evidencia: as tasks primarias T196, T197, T200, T202, T204 e T214 exigem parser de tool call separado do executor, gate estrito, loop fake/offline, tools basicas de codigo, EvidencePacket/micro-contexto e separacao entre teste offline e teste real. A base T221 tinha renderer, HTTP, SQLite, gate fake, `read_file_range` e EvidencePacket, mas ainda nao tinha tool call model-visible, tool loop nem micro-contexto testado.
 
-Impacto: transforma o spike de CLI streaming em uma micro-base minima de agente, nao em agente completo. O que existe agora: um output fake/offline pode conter uma tool call no formato do template Qwopus; o controller offline parseia uma chamada, valida allowlist, executa uma unica tool permitida, gera evidencia e micro-contexto sem depender de modelo real ou host local.
+Impacto: transforma a base de CLI streaming em uma micro-base inicial de agente, nao em agente completo. O que existe agora: um output fake/offline pode conter uma tool call no formato do template Qwopus; o controller offline parseia uma chamada, valida allowlist, executa uma unica tool permitida, gera evidencia e micro-contexto sem depender de modelo real ou host local.
 
 Escopo real implementado:
 
@@ -5380,7 +5380,7 @@ O que ainda falta fora desta task:
 
 Status: implemented-verified-offline.
 
-Cumprimento: parcial deliberado para o pedido amplo de CLI final. Esta task porta a superficie visivel append-only ja suportada pelo spike Zig: user query, assistant stream, thinking em baixo destaque, sample de tool, diff preview, status textual, `[done]`, prompt row e status row. Nao implementa ainda o event loop interativo raw-mode completo do `phenom-cli-ts`, nem visualizer animado, resize/reflow, scroll region DECSTBM, historico de input, bracketed paste ou markdown renderer completo.
+Cumprimento: parcial deliberado para o pedido amplo de CLI final. Esta task porta a superficie visivel append-only ja suportada pela base Zig: user query, assistant stream, thinking em baixo destaque, sample de tool, diff preview, status textual, `[done]`, prompt row e status row. Nao implementa ainda o event loop interativo raw-mode completo do `phenom-cli-ts`, nem visualizer animado, resize/reflow, scroll region DECSTBM, historico de input, bracketed paste ou markdown renderer completo.
 
 Evidencia:
 
@@ -5394,7 +5394,7 @@ Evidencia:
 
 Impacto:
 
-- O transcript do spike deixa de parecer debug output e passa a seguir a linguagem visual do `phenom-cli-ts`.
+- O transcript do produto deixa de parecer debug output e passa a seguir a linguagem visual do `phenom-cli-ts`.
 - O user prompt e o prompt row usam a mesma paleta ANSI fixa do TS.
 - Assistant/status/done/tool/diff recebem gutter de conteudo de uma coluna, preservando copia em terminal/tmux.
 - Thinking fica separado e de baixo destaque, sem vazar colado ao output final.
@@ -5422,7 +5422,7 @@ Implementacao:
 Passos de implementacao:
 
 1. Comparar `phenom-zig/src/render.zig` com `../phenom-cli-ts/src/cli-renderer.ts`.
-2. Identificar elementos visuais ja suportados pelo spike e os que exigem engine interativa.
+2. Identificar elementos visuais ja suportados pela base Zig e os que exigem engine interativa.
 3. Corrigir user bubble para usar gutter, palette e wrap do TS.
 4. Corrigir assistant stream para prefixar gutter por linha.
 5. Corrigir thinking/tool/status/done/diff para blocos separados e copiaveis.
@@ -6365,7 +6365,7 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast` -> passou.
 - Smoke runtime em `/tmp/phenom-config-smoke/config.toml` com `offline = true`, sem flag `--offline`: `/home/ashirak/Projects/person/ai/cli-ai/phenom-cli/phenom-zig/zig-out/bin/phenom chat --prompt oi` -> passou; exibiu `[offline stub] model not called`.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /tmp/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou; instalou `/home/ashirak/.local/bin/phenom` e `/home/ashirak/.config/phenom/config.toml`.
-- `/home/ashirak/.local/bin/phenom version` -> passou; exibiu `phenom-zig spike 0.1.0`.
+- `/home/ashirak/.local/bin/phenom version` -> passou; exibiu `phenom-zig 0.2.0-dev`.
 
 ## T243 - Persistir estatisticas de inferencia no replay SQLite
 
@@ -8123,7 +8123,7 @@ Validacao executada:
 
 Status: implemented-verified.
 
-Motivacao: revisao de alinhamento apontou cinco riscos de regressao para os mesmos problemas do `phenom-cli-ts`: ranking com vies por linguagem/teste, estrategias anunciadas sem executor maduro, manifesto model-visible maior que o runtime real, contrato ativo fixo sem honestidade de superficie, e reparo de path com falso positivo para `..` textual. Como o projeto nao e mais tratado como spike, a correcao deve estabilizar a regra de negocio: o modelo so ve e so consegue usar contratos que o controller executa de forma auditavel; qualquer estrategia futura fica fora da superficie ativa ate existir executor real.
+Motivacao: revisao de alinhamento apontou cinco riscos de regressao para os mesmos problemas do `phenom-cli-ts`: ranking com vies por linguagem/teste, estrategias anunciadas sem executor maduro, manifesto model-visible maior que o runtime real, contrato ativo fixo sem honestidade de superficie, e reparo de path com falso positivo para `..` textual. Como o projeto e produto final em construcao, a correcao deve estabilizar a regra de negocio: o modelo so ve e so consegue usar contratos que o controller executa de forma auditavel; qualquer estrategia futura fica fora da superficie ativa ate existir executor real.
 
 Evidencia:
 
@@ -8208,7 +8208,7 @@ Pendencias deliberadas:
 - `set_operational_contract` ainda nao e model-visible porque nao existe executor/estado real para trocar contratos em runtime.
 - `symbol`, `semantic`, `diagnostic`, `runtime` e `diff` continuam no enum/roadmap, mas nao sao estrategias ativas ate terem implementacao propria.
 - O smoke `align-271c` ainda mostrou que o modelo pode extrapolar detalhes em linguagem natural mesmo apos evidencia. Nao foi adicionado filtro por blacklist porque isso seria nova heuristica fragil. A solucao correta e uma proxima task de groundedness por claims/citacoes: claims sobre workspace devem apontar para evidence ids/ranges ou serem marcadas como nao evidenciadas.
-- README ainda descreve `phenom-zig spike`; isso afeta a resposta real porque a evidencia vem do arquivo. Deve ser tratado em task separada de documentacao/produto, nao no controller.
+- README descrevia `phenom-zig` com linguagem de base descartavel; isso afetava a resposta real porque a evidencia vem do arquivo. Deve permanecer tratado em task de documentacao/produto, nao no controller.
 
 Validacao executada:
 
@@ -8288,7 +8288,7 @@ Criterio de aceite:
 Pendencias deliberadas:
 
 - O preflight ainda usa `auto`; selecao de contrato/perfil alem de `code_micro` deve vir de `context profiles`, nao de keywords do prompt.
-- `README.md` ainda descreve o produto como spike; a resposta real herdou esse termo da evidencia correta. Isso deve ser corrigido em task de documentacao/produto.
+- `README.md` foi corrigido para enquadrar o produto como desenvolvimento final em Zig + C; se a resposta real herdar linguagem de base descartavel, a causa deve ser outra evidencia antiga ou cache de contexto.
 - Ainda falta groundedness formal por claims/citacoes para impedir que o modelo acrescente detalhes nao evidenciados em linguagem natural.
 
 Validacao executada:

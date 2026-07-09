@@ -136,7 +136,7 @@ Problema criado:
 
 Veredito:
 
-- Bom MVP de loop de evidencia.
+- Boa base inicial de loop de evidencia, ainda insuficiente para declarar o fluxo principal do produto completo.
 - Ainda nao e o loop principal completo do Phenom.
 
 Proxima exigencia:

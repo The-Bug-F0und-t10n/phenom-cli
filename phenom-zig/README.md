@@ -2,6 +2,8 @@
 
 Produto Phenom em Zig + C: agente de CLI/TUI para codigo, sessao operacional, tool loop auditavel e contexto destilado.
 
+Este repositorio deve ser tratado como produto em desenvolvimento de grande porte. Alteracoes exigem alinhamento com `../TASKS.md`, `../doc/AGENTE_AI_BAIXO_CONSUMO_TOKENS_AUDIT.md`, `../alinhamento.md` e validacao objetiva. Linguagem de prova rapida, base descartavel ou implementacao relaxada nao descreve o estado atual do projeto e nao deve orientar decisoes de codigo.
+
 Estado atual:
 
 1. CLI `chat`, `probe`, `snapshot`, `version` e `help`.
