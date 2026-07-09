@@ -10228,3 +10228,41 @@ Criterio de aceite:
 
 - Portar acerto do TS nao pode remover acerto do Zig.
 - Regressao de qualquer acerto listado no `alinhamento.md` falha teste ou checklist.
+
+## T302 - Sincronizar build padrao com binario global
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: o usuario reportou regressao operacional real: ao iniciar build do projeto, `zig-out/bin/phenom` recebia as features novas, mas o executavel global em `~/.local/bin/phenom` permanecia antigo. Isso fazia `phenom chat` global executar codigo obsoleto e mascarar validacoes.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Falha apontada: build local e binario operacional divergentes.
+- O que sera preservado: `install-local` continua existindo e tambem faz merge preservador de `config.toml`.
+- O que foi corrigido no Zig: o step padrao de install agora depende da copia para `~/.local/bin/phenom`; `run`, smokes reais e `test` tambem passam pelo mesmo binario atualizado.
+- Invariantes afetadas: validacao real deve executar o binario recem-buildado; config do usuario nao pode ser sobrescrito.
+- Smoke real obrigatorio, se envolver modelo/servidor/tool loop: nao; mudanca e de grafo de build/instalacao.
+- Revisao baixo nivel Zig antes do commit: sem ponteiros/slices novos; risco principal era ciclo no grafo de build. Evitado fazendo o comando global depender do `addInstallArtifact`, nao do install step completo.
+
+Implementacao:
+
+- `phenom-zig/build.zig`: troca `b.installArtifact(exe)` por `addInstallArtifact` explicito.
+- `phenom-zig/build.zig`: copia global usa `exe.getEmittedBin()` como fonte, nao string fixa `zig-out/bin/phenom`.
+- `phenom-zig/build.zig`: `b.getInstallStep()` depende da copia global.
+- `phenom-zig/build.zig`: `zig build test` tambem depende da copia global, para impedir teste contra fonte nova e CLI global antiga.
+
+Criterio de aceite:
+
+- `zig build test` passa e atualiza `~/.local/bin/phenom`.
+- `zig build -Doptimize=ReleaseFast` passa e deixa `zig-out/bin/phenom` e `~/.local/bin/phenom` com mesmo checksum.
+- `zig build install-local -Doptimize=ReleaseFast` continua passando.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-build-local-sync-test test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-release ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-build-local-sync-release -Doptimize=ReleaseFast` -> passou.
+- `sha256sum zig-out/bin/phenom "$HOME/.local/bin/phenom"` -> ambos retornaram `3b54ba443a3adba0f60d09f41d816f42699bdb6f961cc931fd02fd6efc5b1ced`.
+- `./zig-out/bin/phenom version` e `"$HOME/.local/bin/phenom" version` -> ambos retornaram `phenom-zig 0.2.0-dev`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-release ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-build-local-sync-install install-local -Doptimize=ReleaseFast` -> passou.

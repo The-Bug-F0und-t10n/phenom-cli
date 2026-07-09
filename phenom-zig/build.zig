@@ -16,7 +16,8 @@ pub fn build(b: *std.Build) void {
         .name = "phenom",
         .root_module = exe_mod,
     });
-    b.installArtifact(exe);
+    const install_artifact = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_artifact.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -31,9 +32,12 @@ pub fn build(b: *std.Build) void {
     const install_local_cmd = b.addSystemCommand(&.{
         "sh",
         "-c",
-        "test -n \"$HOME\" && install -Dm755 zig-out/bin/phenom \"$HOME/.local/bin/phenom\" && sh tools/merge_config.sh ../config.toml \"$HOME/.config/phenom/config.toml\"",
+        "test -n \"$HOME\" && install -Dm755 \"$1\" \"$HOME/.local/bin/phenom\" && sh tools/merge_config.sh ../config.toml \"$HOME/.config/phenom/config.toml\"",
+        "sh",
     });
-    install_local_cmd.step.dependOn(b.getInstallStep());
+    install_local_cmd.addFileArg(exe.getEmittedBin());
+    install_local_cmd.step.dependOn(&install_artifact.step);
+    b.getInstallStep().dependOn(&install_local_cmd.step);
     install_local_step.dependOn(&install_local_cmd.step);
 
     const real_backend = b.option([]const u8, "real-backend", "Real backend for smoke test: ollama or llamacpp") orelse "llamacpp";
@@ -188,6 +192,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    run_unit_tests.step.dependOn(&install_local_cmd.step);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 }

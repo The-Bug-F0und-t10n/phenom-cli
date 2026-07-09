@@ -34,6 +34,8 @@ ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build run -- chat --offline --session dev --prompt "responda somente: ok"
 ```
 
+Todo `zig build` que instala o artefato tambem sincroniza `~/.local/bin/phenom` com o binario recem-gerado. O step `install-local` continua disponivel, mas nao e mais necessario para evitar divergencia entre `zig-out/bin/phenom` e o comando global `phenom`.
+
 Probe de backend sem inferencia:
 
 ```sh
