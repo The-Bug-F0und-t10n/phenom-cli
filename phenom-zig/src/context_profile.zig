@@ -69,15 +69,16 @@ pub fn codeEvidenceSchema() []const u8 {
     return
         \\[TOOLS v1]
         \\set_operational_contract(requiresInspection, requiresMutation, requiresRuntimeValidation, requiresBrowserDiagnostics, reason?)
-        \\collect_evidence(path?, terms?, strategy=auto|path|lexical|symbol|diagnostic, start_line=1, max_lines=12, compact=false)
+        \\collect_evidence(intent?, path?, terms?, strategy=auto|path|lexical|symbol|diagnostic, start_line=1, max_lines=12, compact=false)
         \\search_session(intent?, terms, scope=current|all, session?)
         \\The model decides search intent. The controller only executes announced contracts and returns evidence. SESSION_FOCUS is not evidence; use it only to choose whether search_session is needed.
         \\Any claim about prior conversation/session content must call search_session first and cite returned S# evidence. Do not answer that session history is unavailable while search_session is advertised.
+        \\For collect_evidence without path, first decide intent: the workspace/source-code evidence you need. Then set terms to specific retrieval keys for that intent: symbols, function/type names, file names, error strings, UI labels, protocol fields, or concrete code concepts from your reasoning. For questions asking which function/type/symbol/file is responsible, prefer strategy=symbol or strategy=lexical with symbol-like terms. Do not call strategy=auto without intent+terms unless your intent is explicitly only a workspace overview.
         \\For search_session, first decide intent: the evidence you need to recover. Then set terms to only the specific retrieval keys for that intent from your reasoning or SESSION_FOCUS. Do not pass generic user words like "topics", "subtopics", or "conversation" as the main terms unless they are the actual remembered content.
         \\Format contract:
         \\<tool_call><function=set_operational_contract><parameter=requiresInspection>true</parameter><parameter=requiresMutation>false</parameter><parameter=requiresRuntimeValidation>false</parameter><parameter=requiresBrowserDiagnostics>false</parameter><parameter=reason>short reason</parameter></function></tool_call>
         \\Format evidence:
-        \\<tool_call><function=collect_evidence><parameter=strategy>auto</parameter><parameter=terms>what to find</parameter></function></tool_call>
+        \\<tool_call><function=collect_evidence><parameter=intent>workspace/source-code evidence to find</parameter><parameter=strategy>auto</parameter><parameter=terms>specific retrieval keys</parameter></function></tool_call>
         \\Format path:
         \\<tool_call><function=collect_evidence><parameter=path>relative/path</parameter><parameter=strategy>path</parameter><parameter=start_line>1</parameter><parameter=max_lines>12</parameter></function></tool_call>
         \\Format session:
@@ -88,12 +89,13 @@ pub fn codeEvidenceSchema() []const u8 {
 pub fn activeContractSchema() []const u8 {
     return
         \\[TOOLS v1]
-        \\collect_evidence(path?, terms?, strategy=auto|path|lexical|symbol|diagnostic, start_line=1, max_lines=12, compact=false)
+        \\collect_evidence(intent?, path?, terms?, strategy=auto|path|lexical|symbol|diagnostic, start_line=1, max_lines=12, compact=false)
         \\search_session(intent?, terms, scope=current|all, session?)
         \\The operational contract is active. Do not call set_operational_contract again.
+        \\For collect_evidence without path, intent is the source-code evidence to recover; terms are specific retrieval keys from current reasoning. For function/type/symbol identity, prefer strategy=symbol or strategy=lexical. Auto without path must not be empty unless explicitly asking for workspace overview.
         \\For search_session, intent is the evidence to recover; terms are only the specific retrieval keys from SESSION_FOCUS/current reasoning.
         \\Format evidence:
-        \\<tool_call><function=collect_evidence><parameter=strategy>auto</parameter><parameter=terms>what to find</parameter></function></tool_call>
+        \\<tool_call><function=collect_evidence><parameter=intent>source-code evidence to recover</parameter><parameter=strategy>auto</parameter><parameter=terms>specific retrieval keys</parameter></function></tool_call>
         \\Format session:
         \\<tool_call><function=search_session><parameter=intent>evidence to recover</parameter><parameter=terms>specific retrieval keys</parameter><parameter=scope>current</parameter></function></tool_call>
     ;
@@ -116,6 +118,7 @@ test "schemas are state scoped" {
     try std.testing.expect(std.mem.indexOf(u8, evidence, "collect_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "set_operational_contract") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "first decide intent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "strategy=auto without intent+terms") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "Do not pass generic user words") != null);
 
     try std.testing.expectEqualStrings("", toolSchema(.code_evidence, .after_collect_evidence));

@@ -10,6 +10,7 @@ const tools = @import("tools.zig");
 
 pub const Args = struct {
     path: ?[]const u8 = null,
+    intent: ?[]const u8 = null,
     terms: ?[]const u8 = null,
     task: []const u8 = "",
     strategy: contracts.StrategyName = .auto,
@@ -192,7 +193,7 @@ fn executeRanked(allocator: std.mem.Allocator, io: std.Io, args: Args, strategy:
     errdefer allocator.free(micro_context_text);
     const first_context_id = try allocator.dupe(u8, micro_contexts.items[0].id);
     errdefer allocator.free(first_context_id);
-    const tool_event_audit_text = try renderRankedAudit(allocator, strategy, audit_task, args.budget_bytes, ranked.audit_text, packet.entries.items.len, raw_bytes_read, best_quality);
+    const tool_event_audit_text = try renderRankedAudit(allocator, strategy, args.intent, audit_task, args.budget_bytes, ranked.audit_text, packet.entries.items.len, raw_bytes_read, best_quality);
     errdefer allocator.free(tool_event_audit_text);
 
     return .{
@@ -236,6 +237,7 @@ fn renderMicroContexts(allocator: std.mem.Allocator, contexts: []const micro_con
 fn renderRankedAudit(
     allocator: std.mem.Allocator,
     strategy: contracts.StrategyName,
+    intent: ?[]const u8,
     task: []const u8,
     budget_bytes: usize,
     ranking_audit: []const u8,
@@ -245,8 +247,8 @@ fn renderRankedAudit(
 ) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "[TOOL_EVENT]\ntool=collect_evidence\nsuccess=true\nargs=strategy={s} task_bytes={} budget_bytes={} ranges={} raw_bytes={} quality_score={}\n{s}",
-        .{ @tagName(strategy), task.len, budget_bytes, range_count, raw_bytes_read, quality_score, ranking_audit },
+        "[TOOL_EVENT]\ntool=collect_evidence\nsuccess=true\nargs=strategy={s} intent_bytes={} task_bytes={} budget_bytes={} ranges={} raw_bytes={} quality_score={}\n{s}",
+        .{ @tagName(strategy), if (intent) |value| value.len else 0, task.len, budget_bytes, range_count, raw_bytes_read, quality_score, ranking_audit },
     );
 }
 

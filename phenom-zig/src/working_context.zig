@@ -152,9 +152,7 @@ pub const WorkingContext = struct {
     }
 
     pub fn shouldAllowMoreEvidence(self: WorkingContext) bool {
-        if (!self.hasBudgetForMoreEvidence()) return false;
-        if (self.best_quality >= 82) return false;
-        return true;
+        return self.hasBudgetForMoreEvidence();
     }
 
     fn compactToBudget(self: *WorkingContext) void {
@@ -308,6 +306,24 @@ test "working context compact all removes full snippets from model visible block
     try std.testing.expect(std.mem.indexOf(u8, blocks[0].text, "[EVIDENCE_ANCHOR]") != null);
     try std.testing.expect(std.mem.indexOf(u8, blocks[0].text, "full snippet text") == null);
     try std.testing.expect(std.mem.indexOf(u8, blocks[0].text, "README.md") != null);
+}
+
+test "working context permits refinement by budget not ranking score" {
+    var ctx = WorkingContext.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.remember(.{
+        .terms = "renderer",
+        .strategy = .symbol,
+        .start_line = 1,
+        .max_lines = 12,
+        .context_id = "ctx_symbol",
+        .evidence_text = "[EVIDENCE]\n- build.zig L1-L12 hash=abc\npub fn build() void {}\n",
+        .model_bytes = 128,
+        .quality_score = 116,
+    });
+
+    try std.testing.expect(ctx.shouldAllowMoreEvidence());
 }
 
 test "working context caps oversized active evidence before model rendering" {

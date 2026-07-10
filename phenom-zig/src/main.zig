@@ -620,9 +620,26 @@ fn initialContextRequiresTool(context: ?[]const u8) bool {
 fn renderInitialToolCallRepairContext(allocator: std.mem.Allocator, initial_context: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{s}\n[PROTOCOL_REPAIR]\nYour previous output was prose, but this turn requires a context tool call before prose. Emit exactly one tool_call now. For search_session, set <parameter=intent> to the evidence you want to recover and <parameter=terms> to specific retrieval keys from SESSION_FOCUS/current reasoning; do not copy the user's vague wording.\n",
+        "{s}\n[PROTOCOL_REPAIR]\nYour previous output was prose, but this turn requires a context tool call before prose. Emit exactly one tool_call now. For collect_evidence/search_session, set <parameter=intent> to the evidence you want to recover and <parameter=terms> to specific retrieval keys from current reasoning/SESSION_FOCUS; do not copy the user's vague wording.\n",
         .{initial_context},
     );
+}
+
+fn renderCollectEvidenceSearchIntentRepairContext(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    contracts_text: []const u8,
+) ![]u8 {
+    return model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = contracts_text,
+        .obligations = &.{
+            "A pathless collect_evidence call must include <parameter=intent>what source-code evidence you want</parameter> and <parameter=terms>specific retrieval keys for that intent</parameter>.",
+            "The controller does not infer search terms from the user prompt. The model must choose the search intent and keys before evidence collection.",
+        },
+        .grounding = groundingRules(),
+        .next_action = "Emit one corrected collect_evidence tool call with path, or with intent+terms and a valid strategy. Use strategy=symbol/lexical/auto according to the evidence you intend to recover.",
+    });
 }
 
 fn runOneToolLoopStep(
@@ -668,7 +685,7 @@ fn runOneToolLoopStep(
         contracts.StrategyName.path
     else
         call.strategy orelse if (path == null) contracts.StrategyName.auto else contracts.StrategyName.path;
-    if (path == null and strategy == .path) {
+    if (path == null and (strategy == .path or strategy == .diagnostic)) {
         if (repairs.* >= max_tool_repairs) {
             try db.recordEvent(config.session, "tool_rejected", "collect_evidence missing path after repair");
             return .stopped;
@@ -683,11 +700,32 @@ fn runOneToolLoopStep(
             else
                 context_profile.toolSchema(.code_evidence, .initial),
             .obligations = &.{
-                "A collect_evidence call must include <parameter=path>relative/file</parameter>.",
+                "This collect_evidence strategy must include <parameter=path>relative/file</parameter>.",
                 "Do not answer with prose until evidence is collected or you decide evidence is unnecessary.",
             },
             .next_action = "Emit one corrected collect_evidence tool call with path, or answer directly if no file evidence is needed.",
         });
+        defer allocator.free(repair_context);
+        try db.recordEvent(config.session, "model_context", repair_context);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    }
+
+    if (collectEvidenceNeedsSearchIntentRepair(call, path, strategy)) {
+        if (repairs.* >= max_tool_repairs) {
+            try db.recordEvent(config.session, "tool_rejected", "collect_evidence missing intent/terms after repair");
+            return .stopped;
+        }
+        repairs.* += 1;
+        try db.recordEvent(config.session, "tool_repair", "collect_evidence missing intent/terms");
+        try events.emit(.{ .progress_update = "repairing tool call: collect_evidence requires search intent" });
+        const repair_context = try renderCollectEvidenceSearchIntentRepairContext(
+            allocator,
+            prompt,
+            if (state.contract_selected)
+                context_profile.toolSchema(.code_evidence, .active_contract)
+            else
+                context_profile.toolSchema(.code_evidence, .initial),
+        );
         defer allocator.free(repair_context);
         try db.recordEvent(config.session, "model_context", repair_context);
         return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
@@ -731,13 +769,14 @@ fn runOneToolLoopStep(
     tool_iterations.* += 1;
 
     if (ui_ptr) |active_ui| try active_ui.showStatus("Reading");
-    const tool_start = try std.fmt.allocPrint(allocator, "collect_evidence\t{s}", .{path orelse @tagName(strategy)});
+    const tool_start = try renderCollectEvidenceAuditKey(allocator, path, call.intent, call.terms, strategy);
     defer allocator.free(tool_start);
     try db.recordEvent(config.session, "tool_start", tool_start);
     try events.emit(.{ .tool_start = .{ .name = "collect_evidence", .detail = path orelse @tagName(strategy) } });
 
     const result = collect_evidence.execute(allocator, io, .{
         .path = path,
+        .intent = call.intent,
         .terms = call.terms,
         .task = prompt,
         .strategy = strategy,
@@ -784,9 +823,12 @@ fn runOneToolLoopStep(
         &state.context,
         null,
         null,
-        context_profile.toolSchema(.code_evidence, .after_collect_evidence),
         if (state.shouldAllowMoreEvidence())
-            "Answer using only cited evidence above. Cite E# for workspace claims and S# for session claims. Do not add capabilities, files, tools, or architecture not present in evidence. If a different evidence range is strictly required and budget remains, emit one collect_evidence or search_session call. Do not request the same file/range/session terms again."
+            context_profile.toolSchema(.code_evidence, .active_contract)
+        else
+            context_profile.toolSchema(.code_evidence, .after_collect_evidence),
+        if (state.shouldAllowMoreEvidence())
+            "Answer using only cited evidence above. Cite E# for workspace claims and S# for session claims. Do not add capabilities, files, tools, or architecture not present in evidence. If the user asks which function/type/file and the identifier is not present in E#, emit one refined collect_evidence call with intent+terms instead of guessing. Do not request the same file/range/session terms again."
         else
             "Answer the current user request using only cited evidence above. Do not add capabilities, files, tools, architecture, or prior-session facts not present in evidence. If evidence is insufficient, say what is evidenced and what is not. Do not call tools again in this turn.",
     );
@@ -794,6 +836,15 @@ fn runOneToolLoopStep(
     try db.recordEvent(config.session, "model_context", follow_context);
 
     return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+fn collectEvidenceNeedsSearchIntentRepair(
+    call: *const tool_call.ToolCall,
+    effective_path: ?[]const u8,
+    strategy: contracts.StrategyName,
+) bool {
+    if (effective_path != null or strategy == .path) return false;
+    return call.intent == null or call.terms == null;
 }
 
 fn runSetOperationalContractStep(
@@ -1040,6 +1091,21 @@ fn renderSessionSearchAuditKey(allocator: std.mem.Allocator, scope: SessionSearc
     });
 }
 
+fn renderCollectEvidenceAuditKey(
+    allocator: std.mem.Allocator,
+    path: ?[]const u8,
+    intent: ?[]const u8,
+    terms: ?[]const u8,
+    strategy: contracts.StrategyName,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator, "collect_evidence\tpath={s} strategy={s} intent_bytes={} terms_bytes={}", .{
+        path orelse "",
+        @tagName(strategy),
+        if (intent) |value| value.len else 0,
+        if (terms) |value| value.len else 0,
+    });
+}
+
 fn renderAllowedTools(allocator: std.mem.Allocator, allowed_tools: []const []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -1281,7 +1347,9 @@ fn collectEvidenceToolSchema(include_contract_tool: bool) []const u8 {
 fn groundingRules() []const []const u8 {
     return &.{
         "Workspace/source-code claims must cite E# evidence from [EVIDENCE].",
+        "For code identity questions, only name a function/type/file when that identifier or declaration/callsite appears in E# evidence. If the collected E# does not contain the needed identifier, refine with another collect_evidence call while budget remains.",
         "Use [RECENT_DIALOGUE] for continuity only; use [SESSION_FOCUS] only as a routing map. Exact claims about what was said or done in prior conversation must cite S# evidence from [SESSION_CONTEXT].",
+        "collect_evidence intent states what workspace/source-code evidence to recover; pathless collect_evidence terms are retrieval keys for that intent, not the user's vague wording.",
         "search_session intent states what evidence to recover; search_session terms are retrieval keys for that intent, not the user's vague wording.",
         "Do not answer that conversation history is unavailable while search_session is available; call search_session first when prior conversation context is required.",
         "If no E#/S# supports a workspace or exact prior-session claim, say that claim is not evidenced in the provided context.",
@@ -2072,6 +2140,57 @@ test "initial context repair preserves context and asks for intent terms split" 
     try std.testing.expect(std.mem.indexOf(u8, repair, "do not copy the user's vague wording") != null);
 }
 
+test "pathless collect evidence requires model search intent and terms" {
+    const weak_xml =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=strategy>auto</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const weak = (try tool_call.parseFirst(std.testing.allocator, weak_xml)) orelse return error.NoToolCall;
+    defer weak.deinit(std.testing.allocator);
+    try std.testing.expect(collectEvidenceNeedsSearchIntentRepair(&weak, null, .auto));
+
+    const focused_xml =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=intent>find CLI renderer implementation</parameter>
+        \\<parameter=strategy>symbol</parameter>
+        \\<parameter=terms>renderer render output TerminalUi markdown diff</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const focused = (try tool_call.parseFirst(std.testing.allocator, focused_xml)) orelse return error.NoToolCall;
+    defer focused.deinit(std.testing.allocator);
+    try std.testing.expect(!collectEvidenceNeedsSearchIntentRepair(&focused, null, .symbol));
+
+    const path_xml =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=path>src/main.zig</parameter>
+        \\<parameter=strategy>path</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const path = (try tool_call.parseFirst(std.testing.allocator, path_xml)) orelse return error.NoToolCall;
+    defer path.deinit(std.testing.allocator);
+    try std.testing.expect(!collectEvidenceNeedsSearchIntentRepair(&path, path.path, .path));
+}
+
+test "collect evidence search intent repair explains model responsibility" {
+    const repair = try renderCollectEvidenceSearchIntentRepairContext(
+        std.testing.allocator,
+        "qual e a funcao que renderiza o cli?",
+        context_profile.toolSchema(.code_evidence, .initial),
+    );
+    defer std.testing.allocator.free(repair);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "pathless collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "<parameter=intent>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "<parameter=terms>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "controller does not infer search terms") != null);
+}
+
 test "tool loop state detects duplicate collect evidence calls and preserves evidence" {
     const xml =
         \\<tool_call>
@@ -2260,12 +2379,14 @@ test "session evidence context keeps focus map for corrective searches" {
 
 test "grounding rules separate dialogue continuity from exact session evidence" {
     const rules = groundingRules();
-    try std.testing.expect(std.mem.indexOf(u8, rules[1], "[RECENT_DIALOGUE]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rules[1], "continuity") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rules[1], "S#") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rules[2], "retrieval keys") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rules[3], "search_session") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rules[3], "history is unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[2], "[RECENT_DIALOGUE]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[2], "continuity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[2], "S#") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[3], "collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[3], "retrieval keys") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[4], "search_session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[4], "retrieval keys") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules[5], "history is unavailable") != null);
 }
 
 const EventRecorder = struct {

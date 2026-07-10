@@ -216,6 +216,7 @@ test "collect evidence owns model search terms" {
     var output = try std.testing.allocator.dupe(u8,
         \\<tool_call>
         \\<function=collect_evidence>
+        \\<parameter=intent>find CLI renderer implementation</parameter>
         \\<parameter=strategy>auto</parameter>
         \\<parameter=terms>CLI render output function</parameter>
         \\</function>
@@ -226,6 +227,7 @@ test "collect evidence owns model search terms" {
     defer call.deinit(std.testing.allocator);
     output[80] = 'X';
     try std.testing.expectEqualStrings("collect_evidence", call.name);
+    try std.testing.expectEqualStrings("find CLI renderer implementation", call.intent.?);
     try std.testing.expectEqualStrings("CLI render output function", call.terms.?);
 }
 

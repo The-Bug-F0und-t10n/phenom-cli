@@ -10363,3 +10363,50 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-session-intent-search-3 test` -> passou.
 - Smoke real: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 1600 --session default --prompt 'quais sao os assuntos por topicos e subtopicos que estavamos conversando' --fail-on-model-error --no-color` -> passou no fluxo: a prosa inicial foi reparada, `search_session` executou e os termos passaram a ser chaves de conteudo (`phenom`, `zig`, `c`, `llama`, `ollama`, `Mateus`/genealogia etc.), nao a query literal `assuntos topicos subtopicos`.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-release ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-session-intent-release -Doptimize=ReleaseFast` -> passou.
+
+## T305 - Separar intencao de busca e termos em `collect_evidence`
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: o usuario mostrou log onde a pergunta `qual e a funcao que e responsavel por renderizacao do cli no projeto ?` fazia o modelo chamar `collect_evidence(strategy=auto)` sem `intent`, sem `terms` e sem `path`. O controller aceitava isso e o executor caia no overview generico do workspace, geralmente README. Para um agente coder isso viola a regra de negocio: evidencia de codigo precisa ser dirigida pela intencao do modelo, nao por fallback generico nem por inferencia do controller.
+
+Alinhamento AUDIT/TASKS/phenom-cli-ts:
+
+- Nao foi adicionada heuristica linguistica hardcoded, lista de arquivos preferidos, stack preferida ou bias por linguagem.
+- O modelo continua sendo o cerebro da coleta: ele define `intent`, `terms`, `path` e `strategy`.
+- O controller nao gera termos a partir do prompt do usuario; ele apenas valida protocolo, executa contrato, audita e devolve evidencia destilada.
+- O overview do workspace continua existindo no executor para chamadas explicitamente direcionadas a overview, mas o tool loop nao aceita `collect_evidence` pathless sem `intent+terms` como busca de codigo precisa.
+
+Implementacao:
+
+- `phenom-zig/src/context_profile.zig`: contrato de `collect_evidence` virou `collect_evidence(intent?, path?, terms?, strategy=...)`.
+- `phenom-zig/src/context_profile.zig`: schema instrui o modelo a separar `intent` de `terms` e a usar `symbol`/`lexical` para perguntas de funcao/tipo/simbolo quando adequado.
+- `phenom-zig/src/tool_call.zig`: teste de parser cobre `intent` em `collect_evidence`.
+- `phenom-zig/src/main.zig`: `collect_evidence` sem `path` agora exige `intent+terms`; se vier fraco, o loop emite repair de protocolo antes de executar overview implicito.
+- `phenom-zig/src/main.zig`: audit de `tool_start collect_evidence` registra `intent_bytes` e `terms_bytes`.
+- `phenom-zig/src/collect_evidence.zig`: `Args` ganhou `intent` e o audit do tool event registra `intent_bytes`; ranking continua usando apenas `terms` escolhidos pelo modelo.
+- `phenom-zig/src/working_context.zig`: refinamento pos-evidencia agora e limitado por budget, nao por score de ranking. Score alto de match textual nao encerra o loop se o modelo julgar que precisa de outra coleta.
+- `phenom-zig/src/main.zig`: contexto pos-`collect_evidence` mantem o contrato ativo enquanto ainda ha budget, permitindo coleta guiada adicional. Sem budget, o schema sai do contexto e o modelo deve responder ou declarar insuficiencia.
+- `phenom-zig/src/main.zig`: regras de groundedness exigem que perguntas de identidade de codigo so nomeiem funcao/tipo/arquivo quando o identificador/declaracao/callsite aparecer em E#.
+
+Limite residual:
+
+- O ranking ainda pode retornar falso positivo na primeira coleta se os termos do modelo forem ruins. A correcao nao tenta compensar isso com heuristica do controller; ela permite refinamento model-driven e impede resposta final inventada quando a evidencia nao contem o identificador necessario.
+- `collect_evidence` ainda nao implementa o contrato TS completo com `stage`, `selectedCandidates`, `need`, `targetFiles` e `scopeRoot`; isso permanece na frente maior de evolucao do contrato de coleta.
+
+Criterio de aceite:
+
+- `collect_evidence(auto|symbol|lexical)` sem path precisa trazer `intent+terms` antes de executar.
+- `collect_evidence(auto)` vazio nao vira README/overview silencioso em pergunta de codigo.
+- Apos evidencia insuficiente, o modelo ainda recebe contrato ativo se houver budget para refinamento.
+- Resposta final de pergunta de funcao cita E# contendo o identificador nomeado.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/tool_call.zig` -> passou; 16 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/context_profile.zig` -> passou; 2 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 210 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-collect-intent-test test` -> passou com sync global.
+- Smoke real: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 2600 --session collect-render-intent-20260710b --prompt 'qual e a funcao que e responsavel por renderizacao do cli no projeto ?' --fail-on-model-error --no-color` -> passou no comportamento. O primeiro passe usou `intent+terms`; uma coleta ruim retornou `build.zig`, o contexto pos-evidencia manteve contrato ativo, a coleta seguinte retornou `src/render.zig` com `pub fn AppendOnlyRenderer`, e a resposta final citou `AppendOnlyRenderer` em E1.
