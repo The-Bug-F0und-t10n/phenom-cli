@@ -103,7 +103,12 @@ pub fn rankForPrompt(
     var symbol_indexed_files: usize = 0;
     var symbols_seen: usize = 0;
 
-    // Phase 1: syntax-aware symbols for strategy=symbol.
+    // Phase 1: model terms against workspace path names.
+    if (prompt.len > 0) {
+        try collectPathNameCandidates(allocator, io, &candidates, terms.items.items, strategy, budget);
+    }
+
+    // Phase 2: syntax-aware symbols for strategy=symbol.
     if (strategy == .symbol and prompt.len > 0) {
         const symbol_result = collectSymbolCandidates(allocator, io, &candidates, prompt, budget) catch blk: {
             symbol_available = false;
@@ -115,7 +120,7 @@ pub fn rankForPrompt(
         }
     }
 
-    // Phase 2: per-term rg for structured terms only (paths, code symbols, camelCase, etc.)
+    // Phase 3: per-term rg for structured terms only (paths, code symbols, camelCase, etc.)
     for (terms.items.items) |term| {
         if (candidates.items.len >= budget.max_candidates) break;
         if (!isStructuredSearchTerm(term)) continue;
@@ -129,7 +134,7 @@ pub fn rankForPrompt(
         rg_invocations += 1;
     }
 
-    // Phase 3: SQLite FTS5/BM25 over current workspace, using model-provided terms only.
+    // Phase 4: SQLite FTS5/BM25 over current workspace, using model-provided terms only.
     if ((candidates.items.len < budget.max_candidates or strategy == .symbol) and (strategy == .auto or strategy == .lexical or strategy == .symbol) and prompt.len > 0) {
         const fts_result = collectFtsCandidates(allocator, io, &candidates, prompt, budget, strategy == .symbol) catch |err| switch (err) {
             error.SqliteOpenFailed, error.SqliteExecFailed, error.SqlitePrepareFailed, error.SqliteBindFailed, error.SqliteStepFailed => blk: {
@@ -141,17 +146,17 @@ pub fn rankForPrompt(
         if (fts_result) |indexed| fts_indexed_files = indexed;
     }
 
-    // Phase 4: batch file discovery via plain keywords (single rg -l call for all NL-like words)
+    // Phase 5: batch file discovery via plain keywords (single rg -l call for all NL-like words)
     if (candidates.items.len < budget.max_candidates and strategy == .auto) {
         try discoverFilesByKeywords(allocator, io, &candidates, terms.items.items, budget);
     }
 
-    // Phase 5: path candidates from prompt text
+    // Phase 6: path candidates from prompt text
     if (candidates.items.len == 0) {
         try addPromptPathCandidates(allocator, &candidates, prompt, strategy, budget);
     }
 
-    // Phase 6: workspace overview fallback
+    // Phase 7: workspace overview fallback
     if (candidates.items.len == 0 and strategy == .auto) {
         try addWorkspaceOverviewCandidates(allocator, io, &candidates, budget);
     }
@@ -290,6 +295,46 @@ fn collectFallbackCandidates(
                 .reasons = reasons,
             });
         }
+    }
+}
+
+fn collectPathNameCandidates(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    out: *std.ArrayList(EvidenceCandidate),
+    term_slice: []const []u8,
+    strategy: contracts.StrategyName,
+    budget: RankBudget,
+) !void {
+    var inventory = try workspace_inventory.collect(allocator, io, budget.max_candidates * 64);
+    defer inventory.deinit(allocator);
+    for (inventory.paths.items) |path| {
+        if (out.items.len >= budget.max_candidates) break;
+        var best_score: i32 = 0;
+        for (term_slice) |term| {
+            if (term.len < 3) continue;
+            const exact = containsIgnoreCase(path, term);
+            const fuzzy = fuzzyTextMatchScore(path, term);
+            if (!exact and fuzzy == 0) continue;
+            const score: i32 = if (exact)
+                140 + @as(i32, @intCast(@min(term.len, 24)))
+            else
+                104 + @as(i32, @intCast(fuzzy));
+            best_score = @max(best_score, score);
+        }
+        if (best_score == 0) continue;
+        const reasons = try std.fmt.allocPrint(allocator, "path_name_match,strategy={s}", .{@tagName(strategy)});
+        errdefer allocator.free(reasons);
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        try out.append(allocator, .{
+            .path = owned_path,
+            .start_line = 1,
+            .end_line = budget.max_lines_per_range,
+            .score = best_score,
+            .source = .prompt_path,
+            .reasons = reasons,
+        });
     }
 }
 
@@ -433,7 +478,7 @@ fn collectSymbolCandidates(
             .path = owned_path,
             .start_line = candidate.start_line,
             .end_line = @min(candidate.end_line, candidate.start_line + budget.max_lines_per_range - 1),
-            .score = candidate.score,
+            .score = candidate.score + 80,
             .source = .symbol_ast,
             .reasons = reasons,
         });
@@ -510,9 +555,15 @@ pub fn mergeCandidates(
         for (merged.items) |*existing| {
             if (!std.mem.eql(u8, existing.path, candidate.path)) continue;
             if (!rangesTouch(existing.start_line, existing.end_line, candidate.start_line, candidate.end_line)) continue;
+            if (!canMergeCandidateSources(existing.*, candidate)) continue;
             existing.start_line = @min(existing.start_line, candidate.start_line);
             existing.end_line = @min(@max(existing.end_line, candidate.end_line), existing.start_line + budget.max_lines_per_range - 1);
             existing.score = @max(existing.score, candidate.score) + 4;
+            if (std.mem.indexOf(u8, existing.reasons, candidate.reasons) == null) {
+                const merged_reasons = try std.fmt.allocPrint(allocator, "{s};{s}", .{ existing.reasons, candidate.reasons });
+                allocator.free(existing.reasons);
+                existing.reasons = merged_reasons;
+            }
             merged_existing = true;
             break;
         }
@@ -527,6 +578,13 @@ pub fn mergeCandidates(
         });
     }
     return merged;
+}
+
+fn canMergeCandidateSources(a: EvidenceCandidate, b: EvidenceCandidate) bool {
+    if (a.source == .symbol_ast or b.source == .symbol_ast) {
+        return a.source == b.source and a.start_line == b.start_line;
+    }
+    return true;
 }
 
 pub fn adaptiveBudget(total_budget: usize, quality_score: i32, range_count: usize) usize {
@@ -545,6 +603,8 @@ fn scoreMatch(path: []const u8, text: []const u8, term: []const u8, strategy: co
     var score: i32 = 20;
     if (containsIgnoreCase(text, term)) score += 35;
     if (containsIgnoreCase(path, term)) score += 22;
+    score += @as(i32, @intCast(fuzzyTextMatchScore(text, term) / 2));
+    score += @as(i32, @intCast(fuzzyTextMatchScore(path, term)));
     return score;
 }
 
@@ -652,6 +712,32 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn fuzzyTextMatchScore(haystack: []const u8, term: []const u8) usize {
+    if (term.len < 5 or haystack.len < 5) return 0;
+    const common = longestAsciiFoldedTermPrefixInHaystack(haystack, term);
+    if (common < 5) return 0;
+    return common * 6;
+}
+
+fn longestAsciiFoldedTermPrefixInHaystack(haystack: []const u8, term: []const u8) usize {
+    var best: usize = 0;
+    var i: usize = 0;
+    while (i < haystack.len) : (i += 1) {
+        var term_start: usize = 0;
+        while (term_start < term.len) : (term_start += 1) {
+            var n: usize = 0;
+            while (i + n < haystack.len and term_start + n < term.len and asciiFold(haystack[i + n]) == asciiFold(term[term_start + n])) : (n += 1) {}
+            if (term_start > 0 and n < 6) continue;
+            best = @max(best, n);
+        }
+    }
+    return best;
+}
+
+fn asciiFold(byte: u8) u8 {
+    return std.ascii.toLower(byte);
+}
+
 fn cleanTerm(raw: []const u8) []const u8 {
     return std.mem.trim(u8, raw, " \t\r\n\"'`()[]{}<>:;,.!?");
 }
@@ -757,12 +843,21 @@ test "ranking can use sqlite fts bm25 without semantic model" {
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "---BEGIN CONTENT---") == null);
 }
 
+test "ranking uses model terms against workspace paths without preferred file list" {
+    var ranked = try rankForPrompt(std.testing.allocator, std.testing.io, "render", .lexical, .{ .max_ranges = 4 });
+    defer ranked.deinit(std.testing.allocator);
+    try std.testing.expect(ranked.candidates.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "path_name_match") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "src/render.zig") != null);
+}
+
 test "symbol ranking uses fts corroboration for conceptual renderer query" {
     var ranked = try rankForPrompt(std.testing.allocator, std.testing.io, "CLI renderer output statusbar markdown diff", .symbol, .{ .max_ranges = 4 });
     defer ranked.deinit(std.testing.allocator);
     try std.testing.expect(ranked.candidates.items.len > 0);
     try std.testing.expect(ranked.fts_indexed_files > 0);
-    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "source=fts_bm25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "fts_indexed_files=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "source=symbol_ast") != null);
 }
 
 test "term extraction keeps structured symbols and plain keywords" {

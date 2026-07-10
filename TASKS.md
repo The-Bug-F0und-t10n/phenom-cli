@@ -9300,7 +9300,7 @@ Validacao executada:
 
 ## T282 - Portar `set_operational_contract` como contrato model-visible pequeno
 
-Status: pending-urgent.
+Status: implemented-verified.
 
 Prioridade: urgente.
 
@@ -10131,6 +10131,27 @@ Criterio de aceite:
 - Pergunta ambigua melhora por iteracao do modelo, nao por adivinhacao do agente.
 - O audit explica por que uma evidencia foi escolhida ou descartada.
 
+Implementacao em 2026-07-10:
+
+- `phenom-zig/src/tool_call.zig`: `collect_evidence` parseia `stage` e `selectedCandidate`/`selected_candidate`.
+- `phenom-zig/src/collect_evidence.zig`: `stage=candidates` retorna `[CANDIDATES]` temporario, sem `[EVIDENCE]`/`[MICRO_CONTEXT]`; `stage=expand` expande um C# para E# real.
+- `phenom-zig/src/model_context.zig`: C# entra em `[CANDIDATES_CONTEXT]`, separado de E#, impedindo candidato temporario virar evidencia final.
+- `phenom-zig/src/main.zig`: tool loop suporta candidates -> expand, reparo quando falta `selectedCandidate`, dedupe por budget e parsing de tool call escondido em `<think>`.
+- `phenom-zig/src/context_profile.zig`: schema por estado agora anuncia candidates/expand e remove placeholder perigoso que o modelo copiava como termo.
+- `phenom-zig/src/main.zig`: valida placeholders de schema (`specific retrieval keys`, `SymbolName FileName ErrorCode`, etc.) como erro de contrato antes de executar busca.
+- `phenom-zig/src/evidence_ranker.zig`: merge nao funde `symbol_ast` com path/FTS quando isso desloca a linha real da definicao.
+- `phenom-zig/src/symbol_ranker.zig`: ranking definitions-first usa sinais estruturais, sem lista de paths/linguagens/stacks: aliases de import nao viram candidatos, matching aproximado e por especificidade, top-level ganha peso sobre metodos internos.
+- `phenom-zig/src/collect_evidence.zig`: C# de simbolo le a assinatura no range real do simbolo, inclusive apos L512, sem fallback para cabecalho do arquivo.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/symbol_ranker.zig` -> passou; 5 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/evidence_ranker.zig -lc -lsqlite3` -> passou; 25 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/collect_evidence.zig -lc -lsqlite3` -> passou; 56 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 221 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-definition-candidates-test test` -> passou.
+- Smoke real final: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 4200 --session definition-first-render-20260710p --prompt 'qual e a funcao que e responsavel por renderizacao do cli no projeto ?' --fail-on-model-error --no-color` -> passou; `stage=candidates` retornou C1 `src/render.zig L18-L65 pub fn AppendOnlyRenderer`, `stage=expand selectedCandidate=C1` gerou E1 e a resposta final citou `AppendOnlyRenderer`.
+
 ## T299 - Robustecer HTTP/backend/model protocol com classificacao de falhas
 
 Status: pending-urgent.
@@ -10393,8 +10414,8 @@ Implementacao:
 
 Limite residual:
 
-- O ranking ainda pode retornar falso positivo na primeira coleta se os termos do modelo forem ruins. A correcao nao tenta compensar isso com heuristica do controller; ela permite refinamento model-driven e impede resposta final inventada quando a evidencia nao contem o identificador necessario.
-- `collect_evidence` ainda nao implementa o contrato TS completo com `stage`, `selectedCandidates`, `need`, `targetFiles` e `scopeRoot`; isso permanece na frente maior de evolucao do contrato de coleta.
+- `need`, `targetFiles` e `scopeRoot` ainda nao foram portados para o contrato Zig. `stage=candidates` e `stage=expand selectedCandidate=C#` foram implementados na T298.
+- O ranking ainda depende de termos do modelo; a correcao nao adiciona heuristica semantica hardcoded no controller. A mitigacao atual e contrato mais estrito, reparo de placeholders, candidates temporarios e expansao obrigatoria para E#.
 
 Criterio de aceite:
 

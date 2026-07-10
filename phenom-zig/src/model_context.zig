@@ -9,6 +9,10 @@ pub const EvidenceBlock = struct {
     text: []const u8,
 };
 
+pub const CandidateBlock = struct {
+    text: []const u8,
+};
+
 pub const SessionBlock = struct {
     text: []const u8,
 };
@@ -26,6 +30,7 @@ pub const ModelTurnContext = struct {
     mode: []const u8 = "code_micro",
     budget: []const u8 = "small",
     contracts: []const u8 = "",
+    candidates: []const CandidateBlock = &.{},
     evidence: []const EvidenceBlock = &.{},
     focus: []const FocusBlock = &.{},
     dialogue: []const DialogueBlock = &.{},
@@ -64,6 +69,17 @@ pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContex
     if (ctx.memory.len > 0) {
         try out.appendSlice(allocator, "\n[MEMORY]\n");
         try appendList(&out, allocator, ctx.memory);
+    }
+
+    if (ctx.candidates.len > 0) {
+        try out.appendSlice(allocator, "\n[CANDIDATES_CONTEXT]\n");
+        try out.appendSlice(allocator, "C# candidates are temporary selection handles, not E# evidence. Expand one C# before final answer.\n");
+        for (ctx.candidates, 0..) |entry, i| {
+            const label = try std.fmt.allocPrint(allocator, "CANDIDATES{}:\n", .{i + 1});
+            defer allocator.free(label);
+            try out.appendSlice(allocator, label);
+            try appendEvidenceText(&out, allocator, entry.text);
+        }
     }
 
     if (ctx.evidence.len > 0) {
@@ -214,6 +230,26 @@ test "model context renders evidence obligations and next action" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "src/main.zig L1-L2") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "O1: validate syntax") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[NEXT_ACTION]") != null);
+}
+
+test "model context renders candidates outside evidence" {
+    const candidate_blocks = [_]CandidateBlock{.{ .text =
+        \\[CANDIDATES]
+        \\- C1 path=src/render.zig
+    }};
+    const rendered = try renderModelTurnContext(std.testing.allocator, .{
+        .task = "selecionar funcao",
+        .contracts = "tools: collect_evidence",
+        .candidates = &candidate_blocks,
+        .next_action = "expand C1",
+    });
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[CANDIDATES_CONTEXT]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "C# candidates are temporary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "C1 path=src/render.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[EVIDENCE]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "E1:") == null);
 }
 
 test "model context renders temporary session context separately from memory" {

@@ -5,6 +5,7 @@ const workspace_inventory = @import("workspace_inventory.zig");
 const max_indexed_files: usize = 512;
 const max_file_bytes: usize = 128 * 1024;
 const max_symbol_lines: usize = 96;
+const candidate_headroom: usize = 128;
 
 pub const Candidate = struct {
     path: []u8,
@@ -36,6 +37,7 @@ const Symbol = struct {
     line: usize,
     end_line: usize,
     signature: []const u8,
+    top_level: bool,
 };
 
 pub fn rank(
@@ -93,7 +95,7 @@ fn collectFileSymbols(
         symbol_count.* += 1;
         const score = scoreSymbol(symbol, query);
         if (score == 0) continue;
-        if (out.items.len >= max_candidates * 2) continue;
+        if (out.items.len >= max_candidates * candidate_headroom) continue;
         const owned_path = try allocator.dupe(u8, symbol.path);
         errdefer allocator.free(owned_path);
         const owned_symbol = try allocator.dupe(u8, symbol.name);
@@ -110,43 +112,46 @@ fn collectFileSymbols(
 
 fn parseSymbolLine(path: []const u8, line: []const u8, line_no: usize, tail: []const u8) ?Symbol {
     const trimmed = std.mem.trim(u8, line, " \t\r\n");
-    if (std.mem.endsWith(u8, path, ".zig")) return parseZigSymbol(path, trimmed, line_no, tail);
-    if (std.mem.endsWith(u8, path, ".ts") or std.mem.endsWith(u8, path, ".js")) return parseJsTsSymbol(path, trimmed, line_no, tail);
+    const top_level = line.len == trimmed.len;
+    if (std.mem.endsWith(u8, path, ".zig")) return parseZigSymbol(path, trimmed, line_no, tail, top_level);
+    if (std.mem.endsWith(u8, path, ".ts") or std.mem.endsWith(u8, path, ".js")) return parseJsTsSymbol(path, trimmed, line_no, tail, top_level);
     return null;
 }
 
-fn parseZigSymbol(path: []const u8, line: []const u8, line_no: usize, tail: []const u8) ?Symbol {
+fn parseZigSymbol(path: []const u8, line: []const u8, line_no: usize, tail: []const u8, top_level: bool) ?Symbol {
     var text = stripPrefix(line, "pub ") orelse line;
     text = stripPrefix(text, "export ") orelse text;
     if (stripPrefix(text, "fn ")) |rest| {
         const name = takeIdentifier(rest);
         if (name.len == 0) return null;
-        return .{ .path = path, .name = name, .line = line_no, .end_line = estimateEndLine(line_no, tail), .signature = line };
+        return .{ .path = path, .name = name, .line = line_no, .end_line = estimateEndLine(line_no, tail), .signature = line, .top_level = top_level };
     }
     if (stripPrefix(text, "const ")) |rest| {
         const name = takeIdentifier(rest);
         if (name.len == 0) return null;
-        return .{ .path = path, .name = name, .line = line_no, .end_line = estimateEndLine(line_no, tail), .signature = line };
+        const after_name = std.mem.trim(u8, rest[name.len..], " \t");
+        if (std.mem.startsWith(u8, after_name, "= @import(") or std.mem.startsWith(u8, after_name, "= @cImport(")) return null;
+        return .{ .path = path, .name = name, .line = line_no, .end_line = estimateEndLine(line_no, tail), .signature = line, .top_level = top_level };
     }
     return null;
 }
 
-fn parseJsTsSymbol(path: []const u8, line: []const u8, line_no: usize, tail: []const u8) ?Symbol {
+fn parseJsTsSymbol(path: []const u8, line: []const u8, line_no: usize, tail: []const u8, top_level: bool) ?Symbol {
     var text = stripPrefix(line, "export ") orelse line;
     text = stripPrefix(text, "default ") orelse text;
-    if (stripPrefix(text, "async function ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line);
-    if (stripPrefix(text, "function ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line);
-    if (stripPrefix(text, "class ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line);
-    if (stripPrefix(text, "const ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line);
-    if (stripPrefix(text, "let ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line);
-    if (stripPrefix(text, "var ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line);
+    if (stripPrefix(text, "async function ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level);
+    if (stripPrefix(text, "function ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level);
+    if (stripPrefix(text, "class ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level);
+    if (stripPrefix(text, "const ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level);
+    if (stripPrefix(text, "let ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level);
+    if (stripPrefix(text, "var ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level);
     return null;
 }
 
-fn namedJsSymbol(path: []const u8, rest: []const u8, line_no: usize, tail: []const u8, signature: []const u8) ?Symbol {
+fn namedJsSymbol(path: []const u8, rest: []const u8, line_no: usize, tail: []const u8, signature: []const u8, top_level: bool) ?Symbol {
     const name = takeIdentifier(rest);
     if (name.len == 0) return null;
-    return .{ .path = path, .name = name, .line = line_no, .end_line = estimateEndLine(line_no, tail), .signature = signature };
+    return .{ .path = path, .name = name, .line = line_no, .end_line = estimateEndLine(line_no, tail), .signature = signature, .top_level = top_level };
 }
 
 fn scoreSymbol(symbol: Symbol, query: []const u8) i32 {
@@ -155,12 +160,24 @@ fn scoreSymbol(symbol: Symbol, query: []const u8) i32 {
     while (it.next()) |raw| {
         const term = std.mem.trim(u8, raw, "-_*");
         if (term.len < 2) continue;
-        if (std.ascii.eqlIgnoreCase(symbol.name, term)) score += 80;
-        if (containsIgnoreCase(symbol.name, term)) score += 36;
-        if (containsIgnoreCase(symbol.signature, term)) score += 18;
-        if (containsIgnoreCase(symbol.path, term)) score += 10;
+        if (std.ascii.eqlIgnoreCase(symbol.name, term)) score += @as(i32, @intCast(@min(term.len * 8, 96)));
+        if (containsIgnoreCase(symbol.name, term)) {
+            score += @as(i32, @intCast(@min(term.len * 5, 48)));
+            score += symbolSpecificityBonus(symbol.name, term);
+        }
+        if (containsIgnoreCase(symbol.signature, term)) score += @as(i32, @intCast(@min(term.len * 3, 30)));
+        if (containsIgnoreCase(symbol.path, term)) score += @as(i32, @intCast(@min(term.len * 7, 56)));
+        score += @as(i32, @intCast(fuzzyTextMatchScore(symbol.name, term)));
+        score += @as(i32, @intCast(fuzzyTextMatchScore(symbol.signature, term) / 2));
+        score += @as(i32, @intCast(fuzzyTextMatchScore(symbol.path, term)));
     }
+    if (score > 0 and symbol.top_level) score += 80;
     return score;
+}
+
+fn symbolSpecificityBonus(symbol_name: []const u8, term: []const u8) i32 {
+    if (symbol_name.len <= term.len) return 0;
+    return @as(i32, @intCast(@min(symbol_name.len - term.len, 24)));
 }
 
 fn estimateEndLine(start_line: usize, tail: []const u8) usize {
@@ -222,6 +239,28 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn fuzzyTextMatchScore(haystack: []const u8, term: []const u8) usize {
+    if (term.len < 5 or haystack.len < 5) return 0;
+    const common = longestAsciiFoldedTermPrefixInHaystack(haystack, term);
+    if (common < 5) return 0;
+    return common * 6;
+}
+
+fn longestAsciiFoldedTermPrefixInHaystack(haystack: []const u8, term: []const u8) usize {
+    var best: usize = 0;
+    var i: usize = 0;
+    while (i < haystack.len) : (i += 1) {
+        var term_start: usize = 0;
+        while (term_start < term.len) : (term_start += 1) {
+            var n: usize = 0;
+            while (i + n < haystack.len and term_start + n < term.len and std.ascii.toLower(haystack[i + n]) == std.ascii.toLower(term[term_start + n])) : (n += 1) {}
+            if (term_start > 0 and n < 6) continue;
+            best = @max(best, n);
+        }
+    }
+    return best;
+}
+
 test "symbol ranker finds zig container symbols" {
     var result = try rank(std.testing.allocator, std.testing.io, "AppendOnlyRenderer", 5);
     defer result.deinit(std.testing.allocator);
@@ -232,7 +271,15 @@ test "symbol ranker finds zig container symbols" {
 }
 
 test "symbol parser extracts js ts declarations" {
-    const symbol = parseJsTsSymbol("x.ts", "export async function runToolLoop() {", 7, "{\n}\n") orelse return error.NoSymbol;
+    const symbol = parseJsTsSymbol("x.ts", "export async function runToolLoop() {", 7, "{\n}\n", true) orelse return error.NoSymbol;
     try std.testing.expectEqualStrings("runToolLoop", symbol.name);
     try std.testing.expectEqual(@as(usize, 7), symbol.line);
+    try std.testing.expect(symbol.top_level);
+}
+
+test "symbol ranker uses generic fuzzy definition matching" {
+    var result = try rank(std.testing.allocator, std.testing.io, "renderizacao cli projeto", 5);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.candidates.items.len > 0);
+    try std.testing.expectEqualStrings("src/render.zig", result.candidates.items[0].path);
 }

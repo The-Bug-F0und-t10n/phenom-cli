@@ -38,6 +38,39 @@ pub const Result = struct {
     }
 };
 
+pub const CandidateItem = struct {
+    id: []u8,
+    path: []u8,
+    start_line: usize,
+    end_line: usize,
+    score: i32,
+    source: []u8,
+    signature: []u8,
+    preview: []u8,
+
+    pub fn deinit(self: CandidateItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.path);
+        allocator.free(self.source);
+        allocator.free(self.signature);
+        allocator.free(self.preview);
+    }
+};
+
+pub const CandidateResult = struct {
+    text: []u8,
+    audit_text: []u8,
+    model_bytes: usize,
+    candidates: std.ArrayList(CandidateItem),
+
+    pub fn deinit(self: *CandidateResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.audit_text);
+        for (self.candidates.items) |candidate| candidate.deinit(allocator);
+        self.candidates.deinit(allocator);
+    }
+};
+
 pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: Args) !Result {
     if (args.budget_bytes == 0) return error.InvalidEvidenceBudget;
     const strategy = contracts.resolveCollectEvidenceStrategy(args.strategy) orelse return error.InvalidStrategy;
@@ -54,8 +87,206 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: Args) !Result {
     return executeRanked(allocator, io, args, strategy);
 }
 
+pub fn executeCandidates(allocator: std.mem.Allocator, io: std.Io, args: Args) !CandidateResult {
+    if (args.budget_bytes == 0) return error.InvalidEvidenceBudget;
+    const strategy = contracts.resolveCollectEvidenceStrategy(args.strategy) orelse return error.InvalidStrategy;
+    const search_terms = args.terms orelse return error.MissingTerms;
+    var ranked = try evidence_ranker.rankForPrompt(allocator, io, search_terms, strategy, .{
+        .max_ranges = 6,
+        .max_lines_per_range = 48,
+    });
+    defer ranked.deinit(allocator);
+    if (ranked.candidates.items.len == 0) return error.NoEvidenceCandidates;
+
+    var candidates = std.ArrayList(CandidateItem).empty;
+    errdefer {
+        for (candidates.items) |candidate| candidate.deinit(allocator);
+        candidates.deinit(allocator);
+    }
+
+    for (ranked.candidates.items, 0..) |candidate, idx| {
+        const signature_start = if (candidate.source == .symbol_ast) candidate.start_line else 1;
+        const signature_max_lines: usize = if (candidate.source == .symbol_ast) 1 else 512;
+        const signature_range = tools.readFileRange(allocator, candidate.path, signature_start, signature_max_lines, 32 * 1024) catch continue;
+        defer signature_range.deinit(allocator);
+        const signature = if (candidate.source == .symbol_ast)
+            firstLineAt(signature_range.text, signature_start)
+        else
+            selectCandidateLine(signature_range.text, 1, candidate.start_line, search_terms, candidate.path);
+        const preview = candidate.reasons[0..@min(candidate.reasons.len, 160)];
+        const item_start = if (candidate.source == .symbol_ast) candidate.start_line else signature.line;
+        const item_end = if (candidate.source == .symbol_ast) candidate.end_line else @max(signature.line, candidate.end_line);
+        {
+            var item = try makeCandidateItem(
+                allocator,
+                idx + 1,
+                candidate.path,
+                item_start,
+                item_end,
+                candidate.score,
+                @tagName(candidate.source),
+                signature.text,
+                preview,
+            );
+            errdefer item.deinit(allocator);
+            try candidates.append(allocator, item);
+        }
+    }
+    if (candidates.items.len == 0) return error.NoEvidenceCandidatesReadable;
+
+    const text = try renderCandidates(allocator, candidates.items);
+    errdefer allocator.free(text);
+    const audit_text = try std.fmt.allocPrint(
+        allocator,
+        "[TOOL_EVENT]\ntool=collect_evidence\nsuccess=true\nargs=stage=candidates strategy={s} intent_bytes={} terms_bytes={} candidates={} model_bytes={}\n{s}",
+        .{ @tagName(strategy), if (args.intent) |value| value.len else 0, search_terms.len, candidates.items.len, text.len, ranked.audit_text },
+    );
+    errdefer allocator.free(audit_text);
+
+    return .{
+        .text = text,
+        .audit_text = audit_text,
+        .model_bytes = text.len,
+        .candidates = candidates,
+    };
+}
+
 fn isWorkspaceRootPath(path: []const u8) bool {
     return std.mem.eql(u8, path, ".") or std.mem.eql(u8, path, "./");
+}
+
+fn renderCandidates(allocator: std.mem.Allocator, candidates: []const CandidateItem) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "[CANDIDATES]\nsource=definition_first temporary=true raw_context_persisted=false\n");
+    for (candidates) |candidate| {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "- {s} score={} source={s} path={s} range={}-{}\n  def: {s}\n  preview: {s}\n",
+            .{
+                candidate.id,
+                candidate.score,
+                candidate.source,
+                candidate.path,
+                candidate.start_line,
+                candidate.end_line,
+                candidate.signature,
+                candidate.preview,
+            },
+        );
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn makeCandidateItem(
+    allocator: std.mem.Allocator,
+    ordinal: usize,
+    path: []const u8,
+    start_line: usize,
+    end_line: usize,
+    score: i32,
+    source: []const u8,
+    signature: []const u8,
+    preview: []const u8,
+) !CandidateItem {
+    const id = try std.fmt.allocPrint(allocator, "C{}", .{ordinal});
+    errdefer allocator.free(id);
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    const owned_source = try allocator.dupe(u8, source);
+    errdefer allocator.free(owned_source);
+    const owned_signature = try allocator.dupe(u8, signature);
+    errdefer allocator.free(owned_signature);
+    const owned_preview = try allocator.dupe(u8, preview);
+    errdefer allocator.free(owned_preview);
+
+    return .{
+        .id = id,
+        .path = owned_path,
+        .start_line = start_line,
+        .end_line = end_line,
+        .score = score,
+        .source = owned_source,
+        .signature = owned_signature,
+        .preview = owned_preview,
+    };
+}
+
+const SelectedLine = struct {
+    text: []const u8,
+    line: usize,
+};
+
+fn selectCandidateLine(text: []const u8, start_line: usize, target_line: usize, terms: []const u8, path: []const u8) SelectedLine {
+    var best = SelectedLine{ .text = firstNonEmptyLine(text), .line = start_line };
+    var best_score: usize = 0;
+    var best_distance: usize = std.math.maxInt(usize);
+    var saw_best = false;
+    var line_no = start_line;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| : (line_no += 1) {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const score = lineTermScore(trimmed, terms) + linePathStemScore(trimmed, path);
+        const distance = if (line_no > target_line) line_no - target_line else target_line - line_no;
+        if (!saw_best or score > best_score or (score == best_score and distance < best_distance) or (score == best_score and distance == best_distance and score > 0 and trimmed.len < best.text.len)) {
+            best = .{ .text = trimmed, .line = line_no };
+            best_score = score;
+            best_distance = distance;
+            saw_best = true;
+        }
+    }
+    return best;
+}
+
+fn firstNonEmptyLine(text: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return "<empty definition>";
+}
+
+fn firstLineAt(text: []const u8, start_line: usize) SelectedLine {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    if (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len > 0) return .{ .text = trimmed, .line = start_line };
+    }
+    return .{ .text = firstNonEmptyLine(text), .line = start_line };
+}
+
+fn lineTermScore(line: []const u8, terms: []const u8) usize {
+    var score: usize = 0;
+    var it = std.mem.tokenizeAny(u8, terms, " \t\r\n\"'`()[]{}<>:;,./\\|");
+    while (it.next()) |raw| {
+        const term = std.mem.trim(u8, raw, "-_*");
+        if (term.len < 2) continue;
+        if (containsIgnoreCase(line, term)) score += term.len;
+    }
+    return score;
+}
+
+fn linePathStemScore(line: []const u8, path: []const u8) usize {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse 0;
+    const file = if (slash == 0) path else path[slash + 1 ..];
+    const dot = std.mem.lastIndexOfScalar(u8, file, '.') orelse file.len;
+    const stem = file[0..dot];
+    if (stem.len < 3) return 0;
+    if (!containsIgnoreCase(line, stem)) return 0;
+    return stem.len;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 fn executeDiagnostic(allocator: std.mem.Allocator, args: Args) !Result {
@@ -301,6 +532,46 @@ test "collect evidence ranked lexical uses rg candidates and audit without raw r
     try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "[EVIDENCE]") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "[CANDIDATE_RANKING]") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "---BEGIN CONTENT---") == null);
+}
+
+test "collect evidence candidates returns definitions without evidence body" {
+    var result = try executeCandidates(std.testing.allocator, std.testing.io, .{
+        .intent = "find renderer definition candidates",
+        .terms = "AppendOnlyRenderer render",
+        .strategy = .symbol,
+        .budget_bytes = 6000,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.candidates.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "[CANDIDATES]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "[EVIDENCE]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "\n[MICRO_CONTEXT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "raw_context_persisted=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "C1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.audit_text, "stage=candidates") != null);
+    try std.testing.expect(result.model_bytes == result.text.len);
+}
+
+test "candidate line selection follows model terms inside ranked range" {
+    const selected = selectCandidateLine(
+        \\unrelated header
+        \\const alpha = 1;
+        \\pub fn renderCliOutput() void {}
+        \\footer
+    , 41, 43, "renderCliOutput output", "src/render.zig");
+    try std.testing.expectEqual(@as(usize, 43), selected.line);
+    try std.testing.expectEqualStrings("pub fn renderCliOutput() void {}", selected.text);
+}
+
+test "candidate line selection can use candidate path stem without language lists" {
+    const selected = selectCandidateLine(
+        \\terminal_columns: usize = 80,
+        \\max_tool_sample_lines: usize = 20,
+        \\pub fn AppendOnlyRenderer(comptime Writer: type) type {
+    , 7, 11, "funcao responsavel cli projeto", "src/render.zig");
+    try std.testing.expectEqual(@as(usize, 9), selected.line);
+    try std.testing.expectEqualStrings("pub fn AppendOnlyRenderer(comptime Writer: type) type {", selected.text);
 }
 
 test "collect evidence rejects inactive strategies instead of falling back" {

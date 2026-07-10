@@ -8,6 +8,8 @@ pub const ToolCall = struct {
     scope: ?[]const u8 = null,
     intent: ?[]const u8 = null,
     terms: ?[]const u8 = null,
+    stage: ?[]const u8 = null,
+    selected_candidate: ?[]const u8 = null,
     strategy: ?contracts.StrategyName = null,
     start_line: usize = 1,
     max_lines: usize = 12,
@@ -25,6 +27,8 @@ pub const ToolCall = struct {
         if (self.scope) |scope| allocator.free(scope);
         if (self.intent) |intent| allocator.free(intent);
         if (self.terms) |terms| allocator.free(terms);
+        if (self.stage) |stage| allocator.free(stage);
+        if (self.selected_candidate) |selected_candidate| allocator.free(selected_candidate);
         if (self.reason) |reason| allocator.free(reason);
     }
 };
@@ -44,6 +48,8 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
     const scope = normalizeOptionalText(parseParameter(body, "scope"));
     const intent = normalizeOptionalText(parseParameter(body, "intent"));
     const terms = normalizeOptionalText(parseParameter(body, "terms"));
+    const stage = normalizeOptionalText(parseParameter(body, "stage"));
+    const selected_candidate = normalizeOptionalText(parseParameter(body, "selectedCandidate") orelse parseParameter(body, "selected_candidate"));
     const reason = normalizeOptionalText(parseParameter(body, "reason"));
     const strategy = try parseStrategyParameter(body);
 
@@ -54,6 +60,8 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
         .scope = if (scope) |value| try allocator.dupe(u8, value) else null,
         .intent = if (intent) |value| try allocator.dupe(u8, value) else null,
         .terms = if (terms) |value| try allocator.dupe(u8, value) else null,
+        .stage = if (stage) |value| try allocator.dupe(u8, value) else null,
+        .selected_candidate = if (selected_candidate) |value| try allocator.dupe(u8, value) else null,
         .strategy = strategy,
         .start_line = parseIntParameter(body, "start_line") orelse 1,
         .max_lines = parseIntParameter(body, "max_lines") orelse 12,
@@ -267,6 +275,24 @@ test "collect evidence parses compact flag" {
     defer call.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("collect_evidence", call.name);
     try std.testing.expect(call.compact);
+}
+
+test "collect evidence parses definition candidate stage fields" {
+    const output =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=stage>expand</parameter>
+        \\<parameter=selectedCandidate>C2</parameter>
+        \\<parameter=max_lines>32</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("collect_evidence", call.name);
+    try std.testing.expectEqualStrings("expand", call.stage.?);
+    try std.testing.expectEqualStrings("C2", call.selected_candidate.?);
+    try std.testing.expectEqual(@as(usize, 32), call.max_lines);
 }
 
 test "parses set operational contract fields and owns reason" {
