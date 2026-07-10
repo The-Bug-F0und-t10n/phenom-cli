@@ -173,17 +173,22 @@ fn executeRanked(allocator: std.mem.Allocator, io: std.Io, args: Args, strategy:
 
     var raw_bytes_read: usize = 0;
     var best_quality: i32 = 0;
-    const per_range_budget = evidence_ranker.adaptiveBudget(args.budget_bytes, ranked.candidates.items[0].score, ranked.candidates.items.len);
+    const fair_range_budget = @max(@as(usize, 512), args.budget_bytes / ranked.candidates.items.len);
+    const per_range_budget = @min(evidence_ranker.adaptiveBudget(args.budget_bytes, ranked.candidates.items[0].score, ranked.candidates.items.len), fair_range_budget);
+    var evidence_budget_remaining = args.budget_bytes;
 
     for (ranked.candidates.items) |candidate| {
+        if (evidence_budget_remaining == 0) break;
         best_quality = @max(best_quality, candidate.score);
         const max_lines = candidate.end_line - candidate.start_line + 1;
-        const range = tools.readFileRange(allocator, candidate.path, candidate.start_line, max_lines, per_range_budget) catch continue;
+        const range_budget = @min(per_range_budget, evidence_budget_remaining);
+        const range = tools.readFileRange(allocator, candidate.path, candidate.start_line, max_lines, range_budget) catch continue;
         defer range.deinit(allocator);
         if (containsForbiddenModelMarker(range.text)) continue;
         raw_bytes_read += range.text.len;
-        try packet.add(try evidence.fromFileRangeBudgeted(allocator, range, per_range_budget));
-        try micro_contexts.append(allocator, try micro_context.fromFileRange(allocator, range, "collect_evidence", per_range_budget));
+        try packet.add(try evidence.fromFileRangeBudgeted(allocator, range, range_budget));
+        try micro_contexts.append(allocator, try micro_context.fromFileRange(allocator, range, "collect_evidence", range_budget));
+        evidence_budget_remaining -|= range_budget;
     }
     if (packet.entries.items.len == 0) return error.NoEvidenceCandidatesReadable;
 

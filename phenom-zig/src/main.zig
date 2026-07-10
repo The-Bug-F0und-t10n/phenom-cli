@@ -495,7 +495,7 @@ fn buildInitialModelContext(
         .next_action = if (enable_tool_loop and focus_text != null)
             "SESSION_FOCUS is present. First emit exactly one context tool call before prose: use search_session for prior-session facts, or collect_evidence for workspace/source-code facts. For search_session, set intent to the evidence you want, then set terms to specific retrieval keys from SESSION_FOCUS/current reasoning, not the user's vague wording. The controller only executes the model-chosen contract."
         else if (enable_tool_loop)
-            "Infer the user's intent. If workspace/source-code facts are needed, call collect_evidence with model-chosen terms/path. If prior-session facts are needed, call search_session with intent plus specific model-chosen retrieval keys before answering. Otherwise answer directly."
+            "First emit exactly one context tool call before prose: use collect_evidence for workspace/source-code facts, search_session for prior-session facts, or set_operational_contract with all booleans false if no context evidence is needed. For collect_evidence/search_session, set intent to the evidence you want, then set terms to specific retrieval keys from current reasoning. The controller only executes the model-chosen contract."
         else
             "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
     });
@@ -520,6 +520,7 @@ fn loadMergedSessionFocus(
 const max_tool_emergency_iterations = 8;
 const max_tool_repairs = 1;
 const max_duplicate_tool_repairs = 1;
+const max_pathless_collect_budget: usize = 6 * 1024;
 
 const ToolLoopNext = union(enum) {
     final_answer,
@@ -782,7 +783,7 @@ fn runOneToolLoopStep(
         .strategy = strategy,
         .start_line = call.start_line,
         .max_lines = call.max_lines,
-        .budget_bytes = state.remainingBudget(),
+        .budget_bytes = collectEvidenceExecutionBudget(path, state.remainingBudget()),
     }) catch |err| {
         try db.recordEvent(config.session, "tool_error", @errorName(err));
         try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = @errorName(err) } });
@@ -845,6 +846,11 @@ fn collectEvidenceNeedsSearchIntentRepair(
 ) bool {
     if (effective_path != null or strategy == .path) return false;
     return call.intent == null or call.terms == null;
+}
+
+fn collectEvidenceExecutionBudget(path: ?[]const u8, remaining_budget: usize) usize {
+    if (path != null) return remaining_budget;
+    return @min(remaining_budget, max_pathless_collect_budget);
 }
 
 fn runSetOperationalContractStep(
@@ -2176,6 +2182,16 @@ test "pathless collect evidence requires model search intent and terms" {
     const path = (try tool_call.parseFirst(std.testing.allocator, path_xml)) orelse return error.NoToolCall;
     defer path.deinit(std.testing.allocator);
     try std.testing.expect(!collectEvidenceNeedsSearchIntentRepair(&path, path.path, .path));
+}
+
+test "pathless collect evidence uses exploratory budget cap" {
+    try std.testing.expectEqual(@as(usize, max_pathless_collect_budget), collectEvidenceExecutionBudget(null, defaultContextBudgetForTest()));
+    try std.testing.expectEqual(@as(usize, 512), collectEvidenceExecutionBudget(null, 512));
+    try std.testing.expectEqual(@as(usize, defaultContextBudgetForTest()), collectEvidenceExecutionBudget("src/main.zig", defaultContextBudgetForTest()));
+}
+
+fn defaultContextBudgetForTest() usize {
+    return 18 * 1024;
 }
 
 test "collect evidence search intent repair explains model responsibility" {

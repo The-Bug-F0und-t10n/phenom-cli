@@ -130,8 +130,8 @@ pub fn rankForPrompt(
     }
 
     // Phase 3: SQLite FTS5/BM25 over current workspace, using model-provided terms only.
-    if (candidates.items.len < budget.max_candidates and (strategy == .auto or strategy == .lexical) and prompt.len > 0) {
-        const fts_result = collectFtsCandidates(allocator, io, &candidates, prompt, budget) catch |err| switch (err) {
+    if ((candidates.items.len < budget.max_candidates or strategy == .symbol) and (strategy == .auto or strategy == .lexical or strategy == .symbol) and prompt.len > 0) {
+        const fts_result = collectFtsCandidates(allocator, io, &candidates, prompt, budget, strategy == .symbol) catch |err| switch (err) {
             error.SqliteOpenFailed, error.SqliteExecFailed, error.SqlitePrepareFailed, error.SqliteBindFailed, error.SqliteStepFailed => blk: {
                 fts_available = false;
                 break :blk null;
@@ -385,11 +385,13 @@ fn collectFtsCandidates(
     out: *std.ArrayList(EvidenceCandidate),
     terms: []const u8,
     budget: RankBudget,
+    allow_extra: bool,
 ) !usize {
     var ranked = try fts_ranker.rank(allocator, io, terms, budget.max_candidates);
     defer ranked.deinit(allocator);
+    const max_out = if (allow_extra) budget.max_candidates * 2 else budget.max_candidates;
     for (ranked.candidates.items) |candidate| {
-        if (out.items.len >= budget.max_candidates) break;
+        if (out.items.len >= max_out) break;
         if (!workspace_inventory.isWorkspacePath(candidate.path)) continue;
         const start = if (candidate.line > budget.window_before) candidate.line - budget.window_before else 1;
         const reasons = try std.fmt.allocPrint(allocator, "fts5_bm25,indexed_files={}", .{ranked.indexed_files});
@@ -753,6 +755,14 @@ test "ranking can use sqlite fts bm25 without semantic model" {
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "fts_available=") != null);
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "fts_indexed_files=") != null);
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "---BEGIN CONTENT---") == null);
+}
+
+test "symbol ranking uses fts corroboration for conceptual renderer query" {
+    var ranked = try rankForPrompt(std.testing.allocator, std.testing.io, "CLI renderer output statusbar markdown diff", .symbol, .{ .max_ranges = 4 });
+    defer ranked.deinit(std.testing.allocator);
+    try std.testing.expect(ranked.candidates.items.len > 0);
+    try std.testing.expect(ranked.fts_indexed_files > 0);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "source=fts_bm25") != null);
 }
 
 test "term extraction keeps structured symbols and plain keywords" {

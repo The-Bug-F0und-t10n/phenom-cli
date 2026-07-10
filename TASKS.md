@@ -10410,3 +10410,14 @@ Validacao executada:
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 210 testes.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-collect-intent-test test` -> passou com sync global.
 - Smoke real: `./zig-out/bin/phenom chat --backend llamacpp --host 192.168.1.122:11434 --model phenom:latest --thinking off --max-tokens 2600 --session collect-render-intent-20260710b --prompt 'qual e a funcao que e responsavel por renderizacao do cli no projeto ?' --fail-on-model-error --no-color` -> passou no comportamento. O primeiro passe usou `intent+terms`; uma coleta ruim retornou `build.zig`, o contexto pos-evidencia manteve contrato ativo, a coleta seguinte retornou `src/render.zig` com `pub fn AppendOnlyRenderer`, e a resposta final citou `AppendOnlyRenderer` em E1.
+
+Atualizacao de economia de contexto em 2026-07-10:
+
+- Causa do custo alto: coleta pathless recebia todo o budget restante do turno; `adaptiveBudget` era aplicado por range e podia gastar quase o budget inteiro no primeiro candidato, multiplicando evidencia model-visible.
+- Correcao: coleta pathless passou a usar budget exploratorio curto; `collect_evidence` distribui o budget entre candidatos em vez de consumir tudo no primeiro range.
+- Correcao: `strategy=symbol` agora usa FTS/BM25 como corroboracao interna antes do sort/trim final, evitando ficar preso ao primeiro simbolo generico chamado `render`.
+- Correcao: contexto inicial com tool loop volta a exigir uma tool de contexto antes da prosa; respostas "nao tenho acesso ao repositorio" sem tool viram repair em vez de resposta final.
+- Smoke real comparativo:
+  - Antes da otimizacao: `collect-render-intent-20260710b` -> `total_tokens=4177`, `max_context_bytes=7260`, `evidence_bytes=12312`, `tool_calls=2`.
+  - Depois da otimizacao: `collect-render-budget-20260710c` -> `total_tokens=2141`, `max_context_bytes=4305`, `evidence_bytes=995`, `tool_calls=1`.
+  - Resultado final continuou correto: `AppendOnlyRenderer` em `src/render.zig` citado por E1.
