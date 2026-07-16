@@ -1,0 +1,56 @@
+ <!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hello World</title>
+    <style>
+        body {
+            margin: 0;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-family: Arial, sans-serif;
+            color: white;
+            transition: background-color 2s ease;
+        }
+
+        .content {
+            background-color: rgba(0, 0, 0, 0.5); /* Fundo translúcido */
+            padding: 40px 60px;
+            border-radius: 15px;
+            text-align: center;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+        }
+
+        h1 {
+            font-size: 3rem;
+            margin: 0;
+        }
+    </style>
+</head>
+<body id="body">
+    <div class="content">
+        <h1>Hello World</h1>
+    </div>
+
+    <script>
+        const colors = [
+            '#ff7e5f', '#feb47b', '#a8e6cf', '#dcedc1', '#ffd3b6',
+            '#d4fc79', '#96e6a1', '#95d5b2', '#84fab0', '#8fd3f4',
+            '#a1c4fd', '#c2e9fb', '#fbc2eb', '#e9d8a6', '#fca5a5'
+        ];
+
+        let colorIndex = 0;
+
+        function changeColor() {
+            document.getElementById('body').style.backgroundColor = colors[colorIndex];
+            colorIndex = (colorIndex + 1) % colors.length;
+        }
+
+        // Muda a cor a cada 3 segundos
+        setInterval(changeColor, 3000);
+    </script>
+</body>
+</html>
