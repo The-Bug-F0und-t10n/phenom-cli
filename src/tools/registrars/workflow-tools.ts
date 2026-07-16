@@ -30,18 +30,25 @@ export function registerWorkflowTools(deps: RegisterWorkflowToolsDeps): void {
   // turns, so the model can self-track progress.
   register({
     name: 'set_plan',
-    description: 'Record a structured plan for the current task. Call this FIRST for any task involving multiple files or steps — before any read/write. Each step is a short imperative phrase ("read agent.ts", "patch run-tool-loop", "validate syntax", "run tests"). Subsequent turns see the plan and can mark steps complete via complete_step.',
+    description:
+      'Record a structured plan for the current task. Call this FIRST for any task involving multiple files or steps — before any read/write. ' +
+      'Each step is a short imperative phrase ("read agent.ts", "patch run-tool-loop", "validate syntax", "run tests"). ' +
+      'Max 7 steps per plan — if the task needs more, group related steps or split into a second plan after the first finishes. ' +
+      'Optional `file` and `tool` fields per step help you (and the next turn) execute precisely. ' +
+      'Subsequent turns see the plan as "Active plan" in the system prompt; call complete_step(N) immediately after finishing step N.',
     parameters: {
       type: 'object',
       properties: {
         steps: {
           type: 'array',
-          description: 'Ordered list of steps. Each is a short imperative phrase.',
+          description: 'Ordered list of steps (1–7 items).',
           items: {
             type: 'object',
             properties: {
-              title: { type: 'string', description: 'Imperative phrase, ≤80 chars.' },
-              description: { type: 'string', description: 'Optional clarifier.' }
+              title: { type: 'string', description: 'Imperative phrase, ≤80 chars. Be specific: "patch foo.ts: change signature of bar()" beats "fix bar".' },
+              description: { type: 'string', description: 'Optional 1-line clarifier.' },
+              file: { type: 'string', description: 'Optional: path of the file this step touches. Helps you remember which file when you get here.' },
+              tool: { type: 'string', description: 'Optional: name of the tool you intend to call for this step (e.g. "apply_patch", "validate_syntax").' }
             },
             required: ['title']
           }
@@ -58,9 +65,33 @@ export function registerWorkflowTools(deps: RegisterWorkflowToolsDeps): void {
       if (raw.length === 0) {
         return { success: false, output: '', error: 'set_plan requires steps (non-empty array).' };
       }
+
+      // Cap at MAX_PLAN_STEPS. Going bigger is exactly the failure mode a
+      // 7B can't recover from — it loses the thread halfway. Forcing the
+      // model to group/decompose here is a structural fix, not a hint.
+      const MAX_PLAN_STEPS = 7;
+      if (raw.length > MAX_PLAN_STEPS) {
+        return {
+          success: false,
+          output: '',
+          error:
+            `set_plan rejected: ${raw.length} steps exceeds max ${MAX_PLAN_STEPS}. ` +
+            `Group related steps (e.g. "read+patch foo.ts" as one step) OR commit ` +
+            `to the first ${MAX_PLAN_STEPS} now and call set_plan again with the ` +
+            `next batch after they're complete.`
+        };
+      }
+
       const steps = raw.map((s: any, i: number) => ({
         title: String(s?.title || '').trim().slice(0, 200),
         description: s?.description ? String(s.description).trim().slice(0, 500) : undefined,
+        // Optional granularity hints — stored on the step so the prompt
+        // injection (Active plan section) can surface them on the focused
+        // step. SessionBrain's PlanStep type accepts unknown fields; we
+        // attach them via cast to avoid a schema migration for an
+        // additive change.
+        file: s?.file ? String(s.file).trim().slice(0, 240) : undefined,
+        tool: s?.tool ? String(s.tool).trim().slice(0, 80) : undefined,
         status: 'pending' as const,
         order: i + 1
       })).filter((s) => s.title.length > 0);
@@ -70,10 +101,53 @@ export function registerWorkflowTools(deps: RegisterWorkflowToolsDeps): void {
       }
 
       brain.setPlanSteps(steps);
-      const summary = steps.map(s => `  ${s.order}. ${s.title}`).join('\n');
+      const summary = steps.map(s => {
+        const hint = [s.file && `file=${s.file}`, s.tool && `tool=${s.tool}`].filter(Boolean).join(' ');
+        return `  ${s.order}. ${s.title}${hint ? `  (${hint})` : ''}`;
+      }).join('\n');
       return {
         success: true,
-        output: `[PLAN_SET] ${steps.length} steps registered:\n${summary}`,
+        output:
+          `[PLAN_SET] ${steps.length} step(s) registered:\n${summary}\n\n` +
+          `Next: start step 1, then call complete_step(1) before moving to step 2.`,
+        error: null
+      };
+    }
+  });
+
+  // ── list_pending_tasks ───────────────────────────────────────────
+  // Compact read of the brain's plan steps that aren't done. Used by the
+  // model on the first turn of a restored session to verify status of
+  // prior work BEFORE acting on the user's current message. Returns the
+  // smallest useful payload — just titles + status + file refs — so the
+  // pending-tasks check doesn't eat the inference budget.
+  register({
+    name: 'list_pending_tasks',
+    description: 'Return pending/in_progress plan steps from the SessionBrain in compact form. Use this on the first turn of a restored session to know what was unfinished, OR mid-session to refresh memory of what is still open. Output is short by design — pair it with grep_file/find_function (micro-context) to verify whether each task was actually completed in the codebase.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      required: []
+    },
+    execute: async () => {
+      const brain = brainProvider();
+      if (!brain) {
+        return { success: true, output: '[PENDING_TASKS] no brain attached', error: null };
+      }
+      const steps = brain.getPlanSteps();
+      const pending = steps.filter(s => s.status === 'pending' || s.status === 'in_progress');
+      if (pending.length === 0) {
+        return { success: true, output: '[PENDING_TASKS] none', error: null };
+      }
+      const lines = pending.map((s, i) => {
+        const files = (s as any).files && Array.isArray((s as any).files) && (s as any).files.length > 0
+          ? ` · files: ${(s as any).files.slice(0, 4).join(', ')}`
+          : '';
+        return `${i + 1}. [${s.status}] ${s.title}${files}`;
+      });
+      return {
+        success: true,
+        output: `[PENDING_TASKS] ${pending.length}\n${lines.join('\n')}`,
         error: null
       };
     }
@@ -84,7 +158,10 @@ export function registerWorkflowTools(deps: RegisterWorkflowToolsDeps): void {
   // shows visible progress as it works through the plan.
   register({
     name: 'complete_step',
-    description: 'Mark a plan step complete by its order number (1-based) OR by title substring. Use after finishing the step\'s work (and after validate_syntax / run_tests if it was a mutation step).',
+    description:
+      'Mark a plan step complete by its order number (1-based) OR by title substring. ' +
+      'Call this IMMEDIATELY after the step\'s last successful tool call (e.g. right after the validate_syntax that confirmed the edit). ' +
+      'Do NOT batch multiple completions — one call per step. The Active plan section refreshes on the next turn to show the new focused step.',
     parameters: {
       type: 'object',
       properties: {
@@ -252,22 +329,40 @@ export function registerWorkflowTools(deps: RegisterWorkflowToolsDeps): void {
         };
       }
 
+      // BUG-B-08: explicit truncation markers on stdout/stderr so the model
+      // knows when an assertion message or root-cause line was cut. Without
+      // them the model treated truncated stderr as the full failure trace.
+      const STDOUT_CAP = 8000;
+      const STDERR_CAP_PASS = 2000;
+      const STDERR_CAP_FAIL = 4000;
+      const truncate = (raw: string, cap: number): string => {
+        if (raw.length <= cap) return raw;
+        // Keep both head and tail — the tail usually carries the failing
+        // assertion / final summary which is the most diagnostic part.
+        const headCap = Math.floor(cap * 0.6);
+        const tailCap = cap - headCap - 80;
+        const head = raw.slice(0, headCap);
+        const tail = tailCap > 0 ? raw.slice(-tailCap) : '';
+        const dropped = raw.length - head.length - tail.length;
+        return `${head}\n…[truncated ${dropped} chars]…\n${tail}`;
+      };
+
       try {
         const result = await execFileAsync(cmd, cmdArgs, {
           maxBuffer,
           cwd,
           ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeout: Math.floor(timeoutMs) } : { timeout: 120000 })
         } as any);
-        const stdoutShort = (result.stdout || '').slice(0, 8000);
-        const stderrShort = (result.stderr || '').slice(0, 2000);
+        const stdoutShort = truncate(result.stdout || '', STDOUT_CAP);
+        const stderrShort = truncate(result.stderr || '', STDERR_CAP_PASS);
         return {
           success: true,
           output: `[TESTS_PASS] ${detected}: ${cmd} ${cmdArgs.join(' ')}\n${stdoutShort}${stderrShort ? '\n--- stderr ---\n' + stderrShort : ''}`,
           error: null
         };
       } catch (error: any) {
-        const stdout = (error?.stdout || '').toString().slice(0, 8000);
-        const stderr = (error?.stderr || '').toString().slice(0, 4000);
+        const stdout = truncate((error?.stdout || '').toString(), STDOUT_CAP);
+        const stderr = truncate((error?.stderr || '').toString(), STDERR_CAP_FAIL);
         return {
           success: false,
           output: `${stdout}${stderr ? '\n--- stderr ---\n' + stderr : ''}`,

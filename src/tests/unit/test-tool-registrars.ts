@@ -1,4 +1,7 @@
 import { ToolSystem } from '../../tools.js';
+import os from 'os';
+import path from 'path';
+import { promises as fs } from 'fs';
 
 let passed = 0;
 const tests: { name: string; fn: () => Promise<void> | void }[] = [];
@@ -44,6 +47,21 @@ test('extract_block rejects invalid startLine', async () => {
   const result = await tools.execute('extract_block', { path: 'package.json', startLine: 0 });
   assert(!result.success, 'expected failure');
   assert((result.error || '').includes('startLine inválido'), `unexpected error: ${result.error}`);
+});
+
+test('grep_file output is plain text without ANSI escapes', async () => {
+  const tools = new ToolSystem();
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'phenom-grep-plain-'));
+  const p = path.join(tmp, 'sample.ts');
+  await fs.writeFile(p, 'const alpha = 1;\nconst beta = 2;\n', 'utf-8');
+  try {
+    const result = await tools.execute('grep_file', { path: p, pattern: 'beta', context: 0 });
+    assert(result.success === true, `expected success, got: ${result.error}`);
+    const out = String(result.output || '');
+    assert(!out.includes('\x1b['), `grep_file output must not contain ANSI escapes: ${out}`);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
 });
 
 async function main(): Promise<void> {

@@ -11,6 +11,14 @@ export interface PlanStep {
   description?: string;
   status: PlanStatus;
   order: number;
+  /** Optional: file path this step is expected to touch. Set via set_plan
+   *  so the model can keep the focused file in working memory when it
+   *  cycles back to the step. Not enforced — purely a hint. */
+  file?: string;
+  /** Optional: name of the tool this step is expected to call. Same
+   *  rationale as `file`: keeps the model anchored on the executor it
+   *  declared at planning time. */
+  tool?: string;
 }
 
 export interface SessionNote {
@@ -35,10 +43,20 @@ export interface SessionData {
   messages: Message[];
 }
 
+export interface RequestWorkMetrics {
+  mutationFiles: string[];
+  mutationCount: number;
+  searchCount: number;
+  validationCount: number;
+  testsRun: number;
+  buildRun: number;
+}
+
 export class SessionBrain {
   private sessionPath: string;
   private data: SessionData;
   private dirty: boolean = false;
+  private requestMetrics: RequestWorkMetrics = this.emptyRequestMetrics();
 
   constructor(sessionDir: string, sessionId: string) {
     this.sessionPath = path.join(sessionDir, `${sessionId}.json`);
@@ -59,6 +77,17 @@ export class SessionBrain {
       pendingTasks: [],
       planSteps: [],
       messages: []
+    };
+  }
+
+  private emptyRequestMetrics(): RequestWorkMetrics {
+    return {
+      mutationFiles: [],
+      mutationCount: 0,
+      searchCount: 0,
+      validationCount: 0,
+      testsRun: 0,
+      buildRun: 0
     };
   }
 
@@ -92,6 +121,7 @@ export class SessionBrain {
     this.data.failedOperations = [];
     this.data.pendingTasks = [];
     this.data.planSteps = [];
+    this.requestMetrics = this.emptyRequestMetrics();
     this.dirty = true;
   }
 
@@ -115,7 +145,46 @@ export class SessionBrain {
       this.data.planSteps = [];
     }
     // createdFiles intentionally kept — session-level context
+    this.requestMetrics = this.emptyRequestMetrics();
     this.dirty = true;
+  }
+
+  // ── Request metrics (non-persistent) ─────────────────────────────
+
+  noteMutation(filePath: string): void {
+    const normalized = path.normalize(String(filePath || '').trim());
+    if (!normalized) return;
+    this.requestMetrics.mutationCount += 1;
+    if (!this.requestMetrics.mutationFiles.includes(normalized)) {
+      this.requestMetrics.mutationFiles.push(normalized);
+    }
+  }
+
+  noteSearchEvidence(): void {
+    this.requestMetrics.searchCount += 1;
+  }
+
+  noteValidation(): void {
+    this.requestMetrics.validationCount += 1;
+  }
+
+  noteTestsRun(): void {
+    this.requestMetrics.testsRun += 1;
+  }
+
+  noteBuildRun(): void {
+    this.requestMetrics.buildRun += 1;
+  }
+
+  getRequestMetrics(): RequestWorkMetrics {
+    return {
+      mutationFiles: [...this.requestMetrics.mutationFiles],
+      mutationCount: this.requestMetrics.mutationCount,
+      searchCount: this.requestMetrics.searchCount,
+      validationCount: this.requestMetrics.validationCount,
+      testsRun: this.requestMetrics.testsRun,
+      buildRun: this.requestMetrics.buildRun
+    };
   }
 
   addNote(type: SessionNote['type'], content: string, metadata?: Record<string, any>): string {

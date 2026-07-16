@@ -310,18 +310,20 @@ export class ProfessionalTUI {
     });
 
     eventBus.on(EventType.AGENT_MESSAGE, (event) => {
-      // If we have a stream buffer, flush it first
-      if (this.streamBuffer.trim()) {
-        stateStore.addMessage({
-          role: 'assistant',
-          content: this.streamBuffer,
-        });
-        this.streamBuffer = '';
-      }
+      // Match llama.cpp webui pattern (chat.svelte.ts onComplete):
+      //   const content = streamedContent || finalContent || '';
+      // The streamed bytes are canonical — the payload at end-of-turn is the
+      // same answer post-processed. Writing both produces a visible duplicate.
+      const buffered = this.streamBuffer;
+      const payload = event.payload.content || '';
+      this.streamBuffer = '';
+
+      const content = buffered.trim() ? buffered : payload;
+      if (!content) return;
 
       stateStore.addMessage({
         role: 'assistant',
-        content: event.payload.content,
+        content,
       });
     });
 
@@ -364,12 +366,12 @@ export class ProfessionalTUI {
     });
 
     eventBus.on(EventType.TOOL_ERROR, (event) => {
-      const { id, error, name, args } = event.payload;
+      const { id, error, output, name, args, toolName } = event.payload;
       let tool = this.toolExecutions.get(id);
       if (!tool) {
         tool = {
           id,
-          name: name || 'tool',
+          name: name || toolName || 'tool',
           args: args || {},
           status: 'error',
           startTime: Date.now()
@@ -378,7 +380,9 @@ export class ProfessionalTUI {
       }
       tool.status = 'error';
       tool.endTime = Date.now();
-      tool.results = error ? [String(error)] : [];
+      const err = error ? [String(error)] : [];
+      const out = output ? [String(output)] : [];
+      tool.results = [...err, ...out];
       this.requestRender();
     });
 

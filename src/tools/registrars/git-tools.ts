@@ -1,11 +1,55 @@
 import type { SimpleGit } from 'simple-git';
 import { promises as fs } from 'fs';
 import path from 'path';
-import type { Tool } from '../../tools.js';
+import type { Tool, } from '../../tools.js';
+import type { ToolResult } from '../../types.js';
 
 interface RegisterGitToolsDeps {
   register: (tool: Tool) => void;
   git: SimpleGit;
+}
+
+// "not a git repository" message we keep seeing in non-git workspaces. The
+// model would loop on git_* tools because each one returned the raw fatal
+// message and the model couldn't tell it was a workspace-wide condition. We
+// memoise the verdict once per process so the second call costs nothing and
+// returns a directive that tells the model to stop trying git tools.
+let nonGitWorkspaceCached: boolean | null = null;
+
+function isNotARepoError(message: string): boolean {
+  return /not a git repository|fatal:.+git/i.test(message);
+}
+
+async function ensureGitRepoOrSkip(git: SimpleGit): Promise<ToolResult | null> {
+  if (nonGitWorkspaceCached === true) {
+    return {
+      success: false,
+      output: '',
+      error:
+        'WORKSPACE_NOT_GIT: este diretório não é um repositório git. NÃO chame git_* (git_status, git_diff, git_log, git_*) novamente nesta sessão — eles vão falhar idênticos. Use list_dir, grep_file, find_function, read_file. Se precisar inicializar git, peça ao usuário ou use run_code com `git init` explicitamente.'
+    };
+  }
+  if (nonGitWorkspaceCached === false) return null;
+  // First call: probe. checkIsRepo() is one fs.stat, no shell-out.
+  try {
+    const isRepo = await git.checkIsRepo();
+    nonGitWorkspaceCached = !isRepo;
+    if (isRepo) return null;
+    return {
+      success: false,
+      output: '',
+      error:
+        'WORKSPACE_NOT_GIT: este diretório não é um repositório git. NÃO chame git_* novamente nesta sessão. Use list_dir / grep_file / find_function / read_file.'
+    };
+  } catch {
+    // Probe itself failed — assume not a repo, cache, and surface clearly.
+    nonGitWorkspaceCached = true;
+    return {
+      success: false,
+      output: '',
+      error: 'WORKSPACE_NOT_GIT: probe falhou. Trate como não-git e use list_dir / grep_file no lugar.'
+    };
+  }
 }
 
 export function registerGitTools(deps: RegisterGitToolsDeps): void {
@@ -35,11 +79,17 @@ export function registerGitTools(deps: RegisterGitToolsDeps): void {
       required: []
     },
     execute: async () => {
+      const skip = await ensureGitRepoOrSkip(git);
+      if (skip) return skip;
       try {
         const status = await git.status();
         const output = `Branch: ${status.current}\nModificados: ${status.modified.length}\nNão rastreados: ${status.not_added.length}`;
         return { success: true, output, error: null };
       } catch (error: any) {
+        if (isNotARepoError(error?.message || '')) {
+          nonGitWorkspaceCached = true;
+          return (await ensureGitRepoOrSkip(git))!;
+        }
         return { success: false, output: '', error: error.message };
       }
     }
@@ -62,10 +112,16 @@ export function registerGitTools(deps: RegisterGitToolsDeps): void {
       required: []
     },
     execute: async (args) => {
+      const skip = await ensureGitRepoOrSkip(git);
+      if (skip) return skip;
       try {
         const diff = await git.diff(args.files || []);
         return { success: true, output: diff || 'Sem mudanças', error: null };
       } catch (error: any) {
+        if (isNotARepoError(error?.message || '')) {
+          nonGitWorkspaceCached = true;
+          return (await ensureGitRepoOrSkip(git))!;
+        }
         return { success: false, output: '', error: error.message };
       }
     }
@@ -85,11 +141,17 @@ export function registerGitTools(deps: RegisterGitToolsDeps): void {
       required: []
     },
     execute: async (args) => {
+      const skip = await ensureGitRepoOrSkip(git);
+      if (skip) return skip;
       try {
         const log = await git.log({ maxCount: args.count || 10 });
         const output = log.all.map(c => `${c.hash.substring(0, 7)} - ${c.message}`).join('\n');
         return { success: true, output, error: null };
       } catch (error: any) {
+        if (isNotARepoError(error?.message || '')) {
+          nonGitWorkspaceCached = true;
+          return (await ensureGitRepoOrSkip(git))!;
+        }
         return { success: false, output: '', error: error.message };
       }
     }
@@ -109,10 +171,16 @@ export function registerGitTools(deps: RegisterGitToolsDeps): void {
       required: []
     },
     execute: async (args) => {
+      const skip = await ensureGitRepoOrSkip(git);
+      if (skip) return skip;
       try {
         await git.add(args.files || '.');
         return { success: true, output: 'Arquivos adicionados', error: null };
       } catch (error: any) {
+        if (isNotARepoError(error?.message || '')) {
+          nonGitWorkspaceCached = true;
+          return (await ensureGitRepoOrSkip(git))!;
+        }
         return { success: false, output: '', error: error.message };
       }
     }
@@ -132,10 +200,16 @@ export function registerGitTools(deps: RegisterGitToolsDeps): void {
       required: ['message']
     },
     execute: async (args) => {
+      const skip = await ensureGitRepoOrSkip(git);
+      if (skip) return skip;
       try {
         await git.commit(args.message);
         return { success: true, output: `Commit criado: ${args.message}`, error: null };
       } catch (error: any) {
+        if (isNotARepoError(error?.message || '')) {
+          nonGitWorkspaceCached = true;
+          return (await ensureGitRepoOrSkip(git))!;
+        }
         return { success: false, output: '', error: error.message };
       }
     }

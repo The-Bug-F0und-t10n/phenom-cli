@@ -200,9 +200,17 @@ test('extractPlanFromText: updates plan when new one has MORE steps', () => {
   assert(brain.getPlanSteps()[0].title === 'Step 1', 'titles updated');
 });
 
-// ── extractPlanProgressFromText ──────────────────────────────────────
+// ── extractPlanProgressFromText is now a no-op ─────────────────────
+//
+// The prior regex-based progress tracker matched loose patterns like
+// "Step N done" anywhere in model output, which false-positives on
+// prose discussing future work ("I'll only do step 2 once step 1 is
+// done" auto-completed step 1). Progress is now driven EXCLUSIVELY by
+// the explicit `complete_step` tool. These tests assert the no-op
+// contract: feeding any prose into extractPlanProgressFromText must
+// not mutate step status. Tools own progress; prose does not.
 
-test('extractPlanProgressFromText: "Step N done" marks step completed', () => {
+test('extractPlanProgressFromText: no-op — prose does not auto-complete steps', () => {
   const agent = makeAgent();
   const brain = (agent as any).brain;
 
@@ -211,18 +219,15 @@ test('extractPlanProgressFromText: "Step N done" marks step completed', () => {
     { title: 'Write code', status: 'pending', order: 2 },
   ]);
 
-  const id1 = brain.getPlanSteps()[0].id;
-  const id2 = brain.getPlanSteps()[1].id;
-
   (agent as any).extractPlanProgressFromText('Step 1 done, moving to step 2');
-  assert(brain.getPlanSteps()[0].status === 'completed', 'step 1 completed');
+  assert(brain.getPlanSteps()[0].status === 'in_progress', 'step 1 still in_progress (no auto-complete from prose)');
   assert(brain.getPlanSteps()[1].status === 'pending', 'step 2 still pending');
 
   (agent as any).extractPlanProgressFromText('Step 2 done as well');
-  assert(brain.getPlanSteps()[1].status === 'completed', 'step 2 completed');
+  assert(brain.getPlanSteps()[1].status === 'pending', 'step 2 still pending (prose ignored)');
 });
 
-test('extractPlanProgressFromText: "working on Step N" sets current step', () => {
+test('extractPlanProgressFromText: no-op — prose does not promote to in_progress', () => {
   const agent = makeAgent();
   const brain = (agent as any).brain;
 
@@ -233,11 +238,11 @@ test('extractPlanProgressFromText: "working on Step N" sets current step', () =>
   ]);
 
   (agent as any).extractPlanProgressFromText('Now working on step 2: implementing the feature');
-  assert(brain.getPlanSteps()[1].status === 'in_progress', 'step 2 set to in_progress');
-  assert(brain.getPlanSteps()[0].status === 'completed', 'step 1 stays completed');
+  assert(brain.getPlanSteps()[1].status === 'pending', 'step 2 stays pending (prose ignored)');
+  assert(brain.getPlanSteps()[0].status === 'completed', 'step 1 stays completed (untouched)');
 });
 
-test('extractPlanProgressFromText: PT-BR "Passo N concluido"', () => {
+test('extractPlanProgressFromText: no-op — PT-BR prose patterns ignored', () => {
   const agent = makeAgent();
   const brain = (agent as any).brain;
 
@@ -247,13 +252,13 @@ test('extractPlanProgressFromText: PT-BR "Passo N concluido"', () => {
   ]);
 
   (agent as any).extractPlanProgressFromText('Passo 1 concluido, seguindo para o passo 2');
-  assert(brain.getPlanSteps()[0].status === 'completed', 'step 1 completed (PT-BR)');
+  assert(brain.getPlanSteps()[0].status === 'in_progress', 'step 1 still in_progress (PT-BR prose ignored)');
 
   (agent as any).extractPlanProgressFromText('trabalhando no passo 2');
-  assert(brain.getPlanSteps()[1].status === 'in_progress', 'step 2 in_progress (PT-BR)');
+  assert(brain.getPlanSteps()[1].status === 'pending', 'step 2 still pending (PT-BR prose ignored)');
 });
 
-test('extractPlanProgressFromText: "Etapa N done" patterns', () => {
+test('extractPlanProgressFromText: no-op — Etapa prose ignored', () => {
   const agent = makeAgent();
   const brain = (agent as any).brain;
 
@@ -263,17 +268,29 @@ test('extractPlanProgressFromText: "Etapa N done" patterns', () => {
   ]);
 
   (agent as any).extractPlanProgressFromText('Etapa 1 concluida');
-  assert(brain.getPlanSteps()[0].status === 'completed', 'etapa 1 completed');
+  assert(brain.getPlanSteps()[0].status === 'in_progress', 'etapa 1 stays in_progress (prose ignored)');
 });
 
 // ── Integration: plan flows through buildMessages ────────────────────
 
-test('buildMessages includes plan in system prompt context', async () => {
+function lastUserText(msgs: any[]): string {
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'user') {
+      const c = msgs[i].content;
+      return typeof c === 'string' ? c : (Array.isArray(c) ? c.map((p: any) => p.text || '').join('') : '');
+    }
+  }
+  return '';
+}
+
+test('buildMessages keeps pending plan out of prompt prefix and user text', async () => {
+  // Session continuity is pulled on demand through get_session_context.
+  // buildMessages keeps both system prompt and current user text stable so
+  // prompt-cache reuse is not invalidated by pending plan state.
   const agent = makeAgent();
   const brain = (agent as any).brain;
   const state = (agent as any).state;
 
-  // Set up plan
   brain.setPlanSteps([
     { title: 'Analyze code', status: 'completed', order: 1 },
     { title: 'Write patch', status: 'in_progress', order: 2 },
@@ -285,11 +302,36 @@ test('buildMessages includes plan in system prompt context', async () => {
 
   const msgs: any[] = await (agent as any).buildMessages('fix the bug');
   const system = msgs[0];
+  const userText = lastUserText(msgs);
 
   assert(system.role === 'system', 'msg 0 is system prompt');
-  assert(system.content.includes('[✓] Analyze code'), 'plan shows completed Analyze');
-  assert(system.content.includes('[→] Write patch'), 'plan shows in_progress Write');
-  assert(system.content.includes('[ ] Verify'), 'plan shows pending Verify');
+  assert(!system.content.includes('## Active plan'), 'plan is NOT in the system prompt (stable prefix)');
+  assert(!system.content.includes('## PLAN'), 'plan summary is NOT in the system prompt');
+  assert(!userText.includes('## Active plan'), 'plan is NOT injected into the current user message');
+  assert(!userText.includes('## PLAN'), 'plan summary is NOT injected into the current user message');
+  assert(userText.includes('fix the bug'), 'still carries the actual user query');
+  assert(!userText.includes('Analyze code'), 'does not include completed step details');
+});
+
+test('buildMessages does NOT inject pending plan for greeting-only queries', async () => {
+  // Prevent greeting autopilot: with a short social message the model should
+  // not receive pending plan context (neither in system nor user message).
+  const agent = makeAgent();
+  const brain = (agent as any).brain;
+  const state = (agent as any).state;
+
+  brain.setPlanSteps([
+    { title: 'Analyze code', status: 'completed', order: 1 },
+    { title: 'Write patch', status: 'in_progress', order: 2 },
+    { title: 'Verify', status: 'pending', order: 3 },
+  ]);
+
+  state.addMessage({ role: 'user', content: 'oi', timestamp: 1 });
+
+  const msgs: any[] = await (agent as any).buildMessages('oi');
+  const system = msgs[0];
+  assert(!system.content.includes('## Active plan'), 'no plan block in system for greeting');
+  assert(!lastUserText(msgs).includes('## Active plan'), 'no plan block in user message for greeting');
 });
 
 test('plan context is empty when no plan exists', async () => {

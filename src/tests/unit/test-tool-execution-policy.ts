@@ -43,6 +43,25 @@ test('formatToolResultForModelPolicy formats error consistently', () => {
   assert(out === 'Error (read_file): not found', `unexpected output: ${out}`);
 });
 
+test('formatToolResultForModelPolicy includes captured output on failure', () => {
+  const out = formatToolResultForModelPolicy('run_code', {
+    success: false,
+    output: '$ npm run build\nerror TS2304: Cannot find name "Foo"\nexit=1',
+    error: 'Exit code 1.'
+  });
+  assert(out.startsWith('Error (run_code): Exit code 1.'), `missing error head: ${out}`);
+  assert(out.includes('--- output ---'), `missing output separator: ${out}`);
+  assert(out.includes('error TS2304'), `dropped stderr from model view: ${out}`);
+});
+
+test('formatToolResultForModelPolicy truncates captured output on failure', () => {
+  const raw = 'y'.repeat(45000);
+  const out = formatToolResultForModelPolicy('run_code', { success: false, output: raw, error: 'Exit code 1.' });
+  assert(out.includes('--- output ---'), 'missing output separator');
+  assert(out.includes('...[truncated:'), 'expected truncation marker on failure path');
+  assert(out.length < raw.length + 200, 'failure path did not respect the cap');
+});
+
 function main(): void {
   let failures = 0;
   for (const { name, fn } of tests) {

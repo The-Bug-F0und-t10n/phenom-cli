@@ -7,11 +7,15 @@ import { SyntaxValidator } from './syntax-validator.js';
 import { registerFilesystemTools } from './tools/registrars/filesystem-tools.js';
 import { registerGitTools } from './tools/registrars/git-tools.js';
 import { registerNavigationTools } from './tools/registrars/navigation-tools.js';
+import { registerProjectTools } from './tools/registrars/project-tools.js';
 import { registerSearchTools } from './tools/registrars/search-tools.js';
 import { registerUtilityTools } from './tools/registrars/utility-tools.js';
 import { registerSessionTools } from './tools/registrars/session-tools.js';
 import { registerWorkflowTools } from './tools/registrars/workflow-tools.js';
 import { registerMemoryTools } from './tools/registrars/memory-tools.js';
+import { registerNewsTools } from './tools/registrars/news-tools.js';
+import { registerAstTools } from './tools/registrars/ast-tools.js';
+import { registerRagTools } from './tools/registrars/rag-tools.js';
 import type { SessionBrain } from './session-brain.js';
 
 const execFileAsync = promisify(execFile);
@@ -83,6 +87,11 @@ export class ToolSystem {
       execFileAsync
     });
 
+    registerProjectTools({
+      register: this.register.bind(this),
+      execFileAsync
+    });
+
     registerGitTools({
       register: this.register.bind(this),
       git: this.git
@@ -106,6 +115,18 @@ export class ToolSystem {
     });
 
     registerMemoryTools({
+      register: this.register.bind(this)
+    });
+
+    registerNewsTools({
+      register: this.register.bind(this)
+    });
+
+    registerAstTools({
+      register: this.register.bind(this)
+    });
+
+    registerRagTools({
       register: this.register.bind(this)
     });
   }

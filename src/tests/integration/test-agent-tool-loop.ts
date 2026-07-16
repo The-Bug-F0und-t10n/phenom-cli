@@ -28,7 +28,9 @@ test('runToolLoop executes JSON tool protocol fallback when native tool call is 
       return '';
     },
     chat: async () => ({ message: { content: 'no' } }),
-    generate: async () => ''
+    generate: async () => '',
+    getEffectiveContextLimit: async () => 32768,
+    tokenizeCount: async () => null
   };
 
   agent.executeToolWithEvents = async (toolName: string, args: any) => {
@@ -60,7 +62,9 @@ test('runToolLoop preserves tool_call_id in tool role messages', async () => {
       return '';
     },
     chat: async () => ({ message: { content: 'no' } }),
-    generate: async () => ''
+    generate: async () => '',
+    getEffectiveContextLimit: async () => 32768,
+    tokenizeCount: async () => null
   };
 
   agent.executeToolWithEvents = async () => ({ success: true, output: 'ok', error: null });
@@ -71,6 +75,80 @@ test('runToolLoop preserves tool_call_id in tool role messages', async () => {
   const toolMsgs = memory.filter((m: any) => m.role === 'tool');
   assert(toolMsgs.length >= 1, 'expected at least one tool message');
   assert(toolMsgs.some((m: any) => m.tool_call_id === 'call_abc123'), 'expected tool_call_id call_abc123 in tool message');
+});
+
+test('runToolLoop skips tool execution when native tool args are malformed JSON string', async () => {
+  const agent: any = new Agent();
+
+  let streamCalls = 0;
+  let executeCalls = 0;
+
+  agent.llm = {
+    chatStream: async (_messages: any, onChunk: (c: string) => void, onToolCall: any) => {
+      streamCalls++;
+      if (streamCalls === 1) {
+        onToolCall('apply_patch', '{"path":"a.ts","operations":[{"search":"x","replace":"y"}]\\', 'call_bad');
+      } else {
+        onChunk('{"type":"final","content":"ok"}');
+      }
+      return '';
+    },
+    chat: async () => ({ message: { content: 'no' } }),
+    generate: async () => '',
+    getEffectiveContextLimit: async () => 32768,
+    tokenizeCount: async () => null
+  };
+
+  agent.executeToolWithEvents = async () => {
+    executeCalls++;
+    return { success: true, output: 'ok', error: null };
+  };
+
+  const result = await agent.runToolLoop('edite arquivo');
+
+  assert(executeCalls === 0, `expected 0 tool executions, got ${executeCalls}`);
+  assert(result.includes('ok'), `expected final ok response, got ${result}`);
+
+  const memory = agent.state.getState().memory || [];
+  const toolMsgs = memory.filter((m: any) => m.role === 'tool');
+  assert(toolMsgs.some((m: any) => String(m.content || '').includes('Invalid tool arguments JSON')), 'expected malformed arguments tool error');
+});
+
+test('runToolLoop does not conclude early on IO task without any tool call', async () => {
+  const agent: any = new Agent();
+
+  let streamCalls = 0;
+  const executed: Array<{ tool: string; args: any }> = [];
+
+  agent.llm = {
+    chatStream: async (_messages: any, onChunk: (c: string) => void) => {
+      streamCalls++;
+      if (streamCalls === 1) {
+        onChunk('Vou explicar e concluir sem usar ferramentas.');
+      } else if (streamCalls === 2) {
+        onChunk('{"type":"tool","toolName":"write_file","args":{"path":"io-guard.txt","content":"ok"}}');
+      } else {
+        onChunk('{"type":"final","content":"concluido"}');
+      }
+      return '';
+    },
+    chat: async () => ({ message: { content: 'no' } }),
+    generate: async () => '',
+    getEffectiveContextLimit: async () => 32768,
+    tokenizeCount: async () => null
+  };
+
+  agent.executeToolWithEvents = async (toolName: string, args: any) => {
+    executed.push({ tool: toolName, args });
+    return { success: true, output: 'ok', error: null };
+  };
+
+  const result = await agent.runToolLoop('edite o arquivo app.ts e aplique patch');
+
+  assert(streamCalls >= 3, `expected guard continuation before concluding, got ${streamCalls} streams`);
+  assert(executed.length === 1, `expected one tool execution, got ${executed.length}`);
+  assert(executed[0].tool === 'write_file', `expected write_file, got ${executed[0].tool}`);
+  assert(result.includes('concluido'), `expected final concluido, got ${result}`);
 });
 
 async function main() {

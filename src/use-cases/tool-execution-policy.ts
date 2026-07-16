@@ -20,6 +20,7 @@ const TOOL_ALIASES: Record<string, string> = {
   shell: 'run_code',
   run: 'run_code',
   exec: 'run_code',
+  runcommand: 'run_code',
   gitstatus: 'git_status',
   gitdiff: 'git_diff',
   gitlog: 'git_log',
@@ -51,5 +52,10 @@ export function formatToolResultForModelPolicy(
   if (result.success) {
     return output || `${toolName}: success`;
   }
-  return `Error (${toolName}): ${result.error || 'failed'}`;
+  // Failure: keep the error tag AND surface the captured output (stdout +
+  // stderr for run_code, etc). Without this the model only sees "Exit code 1"
+  // and has no evidence to diagnose, so it retries the same command or gives
+  // up with [done].
+  const head = `Error (${toolName}): ${result.error || 'failed'}`;
+  return output ? `${head}\n--- output ---\n${output}` : head;
 }

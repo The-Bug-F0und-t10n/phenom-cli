@@ -94,4 +94,55 @@ export function registerSessionTools(deps: RegisterSessionToolsDeps): void {
       };
     }
   });
+
+  // ── get_session_context ──────────────────────────────────────────
+  // Returns the active plan / focused step / user request on demand.
+  // Previously this content was glued onto the last user message at
+  // build time (appendCurrentTurnContext). That mutated the cached
+  // prefix between turns — the next turn rebuilt the user message
+  // WITHOUT the appended context, diverging from the slot's KV and
+  // triggering "erased invalidated context checkpoint" + full prompt
+  // re-processing on SWA/hybrid models. By moving it to a tool the
+  // model calls when needed, the conversation prefix becomes truly
+  // append-only and the slot cache survives across turns.
+  register({
+    name: 'get_session_context',
+    description: 'Return the active plan, focused step, and original user request for this session. Call this at the start of a turn when you need to know what plan you are following and which step is current. Returns "[NO_PLAN]" when no plan is set — in that case proceed without it. Cheap and pure (no filesystem access).',
+    parameters: { type: 'object', properties: {} },
+    execute: async () => {
+      const brain = brainProvider();
+      if (!brain) {
+        return { success: true, output: '[NO_PLAN] session brain not available.', error: null };
+      }
+      const all = brain.getPlanSteps();
+      const pending = all
+        .filter(s => s.status === 'pending' || s.status === 'in_progress')
+        .sort((a, b) => a.order - b.order);
+      if (pending.length === 0) {
+        return { success: true, output: '[NO_PLAN] no active plan steps. Set one via set_plan if the task warrants it.', error: null };
+      }
+      const current = pending.find(s => s.status === 'in_progress') || pending[0];
+      const totalSteps = all.length;
+      const completedCount = totalSteps - pending.length;
+      const request = String(brain.getUserRequest() || '').trim();
+      const focusHints = [
+        current.file ? `file=${current.file}` : null,
+        current.tool ? `tool=${current.tool}` : null
+      ].filter(Boolean).join(', ');
+      const focusLine = focusHints
+        ? `- Focused step ${current.order}/${totalSteps}: ${current.title}  (${focusHints})`
+        : `- Focused step ${current.order}/${totalSteps}: ${current.title}`;
+      const lines = [
+        '## Active plan',
+        '- Plan is binding for this turn. Do the focused step, then call complete_step(order) before moving on.',
+        '- If the focused step no longer makes sense (scope changed, blocker discovered), call set_plan with a revised plan instead of improvising.',
+        request ? `- Task: ${request.slice(0, 180)}` : '',
+        focusLine,
+        `- Progress: ${completedCount}/${totalSteps} complete, ${pending.length} remaining`,
+        '',
+        'Use list_pending_tasks if you need the full remaining list.'
+      ].filter(Boolean);
+      return { success: true, output: lines.join('\n'), error: null };
+    }
+  });
 }

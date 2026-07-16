@@ -3,7 +3,6 @@ import path from 'path';
 import os from 'os';
 import { Agent } from '../../agent.js';
 import { ToolSystem } from '../../tools.js';
-import { registerAdvancedTools } from '../../advanced-tools.js';
 const SIMPLE_TIMEOUT = 300_000;
 const MEDIUM_TIMEOUT = 600_000;
 const COMPLEX_TIMEOUT = 1_800_000;
@@ -226,7 +225,6 @@ test('Contexto: agente lembra de arquivos criados em chamada anterior', async ()
 // ============================================================
 test('Tools: todas as ferramentas executam sem erro', async () => {
   const toolSystem = new ToolSystem();
-  registerAdvancedTools(toolSystem);
 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'phenom-tools-'));
   const srcFile = path.join(tmpDir, 'test.ts');

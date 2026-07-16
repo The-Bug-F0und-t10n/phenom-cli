@@ -4,6 +4,10 @@ package-lock.json
 
 # Build
 dist/
+zig-out/
+.zig-cache/
+phenom-zig/zig-out/
+phenom-zig/.zig-cache/
 
 # ChromaDB
 data/
@@ -26,3 +30,15 @@ npm-debug.log*
 # OS
 .DS_Store
 Thumbs.db
+
+# External reference code (read-only, for architecture study)
+.reference/
+
+# Local RAG index (rebuilds from source — never commit)
+.phenom-context/
+
+# Per-session trace log (regenerated each run)
+.phenom-trace.log
+
+# Phenom Zig spike runtime store
+phenom-zig/.phenom-zig/

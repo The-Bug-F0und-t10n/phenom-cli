@@ -103,6 +103,26 @@ const OPENAI_FORMAT_FAMILIES = [
   'gemma'
 ];
 
+// Models that lexically match a native-tools family (e.g. include "qwen") but
+// were NOT fine-tuned with native tool-calling. Without this guard the family
+// catch-all flagged supportsNativeTools=true for plain qwen2.5 / qwen2 /
+// qwen1.x and the agent sent the `tools` field — the model couldn't emit
+// native tool_calls, looped over the same prompt, and burnt context until
+// it crashed. These variants fall back to the text-based <tool_call>
+// protocol which the parser in tool-call-parser.ts handles.
+//
+// Exceptions: qwen2.5-coder and qwen2.1 ARE native-tool-trained — the
+// negative lookahead `(?!-coder|\.1)` lets them through.
+const NO_NATIVE_TOOLS_PATTERNS: RegExp[] = [
+  /\bqwen-?2(\.5)?(?!-coder|\.1)/i,
+  /\bqwen-?1(\.\d+)?/i,
+  // BUG-M7 audit recommendation was based on an outdated assumption: the
+  // project's own test-model-capabilities suite asserts that qwen3 base
+  // (e.g. `qwen3:14b`) DOES advertise native tools, and qwen3 is in the
+  // explicit NATIVE_TOOLS_MODELS allowlist. No additional blocklist entry
+  // is correct here — leaving the array as-is.
+];
+
 function detectModelFamily(modelName: string): string {
   const lower = modelName.toLowerCase();
 
@@ -126,8 +146,12 @@ export function detectModelCapabilities(modelName: string): ModelCapabilities {
   const lower = modelName.toLowerCase();
   const family = detectModelFamily(modelName);
   
-  const supportsNativeTools = NATIVE_TOOLS_FAMILIES.some(f => lower.includes(f)) || 
-    NATIVE_TOOLS_MODELS.some(m => lower.includes(m));
+  const explicitlyBlocked = NO_NATIVE_TOOLS_PATTERNS.some(rx => rx.test(modelName));
+  // Explicit model match (e.g. 'qwen2.5-coder') wins over the blocklist —
+  // it's a more specific signal than the qwen2.5-base regex.
+  const explicitlyAllowed = NATIVE_TOOLS_MODELS.some(m => lower.includes(m));
+  const familyAllowed = NATIVE_TOOLS_FAMILIES.some(f => lower.includes(f));
+  const supportsNativeTools = explicitlyAllowed || (familyAllowed && !explicitlyBlocked);
   
   const supportsOpenAIFormat = !supportsNativeTools && OPENAI_FORMAT_FAMILIES.some(f => lower.includes(f));
   
@@ -239,19 +263,21 @@ interface ToolResultLike {
 
 export function formatToolResultForNative(result: ToolResultLike | null | undefined): string {
   if (!result) return '[OK] Tool executed successfully';
-  
+
+  const rawOutput = typeof result.output === 'string' ? result.output : '';
+  const truncated = rawOutput.length > 4000
+    ? `${rawOutput.slice(0, 4000)}\n...[truncated]`
+    : rawOutput;
+
   if (result.success) {
-    const output = result.output;
-    if (typeof output === 'string') {
-      if (output.length > 4000) {
-        return `[OK] ${output.slice(0, 4000)}\n...[truncated]`;
-      }
-      if (output.length > 0) return `[OK] ${output}`;
-    }
+    if (truncated.length > 0) return `[OK] ${truncated}`;
     return '[OK] Tool completed';
   }
-  
-  return `[FAIL] ${result.error || 'Unknown error'}`;
+
+  // Failure: include the captured output below the error tag so the model
+  // can read the actual stderr/stdout instead of just "Exit code 1".
+  const head = `[FAIL] ${result.error || 'Unknown error'}`;
+  return truncated ? `${head}\n--- output ---\n${truncated}` : head;
 }
 
 function safeParseObject(raw: string): unknown {
@@ -267,4 +293,41 @@ function toObject(value: unknown): Record<string, unknown> {
     return value as Record<string, unknown>;
   }
   return {};
+}
+
+// FIX-08: Fetch model capabilities from backend API when available
+export async function fetchModelCapabilities(
+  baseUrl: string,
+  modelName: string
+): Promise<Partial<ModelCapabilities> | null> {
+  try {
+    // Try Ollama's /api/show endpoint to get model info
+    const url = `${baseUrl.replace(/\/+$/, '')}/api/show`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: modelName }),
+      signal: AbortSignal.timeout(5000)
+    });
+    if (!res.ok) return null;
+
+    const info = await res.json() as { capabilities?: string[]; model?: string } | null;
+    if (!info) return null;
+
+    // Check if model explicitly supports tools
+    if (info.capabilities?.includes('tools')) {
+      return { supportsNativeTools: true };
+    }
+
+    // Try to detect family from model name
+    const family = detectModelFamily(modelName);
+    const supportsNative = NATIVE_TOOLS_FAMILIES.some(f => family === f);
+
+    return {
+      modelFamily: family,
+      supportsNativeTools: supportsNative,
+    };
+  } catch {
+    return null;
+  }
 }

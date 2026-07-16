@@ -259,7 +259,8 @@ test('write_file: conteudo identico retorna sucesso sem escrever', async () => {
   });
 
   assert(result.success === true, 'identical content should succeed');
-  assert((result.output || '').includes('ja atualizado'), `should say 'already updated': ${result.output}`);
+  assert((result.output || '').includes('[NO_OP]'), `should mark no-op: ${result.output}`);
+  assert((result.output || '').includes('unchanged'), `should say unchanged: ${result.output}`);
 
   await fs.rm(tmpDir, { recursive: true, force: true });
 });

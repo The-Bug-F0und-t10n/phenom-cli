@@ -9,6 +9,7 @@ interface BuildInferenceMessagesDeps {
   currentUserContent?: ApiContentPart[];
   maxContextTokens: number;
   summarizeConversation(messages: InferenceMessage[]): Promise<string>;
+  tokenCount?: (text: string) => Promise<number | null>;
   /**
    * Optional session id — was used by a context-store integration that is
    * currently not wired (deferred from the minimal-recovery scope). Accepted
@@ -29,7 +30,8 @@ export async function buildInferenceMessagesUseCase(
     currentQuery,
     currentUserContent,
     maxContextTokens,
-    summarizeConversation
+    summarizeConversation,
+    tokenCount
   } = deps;
 
   const messages: InferenceMessage[] = [
@@ -77,16 +79,18 @@ export async function buildInferenceMessagesUseCase(
     }
   }
 
-  return compactMessagesIfNeeded(messages, currentQuery, maxContextTokens, summarizeConversation);
+  return compactMessagesIfNeeded(messages, currentQuery, maxContextTokens, summarizeConversation, tokenCount);
 }
 
 async function compactMessagesIfNeeded(
   messages: InferenceMessage[],
   currentQuery: string,
   maxContextTokens: number,
-  summarizeConversation: (messages: InferenceMessage[]) => Promise<string>
+  summarizeConversation: (messages: InferenceMessage[]) => Promise<string>,
+  tokenCount?: (text: string) => Promise<number | null>
 ): Promise<InferenceMessage[]> {
-  const threshold = Math.floor(maxContextTokens * 0.85);
+  // BUG-A1: aligned with run-tool-loop.ts compaction threshold (0.9) — was 0.85.
+  const threshold = Math.floor(maxContextTokens * 0.9);
   let compacted = messages.map(msg => ({ ...msg }));
 
   if (estimateMessagesTokens(compacted) <= threshold) return compacted;
@@ -100,11 +104,12 @@ async function compactMessagesIfNeeded(
   try {
     const summary = await summarizeConversation(historyMessages);
     if (summary) {
+      // FIX-01: Inject summary as a separate message instead of modifying
+      // the system prompt. This keeps the system message byte-identical across
+      // turns, enabling llama.cpp's prompt-cache to reuse the KV cache.
       compacted = [
-        {
-          role: compacted[0].role,
-          content: compacted[0].content + `\n\n## Conversation History (summarized)\n${summary}`
-        },
+        { ...compacted[0] },  // Keep original system message unchanged
+        { role: 'system', content: `## Conversation History (summarized)\n${summary}` },
         ...recentMessages
       ];
     }
@@ -113,7 +118,23 @@ async function compactMessagesIfNeeded(
   }
 
   if (estimateMessagesTokens(compacted) <= threshold) return compacted;
-  return [compacted[0], ...recentMessages.slice(-4)];
+
+  // BUG-A4: On hard-trim, ALWAYS preserve currentQuery as the last user
+  // message. Without this, the current turn was droppable when recentMessages
+  // was empty (BUG-A3 path) or when the trim window omitted it.
+  const trimmed: InferenceMessage[] = [compacted[0], ...recentMessages.slice(-4)];
+  let lastUserMsg: InferenceMessage | null = null;
+  for (let i = trimmed.length - 1; i >= 0; i--) {
+    if (trimmed[i].role === 'user') { lastUserMsg = trimmed[i]; break; }
+  }
+  const lastUserIsCurrent =
+    lastUserMsg !== null &&
+    typeof lastUserMsg.content === 'string' &&
+    lastUserMsg.content === currentQuery;
+  if (!lastUserIsCurrent) {
+    trimmed.push({ role: 'user', content: currentQuery });
+  }
+  return trimmed;
 }
 
 function findCurrentUserMessageIndex(messages: InferenceMessage[], currentQuery: string): number {
@@ -124,23 +145,58 @@ function findCurrentUserMessageIndex(messages: InferenceMessage[], currentQuery:
       messages[i].content === currentQuery
     ) return i;
   }
+  // BUG-A3: When currentQuery doesn't match any message (e.g., the user-turn
+  // content was replaced by multimodal `currentUserContent` parts at line 69),
+  // the previous fallback of `messages.length` caused
+  // `slice(currentUserIndex) === []` → recentMessages was empty → ALL history
+  // (including the live turn) got summarized away. Fall back to the LAST
+  // user message instead so the current turn is preserved.
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user') return i;
+  }
   return messages.length;
+}
+
+// FIX-03: Detect content type for accurate token estimation
+function getCharsPerToken(text: string): number {
+  // CJK (Chinese/Japanese/Korean) characters - typically 1-2 chars per token
+  if (/[\u4e00-\u9fff\u3040-\u30ff]/.test(text)) {
+    return 1.5;
+  }
+  // Code-like content - typically 3-4 chars per token
+  if (text.includes('```') || /(?:function|const|let|import|def|class|var|return|if|for)\s+/.test(text)) {
+    return 3.5;
+  }
+  // English prose - typically 4-5 chars per token
+  if (/^[A-Za-z\s.,!?;:'''"()-]+$/.test(text)) {
+    return 4.5;
+  }
+  // Mixed content - conservative estimate
+  return 4.0;
 }
 
 function estimateMessagesTokens(messages: InferenceMessage[]): number {
   return messages.reduce((total, msg) => {
     let chars = 0;
+    let contentText = '';
+
     if (typeof msg.content === 'string') {
       chars += msg.content.length;
+      contentText = msg.content;
     } else if (Array.isArray(msg.content)) {
       for (const part of msg.content) {
-        chars += (part.text || '').length;
+        const text = part.text || '';
+        chars += text.length;
+        contentText += text;
         chars += (part.image_url?.url || '').length;
       }
     }
     if (msg.tool_calls?.length) {
       chars += JSON.stringify(msg.tool_calls).length;
     }
-    return total + Math.ceil(chars / 4) + 24;
+
+    // FIX-03: Use content-type-aware estimation
+    const ratio = getCharsPerToken(contentText);
+    return total + Math.ceil(chars / ratio) + 6;
   }, 0);
 }

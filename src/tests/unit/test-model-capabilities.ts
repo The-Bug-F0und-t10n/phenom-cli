@@ -32,6 +32,38 @@ test('unknown model stays conservative for vision/reasoning', () => {
   assert(!caps.supportsVision, 'supportsVision should be false');
 });
 
+test('qwen2.5 base (not coder) must NOT advertise native tools', () => {
+  const caps = detectModelCapabilities('qwen2.5:7b');
+  assert(!caps.supportsNativeTools, 'plain qwen2.5 should fall back to text-based tools');
+});
+
+test('qwen2.5-coder keeps native tools', () => {
+  const caps = detectModelCapabilities('qwen2.5-coder:7b');
+  assert(caps.supportsNativeTools, 'qwen2.5-coder is tool-tuned and must keep native flag');
+});
+
+test('qwen2 base must NOT advertise native tools', () => {
+  const caps = detectModelCapabilities('qwen2:7b-instruct');
+  assert(!caps.supportsNativeTools, 'qwen2 base is not tool-tuned');
+});
+
+test('qwen2.1 keeps native tools (explicit allowlist)', () => {
+  const caps = detectModelCapabilities('qwen2.1:32b');
+  assert(caps.supportsNativeTools, 'qwen2.1 is in NATIVE_TOOLS_MODELS — must remain native');
+});
+
+test('qwen1.5 must NOT advertise native tools', () => {
+  const caps = detectModelCapabilities('qwen1.5:14b');
+  assert(!caps.supportsNativeTools, 'qwen1.x has no tool support');
+});
+
+test('qwen3 / qwen3.5 unaffected by the qwen2 blocklist', () => {
+  for (const name of ['qwen3:14b', 'qwen3.5:32b', 'qwen3-coder:7b']) {
+    const caps = detectModelCapabilities(name);
+    assert(caps.supportsNativeTools, `${name} should keep native tools`);
+  }
+});
+
 function main(): void {
   let failures = 0;
   for (const { name, fn } of tests) {

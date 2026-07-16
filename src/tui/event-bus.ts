@@ -28,6 +28,15 @@ export enum EventType {
   SESSION_UPDATE = 'SESSION_UPDATE',
   CLEAR_STREAMING = 'CLEAR_STREAMING',
   REASONING_CHUNK = 'REASONING_CHUNK',
+  /**
+   * Fires ONCE per user turn, when the agent has produced its final
+   * assistant response (after all tool loops). Payload: { content: string }.
+   * Distinct from AGENT_MESSAGE which can also fire mid-loop for tool
+   * announcements ("Using: read_file"). Consumers that need to react to
+   * "user got a complete answer" (TTS, notifications, telemetry) subscribe
+   * here instead of trying to filter AGENT_MESSAGE.
+   */
+  AGENT_FINAL_RESPONSE = 'AGENT_FINAL_RESPONSE',
 }
 
 export interface Event {

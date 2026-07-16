@@ -44,21 +44,50 @@ export function parseToolCallOrFinalDetailed(raw: string): ToolLoopParseResult {
 }
 
 function parseTaggedToolCall(raw: string): ToolLoopResponse | null {
-  const match = raw.match(/<tool_call>([\s\S]*?)<\/tool_call>/i);
-  if (!match) return null;
+  // BUG-M6: previously only `<tool_call>...</tool_call>` (the qwen3 /
+  // hermes-style marker) was recognized. llama.cpp's PEG grammars
+  // (.reference/llama.cpp/common/chat.cpp `common_chat_format`) emit four
+  // distinct markers depending on the model template, and the model loops
+  // when its native marker is dropped to `looksLikeBrokenToolJson() → null`.
+  //
+  //   - hermes_2_pro:   <tool_call>{...}</tool_call>  OR  <tool_call>[{...},{...}]</tool_call>
+  //   - llama_3_x:      [TOOL_CALLS][{...}, ...][/TOOL_CALLS]   (also accepts no closing tag)
+  //   - granite:        <|tool_call|>[{...}, ...]
+  //   - mistral_nemo:   [TOOL_CALLS] [{...}, ...]              (no closing tag)
+  //
+  // Try each marker; the first whose body parses as a tool descriptor wins.
+  const markers: Array<{ rx: RegExp; group: number }> = [
+    { rx: /<tool_call>([\s\S]*?)<\/tool_call>/i, group: 1 },
+    { rx: /\[TOOL_CALLS\]\s*([\s\S]*?)\s*\[\/TOOL_CALLS\]/i, group: 1 },
+    { rx: /\[TOOL_CALLS\]\s*(\[[\s\S]*?\]|\{[\s\S]*?\})/i, group: 1 },
+    { rx: /<\|tool_call\|>\s*(\[[\s\S]*?\]|\{[\s\S]*?\})/i, group: 1 },
+  ];
 
-  const parsed = safeJsonParse<Record<string, unknown>>(match[1].trim());
-  if (!parsed) return null;
+  for (const { rx, group } of markers) {
+    const match = raw.match(rx);
+    if (!match) continue;
+    const body = match[group].trim();
+    if (!body) continue;
 
-  const fn = toObject(parsed.function);
-  const name = String(parsed.name || parsed.toolName || fn.name || '').trim();
-  if (!name) return null;
+    // Body may be either a single object or an array of objects (hermes2pro
+    // / llama3 / granite all allow batched tool calls). Take the FIRST tool
+    // call when it's an array — the loop processes one tool at a time.
+    const parsed = safeJsonParse<unknown>(body);
+    const first = Array.isArray(parsed) ? parsed[0] : parsed;
+    const obj = (first && typeof first === 'object') ? (first as Record<string, unknown>) : null;
+    if (!obj) continue;
 
-  return {
-    type: 'tool',
-    toolName: name,
-    args: toArgsRecord(parsed.arguments ?? parsed.args ?? parsed.parameters ?? {}),
-  };
+    const fn = toObject(obj.function);
+    const name = String(obj.name || obj.toolName || fn.name || '').trim();
+    if (!name) continue;
+
+    return {
+      type: 'tool',
+      toolName: name,
+      args: toArgsRecord(obj.arguments ?? obj.args ?? obj.parameters ?? fn.arguments ?? {}),
+    };
+  }
+  return null;
 }
 
 function parsePrimaryJsonBlock(raw: string): ToolLoopResponse | null {
@@ -130,7 +159,17 @@ function stripRendererArtifacts(raw: string): string {
 }
 
 function looksLikeBrokenToolJson(raw: string): boolean {
-  return raw.includes('{"type"') || raw.includes('"toolName"') || raw.includes('"tool_call"');
+  // BUG-M6: include the additional markers parseTaggedToolCall now accepts
+  // so an unclosed/garbled native marker is reported as "broken" (and the
+  // loop retries) rather than falling through to plain_text_final.
+  return (
+    raw.includes('{"type"') ||
+    raw.includes('"toolName"') ||
+    raw.includes('"tool_call"') ||
+    raw.includes('[TOOL_CALLS]') ||
+    raw.includes('<|tool_call|>') ||
+    /<tool_call>/i.test(raw)
+  );
 }
 
 function toObject(value: unknown): Record<string, unknown> {

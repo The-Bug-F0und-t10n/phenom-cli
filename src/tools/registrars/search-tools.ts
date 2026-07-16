@@ -195,7 +195,7 @@ export function registerSearchTools(deps: RegisterSearchToolsDeps): void {
             lines.push(...r.contextBefore);
           }
 
-          lines.push(`\x1b[32m>\x1b[0m ${r.lineNum.toString().padStart(4)} | ${r.match}`);
+          lines.push(`> ${r.lineNum.toString().padStart(4)} | ${r.match}`);
 
           if (r.contextAfter.length > 0) {
             lines.push(...r.contextAfter);

@@ -30,6 +30,21 @@ export interface Message {
       arguments: Record<string, unknown> | string;
     };
   }>;
+  /**
+   * The user-visible form of an assistant turn — distinct from `content`,
+   * which holds the byte-for-byte form the model's KV slot saw (think
+   * wrapper + raw stream). When the model emitted ONLY reasoning + a tool
+   * call, `content` is `<think>…</think>\n` with no visible text, so on
+   * session restore the previous logic (splitThink → emit AGENT_MESSAGE if
+   * non-empty) produced no output: the user lost the "Concluded.", the
+   * reasoning-fallback answer, or the "Using: tool_x" hint they saw live.
+   *
+   * Populated by the agent's emitAssistantMessage helper and the tool-loop
+   * iteration persister. Optional for backwards compatibility with sessions
+   * written before this field existed — restoration falls back to splitThink
+   * over `content` when displayContent is absent.
+   */
+  displayContent?: string;
 }
 
 export interface ToolCall {

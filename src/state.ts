@@ -92,6 +92,11 @@ export class SessionState {
     }
   }
 
+  setMemory(messages: Message[]): void {
+    const safe = Array.isArray(messages) ? messages : [];
+    this.state.memory = safe.slice(-this.maxMemory);
+  }
+
   getRecentMessages(count: number = this.maxMemory): Message[] {
     return this.state.memory.slice(-count);
   }
