@@ -40,5 +40,25 @@ Thumbs.db
 # Per-session trace log (regenerated each run)
 .phenom-trace.log
 
+# Local Phenom runtime/session artifacts
+.phenom-history
+.phenom-sessions/
+.phenom-skills/
+.phenom-trash/
+.phenom-zig/
+.7z
+.complete
+.projectcomplete
+.test-*/
+test.txt
+teste.txt
+claude-session
+passou
+*.bkp
+
 # Phenom Zig spike runtime store
 phenom-zig/.phenom-zig/
+phenom-zig/.phenom-history
+phenom-zig/phenom.db
+phenom-zig/bin/
+phenom-zig/zig-cache/
