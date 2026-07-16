@@ -47,6 +47,7 @@ pub fn build(b: *std.Build) void {
     const real_expect = b.option([]const u8, "real-expect", "Expected visible text for smoke test") orelse "PHENOM_REAL_7319";
     const real_session = b.option([]const u8, "real-session", "Session id for multi-turn real smoke test") orelse "real-session-smoke-294";
     const real_dialogue_session = b.option([]const u8, "real-dialogue-session", "Session id for dialogue continuity real smoke test") orelse "real-dialogue-smoke-301";
+    const real_long_session = b.option([]const u8, "real-long-session", "Session id for long-session real smoke test") orelse "real-long-session-smoke-294";
 
     const real_smoke_cmd = b.addRunArtifact(exe);
     real_smoke_cmd.step.dependOn(b.getInstallStep());
@@ -178,6 +179,92 @@ pub fn build(b: *std.Build) void {
 
     const real_dialogue_smoke_step = b.step("real-dialogue-smoke", "Opt-in two-turn recent dialogue continuity smoke test. Requires active HOST:PORT.");
     real_dialogue_smoke_step.dependOn(&real_dialogue_followup_cmd.step);
+
+    const long_turns = [_]struct {
+        prompt: []const u8,
+        expect: []const u8,
+    }{
+        .{
+            .prompt = "Nesta sessao longa, registre este fato operacional antigo: a palavra-codigo longa e LONG-SESSION-294. Responda exatamente: PHENOM_LONG_SEED_294",
+            .expect = "PHENOM_LONG_SEED_294",
+        },
+        .{
+            .prompt = "Registre tambem que o fluxo correto de contexto usa evidencia destilada e nao raw output. Responda exatamente: PHENOM_LONG_FILLER_1",
+            .expect = "PHENOM_LONG_FILLER_1",
+        },
+        .{
+            .prompt = "Registre que SESSION_FOCUS e mapa operacional, nao evidencia citavel. Responda exatamente: PHENOM_LONG_FILLER_2",
+            .expect = "PHENOM_LONG_FILLER_2",
+        },
+        .{
+            .prompt = "Registre que fatos exatos antigos devem usar search_session quando necessario. Responda exatamente: PHENOM_LONG_FILLER_3",
+            .expect = "PHENOM_LONG_FILLER_3",
+        },
+        .{
+            .prompt = "Registre que MEMORY e SKILLS so recebem promocao explicita. Responda exatamente: PHENOM_LONG_FILLER_4",
+            .expect = "PHENOM_LONG_FILLER_4",
+        },
+        .{
+            .prompt = "Registre que patch seguro precisa de micro-contexto fresco. Responda exatamente: PHENOM_LONG_FILLER_5",
+            .expect = "PHENOM_LONG_FILLER_5",
+        },
+    };
+    var long_prev: *std.Build.Step = b.getInstallStep();
+    for (long_turns) |turn| {
+        const cmd = b.addRunArtifact(exe);
+        cmd.step.dependOn(long_prev);
+        cmd.addArgs(&.{
+            "chat",
+            "--backend",
+            real_backend,
+            "--host",
+            real_host,
+            "--model",
+            real_model,
+            "--session",
+            real_long_session,
+            "--prompt",
+            turn.prompt,
+            "--max-tokens",
+            "320",
+            "--thinking",
+            "off",
+            "--expect-contains",
+            turn.expect,
+            "--show-expect-status",
+            "--fail-on-model-error",
+            "--no-color",
+        });
+        long_prev = &cmd.step;
+    }
+
+    const real_long_recall_cmd = b.addRunArtifact(exe);
+    real_long_recall_cmd.step.dependOn(long_prev);
+    real_long_recall_cmd.addArgs(&.{
+        "chat",
+        "--backend",
+        real_backend,
+        "--host",
+        real_host,
+        "--model",
+        real_model,
+        "--session",
+        real_long_session,
+        "--prompt",
+        "Na sessao longa, qual foi a palavra-codigo antiga que combinamos? Responda exatamente no formato: CODIGO=<valor> PHENOM_LONG_RECALL_294",
+        "--max-tokens",
+        "900",
+        "--thinking",
+        "off",
+        "--expect-contains",
+        "LONG-SESSION-294",
+        "--show-expect-status",
+        "--fail-on-model-error",
+        "--no-color",
+    });
+
+    const real_long_session_smoke_step = b.step("real-long-session-smoke", "Opt-in long-session continuity smoke test. Requires active HOST:PORT.");
+    real_long_session_smoke_step.dependOn(&real_long_recall_cmd.step);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

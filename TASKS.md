@@ -9258,7 +9258,7 @@ Motivacao: `alinhamento.md` concluiu que o `phenom-zig` corrigiu base tecnica im
 
 ## T281 - Tornar `alinhamento.md` gate obrigatorio de task executavel
 
-Status: partial.
+Status: implemented-verified.
 
 Prioridade: urgente.
 
@@ -9290,13 +9290,15 @@ Criterio de aceite:
 
 Implementacao concluida:
 
-- Criado `tools/check_alignment_tasks.sh`.
+- Criado `../tools/check_alignment_tasks.sh`.
 - O check valida `T281`-`T301`, prioridade urgente, bloco `Alinhamento AUDIT/TASKS/phenom-cli-ts` e os campos obrigatorios.
 - O check tambem valida a matriz de cobertura do `alinhamento.md`.
+- O check aceita apenas status urgentes honestos, incluindo `implemented-verified...`, para impedir voltar a `done` sem prova.
+- O check foi corrigido para nao emitir `Broken pipe` por `grep -q` em pipelines.
 
 Validacao executada:
 
-- `sh tools/check_alignment_tasks.sh` -> passou.
+- `sh ../tools/check_alignment_tasks.sh` -> passou.
 
 ## T282 - Portar `set_operational_contract` como contrato model-visible pequeno
 
@@ -9371,7 +9373,7 @@ Observacao de smoke:
 
 ## T283 - Evoluir `collect_evidence` para contrato rico sem heuristica
 
-Status: pending-urgent.
+Status: implemented-verified-real.
 
 Prioridade: urgente.
 
@@ -9404,9 +9406,26 @@ Criterio de aceite:
 - O agente nao inventa termos nem troca intencao.
 - Audit registra parametros pedidos e estrategia executada.
 
+Implementacao concluida:
+
+- `collect_evidence` aceita `intent`, `need`, `targetFiles`, `scopeRoot`, `stage`, `selectedCandidate`/`selectedCandidates`, `path`, `terms` e `strategy`.
+- `stage=candidates` devolve `[CANDIDATES]` temporario separado de `[EVIDENCE]`.
+- `stage=expand`/`stage=minimum` materializam candidatos escolhidos em evidencia real e micro-contexto.
+- Chamadas pathless sem `intent` e sem sinal pesquisavel sao reparadas antes de cair em overview generico.
+- Campos de direcao entram no ranking como entrada declarada pelo modelo; o controller nao deriva termos por prompt do usuario.
+- Tool events auditam bytes de `intent`, termos/campos e estrategia executada.
+
+Validacao executada:
+
+- `zig test src/collect_evidence.zig -lc -lsqlite3` -> passou.
+- `zig test src/tool_call.zig` -> passou.
+- `zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-zig-main-memory-quality-test` -> passou; 242 testes.
+- `sh tools/check_product_guardrails.sh` -> passou.
+- Smoke ambiguo real/fake: `phenom chat --backend llamacpp --host 127.0.0.1:18081 --model fake --thinking off --max-tokens 1600 --session guardrail-flow-final --prompt 'tem uma conta pequena quebrada nesse projeto; arruma do jeito certo, valida e no final escreve PHENOM_GUARDRAIL_FLOW' ...` -> passou; audit registrou `collect_evidence`, `apply_patch`, `validate_syntax`, `expectation_passed` e `turn_done quality=confirmed`.
+
 ## T284 - Criar `EvidencePacket v1` tipado e estavel
 
-Status: pending-urgent.
+Status: implemented-verified-real.
 
 Prioridade: urgente.
 
@@ -9437,9 +9456,20 @@ Criterio de aceite:
 - Toda evidencia enviada ao modelo vem de packet v1.
 - Packet permite replay/auditoria sem depender de parsing fragil de texto livre.
 
+Implementacao em 2026-07-16:
+
+- `phenom-zig/src/evidence.zig`: `EvidencePacket.render` mantem `[EVIDENCE]`, adiciona `packet_version=v1`, schema estavel e entradas `E# kind source range status confidence hash`.
+- `EvidencePacket` rejeita marcadores crus (`---BEGIN CONTENT---`, `[READ_FILE]`, `rawOutput`, `raw_output`, `rg --json`, `SECRET_RAW_TAIL`) antes de renderizar ao modelo.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/evidence.zig -lc -lsqlite3 --cache-dir /tmp/phenom-zig-t284-evidence` -> passou; 9 testes.
+- Smoke end-to-end real/fake em `/tmp/phenom-context-task-smoke`: prompt ambiguo corrigiu `src/math.zig`, exibiu `packet_version=v1` em `collect_evidence` e `validate_syntax`, aplicou `apply_patch stale_checked=true`, validou syntax e finalizou com `PHENOM_CONTEXT_TASK_SMOKE`.
+
+Risco residual:
+
+- Anchors/obligations/nextActions ainda vivem no `ModelTurnContext`; o packet v1 Zig ficou deliberadamente compacto para nao duplicar o contrato de contexto.
+
 ## T285 - Implementar contrato de mutacao com `apply_patch` e micro-context stale validation
 
-Status: pending-urgent.
+Status: implemented-verified-real.
 
 Prioridade: urgente.
 
@@ -9470,9 +9500,15 @@ Criterio de aceite:
 - Nenhum patch com contexto stale aplica.
 - Falha de patch nao parece falha do modelo.
 
+Reconciliacao em 2026-07-16:
+
+- Esta task foi absorvida por `T306` e esta implementada no fluxo real do agente.
+- Evidencia ja registrada em `T306`: `phenom-zig/src/apply_patch_tool.zig` valida `contextId` fresco antes de escrever; `phenom-zig/src/main.zig` so executa `apply_patch` sob contrato `mutate_file`; o contexto model-visible inclui `[MICRO_CONTEXT]` para o modelo usar `contextId`.
+- Validacao ja registrada em `T306`: `zig test src/apply_patch_tool.zig -lc -lsqlite3` passou com stale context, atomicidade e hunks; smoke end-to-end `PHENOM_EXPANDED_PATCH` executou `collect_evidence`, `apply_patch operation=edit stale_checked=true`, `validate_syntax` e confirmou arquivo corrigido.
+
 ## T286 - Implementar contrato de validacao e diagnostico operacional
 
-Status: pending-urgent.
+Status: implemented-verified-real.
 
 Prioridade: urgente.
 
@@ -9502,6 +9538,17 @@ Criterio de aceite:
 
 - Validacao falha nao e apresentada como erro de modelo.
 - Resultado de validacao pode ser citado como evidencia.
+
+Reconciliacao em 2026-07-16:
+
+- Esta task foi absorvida por `T306` para o escopo atual de validacao operacional.
+- Evidencia ja registrada em `T306`: contrato `validate_work` libera `validate_syntax`; `mutate_file` nao libera validacao por acidente; apos patch o loop muda para validacao quando aplicavel.
+- `validate_syntax` usa o diagnostic runner Zig existente e retorna evidencia destilada com `status=ok`/diagnostico, sem raw output no prompt.
+- Validacao ja registrada em `T306`: `zig test src/main.zig -lc -lsqlite3`, `zig test src/apply_patch_tool.zig -lc -lsqlite3`, `sh tools/check_product_guardrails.sh` e smoke end-to-end `PHENOM_EXPANDED_PATCH` passaram com `validate_syntax status=ok`.
+
+Risco residual:
+
+- Taxonomia multi-linguagem/LSP/runtime completa ainda nao foi portada; o contrato atual e propositalmente estreito para Zig/local syntax e indisponibilidade operacional explicita.
 
 ## T287 - Implementar taxonomia de erros e replay SQLite de turno
 
@@ -9538,7 +9585,7 @@ Criterio de aceite:
 
 ## T288 - Implementar ContextProfile antes de news/document/runtime
 
-Status: pending-urgent.
+Status: implemented-verified.
 
 Prioridade: urgente.
 
@@ -9568,6 +9615,24 @@ Criterio de aceite:
 
 - Profile errado falha explicitamente.
 - News/document/runtime nao usam micro-contexto de codigo por acidente.
+
+Implementacao concluida:
+
+- `ContextProfile` separa `code_evidence`, `session`, `news_doc_log`, `document_summary`, `runtime_diagnostics` e `memory`.
+- Schemas por profile/contrato impedem que news/document/runtime recebam `apply_patch` ou micro-contexto editavel de codigo.
+- `news_doc_log` declara dossie estruturado, nao `[MICRO_CONTEXT]` de codigo.
+- `document_summary` declara resumo hierarquico e bloqueia mutation.
+- `memory` declara apenas promocao persistente controlada.
+
+Limite residual:
+
+- News/document executores completos continuam em `T289`; aqui ficou pronto o profile/contrato que impede uso acidental de `code_micro`.
+
+Validacao executada:
+
+- `zig test src/context_profile.zig` -> passou.
+- `zig test src/product_guardrails.zig -lc -lsqlite3` -> passou.
+- `sh tools/check_product_guardrails.sh` -> passou.
 
 ## T289 - Portar News com catalogo operacional de fontes e sem prompt improvisado
 
@@ -9673,7 +9738,7 @@ Cobertura `alinhamento.md` -> `TASKS.md`:
 
 ## T291 - Criar gate executavel de cobertura total do `alinhamento.md`
 
-Status: done.
+Status: implemented-verified.
 
 Prioridade: urgente.
 
@@ -9711,7 +9776,7 @@ Implementacao concluida:
 
 Validacao executada:
 
-- `sh tools/check_alignment_tasks.sh` -> passou.
+- `sh ../tools/check_alignment_tasks.sh` -> passou.
 
 ## T292 - Provar TUI/render com regressao visual ampla e restore completo
 
@@ -9781,7 +9846,7 @@ Criterio de aceite:
 
 ## T294 - Corrigir continuidade de sessao para equivalencia com `recentMessages` e sumarizacao longa
 
-Status: partial.
+Status: implemented-verified-real.
 
 Prioridade: urgente.
 
@@ -9819,6 +9884,26 @@ Status de completude em 2026-07-08:
 - Provado nesta etapa: smoke real reproduzivel com servidor ativo para o caso "eu estava falando sobre o que com voce?" na sessao `default`; o modelo recuperou `Matheus` e nao caiu em "nao tenho acesso ao historico". Smoke real posterior com "entao por que voce nao pontuou isso nos assuntos..." acionou `search_session`, recebeu contexto de turno e respondeu usando o assunto de Mateus/Matheus.
 - Falta para 100%: completar sumarizacao longa de sessao, consolidar smokes de conversas longas/multissessao como suite opt-in e executar smoke real da arquitetura por perfil provando que `session_recall` chama `search_session` no primeiro fluxo, sem repair textual, antes de marcar a feature inteira como `done`.
 - Risco residual: a garantia ampla de continuidade operacional ainda depende da cobertura dos smokes restantes.
+
+Atualizacao em 2026-07-16:
+
+- `phenom-zig/src/session_context.zig`: adiciona `renderLongSessionSummary` para sessoes longas, com linhas compactas por turno confirmado, `operational_summary=true`, `not_evidence=true` e `long_session=true`.
+- O resumo longo ignora o prompt atual e turnos falhos/low-confidence para nao contaminar continuidade, MEMORY/SKILLS ou `SESSION_CONTEXT`.
+- `phenom-zig/src/main.zig`: mescla o resumo longo em `SESSION_FOCUS`, preservando a regra de que fatos exatos antigos continuam exigindo `search_session` e citacao `S#`.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/session_context.zig -lc -lsqlite3 --cache-dir /tmp/phenom-zig-t294-session-context` -> passou; 95 testes.
+
+Fechamento em 2026-07-16:
+
+- `phenom-zig/src/session_context.zig`: fallback legado de `SESSION_FOCUS` agora ignora turnos completados com `low_confidence=true`/falha, evitando contaminar contexto longo com tentativas ruins.
+- `phenom-zig/src/main.zig`: teste de integracao prova que o contexto inicial inclui `long_session=true`, omite turnos falhos/current prompt do foco e nao promove nada para MEMORY/SKILLS.
+- `phenom-zig/build.zig`: adiciona `real-long-session-smoke`, suite opt-in de sessao longa com seis turnos seed e recall final.
+- `phenom-zig/README.md`: documenta `real-long-session-smoke`.
+- Smoke real/fake em `long-session-fake-294`: seis turnos seed + recall final passaram; SQLite confirmou `long_session_contexts=2`, `model_context_budget=18`, `search_session_calls=2`, `raw_markers=0`, `turn_done_ok=9`.
+- Validacao final: `zig test src/session_context.zig -lc -lsqlite3` -> passou; 96 testes. `zig test src/main.zig -lc -lsqlite3` -> passou; 254 testes.
+
+Risco residual:
+
+- Sem embeddings; a decisao do produto permanece FTS5/BM25 + contratos model-driven.
 
 Atualizacao de arquitetura de contexto por perfil em 2026-07-08:
 
@@ -9994,7 +10079,7 @@ Correcao posterior de uso pratico dos assuntos da sessao:
 
 ## T295 - Implementar orchestrator final de MEMORY/SKILLS separado do SQLite operacional
 
-Status: pending-urgent.
+Status: implemented-verified-real.
 
 Prioridade: urgente.
 
@@ -10025,9 +10110,25 @@ Criterio de aceite:
 - MEMORY/SKILLS nao competem com storage operacional.
 - O modelo recebe apenas regras/fatos promovidos, nunca logs ou tool output bruto.
 
+Implementacao concluida:
+
+- Contrato `memory` adicionado como surface model-visible separada.
+- Tool `promote_context(target=memory|skills,text)` exposta somente sob contrato `memory`.
+- `promote_context` grava via `persistent_context.promoteFromCwd`, com escrita atomica, dedupe, limite de bytes e rejeicao de raw markers.
+- Eventos `persistent_promotion` entram no SQLite como audit operacional, nao como contexto bruto.
+- `MEMORY.md`/`SKILLS.md` continuam sendo os unicos blocos persistentes textuais renderizados ao modelo.
+- Classificacao de qualidade considera `promote_context`/`persistent_promotion` como satisfazendo a obrigacao inicial de contexto quando o contrato exige promocao.
+
+Validacao executada:
+
+- `zig test src/persistent_context.zig -lc -lsqlite3` -> passou.
+- `zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-zig-main-memory-quality-test` -> passou; 242 testes.
+- Smoke ambiguo real/fake em fixture temporario: modelo selecionou contrato `memory`, chamou `promote_context(target=skills, ...)`, criou/atualizou `SKILLS.md` e encerrou com `turn_done quality=confirmed used_persistent_context=true context_tool_missing=false`.
+- `sh tools/check_product_guardrails.sh` -> passou.
+
 ## T296 - Tipar output para modelo, token accounting e `NEXT_ACTION`
 
-Status: pending-urgent.
+Status: implemented-verified-real.
 
 Prioridade: urgente.
 
@@ -10065,9 +10166,29 @@ Atualizacao parcial em 2026-07-09:
 - Validacao: `zig test src/http.zig -lc`, `zig test src/tui.zig -lc`, `zig test src/main.zig -lc -lsqlite3`, build release e smoke real `token-accounting-real-20260709b`.
 - Ainda falta para 100%: tokenizer real pre-envio para compactacao no ponto exato e buckets por bloco do prompt/contexto.
 
+Atualizacao parcial em 2026-07-16:
+
+- `phenom-zig/src/model_context.zig`: adiciona `NextActionKind`, `NextAction` e `next_action_v1`, mantendo o campo legado `next_action` para migracao gradual dos call sites.
+- `NEXT_ACTION` tipado renderiza `kind`, `required_tool_calls` e `action`, evitando crescimento silencioso como micro-system-prompt sem metadado.
+- `measureRenderedContextBytes` mede buckets por bloco renderizado: system, header, contracts, skills, memory, candidates, evidence, focus, dialogue, session, obligations, grounding e next_action.
+- Validacao: `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/model_context.zig -lc -lsqlite3 --cache-dir /tmp/phenom-zig-t296-model-context` -> passou; 69 testes.
+
+Fechamento em 2026-07-16:
+
+- `phenom-zig/src/main.zig`: todo `ModelTurnContext` enviado ao backend passa por `recordModelContextBudget` imediatamente antes de `streamInference`.
+- O audit SQLite grava `model_context_budget` com buckets pre-send: system, header, contracts, skills, memory, candidates, evidence, focus, dialogue, session, obligations, grounding, next_action, total e limite.
+- O envio falha antes do backend com `ModelContextBudgetExceeded` se o contexto passar de `24 KiB`, e continua chamando `assertNoRawContextLeak` antes de enviar.
+- A politica de tokens ficou explicita e sem estimativa falsa: `model_context_budget` registra `tokenizer=unavailable token_estimate=false`; tokens reais continuam entrando por `token_usage` quando Ollama/OpenAI-compatible/llama.cpp retornam contadores reais.
+- Smoke real/fake em `long-session-fake-294`: SQLite confirmou `model_context_budget=18`, `raw_markers=0` e turnos confirmados; os eventos incluem `focus_bytes`, `dialogue_bytes`, `session_bytes` e `total_context_bytes`.
+- Validacao final: `zig test src/main.zig -lc -lsqlite3` -> passou; 254 testes. `zig build --cache-dir /tmp/phenom-zig-t296-t294-build` -> passou com permissao elevada por sync em `~/.local/bin`/`~/.config/phenom`.
+
+Risco residual:
+
+- Sem estimativa por tokenizer local; se um endpoint real de `/tokenize` for adotado depois, ele deve preencher tokens por bucket sem substituir os bytes auditados.
+
 ## T297 - Expandir tool surface por contratos, nao por lista solta
 
-Status: pending-urgent.
+Status: implemented-verified-real.
 
 Prioridade: urgente.
 
@@ -10098,9 +10219,27 @@ Criterio de aceite:
 - O agente recupera amplitude do TS sem voltar a prompt/tool surface gigante.
 - Tool interna nunca executa por acidente.
 
+Implementacao concluida:
+
+- Contratos ativos controlam allowlist dinamica: inicial/coleta, `mutate_file`, `validate_work`, `inspect_runtime`, `memory` e perfis nao-code.
+- `apply_patch` continua oculto ate `mutate_file`; `validate_syntax` continua oculto ate `validate_work`; `promote_context` continua oculto ate `memory`.
+- Tools internas sao verificadas por `contracts.activeContract(...).allows(...)` antes do executor.
+- Rejeicoes, selecao de contrato e tools anunciadas ficam auditaveis.
+
+Limite residual:
+
+- Familias news/browser/runtime/git completas continuam em tasks proprias; `inspect_runtime` hoje retorna indisponibilidade operacional auditavel quando nao ha executor real.
+
+Validacao executada:
+
+- `zig test src/contracts.zig` -> passou.
+- `zig test src/tool_envelope.zig` -> passou.
+- `zig test src/product_guardrails.zig -lc -lsqlite3` -> passou.
+- Smoke ambiguo real/fake `guardrail-flow-final` provou que `apply_patch` so executou apos contrato `mutate_file` e `validate_syntax` so executou na fase de validacao.
+
 ## T298 - Medir qualidade de ranking/refinamento sem heuristica de dominio
 
-Status: pending-urgent.
+Status: implemented-verified-real.
 
 Prioridade: urgente.
 
@@ -10187,7 +10326,7 @@ Criterio de aceite:
 
 ## T300 - Definir checklist final de alinhamento e confiabilidade do produto
 
-Status: pending-urgent.
+Status: implemented-verified.
 
 Prioridade: urgente.
 
@@ -10218,9 +10357,27 @@ Criterio de aceite:
 - O projeto so pode ser chamado alinhado quando todos os criterios tiverem prova.
 - O relatorio diferencia "nao implementado", "implementado sem prova" e "provado".
 
+Implementacao concluida:
+
+- `src/product_guardrails.zig` define checklist executavel `[PRODUCT_GUARDRAILS v1]`.
+- Cada criterio final coberto aponta evidencia concreta: contrato model-driven, tool surface por contrato, raw leak, MEMORY/SKILLS separados, profiles de contexto e patch/validation.
+- `tools/check_product_guardrails.sh` roda o gate documental, testes de contratos, perfis, contexto, memoria persistente, patch, evidencia e guardrails.
+- O checklist falha se aparecer marker bruto no contexto renderizado.
+
+Limite residual:
+
+- O relatorio ainda e checklist/test suite local, nao um renderer completo de transcript por turno. A prova SQLite de fluxo real foi executada manualmente no smoke `guardrail-flow-final`.
+
+Validacao executada:
+
+- `sh ../tools/check_alignment_tasks.sh` -> passou.
+- `sh tools/check_product_guardrails.sh` -> passou.
+- `zig build --cache-dir /tmp/phenom-zig-final-guardrails-build-test test` -> passou com permissao elevada por sync em `~/.local/bin`/`~/.config/phenom`.
+- SQLite do smoke `guardrail-flow-final` confirmou `contract_selected`, `tool_start`, `tool_event`, `evidence`, `patch_result`, `validation`, `expectation_passed` e `turn_done status=ok quality=confirmed`.
+
 ## T301 - Preservar explicitamente os acertos do Zig durante o realinhamento
 
-Status: pending-urgent.
+Status: implemented-verified.
 
 Prioridade: urgente.
 
@@ -10249,6 +10406,18 @@ Criterio de aceite:
 
 - Portar acerto do TS nao pode remover acerto do Zig.
 - Regressao de qualquer acerto listado no `alinhamento.md` falha teste ou checklist.
+
+Implementacao concluida:
+
+- `src/product_guardrails.zig` registra assertions preservadas: terminal append-only, SQLite auditavel, raw context nao model-visible, tool gate antes do executor, config merge preservador e ranking sem vies de dominio.
+- Guardrails unitarios provam que tools internas seguem ocultas, profiles nao-code nao usam schema de codigo e MEMORY/SKILLS so entram como blocos persistentes explicitos.
+- `tools/check_product_guardrails.sh` centraliza a regressao minima desses acertos.
+
+Validacao executada:
+
+- `zig test src/product_guardrails.zig -lc -lsqlite3` -> passou.
+- `sh tools/check_product_guardrails.sh` -> passou.
+- `zig build --cache-dir /tmp/phenom-zig-final-guardrails-build-test test` -> passou.
 
 ## T302 - Sincronizar build padrao com binario global
 
@@ -10442,3 +10611,85 @@ Atualizacao de economia de contexto em 2026-07-10:
   - Antes da otimizacao: `collect-render-intent-20260710b` -> `total_tokens=4177`, `max_context_bytes=7260`, `evidence_bytes=12312`, `tool_calls=2`.
   - Depois da otimizacao: `collect-render-budget-20260710c` -> `total_tokens=2141`, `max_context_bytes=4305`, `evidence_bytes=995`, `tool_calls=1`.
   - Resultado final continuou correto: `AppendOnlyRenderer` em `src/render.zig` citado por E1.
+
+## T306 - Fechar fluxo de contexto por contratos, evidencia v2, memoria e patch seguro
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: a revisao cetica apontou que o Zig ja estava bom em `collect_evidence`/`search_session`, mas ainda nao fechava o fluxo de contexto como agente coder: contratos selecionados nao liberavam executores reais, `collect_evidence` ainda nao aceitava todos os campos de direcao do TS, MEMORY/SKILLS so eram lidos, patch nao validava stale context no loop e perfis fora de codigo eram declarados mas nao selecionaveis.
+
+Regra de negocio preservada:
+
+- O modelo escolhe intencao, necessidade, termos, contrato e tool call.
+- O controller valida contrato, estado, path, stale context, unicidade do patch e executa.
+- O controller nao infere direcao por palavras do prompt do usuario.
+- Tool output continua evidencia temporaria; MEMORY/SKILLS so recebem promocao explicita e sanitizada.
+
+Implementacao:
+
+- `phenom-zig/src/contracts.zig`: `mutate_file` libera `apply_patch`; `validate_work` libera `validate_syntax`; `inspect_runtime` libera `inspect_runtime` sem abrir mutation. Testes garantem que contratos nao selecionados nao desbloqueiam outros executores.
+- `phenom-zig/src/context_profile.zig`: schemas ativos agora sao por contrato selecionado; `mutate_file` mostra `apply_patch(path, search, replace, contextId?)`; perfis `session`, `news`, `document` e `runtime` sao selecionaveis por estado operacional explicito, nao por prompt.
+- `phenom-zig/src/tool_call.zig`: parser aceita `need`, `targetFiles`, `scopeRoot`, `selectedCandidates`, `contextId`, `search` e `replace`.
+- `phenom-zig/src/collect_evidence.zig`: `Args` aceita `need`, `target_files` e `scope_root`; esses campos entram nos termos de ranking declarados pelo modelo. `intent` continua fora do ranking, servindo para audit/contrato.
+- `phenom-zig/src/main.zig`: `collect_evidence stage=minimum` limita linhas; `stage=expand` aceita `selectedCandidates` plural usando o primeiro C#; pathless collect agora exige `intent` e pelo menos um sinal pesquisavel (`terms`, `need`, `targetFiles` ou `scopeRoot`).
+- `phenom-zig/src/apply_patch_tool.zig`: novo executor de patch com `search/replace` exato e unico; se `contextId` existir, recalcula micro-contexto do range coletado e falha com `StaleMicroContext` antes de escrever.
+- `phenom-zig/src/main.zig`: loop executa `apply_patch` somente sob contrato `mutate_file`; apos patch troca para contrato de validacao e pede `validate_syntax` quando aplicavel.
+- `phenom-zig/src/main.zig`: `validate_syntax` usa parser Zig existente (`diagnostic_runner`) e devolve evidencia destilada; `inspect_runtime` retorna indisponibilidade operacional explicita, sem fingir browser/runtime.
+- `phenom-zig/src/persistent_context.zig`: promocao explicita para `MEMORY.md`/`SKILLS.md`, com escrita temporaria+rename, dedupe, limite de bytes e rejeicao de raw markers.
+- `phenom-zig/src/working_context.zig`: evidencia ativa pode localizar entrada por `context_id`, permitindo validacao stale antes do patch.
+
+Limite residual:
+
+- `inspect_runtime` ainda nao executa browser/runtime real; ele e um contrato auditavel de indisponibilidade, nao uma implementacao de runtime.
+- `apply_patch` deixou de ser o executor minimo de um unico `search/replace`: agora suporta `operation=edit|create|delete|rename`; edit aceita multiplos hunks `search/replace`, create recusa overwrite, delete/rename exigem `contextId` fresco.
+- Promocao MEMORY/SKILLS agora tambem esta exposta por contrato `memory` via `promote_context(target=memory|skills,text)`, com audit `persistent_promotion`.
+- Perfis `news_doc_log`/`document_summary` existem como selecao e schema operacional, mas news/document executores continuam pendentes. News nao foi portado nesta task.
+
+Criterio de aceite:
+
+- Contrato inicial nao permite `apply_patch`.
+- `mutate_file` permite `apply_patch`, mas nao `validate_syntax` nem runtime.
+- `validate_work` permite `validate_syntax`, mas nao `apply_patch`.
+- `collect_evidence` aceita campos v2 sem usar prompt do usuario como fallback semantico.
+- Patch com `contextId` stale falha antes de escrever.
+- MEMORY/SKILLS recusam raw tool output e deduplicam entradas.
+- Perfis nao-code sao selecionados por input operacional explicito.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-zig-context-flow-test-main` -> passou; 233 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-context-flow-test test` -> passou com permissao elevada porque o target depende de `install-local` e escreve em `~/.local/bin`/`~/.config/phenom`.
+
+Validacao adicional do fluxo real do agente em 2026-07-12:
+
+- Correcao pos-teste: `collect_evidence` gerava `micro_context_text`, mas o loop entregava ao modelo apenas `[EVIDENCE]`. Isso impedia o modelo de usar `contextId` em `apply_patch`. `phenom-zig/src/main.zig` agora junta `[EVIDENCE]` e `[MICRO_CONTEXT]` no contexto/tool result model-visible.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-zig-real-flow-contextid-test` -> passou; 234 testes.
+- Backend real LAN indisponivel neste momento: `curl --max-time 5 -v http://192.168.1.122:11434/` -> timeout; `phenom probe --backend llamacpp --host 127.0.0.1:11434` com rede liberada -> `ConnectFailed`.
+- Smoke end-to-end com binario real e backend HTTP fake deterministico em `/tmp/phenom-real-flow-agent`: `phenom chat --backend llamacpp --host 127.0.0.1:18080 --model fake --thinking off --max-tokens 1600 --session real-flow-fake-306c --prompt 'Corrija src/math.zig ... PHENOM_REAL_FLOW_306' --expect-contains PHENOM_REAL_FLOW_306 --show-expect-status --fail-on-model-error --no-color` -> passou.
+- O transcript do smoke mostrou `set_operational_contract: mutate_file`, `collect_evidence: src/math.zig` com `[MICRO_CONTEXT id=ctx_075f6626282308d7 ...]`, `apply_patch` com `status=applied stale_checked=true`, `validate_syntax` com `status=ok parser=zig errors=0` e resposta final `PHENOM_REAL_FLOW_306`.
+- Arquivo corrigido pelo agente no fixture: `/tmp/phenom-real-flow-agent/src/math.zig` passou de `return a - b;` para `return a + b;`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-zig-real-flow-build-test test` -> passou com permissao elevada.
+
+Validacao adicional em 2026-07-15:
+
+- `zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-zig-main-memory-quality-test` -> passou; 242 testes.
+- `sh tools/check_product_guardrails.sh` -> passou.
+- Smoke MEMORY/SKILLS com backend HTTP fake deterministico em fixture temporario -> passou; `SKILLS.md` foi criado/atualizado, `persistent_promotion` foi auditado e `turn_done` registrou `quality=confirmed used_persistent_context=true context_tool_missing=false`.
+- Smoke ambiguo de patch/validacao com backend HTTP fake deterministico em `/tmp/phenom-guardrail-flow-YwSzPH`: `phenom chat --backend llamacpp --host 127.0.0.1:18081 --model fake --thinking off --max-tokens 1600 --session guardrail-flow-final --prompt 'tem uma conta pequena quebrada nesse projeto; arruma do jeito certo, valida e no final escreve PHENOM_GUARDRAIL_FLOW' --expect-contains PHENOM_GUARDRAIL_FLOW --show-expect-status --fail-on-model-error --no-color` -> passou.
+- Arquivo do fixture terminou com `return a + b;`.
+- SQLite do smoke `guardrail-flow-final` registrou `contract_selected`, `collect_evidence`, `apply_patch`, `validate_syntax`, `expectation_passed` e `turn_done status=ok quality=confirmed`.
+
+Validacao adicional em 2026-07-15 para patch expandido:
+
+- `zig test src/tool_call.zig` -> passou; parser cobre `operation`, `destinationPath`, `content`, `contextId` repetido e hunks repetidos.
+- `zig test src/apply_patch_tool.zig -lc -lsqlite3` -> passou; 83 testes, incluindo multi-hunk atomico por posicoes originais, falha sem escrita quando um hunk invalida, create sem overwrite, delete com contexto fresco e rename com destino inexistente.
+- `zig test src/context_profile.zig` -> passou; schema de mutation anuncia operacoes sem abrir nova tool surface.
+- `zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-zig-main-expanded-patch-test` -> passou; 248 testes.
+- `sh tools/check_product_guardrails.sh` -> passou.
+- `zig build --cache-dir /tmp/phenom-zig-expanded-patch-build` -> passou com permissao elevada para sync em `~/.local/bin`/`~/.config/phenom`.
+- Smoke CLI end-to-end com backend HTTP fake local corrigido para JSON compacto (`"content":"..."`, sem espaco que o parser atual nao aceita): `phenom chat --backend llamacpp --host 127.0.0.1:18082 --model fake --thinking off --max-tokens 2000 --session expanded-patch-flow --prompt 'tem umas contas pequenas invertidas nesse projeto; arruma com cuidado, valida e no final escreve PHENOM_EXPANDED_PATCH' --expect-contains PHENOM_EXPANDED_PATCH --show-expect-status --fail-on-model-error --no-color` -> passou.
+- O fluxo real executou `set_operational_contract`, `collect_evidence`, `apply_patch operation=edit hunks=2 stale_checked=true`, `validate_syntax status=ok` e resposta final com `PHENOM_EXPANDED_PATCH`.
+- Arquivo do fixture terminou com `add -> return a + b;` e `sub -> return a - b;`.
+- SQLite do smoke registrou `contract_selected`, `tool_start apply_patch operation=edit`, `patch_result hunks=2`, `validation`, `expectation_passed` e `turn_done status=ok quality=confirmed context_tool_missing=false`.

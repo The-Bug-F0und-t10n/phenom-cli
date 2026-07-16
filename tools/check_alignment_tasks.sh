@@ -34,17 +34,23 @@ require_task_field() {
   field=$2
   block=$(task_block "$task")
   [ -n "$block" ] || fail "missing task: $task"
-  printf '%s\n' "$block" | grep -Fq -- "$field" || fail "$task missing field: $field"
+  case "$block" in
+    *"$field"*) ;;
+    *) fail "$task missing field: $field" ;;
+  esac
 }
 
 require_task_status() {
   task=$1
   block=$(task_block "$task")
   [ -n "$block" ] || fail "missing task: $task"
-  printf '%s\n' "$block" | grep -Eq '^Status: (pending-urgent|in-progress|partial|done|completed)\.$' ||
+  status=$(printf '%s\n' "$block" | awk '/^Status: / { print; exit }')
+  printf '%s\n' "$status" | grep -Eq '^Status: (pending-urgent|in-progress|partial|done|completed|implemented-verified(-[a-z0-9-]+)?)\.$' ||
     fail "$task has invalid urgent status"
-  printf '%s\n' "$block" | grep -Fq 'Prioridade: urgente.' ||
-    fail "$task missing urgent priority"
+  case "$block" in
+    *"Prioridade: urgente."*) ;;
+    *) fail "$task missing urgent priority" ;;
+  esac
 }
 
 require_file "$TASKS"

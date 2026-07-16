@@ -16,6 +16,8 @@ pub const EvidenceEntry = struct {
     }
 };
 
+pub const packet_version = "v1";
+
 pub const EvidencePacket = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(EvidenceEntry),
@@ -37,9 +39,10 @@ pub const EvidencePacket = struct {
     pub fn render(self: *EvidencePacket, allocator: std.mem.Allocator) ![]u8 {
         var out = std.ArrayList(u8).empty;
         errdefer out.deinit(allocator);
-        try out.appendSlice(allocator, "[EVIDENCE]\n");
-        for (self.entries.items) |entry| {
-            const line = try std.fmt.allocPrint(allocator, "- {s} {s} hash={x}\n", .{ entry.source, entry.range, entry.hash });
+        try out.appendSlice(allocator, "[EVIDENCE]\npacket_version=v1 entry_schema=E# kind source range status confidence hash excerpt\n");
+        for (self.entries.items, 0..) |entry, i| {
+            try assertNoRawEvidenceLeak(entry.excerpt);
+            const line = try std.fmt.allocPrint(allocator, "- E{} kind={s} source={s} range={s} status=ok confidence=medium hash={x}\n", .{ i + 1, entry.kind, entry.source, entry.range, entry.hash });
             defer allocator.free(line);
             try out.appendSlice(allocator, line);
             try out.appendSlice(allocator, entry.excerpt);
@@ -82,6 +85,20 @@ fn budgetedExcerpt(allocator: std.mem.Allocator, text: []const u8, max_excerpt_b
     return out.toOwnedSlice(allocator);
 }
 
+fn assertNoRawEvidenceLeak(rendered: []const u8) !void {
+    const forbidden = [_][]const u8{
+        "---BEGIN CONTENT---",
+        "[READ_FILE]",
+        "rawOutput",
+        "raw_output",
+        "rg --json",
+        "SECRET_RAW_TAIL",
+    };
+    for (forbidden) |needle| {
+        if (std.mem.indexOf(u8, rendered, needle) != null) return error.RawContextLeak;
+    }
+}
+
 test "evidence packet renders compact context" {
     var packet = EvidencePacket.init(std.testing.allocator);
     defer packet.deinit();
@@ -95,6 +112,8 @@ test "evidence packet renders compact context" {
     const rendered = try packet.render(std.testing.allocator);
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[EVIDENCE]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "packet_version=v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "E1 kind=file_range source=src/main.zig range=L1-L2 status=ok confidence=medium") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "hash=7b") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "const x = 1;") != null);
 }

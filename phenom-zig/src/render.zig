@@ -620,27 +620,46 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 col_count = @max(col_count, col);
             }
             if (col_count == 0) return;
+            self.capTableWidths(widths[0..col_count]);
             try self.writeTableBorder("┌", "┬", "┐", widths[0..col_count]);
             start = 0;
             var row_index: usize = 0;
             while (nextLine(table, &start)) |line| {
                 if (isTableSeparator(line)) continue;
-                try self.writeContentGutter();
-                try self.writeCyan("│ ");
                 var it = CellIterator.init(line);
+                var cells = [_][]const u8{""} ** 8;
                 var col: usize = 0;
+                var row_lines: usize = 1;
                 while (col < col_count) : (col += 1) {
-                    const cell = if (it.next()) |value| value else "";
-                    if (row_index == 0) try self.writeBoldInlineMarkdown(cell) else try self.writeInlineMarkdown(cell);
-                    const width = visibleMarkdownWidth(cell);
-                    if (width < widths[col]) try self.writeSpaces(widths[col] - width);
-                    try self.writeCyan(" │ ");
+                    cells[col] = if (it.next()) |value| value else "";
+                    row_lines = @max(row_lines, tableCellLineCount(cells[col], widths[col]));
                 }
-                try self.writer.writeAll("\n");
+                var visual_line: usize = 0;
+                while (visual_line < row_lines) : (visual_line += 1) {
+                    try self.writeContentGutter();
+                    try self.writeCyan("│ ");
+                    col = 0;
+                    while (col < col_count) : (col += 1) {
+                        const part = tableCellLineSlice(cells[col], widths[col], visual_line);
+                        if (row_index == 0) try self.writeBoldInlineMarkdown(part.text) else try self.writeInlineMarkdown(part.text);
+                        if (part.width < widths[col]) try self.writeSpaces(widths[col] - part.width);
+                        try self.writeCyan(" │ ");
+                    }
+                    try self.writer.writeAll("\n");
+                }
                 if (row_index == 0) try self.writeTableBorder("├", "┼", "┤", widths[0..col_count]);
                 row_index += 1;
             }
             try self.writeTableBorder("└", "┴", "┘", widths[0..col_count]);
+        }
+
+        fn capTableWidths(self: *Self, widths: []usize) void {
+            if (widths.len == 0) return;
+            const usable = self.contentWrapWidth();
+            const borders = widths.len + 1 + widths.len * 2;
+            const available = if (usable > borders) usable - borders else widths.len;
+            const per_col = @max(@as(usize, 8), available / widths.len);
+            for (widths) |*width| width.* = @min(width.*, per_col);
         }
 
         fn writeTableBorder(self: *Self, left: []const u8, mid: []const u8, right: []const u8, widths: []const usize) !void {
@@ -1220,6 +1239,63 @@ fn visibleTextWidth(text: []const u8) usize {
     return width;
 }
 
+const TableCellSlice = struct {
+    text: []const u8,
+    width: usize,
+};
+
+fn tableCellLineCount(text: []const u8, max_width: usize) usize {
+    if (max_width == 0 or text.len == 0) return 1;
+    var cursor: usize = 0;
+    var count: usize = 0;
+    while (cursor < text.len) : (count += 1) {
+        _ = tableCellNextSlice(text, max_width, &cursor);
+    }
+    return @max(count, 1);
+}
+
+fn tableCellLineSlice(text: []const u8, max_width: usize, line_index: usize) TableCellSlice {
+    if (max_width == 0) return .{ .text = "", .width = 0 };
+    var cursor: usize = 0;
+    var current: usize = 0;
+    while (cursor < text.len) : (current += 1) {
+        const slice = tableCellNextSlice(text, max_width, &cursor);
+        if (current == line_index) return slice;
+    }
+    return .{ .text = "", .width = 0 };
+}
+
+fn tableCellNextSlice(text: []const u8, max_width: usize, cursor: *usize) TableCellSlice {
+    while (cursor.* < text.len and text[cursor.*] == ' ') cursor.* += 1;
+    const start = cursor.*;
+    if (start >= text.len) return .{ .text = "", .width = 0 };
+    var i = start;
+    var width: usize = 0;
+    var last_space: ?usize = null;
+    while (i < text.len) {
+        if (startsWithAt(text, i, "**")) {
+            i += 2;
+            continue;
+        }
+        if (text[i] == '`' or text[i] == '*' or text[i] == '_') {
+            i += 1;
+            continue;
+        }
+        if (text[i] == ' ') last_space = i;
+        const len = utf8ByteLen(text[i]);
+        if (width >= max_width) break;
+        i += len;
+        width += 1;
+    }
+    if (i >= text.len) {
+        cursor.* = text.len;
+        return .{ .text = text[start..text.len], .width = visibleMarkdownWidth(text[start..text.len]) };
+    }
+    const end = if (last_space) |space| if (space > start) space else i else i;
+    cursor.* = if (end < text.len and text[end] == ' ') end + 1 else end;
+    return .{ .text = text[start..end], .width = visibleMarkdownWidth(text[start..end]) };
+}
+
 fn nextLine(text: []const u8, cursor: *usize) ?[]const u8 {
     if (cursor.* >= text.len) return null;
     const start = cursor.*;
@@ -1706,6 +1782,32 @@ test "assistant markdown buffers and renders tables as boxed output" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, " │ src/render.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, " └") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, " Depois") != null);
+}
+
+test "assistant markdown table wraps long cells inside borders" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 44 });
+    try renderer.assistantStart();
+    try renderer.assistantDelta(
+        \\| Nome | Descricao |
+        \\| --- | --- |
+        \\| A | texto longo dentro da celula precisa quebrar sem estourar a borda |
+    );
+    try renderer.done();
+
+    try std.testing.expect(countNeedle(buffer.items, " │ A") == 1);
+    try std.testing.expect(countNeedle(buffer.items, " │  ") >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "estourar") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "borda") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Descricao") != null);
+    var start: usize = 0;
+    while (nextLine(buffer.items, &start)) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(visibleTextWidth(line) <= 43);
+    }
 }
 
 test "assistant markdown split stream keeps incomplete markdown until flush" {

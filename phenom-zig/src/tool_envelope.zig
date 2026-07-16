@@ -208,8 +208,8 @@ test "set operational contract is accepted as model-visible controller tool" {
     try std.testing.expectEqual(true, envelope.call.?.requires_inspection.?);
 }
 
-test "mutation contract still rejects mutation executor until advertised" {
-    const active = contracts.activeContract(.mutate_file) orelse return error.MissingContract;
+test "mutation executor is rejected before contract and accepted by mutation contract" {
+    const initial = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
     const output =
         \\<tool_call>
         \\<function=apply_patch>
@@ -217,10 +217,16 @@ test "mutation contract still rejects mutation executor until advertised" {
         \\</function>
         \\</tool_call>
     ;
-    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
-    defer envelope.deinit(std.testing.allocator);
-    try std.testing.expectEqual(State.rejected, envelope.state);
-    try std.testing.expectEqual(RejectionReason.tool_not_advertised, envelope.rejection_reason.?);
+    var rejected = (try parseFirst(std.testing.allocator, output, initial)) orelse return error.NoToolCall;
+    defer rejected.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.rejected, rejected.state);
+    try std.testing.expectEqual(RejectionReason.tool_not_advertised, rejected.rejection_reason.?);
+
+    const mutation = contracts.activeContract(.mutate_file) orelse return error.MissingContract;
+    var accepted = (try parseFirst(std.testing.allocator, output, mutation)) orelse return error.NoToolCall;
+    defer accepted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.accepted, accepted.state);
+    try std.testing.expectEqualStrings("apply_patch", accepted.raw_name);
 }
 
 test "invalid strategy is a rejected envelope" {
@@ -251,6 +257,29 @@ test "inactive collect evidence strategy is rejected by active contract" {
     defer envelope.deinit(std.testing.allocator);
     try std.testing.expectEqual(State.rejected, envelope.state);
     try std.testing.expectEqual(RejectionReason.invalid_strategy, envelope.rejection_reason.?);
+}
+
+test "persistent promotion only runs under memory contract" {
+    const initial = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
+    const output =
+        \\<tool_call>
+        \\<function=promote_context>
+        \\<parameter=target>skills</parameter>
+        \\<parameter=text>Prefer concise answers.</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    var rejected = (try parseFirst(std.testing.allocator, output, initial)) orelse return error.NoToolCall;
+    defer rejected.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.rejected, rejected.state);
+    try std.testing.expectEqual(RejectionReason.tool_not_advertised, rejected.rejection_reason.?);
+
+    const memory = contracts.activeContract(.memory) orelse return error.MissingContract;
+    var accepted = (try parseFirst(std.testing.allocator, output, memory)) orelse return error.NoToolCall;
+    defer accepted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.accepted, accepted.state);
+    try std.testing.expectEqualStrings("promote_context", accepted.raw_name);
+    try std.testing.expectEqualStrings("skills", accepted.call.?.target.?);
 }
 
 test "envelope audit records contract source parser name and state" {

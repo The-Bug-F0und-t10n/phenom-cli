@@ -4,6 +4,17 @@ const model_context = @import("model_context.zig");
 const max_file_bytes = 32 * 1024;
 const default_max_entries = 24;
 const default_max_entry_bytes = 240;
+const max_promoted_entry_bytes = 240;
+
+pub const PromotionTarget = enum {
+    memory,
+    skills,
+};
+
+pub const Promotion = struct {
+    target: PromotionTarget,
+    text: []const u8,
+};
 
 pub const Loaded = struct {
     allocator: std.mem.Allocator,
@@ -133,6 +144,56 @@ fn containsRawMarker(content: []const u8) bool {
     return false;
 }
 
+pub fn promoteFromCwd(allocator: std.mem.Allocator, io: std.Io, promotion: Promotion) ![]u8 {
+    return promoteFromDir(allocator, io, std.Io.Dir.cwd(), promotion);
+}
+
+pub fn promoteFromDir(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, promotion: Promotion) ![]u8 {
+    const normalized = normalizeLine(promotion.text);
+    if (normalized.len == 0) return error.EmptyPromotion;
+    if (normalized.len > max_promoted_entry_bytes) return error.PromotionTooLarge;
+    if (containsRawMarker(normalized)) return error.RawContextPromotionDenied;
+    const path = switch (promotion.target) {
+        .memory => "MEMORY.md",
+        .skills => "SKILLS.md",
+    };
+
+    const existing = dir.readFileAlloc(io, path, allocator, .limited(max_file_bytes)) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, ""),
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    if (entryExists(existing, normalized)) {
+        return std.fmt.allocPrint(allocator, "target={s} path={s} status=duplicate bytes={}", .{ @tagName(promotion.target), path, normalized.len });
+    }
+
+    var next = std.ArrayList(u8).empty;
+    defer next.deinit(allocator);
+    try next.appendSlice(allocator, existing);
+    if (next.items.len > 0 and !std.mem.endsWith(u8, next.items, "\n")) try next.append(allocator, '\n');
+    try next.appendSlice(allocator, "- ");
+    try next.appendSlice(allocator, normalized);
+    try next.append(allocator, '\n');
+
+    const tmp_path = switch (promotion.target) {
+        .memory => "MEMORY.md.tmp",
+        .skills => "SKILLS.md.tmp",
+    };
+    try dir.writeFile(io, .{ .sub_path = tmp_path, .data = next.items });
+    try dir.rename(tmp_path, dir, path, io);
+
+    return std.fmt.allocPrint(allocator, "target={s} path={s} status=promoted bytes={}", .{ @tagName(promotion.target), path, normalized.len });
+}
+
+fn entryExists(content: []const u8, normalized: []const u8) bool {
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        if (std.mem.eql(u8, normalizeLine(line), normalized)) return true;
+    }
+    return false;
+}
+
 test "persistent context absent files yields empty memory and skills" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -207,4 +268,49 @@ test "persistent context renders through model context only when present" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Nunca use any") != null);
+}
+
+test "promotion writes memory atomically and deduplicates" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const first = try promoteFromDir(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .target = .memory,
+        .text = "Projeto usa EvidencePacket compacto",
+    });
+    defer std.testing.allocator.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "status=promoted") != null);
+
+    const duplicate = try promoteFromDir(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .target = .memory,
+        .text = "Projeto usa EvidencePacket compacto",
+    });
+    defer std.testing.allocator.free(duplicate);
+    try std.testing.expect(std.mem.indexOf(u8, duplicate, "status=duplicate") != null);
+
+    var loaded = try loadFromDir(std.testing.allocator, std.testing.io, tmp.dir);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("Projeto usa EvidencePacket compacto", loaded.memory.items[0]);
+}
+
+test "promotion separates skills and rejects raw tool output" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const audit_body = try promoteFromDir(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .target = .skills,
+        .text = "Nunca use any",
+    });
+    defer std.testing.allocator.free(audit_body);
+    try std.testing.expect(std.mem.indexOf(u8, audit_body, "target=skills") != null);
+
+    try std.testing.expectError(error.RawContextPromotionDenied, promoteFromDir(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .target = .memory,
+        .text = "[TOOL_EVENT]\nraw",
+    }));
+
+    var loaded = try loadFromDir(std.testing.allocator, std.testing.io, tmp.dir);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), loaded.memory.items.len);
+    try std.testing.expectEqualStrings("Nunca use any", loaded.skills.items[0]);
 }

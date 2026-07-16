@@ -335,10 +335,14 @@ pub const AuditDb = struct {
 
         const sql =
             \\select kind, body, cast(strftime('%s', created_at) as integer)
-            \\from events
-            \\where session = ?1
+            \\from (
+            \\  select id, kind, body, created_at
+            \\  from events
+            \\  where session = ?1
+            \\  order by id desc
+            \\  limit ?2
+            \\)
             \\order by id asc
-            \\limit ?2
         ;
         const z_sql = try self.allocator.dupeZ(u8, sql);
         defer self.allocator.free(z_sql);
@@ -400,6 +404,55 @@ pub const AuditDb = struct {
 
         if (c.sqlite3_bind_text(stmt, 1, z_session.ptr, @as(c_int, @intCast(session.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
         if (c.sqlite3_bind_int(stmt, 2, @as(c_int, @intCast(limit))) != c.SQLITE_OK) return error.SqliteBindFailed;
+
+        var events = std.ArrayList(AuditEvent).empty;
+        errdefer freeAuditEvents(allocator, &events);
+
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStepFailed;
+
+            const kind = try dupeColumnText(allocator, stmt, 0);
+            errdefer allocator.free(kind);
+            const body = try dupeColumnText(allocator, stmt, 1);
+            errdefer allocator.free(body);
+            const created_at_unix_s = if (c.sqlite3_column_type(stmt, 2) == c.SQLITE_NULL) null else @as(i64, @intCast(c.sqlite3_column_int64(stmt, 2)));
+            try events.append(allocator, .{ .kind = kind, .body = body, .created_at_unix_s = created_at_unix_s });
+        }
+
+        return events;
+    }
+
+    pub fn loadRecentSessionTurnEvents(self: *AuditDb, allocator: std.mem.Allocator, session: []const u8, turn_limit: usize) !std.ArrayList(AuditEvent) {
+        if (turn_limit > std.math.maxInt(c_int)) return error.EventLimitTooLarge;
+
+        const sql =
+            \\with recent_turns(id) as (
+            \\  select id
+            \\  from events
+            \\  where session = ?1 and kind = 'turn_start'
+            \\  order by id desc
+            \\  limit ?2
+            \\),
+            \\lower_bound(id) as (
+            \\  select coalesce(min(id), (select coalesce(max(id) + 1, 0) from events where session = ?1))
+            \\  from recent_turns
+            \\)
+            \\select kind, body, cast(strftime('%s', created_at) as integer)
+            \\from events, lower_bound
+            \\where session = ?1 and events.id >= lower_bound.id and kind != 'assistant_thinking_delta'
+            \\order by events.id asc
+        ;
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        try bindText(stmt, 1, session);
+        if (c.sqlite3_bind_int(stmt, 2, @as(c_int, @intCast(turn_limit))) != c.SQLITE_OK) return error.SqliteBindFailed;
 
         var events = std.ArrayList(AuditEvent).empty;
         errdefer freeAuditEvents(allocator, &events);
@@ -706,15 +759,25 @@ test "session events load in insertion order" {
     try db.recordEvent("s1", "turn_start", "ola");
     try db.recordEvent("s2", "turn_start", "ignore");
     try db.recordEvent("s1", "assistant_delta", "ok");
+    try db.recordEvent("s1", "turn_done", "status=ok");
 
     var events = try db.loadSessionEvents(std.testing.allocator, "s1", 20);
     defer freeAuditEvents(std.testing.allocator, &events);
 
-    try std.testing.expectEqual(@as(usize, 2), events.items.len);
+    try std.testing.expectEqual(@as(usize, 3), events.items.len);
     try std.testing.expectEqualStrings("turn_start", events.items[0].kind);
     try std.testing.expectEqualStrings("ola", events.items[0].body);
     try std.testing.expectEqualStrings("assistant_delta", events.items[1].kind);
     try std.testing.expectEqualStrings("ok", events.items[1].body);
+    try std.testing.expectEqualStrings("turn_done", events.items[2].kind);
+
+    var recent = try db.loadSessionEvents(std.testing.allocator, "s1", 2);
+    defer freeAuditEvents(std.testing.allocator, &recent);
+
+    try std.testing.expectEqual(@as(usize, 2), recent.items.len);
+    try std.testing.expectEqualStrings("assistant_delta", recent.items[0].kind);
+    try std.testing.expectEqualStrings("ok", recent.items[0].body);
+    try std.testing.expectEqualStrings("turn_done", recent.items[1].kind);
 }
 
 test "session focus stores compact operational turn summaries" {
@@ -808,6 +871,30 @@ test "recent session events ignore thinking noise for dialogue context" {
     try std.testing.expectEqual(@as(usize, 2), events.items.len);
     try std.testing.expectEqualStrings("turn_start", events.items[0].kind);
     try std.testing.expectEqualStrings("assistant_delta", events.items[1].kind);
+}
+
+test "recent session turn events restore newest turns despite old event flood" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordEvent("s1", "turn_start", "Me diga como o livro de Matheus 1 na biblia comprova a existencia de Deus por assinatura divina?");
+    try db.recordEvent("s1", "assistant_delta", "resposta antiga");
+    try db.recordEvent("s1", "turn_done", "status=ok");
+    var i: usize = 0;
+    while (i < 6000) : (i += 1) {
+        try db.recordEvent("s1", "assistant_thinking_delta", "ruido antigo");
+    }
+    try db.recordEvent("s1", "turn_start", "pergunta nova depois de reabrir");
+    try db.recordEvent("s1", "assistant_delta", "resposta nova recuperavel");
+    try db.recordEvent("s1", "turn_done", "status=ok");
+
+    var events = try db.loadRecentSessionTurnEvents(std.testing.allocator, "s1", 1);
+    defer freeAuditEvents(std.testing.allocator, &events);
+
+    try std.testing.expectEqual(@as(usize, 3), events.items.len);
+    try std.testing.expectEqualStrings("pergunta nova depois de reabrir", events.items[0].body);
+    try std.testing.expectEqualStrings("resposta nova recuperavel", events.items[1].body);
+    try std.testing.expectEqualStrings("turn_done", events.items[2].kind);
 }
 
 test "session fts searches body by session and excludes current prompt" {

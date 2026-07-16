@@ -1,11 +1,13 @@
 const std = @import("std");
 
 const audit = @import("audit.zig");
+const apply_patch_tool = @import("apply_patch_tool.zig");
 const cli = @import("cli.zig");
 const collect_evidence = @import("collect_evidence.zig");
 const context_profile = @import("context_profile.zig");
 const contracts = @import("contracts.zig");
 const config_file = @import("config_file.zig");
+const diagnostic_runner = @import("diagnostic_runner.zig");
 const evidence = @import("evidence.zig");
 const fd_writer = @import("fd_writer.zig");
 const gate = @import("gate.zig");
@@ -13,6 +15,7 @@ const http = @import("http.zig");
 const micro_context = @import("micro_context.zig");
 const model_context = @import("model_context.zig");
 const persistent_context = @import("persistent_context.zig");
+const product_guardrails = @import("product_guardrails.zig");
 const reasoning_filter = @import("reasoning_filter.zig");
 const render = @import("render.zig");
 const session_context = @import("session_context.zig");
@@ -190,7 +193,10 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
     var db = try audit.AuditDb.open(allocator, ".phenom-zig/phenom.db");
     defer db.close();
 
-    if (ui_ptr) |active_ui| active_ui.clearTokenUsage();
+    if (ui_ptr) |active_ui| {
+        active_ui.clearTokenUsage();
+        active_ui.setTokenOutputLimit(config.max_tokens);
+    }
     const turn_started_ms = ui_events.monotonicMillis();
     try db.recordEvent(config.session, "turn_start", prompt);
     try events.emit(.{ .user_message = prompt });
@@ -256,6 +262,18 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         );
         defer if (model_context_text) |text| allocator.free(text);
         if (model_context_text) |text| try db.recordEvent(config.session, "model_context", text);
+        if (model_context_text) |text| recordModelContextBudget(allocator, &db, config.session, text) catch |err| {
+            const message = if (err == error.ModelContextBudgetExceeded)
+                "context limit exceeded before model call"
+            else
+                @errorName(err);
+            if (ui_ptr) |active_ui| try active_ui.showStatus(message);
+            try events.emit(.{ .progress_update = message });
+            try db.recordEvent(config.session, "model_error", @errorName(err));
+            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "model_context_error", prompt, sink.visible.items);
+            if (config.fail_on_model_error) return err;
+            return;
+        };
         var dialogue_events = try db.loadRecentSessionEvents(allocator, config.session, 240);
         defer audit.freeAuditEvents(allocator, &dialogue_events);
         var dialogue_messages = try buildRecentChatMessages(allocator, dialogue_events.items, prompt);
@@ -294,6 +312,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             if (!handled_by_tool_loop) try sink.flushDeferredVisible();
         }
         if (sink.visible_bytes == 0) {
+            if (ui_ptr) |active_ui| try active_ui.showStatus("no visible answer; thinking or max tokens");
             try events.emit(.{ .progress_update = "model emitted no visible final answer; reasoning was suppressed or generation ended inside <think>" });
             try db.recordEvent(config.session, "empty_visible_answer", "reasoning_suppressed_or_unclosed");
         }
@@ -368,6 +387,7 @@ fn buildTurnQuality(
     const answered = std.mem.trim(u8, visible, " \t\r\n").len > 0;
     var used_session_context = false;
     var used_evidence = false;
+    var used_persistent_context = false;
     var session_recall_contract = false;
     var initial_context_tool_required = false;
     for (turn_events.items) |event| {
@@ -375,12 +395,14 @@ fn buildTurnQuality(
         if (std.mem.eql(u8, event.kind, "evidence")) used_evidence = true;
         if (std.mem.eql(u8, event.kind, "tool_start") and std.mem.startsWith(u8, event.body, "search_session")) used_session_context = true;
         if (std.mem.eql(u8, event.kind, "tool_start") and std.mem.startsWith(u8, event.body, "collect_evidence")) used_evidence = true;
+        if (std.mem.eql(u8, event.kind, "persistent_promotion")) used_persistent_context = true;
+        if (std.mem.eql(u8, event.kind, "tool_start") and std.mem.startsWith(u8, event.body, "promote_context")) used_persistent_context = true;
         if (std.mem.eql(u8, event.kind, "model_context") and std.mem.indexOf(u8, event.body, "mode: session_recall") != null) session_recall_contract = true;
         if (std.mem.eql(u8, event.kind, "model_context") and initialContextRequiresTool(event.body)) initial_context_tool_required = true;
     }
     const ok_status = std.mem.eql(u8, status, "ok");
     const contract_missing_context = session_recall_contract and !used_session_context;
-    const context_tool_missing = initial_context_tool_required and !used_session_context and !used_evidence;
+    const context_tool_missing = initial_context_tool_required and !used_session_context and !used_evidence and !used_persistent_context;
     const low_confidence = !ok_status or !answered or contract_missing_context;
     const effective_low_confidence = low_confidence or context_tool_missing;
     const quality: []const u8 = if (!ok_status or !answered)
@@ -391,8 +413,8 @@ fn buildTurnQuality(
         "confirmed";
     const flags = try std.fmt.allocPrint(
         allocator,
-        "answered={} used_session_context={} used_evidence={} refusal=false contradicted_context=false contract_missing_context={} context_tool_missing={} low_confidence={}",
-        .{ answered, used_session_context, used_evidence, contract_missing_context, context_tool_missing, effective_low_confidence },
+        "answered={} used_session_context={} used_evidence={} used_persistent_context={} refusal=false contradicted_context=false contract_missing_context={} context_tool_missing={} low_confidence={}",
+        .{ answered, used_session_context, used_evidence, used_persistent_context, contract_missing_context, context_tool_missing, effective_low_confidence },
     );
     errdefer allocator.free(flags);
     return .{
@@ -514,13 +536,18 @@ fn loadMergedSessionFocus(
     defer if (stored_focus_text) |text| allocator.free(text);
     const fallback_focus_text = try session_context.renderFallbackSessionFocusFromEvents(allocator, session_events, prompt);
     defer if (fallback_focus_text) |text| allocator.free(text);
-    return try session_context.mergeSessionFocus(allocator, stored_focus_text, fallback_focus_text);
+    const long_summary_text = try session_context.renderLongSessionSummary(allocator, session_events, prompt);
+    defer if (long_summary_text) |text| allocator.free(text);
+    const fallback_context_text = try session_context.mergeSessionFocus(allocator, fallback_focus_text, long_summary_text);
+    defer if (fallback_context_text) |text| allocator.free(text);
+    return try session_context.mergeSessionFocus(allocator, stored_focus_text, fallback_context_text);
 }
 
 const max_tool_emergency_iterations = 8;
 const max_tool_repairs = 1;
 const max_duplicate_tool_repairs = 1;
 const max_pathless_collect_budget: usize = 6 * 1024;
+const max_model_context_send_bytes: usize = 24 * 1024;
 
 const ToolLoopNext = union(enum) {
     final_answer,
@@ -668,6 +695,18 @@ fn runOneToolLoopStep(
     if (std.mem.eql(u8, call.name, "search_session")) {
         return try runSearchSessionStep(allocator, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
     }
+    if (std.mem.eql(u8, call.name, "apply_patch")) {
+        return try runApplyPatchStep(allocator, io, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
+    }
+    if (std.mem.eql(u8, call.name, "validate_syntax")) {
+        return try runValidateSyntaxStep(allocator, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
+    }
+    if (std.mem.eql(u8, call.name, "inspect_runtime")) {
+        return try runInspectRuntimeStep(allocator, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
+    }
+    if (std.mem.eql(u8, call.name, "promote_context")) {
+        return try runPromoteContextStep(allocator, io, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
+    }
     if (!std.mem.eql(u8, call.name, "collect_evidence")) {
         try db.recordEvent(config.session, "tool_rejected", call.name);
         return .stopped;
@@ -701,7 +740,7 @@ fn runOneToolLoopStep(
         const repair_context = try model_context.renderModelTurnContext(allocator, .{
             .task = prompt,
             .contracts = if (state.contract_selected)
-                context_profile.toolSchema(.code_evidence, .active_contract)
+                activeToolSchema(state)
             else
                 context_profile.toolSchema(.code_evidence, .initial),
             .obligations = &.{
@@ -727,7 +766,7 @@ fn runOneToolLoopStep(
             allocator,
             prompt,
             if (state.contract_selected)
-                context_profile.toolSchema(.code_evidence, .active_contract)
+                activeToolSchema(state)
             else
                 context_profile.toolSchema(.code_evidence, .initial),
         );
@@ -786,11 +825,14 @@ fn runOneToolLoopStep(
     const result = collect_evidence.execute(allocator, io, .{
         .path = path,
         .intent = call.intent,
+        .need = call.need,
         .terms = call.terms,
+        .target_files = call.target_files,
+        .scope_root = call.scope_root,
         .task = prompt,
         .strategy = strategy,
         .start_line = call.start_line,
-        .max_lines = call.max_lines,
+        .max_lines = if (isCollectEvidenceStage(call, "minimum")) @min(call.max_lines, @as(usize, 8)) else call.max_lines,
         .budget_bytes = collectEvidenceExecutionBudget(path, state.remainingBudget()),
     }) catch |err| {
         try db.recordEvent(config.session, "tool_error", @errorName(err));
@@ -810,10 +852,12 @@ fn runOneToolLoopStep(
     };
     defer result.deinit(allocator);
 
+    const model_evidence = try renderEvidenceAndMicroContext(allocator, result.evidence_text, result.micro_context_text);
+    defer allocator.free(model_evidence);
     try db.recordEvent(config.session, "tool_event", result.tool_event_audit_text);
-    try db.recordEvent(config.session, "evidence", result.evidence_text);
-    try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = result.evidence_text } });
-    try state.rememberExecutedArgs(path, call.terms, strategy, call.start_line, call.max_lines, result.context_id, result.evidence_text, result.model_bytes, result.quality_score);
+    try db.recordEvent(config.session, "evidence", model_evidence);
+    try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = model_evidence } });
+    try state.rememberExecutedArgs(path, call.terms, strategy, call.start_line, call.max_lines, result.context_id, model_evidence, result.model_bytes, result.quality_score);
     const working_add = try std.fmt.allocPrint(
         allocator,
         "path={s} terms_bytes={} strategy={s} compact={} model_bytes={} quality={}",
@@ -833,7 +877,7 @@ fn runOneToolLoopStep(
         null,
         null,
         if (state.shouldAllowMoreEvidence())
-            context_profile.toolSchema(.code_evidence, .active_contract)
+            activeToolSchema(state)
         else
             context_profile.toolSchema(.code_evidence, .after_collect_evidence),
         if (state.shouldAllowMoreEvidence())
@@ -853,7 +897,22 @@ fn collectEvidenceNeedsSearchIntentRepair(
     strategy: contracts.StrategyName,
 ) bool {
     if (effective_path != null or strategy == .path) return false;
-    return call.intent == null or call.terms == null or isSchemaPlaceholderText(call.intent.?) or isSchemaPlaceholderText(call.terms.?);
+    if (call.intent == null or isSchemaPlaceholderText(call.intent.?)) return true;
+    if (!collectEvidenceHasSearchTerms(call)) return true;
+    if (call.terms) |value| if (isSchemaPlaceholderText(value)) return true;
+    if (call.need) |value| if (isSchemaPlaceholderText(value)) return true;
+    if (call.target_files) |value| if (isSchemaPlaceholderText(value)) return true;
+    if (call.scope_root) |value| if (isSchemaPlaceholderText(value)) return true;
+    return false;
+}
+
+fn collectEvidenceHasSearchTerms(call: *const tool_call.ToolCall) bool {
+    return hasNonEmptyText(call.terms) or hasNonEmptyText(call.need) or hasNonEmptyText(call.target_files) or hasNonEmptyText(call.scope_root);
+}
+
+fn hasNonEmptyText(value: ?[]const u8) bool {
+    const text = std.mem.trim(u8, value orelse return false, " \t\r\n");
+    return text.len > 0;
 }
 
 fn isSchemaPlaceholderText(text: []const u8) bool {
@@ -865,6 +924,8 @@ fn isSchemaPlaceholderText(text: []const u8) bool {
         "SymbolName FileName ErrorCode",
         "TopicName EntityName DecisionKey",
         "ConcreteSymbolOrPathTerms",
+        "target files",
+        "scope root",
     };
     for (placeholders) |placeholder| {
         if (std.ascii.eqlIgnoreCase(trimmed, placeholder)) return true;
@@ -915,7 +976,10 @@ fn runCollectEvidenceCandidatesStep(
 
     var result = collect_evidence.executeCandidates(allocator, io, .{
         .intent = call.intent,
+        .need = call.need,
         .terms = call.terms,
+        .target_files = call.target_files,
+        .scope_root = call.scope_root,
         .task = prompt,
         .strategy = strategy,
         .budget_bytes = collectEvidenceExecutionBudget(null, state.remainingBudget()),
@@ -970,7 +1034,7 @@ fn runCollectEvidenceExpandStep(
     state: *ToolLoopState,
     tool_iterations: *usize,
 ) !ToolLoopNext {
-    const selected = call.selected_candidate orelse {
+    const selected = call.selected_candidate orelse firstSelectedCandidate(call.selected_candidates) orelse {
         try db.recordEvent(config.session, "tool_repair", "collect_evidence expand missing selectedCandidate");
         const repair_context = try renderCandidateSelectionContext(
             allocator,
@@ -1055,10 +1119,12 @@ fn runCollectEvidenceExpandStep(
     };
     defer result.deinit(allocator);
 
+    const model_evidence = try renderEvidenceAndMicroContext(allocator, result.evidence_text, result.micro_context_text);
+    defer allocator.free(model_evidence);
     try db.recordEvent(config.session, "tool_event", result.tool_event_audit_text);
-    try db.recordEvent(config.session, "evidence", result.evidence_text);
-    try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = result.evidence_text } });
-    try state.rememberExecutedArgs(candidate.path, call.terms, .path, candidate.start_line, max_lines, result.context_id, result.evidence_text, result.model_bytes, result.quality_score);
+    try db.recordEvent(config.session, "evidence", model_evidence);
+    try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = model_evidence } });
+    try state.rememberExecutedArgs(candidate.path, call.terms, .path, candidate.start_line, max_lines, result.context_id, model_evidence, result.model_bytes, result.quality_score);
 
     const follow_context = try renderCollectedEvidenceContext(
         allocator,
@@ -1067,7 +1133,7 @@ fn runCollectEvidenceExpandStep(
         null,
         null,
         if (state.shouldAllowMoreEvidence())
-            context_profile.toolSchema(.code_evidence, .active_contract)
+            activeToolSchema(state)
         else
             context_profile.toolSchema(.code_evidence, .after_collect_evidence),
         "Answer using only cited E# evidence from the expanded candidate. If evidence is insufficient and budget remains, emit one more collect_evidence call with a different selectedCandidate or refined intent+terms.",
@@ -1075,6 +1141,14 @@ fn runCollectEvidenceExpandStep(
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
     return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+fn firstSelectedCandidate(selected_candidates: ?[]const u8) ?[]const u8 {
+    var raw = selected_candidates orelse return null;
+    raw = std.mem.trim(u8, raw, " \t\r\n");
+    if (raw.len == 0) return null;
+    var it = std.mem.tokenizeAny(u8, raw, " ,;\t\r\n");
+    return it.next();
 }
 
 fn renderCandidateSelectionContext(
@@ -1095,7 +1169,7 @@ fn renderCandidateSelectionContext(
     }
     return model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
-        .contracts = context_profile.toolSchema(.code_evidence, .active_contract),
+        .contracts = activeToolSchema(state),
         .obligations = &.{
             "No candidate list is active in this turn.",
             "Do not guess a selectedCandidate that was not returned by collect_evidence stage=candidates.",
@@ -1133,7 +1207,7 @@ fn runSetOperationalContractStep(
         try db.recordEvent(config.session, "contract_duplicate", "set_operational_contract");
         const duplicate_context = try model_context.renderModelTurnContext(allocator, .{
             .task = prompt,
-            .contracts = context_profile.toolSchema(.code_evidence, .active_contract),
+            .contracts = activeToolSchema(state),
             .obligations = &.{
                 "The operational contract was already selected in this turn.",
                 "Do not call set_operational_contract again unless a later tool result changes the operational need.",
@@ -1170,6 +1244,7 @@ fn runSetOperationalContractStep(
         .requires_mutation = call.requires_mutation.?,
         .requires_runtime_validation = call.requires_runtime_validation.?,
         .requires_browser_diagnostics = call.requires_browser_diagnostics.?,
+        .requires_memory_promotion = call.requires_memory_promotion orelse false,
     };
     const selected_name = contracts.selectOperationalContract(request);
     const selected = contracts.activeContract(selected_name) orelse return error.MissingContract;
@@ -1198,17 +1273,365 @@ fn runSetOperationalContractStep(
 
     const follow_context = try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
-        .contracts = context_profile.toolSchema(.code_evidence, .active_contract),
+        .contracts = activeToolSchema(state),
         .obligations = &.{
             "The operational contract is now active for this turn.",
-            "Only advertised tools may be called. Future mutation/validation executors remain blocked until their contracts are implemented.",
+            "Only advertised tools may be called. The controller rejects tools outside the selected contract.",
         },
         .grounding = groundingRules(),
-        .next_action = "Proceed inside the active contract. If workspace evidence is needed, call collect_evidence with model-chosen terms/path. Do not call mutation tools unless they are advertised.",
+        .next_action = "Proceed inside the active contract. If workspace evidence is needed, call collect_evidence with model-chosen terms/path. If mutating from collected context, include contextId in apply_patch.",
     });
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
     return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+fn runApplyPatchStep(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: cli.Config,
+    prompt: []const u8,
+    call: *const tool_call.ToolCall,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    tool_iterations: *usize,
+) !ToolLoopNext {
+    if (tool_iterations.* >= max_tool_emergency_iterations) return .stopped;
+    tool_iterations.* += 1;
+
+    const path = call.path orelse return try repairPatchCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "apply_patch requires path.");
+    const operation = parsePatchOperation(call.operation) catch return try repairPatchCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "apply_patch operation must be edit, create, delete, or rename.");
+    const patch_args = buildPatchArgs(allocator, operation, path, call) catch |err| {
+        return try repairPatchCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, @errorName(err));
+    };
+    defer if (patch_args.hunks.len > 0) allocator.free(patch_args.hunks);
+
+    if (ui_ptr) |active_ui| try active_ui.showStatus("Writing");
+    const tool_start = try std.fmt.allocPrint(allocator, "apply_patch operation={s} path={s}", .{ @tagName(operation), path });
+    defer allocator.free(tool_start);
+    try db.recordEvent(config.session, "tool_start", tool_start);
+    try events.emit(.{ .tool_start = .{ .name = "apply_patch", .detail = path } });
+
+    const result = apply_patch_tool.execute(allocator, io, patch_args, &state.context) catch |err| {
+        try db.recordEvent(config.session, "tool_error", @errorName(err));
+        try events.emit(.{ .tool_result = .{ .name = "apply_patch", .output = @errorName(err) } });
+        const repair_context = try model_context.renderModelTurnContext(allocator, .{
+            .task = prompt,
+            .contracts = activeToolSchema(state),
+            .obligations = &.{
+                "Patch failed. If the context is stale, recollect evidence before another patch.",
+                "For edit, every search must be exact and unique in the original file. For delete/rename, include fresh contextId.",
+            },
+            .grounding = groundingRules(),
+            .next_action = "Emit one corrected apply_patch call, or collect_evidence again if context is stale.",
+        });
+        defer allocator.free(repair_context);
+        try db.recordEvent(config.session, "model_context", repair_context);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    };
+    defer result.deinit(allocator);
+
+    try db.recordEvent(config.session, "tool_event", result.audit_text);
+    try db.recordEvent(config.session, "patch_result", result.text);
+    try events.emit(.{ .tool_result = .{ .name = "apply_patch", .output = result.text } });
+
+    const follow_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = context_profile.activeContractSchemaFor(.validate_work),
+        .obligations = &.{
+            "Patch has been applied. Validate changed code when possible before final answer.",
+        },
+        .grounding = groundingRules(),
+        .next_action = "Call validate_syntax for changed Zig files, or answer with the patch result if validation is not applicable.",
+    });
+    defer allocator.free(follow_context);
+    try db.recordEvent(config.session, "model_context", follow_context);
+    state.active_contract = contracts.activeContract(.validate_work).?;
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+fn repairPatchCall(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    reason: []const u8,
+) !ToolLoopNext {
+    try db.recordEvent(config.session, "tool_repair", reason);
+    const repair_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = activeToolSchema(state),
+        .obligations = &.{reason},
+        .grounding = groundingRules(),
+        .next_action = "Emit one corrected apply_patch call. For edit use path, contextId, repeated search/replace hunks. For create use operation=create and content. For delete/rename use fresh contextId.",
+    });
+    defer allocator.free(repair_context);
+    try db.recordEvent(config.session, "model_context", repair_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+fn parsePatchOperation(value: ?[]const u8) !apply_patch_tool.Operation {
+    const operation = value orelse return .edit;
+    if (std.ascii.eqlIgnoreCase(operation, "edit")) return .edit;
+    if (std.ascii.eqlIgnoreCase(operation, "create")) return .create;
+    if (std.ascii.eqlIgnoreCase(operation, "delete")) return .delete;
+    if (std.ascii.eqlIgnoreCase(operation, "rename")) return .rename;
+    return error.InvalidPatchOperation;
+}
+
+fn buildPatchArgs(
+    allocator: std.mem.Allocator,
+    operation: apply_patch_tool.Operation,
+    path: []const u8,
+    call: *const tool_call.ToolCall,
+) !apply_patch_tool.Args {
+    return switch (operation) {
+        .edit => .{
+            .operation = .edit,
+            .path = path,
+            .hunks = try buildEditHunks(allocator, call),
+        },
+        .create => .{
+            .operation = .create,
+            .path = path,
+            .content = call.content orelse return error.MissingPatchContent,
+            .hunks = &.{},
+        },
+        .delete => .{
+            .operation = .delete,
+            .path = path,
+            .hunks = try buildContextOnlyHunk(allocator, call),
+        },
+        .rename => .{
+            .operation = .rename,
+            .path = path,
+            .destination_path = call.destination_path orelse return error.MissingPatchDestination,
+            .hunks = try buildContextOnlyHunk(allocator, call),
+        },
+    };
+}
+
+fn buildEditHunks(allocator: std.mem.Allocator, call: *const tool_call.ToolCall) ![]const apply_patch_tool.Hunk {
+    const searches = call.searches;
+    const replaces = call.replaces;
+    if (searches.len == 0) return error.MissingPatchSearch;
+    if (searches.len != replaces.len) return error.PatchHunkCountMismatch;
+    if (call.context_ids.len != 1 and call.context_ids.len != searches.len) return error.PatchContextCountMismatch;
+
+    const hunks = try allocator.alloc(apply_patch_tool.Hunk, searches.len);
+    errdefer allocator.free(hunks);
+    for (searches, 0..) |search, idx| {
+        hunks[idx] = .{
+            .search = search,
+            .replace = replaces[idx],
+            .context_id = if (call.context_ids.len == 1) call.context_ids[0] else call.context_ids[idx],
+        };
+    }
+    return hunks;
+}
+
+fn buildContextOnlyHunk(allocator: std.mem.Allocator, call: *const tool_call.ToolCall) ![]const apply_patch_tool.Hunk {
+    const context_id = if (call.context_ids.len > 0) call.context_ids[0] else return error.MissingPatchContextId;
+    const hunks = try allocator.alloc(apply_patch_tool.Hunk, 1);
+    hunks[0] = .{ .search = "", .replace = "", .context_id = context_id };
+    return hunks;
+}
+
+fn runValidateSyntaxStep(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    call: *const tool_call.ToolCall,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    tool_iterations: *usize,
+) !ToolLoopNext {
+    if (tool_iterations.* >= max_tool_emergency_iterations) return .stopped;
+    tool_iterations.* += 1;
+    const path = call.path orelse return try repairValidationCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state);
+
+    try db.recordEvent(config.session, "tool_start", "validate_syntax");
+    try events.emit(.{ .tool_start = .{ .name = "validate_syntax", .detail = path } });
+    const diagnostic = diagnostic_runner.run(allocator, path, state.remainingBudget()) catch |err| {
+        try db.recordEvent(config.session, "tool_error", @errorName(err));
+        try events.emit(.{ .tool_result = .{ .name = "validate_syntax", .output = @errorName(err) } });
+        return .stopped;
+    };
+    defer diagnostic.deinit(allocator);
+
+    var packet = evidence.EvidencePacket.init(allocator);
+    defer packet.deinit();
+    try packet.add(try collect_evidence.cloneEvidenceEntry(allocator, diagnostic.entry));
+    const evidence_text = try packet.render(allocator);
+    defer allocator.free(evidence_text);
+    try db.recordEvent(config.session, "tool_event", diagnostic.audit_text);
+    try db.recordEvent(config.session, "validation", evidence_text);
+    try events.emit(.{ .tool_result = .{ .name = "validate_syntax", .output = evidence_text } });
+
+    const validation_block = [_]model_context.EvidenceBlock{.{ .text = evidence_text }};
+    const follow_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .evidence = &validation_block,
+        .grounding = groundingRules(),
+        .next_action = "Answer with the patch and validation result. Cite validation evidence if it reports errors.",
+    });
+    defer allocator.free(follow_context);
+    try db.recordEvent(config.session, "model_context", follow_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+fn repairValidationCall(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+) !ToolLoopNext {
+    try db.recordEvent(config.session, "tool_repair", "validate_syntax missing path");
+    const repair_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = activeToolSchema(state),
+        .obligations = &.{"validate_syntax requires path."},
+        .next_action = "Emit validate_syntax with a relative Zig path, or answer if validation is not applicable.",
+    });
+    defer allocator.free(repair_context);
+    try db.recordEvent(config.session, "model_context", repair_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+fn runInspectRuntimeStep(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    call: *const tool_call.ToolCall,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    tool_iterations: *usize,
+) !ToolLoopNext {
+    _ = call;
+    if (tool_iterations.* >= max_tool_emergency_iterations) return .stopped;
+    tool_iterations.* += 1;
+    const result =
+        \\[RUNTIME_INSPECTION]
+        \\status=unavailable
+        \\reason=runtime/browser executor is not implemented in this Zig controller pass
+    ;
+    try db.recordEvent(config.session, "tool_event", result);
+    try events.emit(.{ .tool_result = .{ .name = "inspect_runtime", .output = result } });
+    const follow_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .obligations = &.{"Runtime/browser inspection is unavailable in this controller pass; do not claim it ran."},
+        .grounding = groundingRules(),
+        .next_action = "Answer with available evidence and state that runtime inspection was not executed.",
+    });
+    defer allocator.free(follow_context);
+    try db.recordEvent(config.session, "model_context", follow_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+fn runPromoteContextStep(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: cli.Config,
+    prompt: []const u8,
+    call: *const tool_call.ToolCall,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    tool_iterations: *usize,
+) !ToolLoopNext {
+    if (tool_iterations.* >= max_tool_emergency_iterations) return .stopped;
+    tool_iterations.* += 1;
+
+    const target = call.target orelse return try repairPromoteContextCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "promote_context requires target=memory|skills.");
+    const text = call.text orelse return try repairPromoteContextCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "promote_context requires concise text to persist.");
+    const promotion_target: persistent_context.PromotionTarget = if (std.ascii.eqlIgnoreCase(target, "memory"))
+        .memory
+    else if (std.ascii.eqlIgnoreCase(target, "skills"))
+        .skills
+    else
+        return try repairPromoteContextCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "promote_context target must be memory or skills.");
+
+    try db.recordEvent(config.session, "tool_start", "promote_context");
+    try events.emit(.{ .tool_start = .{ .name = "promote_context", .detail = @tagName(promotion_target) } });
+    const result = persistent_context.promoteFromCwd(allocator, io, .{
+        .target = promotion_target,
+        .text = text,
+    }) catch |err| {
+        try db.recordEvent(config.session, "tool_error", @errorName(err));
+        try events.emit(.{ .tool_result = .{ .name = "promote_context", .output = @errorName(err) } });
+        const repair_context = try model_context.renderModelTurnContext(allocator, .{
+            .task = prompt,
+            .contracts = activeToolSchema(state),
+            .obligations = &.{"Promotion failed. Do not promote raw tool output, oversized entries, or unverified claims."},
+            .grounding = groundingRules(),
+            .next_action = "Emit corrected promote_context with target=memory|skills and short verified text, or answer without promotion.",
+        });
+        defer allocator.free(repair_context);
+        try db.recordEvent(config.session, "model_context", repair_context);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    };
+    defer allocator.free(result);
+
+    try db.recordEvent(config.session, "persistent_promotion", result);
+    try events.emit(.{ .tool_result = .{ .name = "promote_context", .output = result } });
+    const follow_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .grounding = groundingRules(),
+        .next_action = "Answer that the explicit persistent context promotion was recorded. Do not claim raw tool output was stored.",
+    });
+    defer allocator.free(follow_context);
+    try db.recordEvent(config.session, "model_context", follow_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+fn repairPromoteContextCall(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    reason: []const u8,
+) !ToolLoopNext {
+    try db.recordEvent(config.session, "tool_repair", reason);
+    const repair_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = activeToolSchema(state),
+        .obligations = &.{reason},
+        .grounding = groundingRules(),
+        .next_action = "Emit promote_context(target=memory|skills,text) with explicit user-confirmed content, or answer without promotion.",
+    });
+    defer allocator.free(repair_context);
+    try db.recordEvent(config.session, "model_context", repair_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
 }
 
 fn runSearchSessionStep(
@@ -1374,6 +1797,40 @@ fn renderAllowedTools(allocator: std.mem.Allocator, allowed_tools: []const []con
     return out.toOwnedSlice(allocator);
 }
 
+fn recordModelContextBudget(
+    allocator: std.mem.Allocator,
+    db: *audit.AuditDb,
+    session: []const u8,
+    rendered: []const u8,
+) !void {
+    try model_context.assertNoRawContextLeak(rendered);
+    const buckets = model_context.measureRenderedContextBytes(rendered);
+    if (buckets.total_context > max_model_context_send_bytes) return error.ModelContextBudgetExceeded;
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "pre_send=true tokenizer=unavailable token_estimate=false system_bytes={} header_bytes={} contracts_bytes={} skills_bytes={} memory_bytes={} candidates_bytes={} evidence_bytes={} focus_bytes={} dialogue_bytes={} session_bytes={} obligations_bytes={} grounding_bytes={} next_action_bytes={} total_context_bytes={} context_limit_bytes={}",
+        .{
+            buckets.system,
+            buckets.header,
+            buckets.contracts,
+            buckets.skills,
+            buckets.memory,
+            buckets.candidates,
+            buckets.evidence,
+            buckets.focus,
+            buckets.dialogue,
+            buckets.session,
+            buckets.obligations,
+            buckets.grounding,
+            buckets.next_action,
+            buckets.total_context,
+            max_model_context_send_bytes,
+        },
+    );
+    defer allocator.free(body);
+    try db.recordEvent(session, "model_context_budget", body);
+}
+
 fn streamDeferredToolLoopTurn(
     allocator: std.mem.Allocator,
     config: cli.Config,
@@ -1442,7 +1899,10 @@ fn streamDeferredToolLoopTurnInternal(
     aggregate_sink: *StreamSink,
     active_contract: contracts.ActiveContract,
 ) !ToolLoopNext {
-    if (ui_ptr) |active_ui| try active_ui.showStatus("Thinking");
+    if (ui_ptr) |active_ui| {
+        active_ui.setTokenOutputLimit(config.max_tokens);
+        try active_ui.showStatus("Thinking");
+    }
     var follow_sink = StreamSink{
         .allocator = allocator,
         .events = events,
@@ -1457,6 +1917,16 @@ fn streamDeferredToolLoopTurnInternal(
         .trim_visible_leading_whitespace = false,
     };
     defer follow_sink.deinit();
+    recordModelContextBudget(allocator, db, config.session, follow_context) catch |err| {
+        const message = if (err == error.ModelContextBudgetExceeded)
+            "context limit exceeded before model call"
+        else
+            @errorName(err);
+        if (ui_ptr) |active_ui| try active_ui.showStatus(message);
+        try events.emit(.{ .progress_update = message });
+        try db.recordEvent(config.session, "model_error", @errorName(err));
+        return .stopped;
+    };
     try client.streamInference(.{ .user_prompt = prompt, .model_context = follow_context }, &follow_sink);
     try follow_sink.flush();
 
@@ -1742,11 +2212,20 @@ fn renderCollectedEvidenceContext(
     });
 }
 
+fn renderEvidenceAndMicroContext(allocator: std.mem.Allocator, evidence_text: []const u8, micro_context_text: []const u8) ![]u8 {
+    if (micro_context_text.len == 0) return allocator.dupe(u8, evidence_text);
+    return std.fmt.allocPrint(allocator, "{s}\n{s}", .{ evidence_text, micro_context_text });
+}
+
 fn collectEvidenceToolSchema(include_contract_tool: bool) []const u8 {
     return if (include_contract_tool)
         context_profile.toolSchema(.code_evidence, .initial)
     else
         context_profile.toolSchema(.code_evidence, .active_contract);
+}
+
+fn activeToolSchema(state: *const ToolLoopState) []const u8 {
+    return context_profile.activeContractSchemaFor(state.active_contract.name);
 }
 
 fn groundingRules() []const []const u8 {
@@ -1780,7 +2259,7 @@ fn renderRestoredSession(
     crlf: bool,
     write_mutex: ?*std.atomic.Mutex,
 ) !usize {
-    var events = try db.loadSessionEvents(allocator, session, 5000);
+    var events = try db.loadRecentSessionTurnEvents(allocator, session, max_restored_session_turns);
     defer audit.freeAuditEvents(allocator, &events);
     if (events.items.len == 0) return 0;
 
@@ -1801,45 +2280,62 @@ fn renderRestoredSession(
 
     var restored_turn_open = false;
     var restored_turn_started_s: ?i64 = null;
+    var restored_assistant = std.ArrayList(u8).empty;
+    defer restored_assistant.deinit(allocator);
     for (events.items) |event| {
         if (std.mem.eql(u8, event.kind, "turn_start")) {
-            if (restored_turn_open) try bus.emit(.{ .think_end = {} });
+            if (restored_turn_open) {
+                try flushRestoredAssistant(&bus, &restored_assistant);
+                try bus.emit(.{ .think_end = {} });
+            }
             try bus.emit(.{ .user_message = event.body });
             try bus.emit(.{ .think_start = "Thinking" });
             restored_turn_open = true;
             restored_turn_started_s = event.created_at_unix_s;
-        } else if (std.mem.eql(u8, event.kind, "assistant_thinking_delta")) {
-            try bus.emit(.{ .reasoning_chunk = event.body });
-            restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "assistant_delta") or std.mem.eql(u8, event.kind, "assistant_offline_stub")) {
-            try bus.emit(.{ .message_chunk = event.body });
+            try restored_assistant.appendSlice(allocator, event.body);
             restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "tool_start")) {
+            try flushRestoredAssistant(&bus, &restored_assistant);
             const parsed = parseRestoredToolStart(event.body);
             try bus.emit(.{ .tool_start = .{ .name = parsed.name, .detail = parsed.detail } });
             restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "evidence")) {
+            try flushRestoredAssistant(&bus, &restored_assistant);
             try bus.emit(.{ .tool_result = .{ .name = "read_file_range", .output = event.body } });
             restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "model_error")) {
+            try flushRestoredAssistant(&bus, &restored_assistant);
             try bus.emit(.{ .progress_update = event.body });
             restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "empty_visible_answer")) {
+            try flushRestoredAssistant(&bus, &restored_assistant);
             try bus.emit(.{ .progress_update = "model emitted no visible final answer; reasoning was suppressed or generation ended inside <think>" });
             restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "expectation_failed")) {
+            try flushRestoredAssistant(&bus, &restored_assistant);
             try bus.emit(.{ .progress_update = event.body });
             restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "expectation_passed")) {
             restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "turn_done")) {
+            try flushRestoredAssistant(&bus, &restored_assistant);
             try bus.emit(.{ .turn_done = .{ .elapsed_ms = restoredElapsedMs(event.body, restored_turn_started_s, event.created_at_unix_s) } });
             restored_turn_open = false;
             restored_turn_started_s = null;
         }
     }
-    if (restored_turn_open) try bus.emit(.{ .think_end = {} });
+    if (restored_turn_open) {
+        try flushRestoredAssistant(&bus, &restored_assistant);
+        try bus.emit(.{ .think_end = {} });
+    }
     return events.items.len;
+}
+
+fn flushRestoredAssistant(bus: *ui_events.EventBus, pending: *std.ArrayList(u8)) !void {
+    if (pending.items.len == 0) return;
+    try bus.emit(.{ .message_chunk = pending.items });
+    pending.clearRetainingCapacity();
 }
 
 const RestoredToolStart = struct {
@@ -1892,6 +2388,7 @@ fn loadHistoryFromDb(allocator: std.mem.Allocator, db: *audit.AuditDb, ui: anyty
 const max_chat_history_messages: usize = 8;
 const max_chat_message_bytes: usize = 1200;
 const chat_truncated_marker = " [TRUNCATED]";
+const max_restored_session_turns: usize = 40;
 
 fn buildRecentChatMessages(allocator: std.mem.Allocator, events: []const audit.AuditEvent, current_prompt: []const u8) !std.ArrayList(http.ChatMessage) {
     var messages = std.ArrayList(http.ChatMessage).empty;
@@ -2104,6 +2601,7 @@ fn makeDirIfMissing(path: []const u8) !void {
 
 test {
     _ = audit;
+    _ = apply_patch_tool;
     _ = cli;
     _ = collect_evidence;
     _ = contracts;
@@ -2114,6 +2612,7 @@ test {
     _ = micro_context;
     _ = model_context;
     _ = persistent_context;
+    _ = product_guardrails;
     _ = reasoning_filter;
     _ = render;
     _ = tool_call;
@@ -2153,6 +2652,17 @@ test "restored sqlite session is rendered through styled transcript events" {
     try db.recordEvent("restore", "tool_start", "read_file_range\tREADME.md");
     try db.recordEvent("restore", "evidence", "[EVIDENCE]\nREADME.md:1\n");
     try db.recordEvent("restore", "assistant_delta", "resposta");
+    try db.recordEvent("restore", "assistant_delta",
+        \\
+        \\# Plano
+        \\- Item com **ne
+    );
+    try db.recordEvent("restore", "assistant_delta",
+        \\grito** e `codigo`
+        \\| Arquivo | Estado |
+        \\| --- | --- |
+        \\| src/main.zig | ok |
+    );
     try db.recordEvent("restore", "turn_done", "status=ok elapsed_ms=1234");
 
     var buffer = std.ArrayList(u8).empty;
@@ -2160,15 +2670,21 @@ test "restored sqlite session is rendered through styled transcript events" {
     const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
 
     const count = try renderRestoredSession(std.testing.allocator, &db, "restore", writer, false, 80, false, null);
-    try std.testing.expectEqual(@as(usize, 6), count);
+    try std.testing.expectEqual(@as(usize, 7), count);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "> [") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "analise") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "thinking") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "vou ler") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "thinking") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "vou ler") == null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Reading") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "README.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "[EVIDENCE]") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "resposta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, " # Plano") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, " • Item com negrito e codigo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "**negrito**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "`codigo`") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, " │ Arquivo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, " │ src/main.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Worked for 1s") != null);
     try std.testing.expectEqual(@as(usize, 1), countNeedle(buffer.items, "▸ Reading"));
     try std.testing.expectEqual(@as(?u64, 1234), parseElapsedMs("status=ok elapsed_ms=1234"));
@@ -2279,6 +2795,25 @@ test "missing required initial context tool marks turn low confidence" {
     try std.testing.expect(std.mem.indexOf(u8, quality.flags, "low_confidence=true") != null);
 }
 
+test "persistent promotion satisfies required context tool contract" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+    try db.recordEvent("quality-memory", "turn_start", "lembre esta regra");
+    try db.recordEvent("quality-memory", "model_context",
+        \\[TURN_CONTEXT v1]
+        \\[NEXT_ACTION]
+        \\First emit exactly one context tool call before prose.
+    );
+    try db.recordEvent("quality-memory", "tool_start", "promote_context");
+    try db.recordEvent("quality-memory", "persistent_promotion", "target=skills path=SKILLS.md status=promoted bytes=29");
+    const quality = try buildTurnQuality(std.testing.allocator, &db, "quality-memory", "ok", "Regra persistida.");
+    defer quality.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("confirmed", quality.quality);
+    try std.testing.expect(std.mem.indexOf(u8, quality.flags, "used_persistent_context=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quality.flags, "context_tool_missing=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quality.flags, "low_confidence=false") != null);
+}
+
 test "initial model context does not run prompt based session fts" {
     var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
     defer db.close();
@@ -2308,6 +2843,47 @@ test "initial model context does not run prompt based session fts" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
     try std.testing.expect(rendered.len < 5000);
+}
+
+test "initial model context includes long session summary without failed or current turns" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var i: usize = 0;
+    while (i < 7) : (i += 1) {
+        const prompt = try std.fmt.allocPrint(std.testing.allocator, "topico longo {}", .{i});
+        defer std.testing.allocator.free(prompt);
+        const answer = try std.fmt.allocPrint(std.testing.allocator, "resumo confirmado {}", .{i});
+        defer std.testing.allocator.free(answer);
+        try db.recordEvent("long-summary", "turn_start", prompt);
+        try db.recordEvent("long-summary", "assistant_delta", answer);
+        try db.recordEvent("long-summary", "turn_done", "status=ok low_confidence=false");
+    }
+    try db.recordEvent("long-summary", "turn_start", "turno falho antigo");
+    try db.recordEvent("long-summary", "assistant_delta", "nao tenho acesso");
+    try db.recordEvent("long-summary", "turn_done", "status=ok low_confidence=true");
+    try db.recordEvent("long-summary", "turn_start", "pedido atual ambiguo");
+
+    const rendered = (try buildInitialModelContext(
+        std.testing.allocator,
+        std.testing.io,
+        &db,
+        "long-summary",
+        "pedido atual ambiguo",
+        true,
+    )) orelse return error.MissingContext;
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SESSION_FOCUS]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "long_session=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "resumo confirmado 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "resumo confirmado 0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "turno falho antigo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "topic: pedido atual ambiguo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "user: pedido atual ambiguo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "S1:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
 }
 
 test "initial model context combines stored focus with legacy turn topics" {
@@ -2583,6 +3159,43 @@ test "initial context repair preserves context and asks for intent terms split" 
     try std.testing.expect(std.mem.indexOf(u8, repair, "do not copy the user's vague wording") != null);
 }
 
+test "model context budget audit records pre-send buckets without token estimates" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+    const rendered = try model_context.renderModelTurnContext(std.testing.allocator, .{
+        .task = "corrigir",
+        .contracts = "tools: collect_evidence",
+        .evidence = &[_]model_context.EvidenceBlock{.{ .text = "packet_version=v1\n- E1 kind=file_range source=src/a.zig range=L1-L1 status=ok confidence=medium hash=1\nconst x = 1;" }},
+        .next_action_v1 = .{ .kind = .collect_context, .required_tool_calls = 1, .text = "collect evidence" },
+    });
+    defer std.testing.allocator.free(rendered);
+
+    try recordModelContextBudget(std.testing.allocator, &db, "budget-audit", rendered);
+    var events = try db.loadSessionEvents(std.testing.allocator, "budget-audit", 8);
+    defer audit.freeAuditEvents(std.testing.allocator, &events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqualStrings("model_context_budget", events.items[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "pre_send=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "tokenizer=unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "token_estimate=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "evidence_bytes=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "next_action_bytes=") != null);
+}
+
+test "model context budget blocks oversized pre-send context" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+    var large = std.ArrayList(u8).empty;
+    defer large.deinit(std.testing.allocator);
+    try large.appendSlice(std.testing.allocator, "[TURN_CONTEXT v1]\ntask: x\n");
+    while (large.items.len <= max_model_context_send_bytes) {
+        try large.appendSlice(std.testing.allocator, "x");
+    }
+
+    try std.testing.expectError(error.ModelContextBudgetExceeded, recordModelContextBudget(std.testing.allocator, &db, "budget-fail", large.items));
+}
+
 test "pathless collect evidence requires model search intent and terms" {
     const weak_xml =
         \\<tool_call>
@@ -2607,6 +3220,20 @@ test "pathless collect evidence requires model search intent and terms" {
     const focused = (try tool_call.parseFirst(std.testing.allocator, focused_xml)) orelse return error.NoToolCall;
     defer focused.deinit(std.testing.allocator);
     try std.testing.expect(!collectEvidenceNeedsSearchIntentRepair(&focused, null, .symbol));
+
+    const focused_v2_xml =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=intent>find mutation contract executor</parameter>
+        \\<parameter=strategy>lexical</parameter>
+        \\<parameter=need>apply_patch route</parameter>
+        \\<parameter=targetFiles>src/main.zig</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const focused_v2 = (try tool_call.parseFirst(std.testing.allocator, focused_v2_xml)) orelse return error.NoToolCall;
+    defer focused_v2.deinit(std.testing.allocator);
+    try std.testing.expect(!collectEvidenceNeedsSearchIntentRepair(&focused_v2, null, .lexical));
 
     const placeholder_xml =
         \\<tool_call>
@@ -2813,6 +3440,18 @@ test "duplicate evidence context keeps evidence and tool schema" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Do not call tools again") != null);
 }
 
+test "model evidence includes micro context id for patch safety" {
+    const rendered = try renderEvidenceAndMicroContext(
+        std.testing.allocator,
+        "[EVIDENCE]\n- src/a.zig L1-L2 hash=abc\n",
+        "[MICRO_CONTEXT id=ctx_123 path=src/a.zig lines=1-2 total_lines=2 sha256=abc source_tool=collect_evidence budget_bytes=128]\nold\n",
+    );
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[EVIDENCE]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[MICRO_CONTEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "ctx_123") != null);
+}
+
 test "tool loop state starts with model-visible operational contract gate" {
     var state = ToolLoopState.init(std.testing.allocator);
     defer state.deinit();
@@ -2826,7 +3465,28 @@ test "allowed tools render compact audit list" {
     const active = contracts.activeContract(.mutate_file) orelse return error.MissingContract;
     const rendered = try renderAllowedTools(std.testing.allocator, active.allowed_tools);
     defer std.testing.allocator.free(rendered);
-    try std.testing.expectEqualStrings("set_operational_contract,collect_evidence,search_session", rendered);
+    try std.testing.expectEqualStrings("collect_evidence,search_session,apply_patch", rendered);
+}
+
+test "active tool schema follows selected contract" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+    state.active_contract = contracts.activeContract(.mutate_file).?;
+    try std.testing.expect(std.mem.indexOf(u8, activeToolSchema(&state), "apply_patch") != null);
+
+    state.active_contract = contracts.activeContract(.validate_work).?;
+    try std.testing.expect(std.mem.indexOf(u8, activeToolSchema(&state), "validate_syntax") != null);
+    try std.testing.expect(std.mem.indexOf(u8, activeToolSchema(&state), "apply_patch") == null);
+
+    state.active_contract = contracts.activeContract(.memory).?;
+    try std.testing.expect(std.mem.indexOf(u8, activeToolSchema(&state), "promote_context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, activeToolSchema(&state), "apply_patch") == null);
+}
+
+test "plural selected candidates uses first candidate id" {
+    try std.testing.expectEqualStrings("C2", firstSelectedCandidate("C2,C3").?);
+    try std.testing.expectEqualStrings("C4", firstSelectedCandidate(" C4 C5 ").?);
+    try std.testing.expect(firstSelectedCandidate(null) == null);
 }
 
 test "collected evidence context renders compact anchors without memory skills or old full text" {

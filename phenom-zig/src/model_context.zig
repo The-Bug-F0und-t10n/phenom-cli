@@ -25,6 +25,36 @@ pub const FocusBlock = struct {
     text: []const u8,
 };
 
+pub const NextActionKind = enum {
+    answer_directly,
+    collect_context,
+    repair_tool_call,
+    validate_work,
+};
+
+pub const NextAction = struct {
+    kind: NextActionKind,
+    text: []const u8,
+    required_tool_calls: u8 = 0,
+};
+
+pub const ContextByteBuckets = struct {
+    system: usize = system_prompt_v1.len,
+    header: usize = 0,
+    contracts: usize = 0,
+    skills: usize = 0,
+    memory: usize = 0,
+    candidates: usize = 0,
+    evidence: usize = 0,
+    focus: usize = 0,
+    dialogue: usize = 0,
+    session: usize = 0,
+    obligations: usize = 0,
+    grounding: usize = 0,
+    next_action: usize = 0,
+    total_context: usize = 0,
+};
+
 pub const ModelTurnContext = struct {
     task: []const u8,
     mode: []const u8 = "code_micro",
@@ -39,6 +69,7 @@ pub const ModelTurnContext = struct {
     skills: []const []const u8 = &.{},
     obligations: []const []const u8 = &.{},
     grounding: []const []const u8 = &.{},
+    next_action_v1: ?NextAction = null,
     next_action: []const u8 = "",
 };
 
@@ -136,7 +167,12 @@ pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContex
         try appendList(&out, allocator, ctx.grounding);
     }
 
-    if (ctx.next_action.len > 0) {
+    if (ctx.next_action_v1) |action| {
+        try out.appendSlice(allocator, "\n[NEXT_ACTION]\n");
+        const line = try std.fmt.allocPrint(allocator, "kind={s} required_tool_calls={} action={s}\n", .{ @tagName(action.kind), action.required_tool_calls, action.text });
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+    } else if (ctx.next_action.len > 0) {
         try out.appendSlice(allocator, "\n[NEXT_ACTION]\n");
         try out.appendSlice(allocator, ctx.next_action);
         if (!std.mem.endsWith(u8, ctx.next_action, "\n")) try out.append(allocator, '\n');
@@ -146,6 +182,36 @@ pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContex
     errdefer allocator.free(rendered);
     try assertNoRawContextLeak(rendered);
     return rendered;
+}
+
+pub fn measureRenderedContextBytes(rendered: []const u8) ContextByteBuckets {
+    const markers = [_][]const u8{
+        "\n[CONTRACTS]\n",
+        "\n[SKILLS]\n",
+        "\n[MEMORY]\n",
+        "\n[CANDIDATES_CONTEXT]\n",
+        "\n[EVIDENCE]\n",
+        "\n[SESSION_FOCUS]\n",
+        "\n[RECENT_DIALOGUE]\n",
+        "\n[SESSION_CONTEXT]\n",
+        "\n[OBLIGATIONS]\n",
+        "\n[GROUNDING]\n",
+        "\n[NEXT_ACTION]\n",
+    };
+    var buckets = ContextByteBuckets{ .total_context = rendered.len };
+    buckets.header = firstBlockStart(rendered, markers[0..]);
+    buckets.contracts = sectionLen(rendered, "\n[CONTRACTS]\n", markers[0..]);
+    buckets.skills = sectionLen(rendered, "\n[SKILLS]\n", markers[0..]);
+    buckets.memory = sectionLen(rendered, "\n[MEMORY]\n", markers[0..]);
+    buckets.candidates = sectionLen(rendered, "\n[CANDIDATES_CONTEXT]\n", markers[0..]);
+    buckets.evidence = sectionLen(rendered, "\n[EVIDENCE]\n", markers[0..]);
+    buckets.focus = sectionLen(rendered, "\n[SESSION_FOCUS]\n", markers[0..]);
+    buckets.dialogue = sectionLen(rendered, "\n[RECENT_DIALOGUE]\n", markers[0..]);
+    buckets.session = sectionLen(rendered, "\n[SESSION_CONTEXT]\n", markers[0..]);
+    buckets.obligations = sectionLen(rendered, "\n[OBLIGATIONS]\n", markers[0..]);
+    buckets.grounding = sectionLen(rendered, "\n[GROUNDING]\n", markers[0..]);
+    buckets.next_action = sectionLen(rendered, "\n[NEXT_ACTION]\n", markers[0..]);
+    return buckets;
 }
 
 pub fn assertNoRawContextLeak(rendered: []const u8) !void {
@@ -160,6 +226,25 @@ pub fn assertNoRawContextLeak(rendered: []const u8) !void {
     for (forbidden) |needle| {
         if (std.mem.indexOf(u8, rendered, needle) != null) return error.RawContextLeak;
     }
+}
+
+fn firstBlockStart(rendered: []const u8, markers: []const []const u8) usize {
+    var first = rendered.len;
+    for (markers) |marker| {
+        const idx = std.mem.indexOf(u8, rendered, marker) orelse continue;
+        if (idx < first) first = idx;
+    }
+    return first;
+}
+
+fn sectionLen(rendered: []const u8, marker: []const u8, markers: []const []const u8) usize {
+    const start = std.mem.indexOf(u8, rendered, marker) orelse return 0;
+    var end = rendered.len;
+    for (markers) |next_marker| {
+        const idx = std.mem.indexOfPos(u8, rendered, start + marker.len, next_marker) orelse continue;
+        if (idx < end) end = idx;
+    }
+    return end - start;
 }
 
 fn appendLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
@@ -230,6 +315,29 @@ test "model context renders evidence obligations and next action" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "src/main.zig L1-L2") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "O1: validate syntax") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[NEXT_ACTION]") != null);
+}
+
+test "model context renders typed next action and byte buckets" {
+    const evidence_blocks = [_]EvidenceBlock{.{ .text = "packet_version=v1\n- E1 kind=file_range source=src/main.zig range=L1-L1 status=ok confidence=medium hash=1\nconst x = 1;" }};
+    const rendered = try renderModelTurnContext(std.testing.allocator, .{
+        .task = "corrigir",
+        .contracts = "tools: collect_evidence",
+        .evidence = &evidence_blocks,
+        .next_action_v1 = .{
+            .kind = .collect_context,
+            .required_tool_calls = 1,
+            .text = "emit one collect_evidence call before prose",
+        },
+    });
+    defer std.testing.allocator.free(rendered);
+
+    const buckets = measureRenderedContextBytes(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "kind=collect_context required_tool_calls=1") != null);
+    try std.testing.expect(buckets.system == system_prompt_v1.len);
+    try std.testing.expect(buckets.contracts > 0);
+    try std.testing.expect(buckets.evidence > 0);
+    try std.testing.expect(buckets.next_action > 0);
+    try std.testing.expectEqual(rendered.len, buckets.header + buckets.contracts + buckets.evidence + buckets.next_action);
 }
 
 test "model context renders candidates outside evidence" {

@@ -11,7 +11,10 @@ const tools = @import("tools.zig");
 pub const Args = struct {
     path: ?[]const u8 = null,
     intent: ?[]const u8 = null,
+    need: ?[]const u8 = null,
     terms: ?[]const u8 = null,
+    target_files: ?[]const u8 = null,
+    scope_root: ?[]const u8 = null,
     task: []const u8 = "",
     strategy: contracts.StrategyName = .auto,
     start_line: usize = 1,
@@ -90,7 +93,9 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: Args) !Result {
 pub fn executeCandidates(allocator: std.mem.Allocator, io: std.Io, args: Args) !CandidateResult {
     if (args.budget_bytes == 0) return error.InvalidEvidenceBudget;
     const strategy = contracts.resolveCollectEvidenceStrategy(args.strategy) orelse return error.InvalidStrategy;
-    const search_terms = args.terms orelse return error.MissingTerms;
+    const search_terms = try renderSearchTerms(allocator, args);
+    defer allocator.free(search_terms);
+    if (search_terms.len == 0) return error.MissingTerms;
     var ranked = try evidence_ranker.rankForPrompt(allocator, io, search_terms, strategy, .{
         .max_ranges = 6,
         .max_lines_per_range = 48,
@@ -321,7 +326,7 @@ fn executeDiagnostic(allocator: std.mem.Allocator, args: Args) !Result {
     };
 }
 
-fn cloneEvidenceEntry(allocator: std.mem.Allocator, entry: evidence.EvidenceEntry) !evidence.EvidenceEntry {
+pub fn cloneEvidenceEntry(allocator: std.mem.Allocator, entry: evidence.EvidenceEntry) !evidence.EvidenceEntry {
     const source = try allocator.dupe(u8, entry.source);
     errdefer allocator.free(source);
     const kind = try allocator.dupe(u8, entry.kind);
@@ -385,7 +390,8 @@ fn executePath(allocator: std.mem.Allocator, args: Args, strategy: contracts.Str
 }
 
 fn executeRanked(allocator: std.mem.Allocator, io: std.Io, args: Args, strategy: contracts.StrategyName) !Result {
-    const search_terms = args.terms orelse "";
+    const search_terms = try renderSearchTerms(allocator, args);
+    defer allocator.free(search_terms);
     const audit_task = if (search_terms.len > 0) search_terms else "workspace_overview";
     var ranked = try evidence_ranker.rankForPrompt(allocator, io, search_terms, strategy, .{
         .max_ranges = adaptiveRangeLimit(args.budget_bytes),
@@ -445,6 +451,23 @@ fn executeRanked(allocator: std.mem.Allocator, io: std.Io, args: Args, strategy:
     };
 }
 
+fn renderSearchTerms(allocator: std.mem.Allocator, args: Args) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendSearchPart(&out, allocator, args.terms);
+    try appendSearchPart(&out, allocator, args.need);
+    try appendSearchPart(&out, allocator, args.target_files);
+    try appendSearchPart(&out, allocator, args.scope_root);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendSearchPart(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: ?[]const u8) !void {
+    const text = std.mem.trim(u8, value orelse return, " \t\r\n");
+    if (text.len == 0) return;
+    if (out.items.len > 0) try out.append(allocator, ' ');
+    try out.appendSlice(allocator, text);
+}
+
 fn containsForbiddenModelMarker(text: []const u8) bool {
     const forbidden = [_][]const u8{
         "---BEGIN CONTENT---",
@@ -483,7 +506,7 @@ fn renderRankedAudit(
 ) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "[TOOL_EVENT]\ntool=collect_evidence\nsuccess=true\nargs=strategy={s} intent_bytes={} task_bytes={} budget_bytes={} ranges={} raw_bytes={} quality_score={}\n{s}",
+        "[TOOL_EVENT]\ntool=collect_evidence\nsuccess=true\nargs=strategy={s} intent_bytes={} search_bytes={} budget_bytes={} ranges={} raw_bytes={} quality_score={}\n{s}",
         .{ @tagName(strategy), if (intent) |value| value.len else 0, task.len, budget_bytes, range_count, raw_bytes_read, quality_score, ranking_audit },
     );
 }
@@ -532,6 +555,22 @@ test "collect evidence ranked lexical uses rg candidates and audit without raw r
     try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "[EVIDENCE]") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "[CANDIDATE_RANKING]") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "---BEGIN CONTENT---") == null);
+}
+
+test "collect evidence v2 fields contribute to model-selected search terms" {
+    const search_terms = try renderSearchTerms(std.testing.allocator, .{
+        .intent = "find contract executor",
+        .need = "mutation gate",
+        .terms = "apply_patch",
+        .target_files = "src/main.zig",
+        .scope_root = "src",
+    });
+    defer std.testing.allocator.free(search_terms);
+    try std.testing.expect(std.mem.indexOf(u8, search_terms, "apply_patch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_terms, "mutation gate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_terms, "src/main.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_terms, "src") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_terms, "find contract executor") == null);
 }
 
 test "collect evidence candidates returns definitions without evidence body" {

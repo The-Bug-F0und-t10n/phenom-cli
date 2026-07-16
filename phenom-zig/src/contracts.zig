@@ -66,6 +66,7 @@ pub const OperationalContractRequest = struct {
     requires_mutation: bool,
     requires_runtime_validation: bool,
     requires_browser_diagnostics: bool,
+    requires_memory_promotion: bool = false,
 };
 
 pub const all_tools = [_]ToolSpec{
@@ -83,6 +84,7 @@ pub const all_tools = [_]ToolSpec{
     .{ .name = "validate_syntax", .visibility = .internal_context },
     .{ .name = "run_tests", .visibility = .internal_context },
     .{ .name = "run_code", .visibility = .internal_context },
+    .{ .name = "inspect_runtime", .visibility = .internal_context },
     .{ .name = "browser_check", .visibility = .internal_context },
     .{ .name = "git_status", .visibility = .internal_context },
     .{ .name = "git_diff", .visibility = .internal_context },
@@ -91,6 +93,7 @@ pub const all_tools = [_]ToolSpec{
     .{ .name = "get_session_context", .visibility = .internal_context },
     .{ .name = "list_session_files", .visibility = .internal_context },
     .{ .name = "set_operational_contract", .visibility = .model_visible },
+    .{ .name = "promote_context", .visibility = .model_visible },
     .{ .name = "build_task_context", .visibility = .internal_context },
     .{ .name = "get_context", .visibility = .internal_context },
     .{ .name = "get_minimal_context", .visibility = .internal_context },
@@ -136,17 +139,22 @@ pub const contract_specs = [_]ContractSpec{
     .{
         .name = .mutate_file,
         .endpoint = "set_operational_contract",
-        .allowed_tools = &.{ "set_operational_contract", "collect_evidence", "search_session" },
+        .allowed_tools = &.{ "collect_evidence", "search_session", "apply_patch" },
     },
     .{
         .name = .validate_work,
         .endpoint = "set_operational_contract",
-        .allowed_tools = &.{ "set_operational_contract", "collect_evidence", "search_session" },
+        .allowed_tools = &.{ "collect_evidence", "search_session", "validate_syntax" },
     },
     .{
         .name = .inspect_runtime,
         .endpoint = "set_operational_contract",
-        .allowed_tools = &.{ "set_operational_contract", "collect_evidence", "search_session" },
+        .allowed_tools = &.{ "collect_evidence", "search_session", "inspect_runtime" },
+    },
+    .{
+        .name = .memory,
+        .endpoint = "set_operational_contract",
+        .allowed_tools = &.{ "collect_evidence", "search_session", "promote_context" },
     },
 };
 
@@ -210,6 +218,7 @@ pub fn activeContract(name: ContractName) ?ActiveContract {
 }
 
 pub fn selectOperationalContract(request: OperationalContractRequest) ContractName {
+    if (request.requires_memory_promotion) return .memory;
     if (request.requires_mutation) return .mutate_file;
     if (request.requires_runtime_validation) return .validate_work;
     if (request.requires_browser_diagnostics) return .inspect_runtime;
@@ -233,6 +242,7 @@ test "tool manifest keeps internal context tools hidden from model surface" {
     try std.testing.expect(isModelVisible("collect_evidence"));
     try std.testing.expect(isModelVisible("search_session"));
     try std.testing.expect(isModelVisible("set_operational_contract"));
+    try std.testing.expect(isModelVisible("promote_context"));
     try std.testing.expect(!isModelVisible("apply_patch"));
     try std.testing.expect(isInternalContextTool("apply_patch"));
     try std.testing.expect(!isModelVisible("grep_file"));
@@ -275,13 +285,14 @@ test "compact model visible tools excludes internal collectors" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "collect_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "set_operational_contract") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "promote_context") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "apply_patch") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "run_tests") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "grep_file") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "rag_search") == null);
 }
 
-test "operational contract selection keeps future mutation tools hidden" {
+test "operational contract selection opens only selected executor family" {
     const selected = selectOperationalContract(.{
         .requires_inspection = true,
         .requires_mutation = true,
@@ -290,9 +301,40 @@ test "operational contract selection keeps future mutation tools hidden" {
     });
     try std.testing.expectEqual(ContractName.mutate_file, selected);
     const active = activeContract(selected) orelse return error.MissingContract;
-    try std.testing.expect(active.allows("set_operational_contract"));
+    try std.testing.expect(active.allows("collect_evidence"));
+    try std.testing.expect(active.allows("search_session"));
+    try std.testing.expect(active.allows("apply_patch"));
+    try std.testing.expect(!active.allows("set_operational_contract"));
+    try std.testing.expect(!active.allows("validate_syntax"));
+    try std.testing.expect(!active.allows("inspect_runtime"));
+    try std.testing.expect(strategyAllowed(selected, .path));
+}
+
+test "memory contract opens only explicit persistent promotion" {
+    const selected = selectOperationalContract(.{
+        .requires_inspection = false,
+        .requires_mutation = false,
+        .requires_runtime_validation = false,
+        .requires_browser_diagnostics = false,
+        .requires_memory_promotion = true,
+    });
+    try std.testing.expectEqual(ContractName.memory, selected);
+    const active = activeContract(selected) orelse return error.MissingContract;
+    try std.testing.expect(active.allows("promote_context"));
     try std.testing.expect(active.allows("collect_evidence"));
     try std.testing.expect(active.allows("search_session"));
     try std.testing.expect(!active.allows("apply_patch"));
-    try std.testing.expect(strategyAllowed(selected, .path));
+    try std.testing.expect(!active.allows("validate_syntax"));
+}
+
+test "validation and runtime contracts do not unlock mutation" {
+    const validation = activeContract(.validate_work) orelse return error.MissingContract;
+    try std.testing.expect(validation.allows("validate_syntax"));
+    try std.testing.expect(!validation.allows("apply_patch"));
+    try std.testing.expect(!validation.allows("inspect_runtime"));
+
+    const runtime = activeContract(.inspect_runtime) orelse return error.MissingContract;
+    try std.testing.expect(runtime.allows("inspect_runtime"));
+    try std.testing.expect(!runtime.allows("apply_patch"));
+    try std.testing.expect(!runtime.allows("validate_syntax"));
 }

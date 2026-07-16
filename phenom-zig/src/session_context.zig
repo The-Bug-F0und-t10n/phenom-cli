@@ -12,6 +12,8 @@ const max_dialogue_entry_bytes: usize = 600;
 const max_search_entries: usize = 6;
 const max_thread_entries: usize = 8;
 const max_thread_entry_bytes: usize = 520;
+const min_long_summary_events: usize = 18;
+const max_long_summary_turns: usize = 6;
 const redacted_raw_marker = "[REDACTED_RAW_CONTEXT_MARKER]";
 const truncated_marker = " [TRUNCATED]";
 
@@ -180,6 +182,12 @@ fn freeOwnedSlices(allocator: std.mem.Allocator, items: *std.ArrayList([]u8)) vo
     items.deinit(allocator);
 }
 
+fn resetOwnedSlice(allocator: std.mem.Allocator, target: *[]u8) !void {
+    const empty = try allocator.alloc(u8, 0);
+    allocator.free(target.*);
+    target.* = empty;
+}
+
 pub fn isFailedTurnDone(body: []const u8) bool {
     return std.mem.indexOf(u8, body, "status=expectation_failed") != null or
         std.mem.indexOf(u8, body, "status=model_error") != null or
@@ -235,14 +243,39 @@ pub fn renderFallbackSessionFocusFromEvents(allocator: std.mem.Allocator, events
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "source=sqlite_audit_turn_starts temporary=true raw_context_persisted=false operational_summary=true not_evidence=true legacy_fallback=true\n");
 
+    var topics = std.ArrayList([]u8).empty;
+    defer freeOwnedSlices(allocator, &topics);
+    var pending_topic: ?[]u8 = null;
+    errdefer if (pending_topic) |topic| allocator.free(topic);
+    var skip_current_turn = false;
+    for (events) |event| {
+        if (std.mem.eql(u8, event.kind, "turn_start")) {
+            if (pending_topic) |topic| try topics.append(allocator, topic);
+            pending_topic = null;
+            skip_current_turn = std.mem.eql(u8, event.body, current_prompt);
+            if (!skip_current_turn) pending_topic = try allocator.dupe(u8, event.body);
+        } else if (std.mem.eql(u8, event.kind, "turn_done")) {
+            if (pending_topic) |topic| {
+                if (!skip_current_turn and !isFailedTurnDone(event.body)) {
+                    try topics.append(allocator, topic);
+                } else {
+                    allocator.free(topic);
+                }
+                pending_topic = null;
+            }
+            skip_current_turn = false;
+        }
+    }
+    if (pending_topic) |topic| {
+        try topics.append(allocator, topic);
+        pending_topic = null;
+    }
+
     var count: usize = 0;
-    var i = events.len;
+    var i = topics.items.len;
     while (i > 0 and count < max_topic_entries) {
         i -= 1;
-        const event = events[i];
-        if (!std.mem.eql(u8, event.kind, "turn_start")) continue;
-        if (std.mem.eql(u8, event.body, current_prompt)) continue;
-        const compact_body = try compactOneLine(allocator, event.body, max_entry_bytes);
+        const compact_body = try compactOneLine(allocator, topics.items[i], max_entry_bytes);
         defer allocator.free(compact_body);
         const safe_body = try redactRawMarkers(allocator, compact_body);
         defer allocator.free(safe_body);
@@ -257,6 +290,60 @@ pub fn renderFallbackSessionFocusFromEvents(allocator: std.mem.Allocator, events
     if (count == 0) {
         out.deinit(allocator);
         return null;
+    }
+    const rendered = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(rendered);
+    try model_context.assertNoRawContextLeak(rendered);
+    return rendered;
+}
+
+pub fn renderLongSessionSummary(allocator: std.mem.Allocator, events: []const audit.AuditEvent, current_prompt: []const u8) !?[]u8 {
+    if (events.len < min_long_summary_events) return null;
+    var lines = std.ArrayList([]u8).empty;
+    defer freeOwnedSlices(allocator, &lines);
+    var turn_user: ?[]u8 = null;
+    var turn_assistant = try allocator.alloc(u8, 0);
+    defer allocator.free(turn_assistant);
+    var skip_current_turn = false;
+
+    for (events) |event| {
+        if (std.mem.eql(u8, event.kind, "turn_start")) {
+            if (turn_user) |owned| allocator.free(owned);
+            turn_user = null;
+            try resetOwnedSlice(allocator, &turn_assistant);
+            skip_current_turn = std.mem.eql(u8, event.body, current_prompt);
+            if (!skip_current_turn) turn_user = try allocator.dupe(u8, event.body);
+        } else if (std.mem.eql(u8, event.kind, "assistant_delta")) {
+            if (!skip_current_turn and turn_user != null) try appendBounded(allocator, &turn_assistant, event.body);
+        } else if (std.mem.eql(u8, event.kind, "turn_done")) {
+            if (!skip_current_turn and turn_user != null and !isFailedTurnDone(event.body)) {
+                const line = try renderSummaryLine(allocator, turn_user.?, turn_assistant);
+                errdefer allocator.free(line);
+                if (line.len > 0) {
+                    try lines.append(allocator, line);
+                } else {
+                    allocator.free(line);
+                }
+            }
+            if (turn_user) |owned| allocator.free(owned);
+            turn_user = null;
+            try resetOwnedSlice(allocator, &turn_assistant);
+            skip_current_turn = false;
+        }
+    }
+    if (turn_user) |owned| allocator.free(owned);
+    if (lines.items.len == 0) return null;
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "source=sqlite_audit_long_session temporary=true raw_context_persisted=false operational_summary=true not_evidence=true long_session=true\n");
+    const start = if (lines.items.len > max_long_summary_turns) lines.items.len - max_long_summary_turns else 0;
+    for (lines.items[start..], 0..) |line, idx| {
+        const prefix = try std.fmt.allocPrint(allocator, "- L{} ", .{idx + 1});
+        defer allocator.free(prefix);
+        try out.appendSlice(allocator, prefix);
+        try out.appendSlice(allocator, line);
+        try out.append(allocator, '\n');
     }
     const rendered = try out.toOwnedSlice(allocator);
     errdefer allocator.free(rendered);
@@ -482,6 +569,19 @@ fn renderEventLine(allocator: std.mem.Allocator, event: audit.AuditEvent) ![]u8 
     const safe_body = try redactRawMarkers(allocator, compact_body);
     defer allocator.free(safe_body);
     return std.fmt.allocPrint(allocator, "{s}: {s}", .{ event.kind, safe_body });
+}
+
+fn renderSummaryLine(allocator: std.mem.Allocator, user: []const u8, assistant: []const u8) ![]u8 {
+    const compact_user = try compactOneLine(allocator, user, max_entry_bytes);
+    defer allocator.free(compact_user);
+    const compact_assistant = try compactOneLine(allocator, assistant, max_entry_bytes);
+    defer allocator.free(compact_assistant);
+    const safe_user = try redactRawMarkers(allocator, compact_user);
+    defer allocator.free(safe_user);
+    const safe_assistant = try redactRawMarkers(allocator, compact_assistant);
+    defer allocator.free(safe_assistant);
+    if (safe_user.len == 0 and safe_assistant.len == 0) return allocator.alloc(u8, 0);
+    return std.fmt.allocPrint(allocator, "user: {s} assistant: {s}", .{ safe_user, safe_assistant });
 }
 
 fn renderHitLine(allocator: std.mem.Allocator, hit: audit.SessionSearchHit) ![]u8 {
@@ -900,6 +1000,46 @@ test "session focus merge keeps stored focus and legacy topics" {
     try std.testing.expect(std.mem.indexOf(u8, merged, "topic: projeto atual") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged, "topic: Mateus 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged, "raw_context_persisted=false") != null);
+}
+
+test "fallback session focus skips failed completed turns" {
+    var events = std.ArrayList(audit.AuditEvent).empty;
+    defer audit.freeAuditEvents(std.testing.allocator, &events);
+    try events.append(std.testing.allocator, .{ .kind = try std.testing.allocator.dupe(u8, "turn_start"), .body = try std.testing.allocator.dupe(u8, "assunto confirmado") });
+    try events.append(std.testing.allocator, .{ .kind = try std.testing.allocator.dupe(u8, "turn_done"), .body = try std.testing.allocator.dupe(u8, "status=ok low_confidence=false") });
+    try events.append(std.testing.allocator, .{ .kind = try std.testing.allocator.dupe(u8, "turn_start"), .body = try std.testing.allocator.dupe(u8, "assunto falho") });
+    try events.append(std.testing.allocator, .{ .kind = try std.testing.allocator.dupe(u8, "turn_done"), .body = try std.testing.allocator.dupe(u8, "status=ok low_confidence=true") });
+
+    const rendered = (try renderFallbackSessionFocusFromEvents(std.testing.allocator, events.items, "pedido atual")) orelse return error.MissingFocus;
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "assunto confirmado") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "assunto falho") == null);
+}
+
+test "long session summary keeps successful turns and skips current or failed turns" {
+    var events = std.ArrayList(audit.AuditEvent).empty;
+    defer audit.freeAuditEvents(std.testing.allocator, &events);
+    var i: usize = 0;
+    while (i < 7) : (i += 1) {
+        const prompt = try std.fmt.allocPrint(std.testing.allocator, "tema antigo {}", .{i});
+        try events.append(std.testing.allocator, .{ .kind = try std.testing.allocator.dupe(u8, "turn_start"), .body = prompt });
+        const answer = try std.fmt.allocPrint(std.testing.allocator, "resumo util {}", .{i});
+        try events.append(std.testing.allocator, .{ .kind = try std.testing.allocator.dupe(u8, "assistant_delta"), .body = answer });
+        try events.append(std.testing.allocator, .{ .kind = try std.testing.allocator.dupe(u8, "turn_done"), .body = try std.testing.allocator.dupe(u8, "status=ok low_confidence=false") });
+    }
+    try events.append(std.testing.allocator, .{ .kind = try std.testing.allocator.dupe(u8, "turn_start"), .body = try std.testing.allocator.dupe(u8, "turno falho") });
+    try events.append(std.testing.allocator, .{ .kind = try std.testing.allocator.dupe(u8, "assistant_delta"), .body = try std.testing.allocator.dupe(u8, "nao tenho acesso") });
+    try events.append(std.testing.allocator, .{ .kind = try std.testing.allocator.dupe(u8, "turn_done"), .body = try std.testing.allocator.dupe(u8, "status=ok low_confidence=true") });
+    try events.append(std.testing.allocator, .{ .kind = try std.testing.allocator.dupe(u8, "turn_start"), .body = try std.testing.allocator.dupe(u8, "pedido atual ambiguo") });
+
+    const rendered = (try renderLongSessionSummary(std.testing.allocator, events.items, "pedido atual ambiguo")) orelse return error.MissingLongSummary;
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "long_session=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "tema antigo 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "tema antigo 0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "turno falho") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "pedido atual ambiguo") == null);
 }
 
 test "session search hits skip failed turn contexts by metadata" {

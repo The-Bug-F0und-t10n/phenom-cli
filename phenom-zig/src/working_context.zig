@@ -155,6 +155,13 @@ pub const WorkingContext = struct {
         return self.hasBudgetForMoreEvidence();
     }
 
+    pub fn findByContextId(self: WorkingContext, context_id: []const u8) ?WorkingEvidence {
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.context_id, context_id)) return entry;
+        }
+        return null;
+    }
+
     fn compactToBudget(self: *WorkingContext) void {
         while (self.renderedBytes() > self.model_budget_limit) {
             var changed = false;
