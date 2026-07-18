@@ -866,18 +866,37 @@ fn renderUnsupportedWorkspaceClaimRepairContext(allocator: std.mem.Allocator, pr
 fn renderCollectEvidenceSearchIntentRepairContext(
     allocator: std.mem.Allocator,
     prompt: []const u8,
-    contracts_text: []const u8,
+    context: *const working_context.WorkingContext,
 ) ![]u8 {
-    return model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts = contracts_text,
-        .obligations = &.{
-            "A pathless collect_evidence call must include <parameter=intent>what source-code evidence you want</parameter> and <parameter=terms>concrete retrieval keys for that intent</parameter>.",
-            "The controller does not infer search terms from the user prompt. The model must choose the search intent and keys before evidence collection.",
-        },
-        .grounding = groundingRules(),
-        .next_action = "Emit one corrected collect_evidence tool call with path, or with intent+terms and a valid strategy. Use strategy=symbol/lexical/auto according to the evidence you intend to recover.",
-    });
+    return renderCollectedEvidenceContext(
+        allocator,
+        prompt,
+        context,
+        null,
+        null,
+        collectEvidenceSearchIntentRepairSchema(),
+        "Emit exactly one visible collect_evidence tool_call with path, or with intent+terms and strategy=auto|lexical|symbol. Use workspace evidence above plus the current task to choose concrete code retrieval keys. No prose.",
+    );
+}
+
+fn collectEvidenceSearchIntentRepairSchema() []const u8 {
+    return
+    \\[TOOLS v1]
+    \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol, stage=minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
+    \\Only collect_evidence is active for this repair. The previous collect_evidence call was malformed; correct it with path, or with intent+terms.
+    \\A pathless collect_evidence call must include <parameter=intent>what source-code evidence you want</parameter> and <parameter=terms>concrete code retrieval keys for that intent</parameter>.
+    \\The controller does not infer search terms from the user prompt. The model must choose the search intent and keys before evidence collection.
+    \\For function/type/file identity, prefer stage=candidates with strategy=symbol, then expand the best C# candidate.
+    \\<tool_call><function=collect_evidence><parameter=intent>find concrete source definition</parameter><parameter=strategy>symbol</parameter><parameter=stage>candidates</parameter><parameter=terms>ConcreteSymbolOrPathTerms</parameter></function></tool_call>
+    ;
+}
+
+fn collectEvidenceRepairContract() contracts.ActiveContract {
+    return .{
+        .name = .collect_evidence,
+        .version = contracts.manifest_version,
+        .allowed_tools = &.{"collect_evidence"},
+    };
 }
 
 fn runOneToolLoopStep(
@@ -975,10 +994,7 @@ fn runOneToolLoopStep(
         const repair_context = try renderCollectEvidenceSearchIntentRepairContext(
             allocator,
             prompt,
-            if (state.contract_selected)
-                activeToolSchema(state)
-            else
-                context_profile.toolSchema(.code_evidence, .initial),
+            &state.context,
         );
         defer allocator.free(repair_context);
         try db.recordEvent(config.session, "model_context", repair_context);
@@ -993,7 +1009,7 @@ fn runOneToolLoopStep(
             db,
             ui_ptr,
             aggregate_sink,
-            state.active_contract,
+            collectEvidenceRepairContract(),
         );
         switch (next) {
             .final_answer => return .final_answer,
@@ -1241,7 +1257,7 @@ fn runCollectEvidenceCandidatesStep(
     });
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
-    return try streamDeferredRequiredToolLoopTurn(
+    const next = try streamDeferredRequiredToolLoopTurn(
         allocator,
         config,
         prompt,
@@ -1254,6 +1270,107 @@ fn runCollectEvidenceCandidatesStep(
         aggregate_sink,
         state.active_contract,
     );
+    switch (next) {
+        .final_answer => return .final_answer,
+        .tool_call => |next_call| return .{ .tool_call = next_call },
+        .stopped => {
+            const fallback_selected = selectedCandidateForProtocolFallback(state) orelse return .stopped;
+            const fallback_candidate = state.findCandidate(fallback_selected) orelse return .stopped;
+            const body = try std.fmt.allocPrint(allocator, "candidate selection missing -> collect range {s}", .{fallback_selected});
+            defer allocator.free(body);
+            try db.recordEvent(config.session, "tool_arg_repair", body);
+            var fallback_call = tool_call.ToolCall{
+                .name = try allocator.dupe(u8, "collect_evidence"),
+                .path = try allocator.dupe(u8, fallback_candidate.path),
+                .strategy = .path,
+                .start_line = fallback_candidate.start_line,
+                .max_lines = 48,
+            };
+            defer fallback_call.deinit(allocator);
+            return try runCollectEvidenceRangeStep(allocator, io, config, prompt, fallback_call.path.?, fallback_call.start_line, fallback_call.max_lines, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
+        },
+    }
+}
+
+fn selectedCandidateForProtocolFallback(state: *const ToolLoopState) ?[]const u8 {
+    for (state.candidates.items) |candidate| {
+        if (std.mem.eql(u8, candidate.source, "symbol_ast")) return candidate.id;
+    }
+    if (state.candidates.items.len == 0) return null;
+    return state.candidates.items[0].id;
+}
+
+fn runCollectEvidenceRangeStep(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: cli.Config,
+    prompt: []const u8,
+    path: []const u8,
+    start_line: usize,
+    max_lines: usize,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    tool_iterations: *usize,
+) !ToolLoopNext {
+    if (state.hasExecutedArgs(path, null, .path, start_line, max_lines)) {
+        try db.recordEvent(config.session, "tool_loop_stop", "duplicate fallback candidate range");
+        return .stopped;
+    }
+    if (tool_iterations.* >= max_tool_emergency_iterations or !state.hasBudgetForMoreEvidence()) {
+        try db.recordEvent(config.session, "tool_loop_stop", "fallback candidate range budget exhausted");
+        return .stopped;
+    }
+    tool_iterations.* += 1;
+
+    if (ui_ptr) |active_ui| try active_ui.showStatus("Reading");
+    const tool_start = try renderCollectEvidenceAuditKey(allocator, path, null, null, .path);
+    defer allocator.free(tool_start);
+    try db.recordEvent(config.session, "tool_start", tool_start);
+    try events.emit(.{ .tool_start = .{ .name = "collect_evidence", .detail = path } });
+
+    const result = collect_evidence.execute(allocator, io, .{
+        .path = path,
+        .task = prompt,
+        .strategy = .path,
+        .start_line = start_line,
+        .max_lines = max_lines,
+        .budget_bytes = collectEvidenceExecutionBudget(path, state.remainingBudget()),
+    }) catch |err| {
+        try db.recordEvent(config.session, "tool_error", @errorName(err));
+        try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = @errorName(err) } });
+        return .stopped;
+    };
+    defer result.deinit(allocator);
+
+    const model_evidence = try renderEvidenceAndMicroContext(allocator, result.evidence_text, result.micro_context_text);
+    defer allocator.free(model_evidence);
+    try db.recordEvent(config.session, "tool_event", result.tool_event_audit_text);
+    try db.recordEvent(config.session, "evidence", model_evidence);
+    try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = model_evidence } });
+    try state.rememberExecutedArgs(path, null, .path, start_line, max_lines, result.context_id, model_evidence, result.model_bytes, result.quality_score);
+
+    const follow_context = try renderCollectedEvidenceContext(
+        allocator,
+        prompt,
+        &state.context,
+        null,
+        null,
+        if (state.shouldAllowMoreEvidence())
+            activeToolSchema(state)
+        else
+            context_profile.toolSchema(.code_evidence, .after_collect_evidence),
+        if (state.shouldAllowMoreEvidence() and result.quality_score < weak_evidence_quality_score)
+            "The fallback candidate range evidence is weak or generic. Emit one refined collect_evidence call before answering."
+        else
+            "Answer using only cited E# evidence from the collected candidate range. If evidence is insufficient, say what is evidenced and what is not.",
+    );
+    defer allocator.free(follow_context);
+    try db.recordEvent(config.session, "model_context", follow_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
 }
 
 fn runCollectEvidenceExpandStep(
@@ -1370,13 +1487,23 @@ fn runCollectEvidenceExpandStep(
         else
             context_profile.toolSchema(.code_evidence, .after_collect_evidence),
         if (state.shouldAllowMoreEvidence() and result.quality_score < weak_evidence_quality_score)
-            "The expanded candidate evidence is weak or generic. Emit one more collect_evidence call with a different selectedCandidate or refined intent+terms before answering."
+            expandedCandidateNextAction(true, true)
         else
-            "Answer using only cited E# evidence from the expanded candidate. If evidence is insufficient and budget remains, emit one more collect_evidence call with a different selectedCandidate or refined intent+terms.",
+            expandedCandidateNextAction(state.shouldAllowMoreEvidence(), false),
     );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
     return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+fn expandedCandidateNextAction(allow_more_evidence: bool, weak_evidence: bool) []const u8 {
+    if (allow_more_evidence and weak_evidence) {
+        return "The expanded candidate evidence is weak or generic. Emit one more collect_evidence call with a different selectedCandidate or refined intent+terms before answering.";
+    }
+    if (allow_more_evidence) {
+        return "Answer using only cited E# evidence from the expanded candidate. If evidence is insufficient, or if the final answer would name a called/related function whose declaration is not in E#, emit one more collect_evidence call for that identifier before answering.";
+    }
+    return "Answer using only cited E# evidence from the expanded candidate. If evidence is insufficient, say what is evidenced and what is not. Do not call tools again.";
 }
 
 fn candidateExpansionLineLimit(requested_max_lines: usize, candidate_start_line: usize, candidate_end_line: usize) usize {
@@ -2617,6 +2744,7 @@ fn activeToolSchema(state: *const ToolLoopState) []const u8 {
 fn groundingRules() []const []const u8 {
     return &.{
         "Workspace/source-code claims must cite E# evidence from [EVIDENCE].",
+        "When quoting E#/S# excerpts, copy only text present in the evidence; put explanations outside quoted code or transcript blocks.",
         "[CONTRACTS], [GROUNDING], and tool schemas are instructions, not evidence; never cite them as proof.",
         "For code identity questions, only name a function/type/file when that identifier or declaration/callsite appears in E# evidence. If the collected E# does not contain the needed identifier, refine with another collect_evidence call while budget remains.",
         "Use [RECENT_DIALOGUE] for continuity only; use [SESSION_FOCUS] only as a routing map. Exact claims about what was said or done in prior conversation must cite S# evidence from [SESSION_CONTEXT].",
@@ -3828,16 +3956,38 @@ fn defaultContextBudgetForTest() usize {
 }
 
 test "collect evidence search intent repair explains model responsibility" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.rememberExecutedArgs(
+        "src/render.zig",
+        "markdown table renderer",
+        .path,
+        18,
+        49,
+        "ctx_render_table",
+        "[EVIDENCE]\n- E1 kind=file_range source=src/render.zig range=L18-L49 status=ok confidence=medium hash=abc\npub fn AppendOnlyRenderer(comptime Writer: type) type {",
+        180,
+        72,
+    );
+
     const repair = try renderCollectEvidenceSearchIntentRepairContext(
         std.testing.allocator,
         "qual e a funcao que renderiza o cli?",
-        context_profile.toolSchema(.code_evidence, .initial),
+        &state.context,
     );
     defer std.testing.allocator.free(repair);
     try std.testing.expect(std.mem.indexOf(u8, repair, "pathless collect_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, repair, "<parameter=intent>") != null);
     try std.testing.expect(std.mem.indexOf(u8, repair, "<parameter=terms>") != null);
     try std.testing.expect(std.mem.indexOf(u8, repair, "controller does not infer search terms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "[EVIDENCE]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "AppendOnlyRenderer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "Only collect_evidence is active for this repair") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "search_session(intent") == null);
+
+    const repair_contract = collectEvidenceRepairContract();
+    try std.testing.expect(repair_contract.allows("collect_evidence"));
+    try std.testing.expect(!repair_contract.allows("search_session"));
 }
 
 test "tool loop state detects duplicate collect evidence calls and preserves evidence" {
@@ -3947,9 +4097,52 @@ test "candidate selection repair reuses temporary candidates only" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
 }
 
+test "candidate selection protocol fallback prefers structural candidate" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.candidates.append(std.testing.allocator, .{
+        .id = try std.testing.allocator.dupe(u8, "C1"),
+        .path = try std.testing.allocator.dupe(u8, "src/render.zig"),
+        .start_line = 18,
+        .end_line = 65,
+        .score = 2150,
+        .source = try std.testing.allocator.dupe(u8, "module_entrypoint"),
+        .signature = try std.testing.allocator.dupe(u8, "pub fn AppendOnlyRenderer(comptime Writer: type) type {"),
+        .preview = try std.testing.allocator.dupe(u8, "module_entrypoint"),
+    });
+    try state.candidates.append(std.testing.allocator, .{
+        .id = try std.testing.allocator.dupe(u8, "C2"),
+        .path = try std.testing.allocator.dupe(u8, "src/render.zig"),
+        .start_line = 385,
+        .end_line = 394,
+        .score = 1662,
+        .source = try std.testing.allocator.dupe(u8, "symbol_ast"),
+        .signature = try std.testing.allocator.dupe(u8, "fn renderMarkdownPending(self: *Self, newline: bool) !void {"),
+        .preview = try std.testing.allocator.dupe(u8, "symbol_ast"),
+    });
+    try std.testing.expectEqualStrings("C2", selectedCandidateForProtocolFallback(&state).?);
+
+    for (state.candidates.items) |candidate| candidate.deinit(std.testing.allocator);
+    state.candidates.clearRetainingCapacity();
+    try state.candidates.append(std.testing.allocator, .{
+        .id = try std.testing.allocator.dupe(u8, "C1"),
+        .path = try std.testing.allocator.dupe(u8, "src/render.zig"),
+        .start_line = 18,
+        .end_line = 65,
+        .score = 2150,
+        .source = try std.testing.allocator.dupe(u8, "module_entrypoint"),
+        .signature = try std.testing.allocator.dupe(u8, "pub fn AppendOnlyRenderer(comptime Writer: type) type {"),
+        .preview = try std.testing.allocator.dupe(u8, "module_entrypoint"),
+    });
+    try std.testing.expectEqualStrings("C1", selectedCandidateForProtocolFallback(&state).?);
+}
+
 test "candidate expansion stays inside selected candidate range" {
     try std.testing.expectEqual(@as(usize, 15), candidateExpansionLineLimit(32, 77, 91));
     try std.testing.expectEqual(@as(usize, 8), candidateExpansionLineLimit(8, 77, 91));
+    try std.testing.expect(std.mem.indexOf(u8, expandedCandidateNextAction(true, false), "called/related function whose declaration is not in E#") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expandedCandidateNextAction(false, false), "Do not call tools again") != null);
 }
 
 test "visible candidate selection converts to expand tool call" {
@@ -4148,6 +4341,7 @@ test "grounding rules separate dialogue continuity from exact session evidence" 
     try std.testing.expect(hasGroundingRule(rules, "[CONTRACTS]", "not evidence"));
     try std.testing.expect(hasGroundingRule(rules, "S# entries", "not automatically confirmed truth"));
     try std.testing.expect(hasGroundingRule(rules, "judge relevance", "direct support"));
+    try std.testing.expect(hasGroundingRule(rules, "copy only text present in the evidence", "outside quoted code"));
 }
 
 fn hasGroundingRule(rules: []const []const u8, a: []const u8, b: []const u8) bool {
