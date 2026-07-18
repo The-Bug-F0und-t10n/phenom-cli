@@ -319,7 +319,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         };
         try sink.flush();
         if (enable_tool_loop) {
-            const handled_by_tool_loop = runToolLoopIterations(allocator, io, config, prompt, sink.raw_model.items, model_context_text, &client, &events, &db, ui_ptr, &sink) catch |err| blk: {
+            const handled_by_tool_loop = runToolLoopIterations(allocator, io, config, prompt, sink.raw_model.items, sink.raw_visible.items, model_context_text, &client, &events, &db, ui_ptr, &sink) catch |err| blk: {
                 const message = try std.fmt.allocPrint(allocator, "tool loop failed: {s}", .{@errorName(err)});
                 defer allocator.free(message);
                 try events.emit(.{ .progress_update = message });
@@ -606,6 +606,7 @@ fn runToolLoopIterations(
     config: cli.Config,
     prompt: []const u8,
     model_output: []const u8,
+    visible_output: []const u8,
     initial_context: ?[]const u8,
     client: *http.LocalModelClient,
     events: *ui_events.EventBus,
@@ -646,7 +647,7 @@ fn runToolLoopIterations(
             },
         }
     }
-    if (maybe_envelope == null and outputNeedsWorkspaceEvidenceRepair(model_output, initial_context, state.active_contract.allowed_tools)) {
+    if (maybe_envelope == null and outputNeedsWorkspaceEvidenceRepair(visible_output, initial_context, state.active_contract.allowed_tools)) {
         first_sink.discardDeferredVisible();
         try db.recordEvent(config.session, "tool_repair", "unsupported workspace claim without evidence");
         const fallback_call = tool_call.ToolCall{
@@ -656,7 +657,7 @@ fn runToolLoopIterations(
         };
         maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, fallback_call);
     }
-    if (maybe_envelope == null and outputCitesMissingSessionEvidence(model_output, initial_context)) {
+    if (maybe_envelope == null and outputCitesMissingSessionEvidence(visible_output, initial_context)) {
         first_sink.discardDeferredVisible();
         try db.recordEvent(config.session, "tool_repair", "answer cited missing evidence");
         const repair_context = try renderMissingCitationRepairContext(allocator, prompt);
@@ -4209,6 +4210,61 @@ test "required workspace refinement defers uncited prose while collection is ava
         "[TURN_CONTEXT v1]\n\n[EVIDENCE]\nE1:\npacket_version=v1\n\n[NEXT_ACTION]\nAnswer now. Do not call tools again.\n",
         &.{"collect_evidence"},
     ));
+}
+
+test "tool loop prose repairs ignore hidden reasoning text" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+
+    var client = http.LocalModelClient{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1:1",
+        .backend = .llamacpp,
+        .model = "fake",
+        .max_tokens = 16,
+        .thinking = .off,
+    };
+    defer client.deinit();
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "hidden-reasoning-repair",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = true,
+    };
+    defer sink.deinit();
+
+    const initial_context =
+        "[TURN_CONTEXT v1]\n\n" ++
+        "[CONTRACTS]\ncollect_evidence(intent, terms, strategy=auto|lexical|symbol)\n\n" ++
+        "[NEXT_ACTION]\nkind=collect_context required_tool_calls=0 action=Otherwise answer directly.\n";
+    const raw_model = "<think>simple identity question; no code evidence or tools needed</think>Sou um assistente.";
+    const visible = "Sou um assistente.";
+
+    const handled = try runToolLoopIterations(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .session = "hidden-reasoning-repair", .backend = .llamacpp, .host = "127.0.0.1:1", .model = "fake" },
+        "quem e voce?",
+        raw_model,
+        visible,
+        initial_context,
+        &client,
+        &bus,
+        &db,
+        null,
+        &sink,
+    );
+    try std.testing.expect(!handled);
 }
 
 test "search plan terms can be parsed from visible model plan" {

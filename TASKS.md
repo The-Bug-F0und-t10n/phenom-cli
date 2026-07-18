@@ -11049,3 +11049,56 @@ Invariantes afetadas:
 Risco residual:
 
 - Se o modelo insistir em repetir overview/candidatos sem expandir, o loop ainda depende dos limites de iteracao/reparo existentes.
+
+## T314 - Separar raw reasoning de reparos de prosa no tool loop
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: pergunta conversacional simples como `quem e voce?` podia acionar `collect_evidence: overview` mesmo quando o proprio modelo raciocinava que nao precisava de tool. A causa raiz era que `runToolLoopIterations` avaliava reparos de "claim sem evidencia" usando `raw_model`, que inclui `<think>`. Quando o reasoning continha palavras como `code evidence` ou `collect_evidence`, o controller interpretava isso como prosa visivel e criava fallback para `collect_evidence`.
+
+Regra de negocio preservada:
+
+- Parser de tool continua lendo `raw_model` para manter suporte a tool calls ocultas/reparaveis ja existentes.
+- Reparos de prosa agora olham apenas `raw_visible`, porque somente texto visivel e resposta ao usuario.
+- Nenhuma heuristica por prompt foi adicionada.
+- Perguntas de codigo continuam podendo acionar `collect_evidence`.
+
+Passos de implementacao:
+
+1. Criar teste de regressao com raw reasoning contendo `code evidence` e resposta visivel direta.
+2. Passar `sink.raw_visible.items` para `runToolLoopIterations`.
+3. Manter `tool_envelope.parseFirst` sobre `raw_model`.
+4. Usar `visible_output` nos reparos `outputNeedsWorkspaceEvidenceRepair` e `outputCitesMissingSessionEvidence`.
+5. Rodar unitario, build release, smokes diretos e smoke de codigo.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: `runToolLoopIterations` agora recebe `model_output` e `visible_output`.
+- `phenom-zig/src/main.zig`: reparos de prosa usam `visible_output`; parser de envelope continua em `model_output`.
+- `phenom-zig/src/main.zig`: teste `tool loop prose repairs ignore hidden reasoning text`.
+
+Criterio de aceite:
+
+- Reasoning oculto que menciona evidencia/tool nao dispara `collect_evidence`.
+- Resposta direta visivel passa sem o tool loop tomar posse do turno.
+- Tool call real em pergunta de codigo continua executando.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-visible-repair-main` -> passou; 308 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
+- Smoke CLI direto com hidden reasoning em `127.0.0.1:18090`: `quem e voce hidden` -> `PHENOM_DIRECT_HIDDEN_OK`; audit `tool_start` = 0.
+- Smoke CLI direto simples em `127.0.0.1:18090`: `quem e voce simples` -> `PHENOM_DIRECT_SIMPLE_OK`; audit `tool_start` = 0.
+- Smoke CLI de codigo em `127.0.0.1:18090`: `qual funcao executa candidatos` -> `PHENOM_CODE_TOOL_OK`; audit `tool_start` = 3.
+
+Invariantes afetadas:
+
+- 1. Tool nao anunciada nunca executa: preservada.
+- 6. Falha de modelo nao parece falha de infraestrutura: corrigida; reasoning oculto nao cria falso reparo.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; smokes registram contagem de `tool_start`.
+
+Risco residual:
+
+- Se o modelo emitir um tool_call real dentro de `<think>`, o parser ainda pode executar porque isso e comportamento preservado por testes existentes.
