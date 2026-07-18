@@ -2844,7 +2844,7 @@ const ToolLoopState = struct {
     }
 
     fn rememberExecutedArgs(self: *ToolLoopState, path: ?[]const u8, terms: ?[]const u8, strategy: contracts.StrategyName, start_line: usize, max_lines: usize, context_id: ?[]const u8, evidence_text: []const u8, model_bytes: usize, quality_score: i32) !void {
-        try self.context.remember(.{
+        self.context.remember(.{
             .path = path,
             .terms = terms,
             .strategy = strategy,
@@ -2854,7 +2854,10 @@ const ToolLoopState = struct {
             .evidence_text = evidence_text,
             .model_bytes = model_bytes,
             .quality_score = quality_score,
-        });
+        }) catch |err| switch (err) {
+            error.DuplicateWorkingEvidence => return,
+            else => return err,
+        };
     }
 
     fn hasBudgetForMoreEvidence(self: ToolLoopState) bool {
@@ -4344,6 +4347,18 @@ test "tool loop state detects duplicate collect evidence calls and preserves evi
     try std.testing.expect(state.hasExecutedArgs(call.path, call.terms, strategy, call.start_line, call.max_lines));
     try std.testing.expectEqual(@as(usize, 1), state.context.entries.items.len);
     try std.testing.expect(std.mem.indexOf(u8, state.context.entries.items[0].evidence_text, "README.md") != null);
+}
+
+test "tool loop state treats duplicate working evidence as idempotent" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.rememberExecutedArgs("README.md", null, .path, 1, 12, "ctx_readme", "[EVIDENCE]\n- README.md L1-L12 hash=abc\n", 120, 72);
+    try state.rememberExecutedArgs("README.md", null, .path, 1, 12, "ctx_readme_dup", "[EVIDENCE]\n- duplicate\n", 50, 1);
+
+    try std.testing.expectEqual(@as(usize, 1), state.context.entries.items.len);
+    try std.testing.expectEqualStrings("ctx_readme", state.context.entries.items[0].context_id);
+    try std.testing.expect(std.mem.indexOf(u8, state.context.entries.items[0].evidence_text, "duplicate") == null);
 }
 
 test "tool loop state keeps session evidence for duplicate search repair" {

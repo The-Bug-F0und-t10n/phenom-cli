@@ -10882,3 +10882,55 @@ Risco residual:
 - O caveman graph nao e tree-sitter, LSP nem embedding neural. Ele cobre simbolos simples, chamadas diretas intra-file e imports Zig locais.
 - Nao ha cache persistente do grafo; ele e reconstruido por ranking.
 - O modelo real ainda pode escolher `stage=overview` em pergunta focada. Esta task melhora a qualidade quando o contrato pathless/focado chega ao ranker, mas nao muda a decisao autonoma do modelo sobre qual stage chamar.
+
+## T311 - Tornar evidencia duplicada idempotente no estado do tool loop
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: em fluxo real o loop podia falhar com `tool loop failed: DuplicateWorkingEvidence` seguido de `[MODEL_PROTOCOL_ERROR] required follow-up tool_call missing after repair; no final evidence was selected`. A causa raiz era uma fronteira errada entre `WorkingContext` e `ToolLoopState`: `WorkingContext.remember` corretamente rejeita duplicata para proteger o store, mas `ToolLoopState.rememberExecutedArgs` propagava essa rejeicao como erro fatal de turno. Para o loop, repetir a mesma evidencia no mesmo turno deve ser idempotente: manter a primeira evidencia, nao duplicar entrada e continuar para resposta/reparo.
+
+Regra de negocio preservada:
+
+- `WorkingContext` continua rejeitando duplicata em sua API baixa.
+- O loop nao executa tool nao anunciada e nao adiciona nova surface.
+- Nenhuma heuristica por prompt foi adicionada.
+- A primeira evidencia coletada continua sendo a fonte preservada; repeticoes nao sobrescrevem texto, `context_id` nem qualidade.
+
+Passos de implementacao:
+
+1. Criar teste em `ToolLoopState` que grava a mesma evidencia duas vezes.
+2. Garantir que a segunda chamada nao aumenta `entries.len`.
+3. Garantir que a segunda chamada nao sobrescreve `context_id` nem evidencia original.
+4. Tratar `error.DuplicateWorkingEvidence` em `ToolLoopState.rememberExecutedArgs` como retorno idempotente.
+5. Rodar `main`, guardrails, build release e smoke CLI com coleta duplicada real no loop.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: `rememberExecutedArgs` captura `error.DuplicateWorkingEvidence` e retorna sucesso sem mutar o estado.
+- `phenom-zig/src/main.zig`: teste `tool loop state treats duplicate working evidence as idempotent`.
+
+Criterio de aceite:
+
+- Duplicata no mesmo turno nao derruba o loop.
+- Entrada original continua unica e preservada.
+- O erro `DuplicateWorkingEvidence` nao vaza como `tool loop failed`.
+- O fluxo ainda consegue emitir resposta final visivel apos repeticao.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-duplicate-working-evidence-main` -> passou; 292 testes.
+- `bash tools/check_product_guardrails.sh` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
+- Smoke CLI com backend llama.cpp fake deterministico em `127.0.0.1:18087`: o backend emitiu `collect_evidence stage=overview` duas vezes no mesmo turno e depois resposta final `PHENOM_DUPLICATE_EVIDENCE_OK`; o comando `./zig-out/bin/phenom chat --backend llamacpp --host 127.0.0.1:18087 --model fake --thinking off --max-tokens 1200 --session duplicate-working-evidence-20260718a --prompt 'force duplicate evidence smoke' --expect-contains PHENOM_DUPLICATE_EVIDENCE_OK --show-expect-status --fail-on-model-error --no-color` -> passou.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; duplicata nao injeta novo bloco bruto.
+- 6. Falha de modelo nao parece falha de infraestrutura: corrigida; repeticao de tool/evidencia nao vira erro fatal.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; o smoke registra duas coletas e resposta final.
+
+Risco residual:
+
+- A tool ainda pode executar novamente antes de ser reconhecida como duplicata em rotas que nao fazem precheck. Esta task impede falha fatal e duplicacao de contexto; dedupe antes da execucao dessas rotas pode ser otimizado depois se o custo virar problema.
