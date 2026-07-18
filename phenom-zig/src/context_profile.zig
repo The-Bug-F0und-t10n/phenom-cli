@@ -192,6 +192,7 @@ pub fn candidateExpandSchema() []const u8 {
     \\[TOOLS v1]
     \\collect_evidence(stage=expand, selectedCandidate, max_lines=32)
     \\Only valid output in this state is one XML tool_call, or one visible line SELECTED_CANDIDATE: C#. Choose the best visible C# candidate for the task. Replace C# with that candidate ID. No prose. No analysis. C# candidates are not E# evidence.
+    \\When the task asks which function/type/file and a visible source=local_symbol_ast or source=symbol_ast candidate has a concrete def: fn/type/file matching the task, prefer it over a broad source=module_entrypoint container.
     \\<tool_call><function=collect_evidence><parameter=stage>expand</parameter><parameter=selectedCandidate>C#</parameter><parameter=max_lines>32</parameter></function></tool_call>
     ;
 }
@@ -236,6 +237,7 @@ test "schemas are state scoped" {
     const expand = candidateExpandSchema();
     try std.testing.expect(std.mem.indexOf(u8, expand, "stage=expand") != null);
     try std.testing.expect(std.mem.indexOf(u8, expand, "best visible C# candidate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expand, "source=local_symbol_ast") != null);
     try std.testing.expect(std.mem.indexOf(u8, expand, "selectedCandidate>C1") == null);
     try std.testing.expect(std.mem.indexOf(u8, expand, "search_session") == null);
     try std.testing.expect(std.mem.indexOf(u8, expand, "strategy=auto") == null);

@@ -9,6 +9,7 @@ pub const CandidateSource = enum {
     prompt_path,
     module_entrypoint,
     symbol_ast,
+    local_symbol_ast,
     rg,
     fts_bm25,
     fallback_scan,
@@ -180,6 +181,17 @@ pub fn rankForPrompt(
     var merged = try mergeCandidates(allocator, candidates.items, budget);
     freeCandidates(allocator, &candidates);
     sortCandidates(merged.items);
+    if (strategy == .symbol and merged.items.len > 0) {
+        const local_stats = collectTopPathLocalSymbolCandidates(allocator, io, &merged, prompt, budget) catch blk: {
+            symbol_available = false;
+            break :blk null;
+        };
+        if (local_stats) |stats| {
+            symbol_indexed_files += stats.indexed_files;
+            symbols_seen += stats.symbol_count;
+        }
+        sortCandidates(merged.items);
+    }
     trimCandidates(allocator, &merged, budget.max_ranges);
 
     const audit = try renderAudit(allocator, merged.items, terms.items.items, strategy, rg_invocations, rg_available, fts_available, fts_indexed_files, symbol_available, symbol_indexed_files, symbols_seen);
@@ -326,17 +338,20 @@ fn collectPathNameCandidates(
     for (inventory.paths.items) |path| {
         if (out.items.len >= budget.max_candidates) break;
         var best_score: i32 = 0;
-        for (term_slice) |term| {
+        for (term_slice, 0..) |term, term_index| {
             if (term.len < 3) continue;
             const exact = containsIgnoreCase(path, term);
             const fuzzy = fuzzyTextMatchScore(path, term);
             const tokenized = symbol_ranker.tokenizedIdentifierMatchScore(path, term, 6, 2);
             if (!exact and fuzzy == 0 and tokenized == 0) continue;
-            var score: i32 = if (exact)
+            var score: i32 = if (exact and isStructuredSearchTerm(term))
+                900 + @as(i32, @intCast(@min(term.len, 48)))
+            else if (exact)
                 68 + @as(i32, @intCast(@min(term.len, 24)))
             else
                 48 + @as(i32, @intCast(fuzzy));
             if (tokenized > 0) score = @max(score, 100 + @as(i32, @intCast(@min(tokenized, 160))));
+            if (term_index < 3) score += 80 else if (term_index < 6) score += 40;
             best_score = @max(best_score, score);
         }
         if (best_score == 0) continue;
@@ -496,7 +511,7 @@ fn collectSymbolCandidates(
             .path = owned_path,
             .start_line = candidate.start_line,
             .end_line = @min(candidate.end_line, candidate.start_line + budget.max_lines_per_range - 1),
-            .score = candidate.score + 80,
+            .score = @min(candidate.score + 80, 1200),
             .source = .symbol_ast,
             .reasons = reasons,
         });
@@ -536,6 +551,48 @@ fn collectModuleEntrypointCandidates(
     return .{ .indexed_files = ranked.indexed_files, .symbol_count = ranked.symbol_count };
 }
 
+fn collectTopPathLocalSymbolCandidates(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    out: *std.ArrayList(EvidenceCandidate),
+    query: []const u8,
+    budget: RankBudget,
+) !SymbolStats {
+    if (out.items.len == 0) return .{ .indexed_files = 0, .symbol_count = 0 };
+    const anchor = localSymbolAnchor(out.items);
+    const paths = [_]symbol_ranker.PathBoost{.{
+        .path = anchor.path,
+        .score = @min(anchor.score, 320),
+        .corroboration_score = 0,
+    }};
+    var ranked = try symbol_ranker.rankLocalSymbolsForPaths(allocator, io, &paths, query, budget.max_candidates);
+    defer ranked.deinit(allocator);
+    for (ranked.candidates.items) |candidate| {
+        if (!workspace_inventory.isWorkspacePath(candidate.path)) continue;
+        const reasons = try std.fmt.allocPrint(allocator, "local_symbol_ast,symbol={s},indexed_files={},symbols={}", .{ candidate.symbol, ranked.indexed_files, ranked.symbol_count });
+        errdefer allocator.free(reasons);
+        try out.append(allocator, .{
+            .path = try allocator.dupe(u8, candidate.path),
+            .start_line = candidate.start_line,
+            .end_line = @min(candidate.end_line, candidate.start_line + budget.max_lines_per_range - 1),
+            .score = candidate.score + 80,
+            .source = .local_symbol_ast,
+            .reasons = reasons,
+        });
+    }
+    return .{ .indexed_files = ranked.indexed_files, .symbol_count = ranked.symbol_count };
+}
+
+fn localSymbolAnchor(candidates: []const EvidenceCandidate) EvidenceCandidate {
+    for (candidates) |candidate| {
+        if (candidate.source == .prompt_path) return candidate;
+    }
+    for (candidates) |candidate| {
+        if (candidate.source == .module_entrypoint) return candidate;
+    }
+    return candidates[0];
+}
+
 fn addPathBoost(
     allocator: std.mem.Allocator,
     boosts: *std.ArrayList(symbol_ranker.PathBoost),
@@ -543,14 +600,18 @@ fn addPathBoost(
     score: i32,
     source: CandidateSource,
 ) !void {
-    const corroboration = if (source == .prompt_path) @min(score, 240) else 0;
+    const capped_score: i32 = switch (source) {
+        .symbol_ast, .local_symbol_ast, .module_entrypoint => @min(score, 240),
+        else => score,
+    };
+    const corroboration = if (source == .prompt_path) @min(capped_score, 240) else 0;
     for (boosts.items) |*boost| {
         if (!std.mem.eql(u8, boost.path, path)) continue;
-        boost.score = @max(boost.score, score);
+        boost.score = @max(boost.score, capped_score);
         boost.corroboration_score = @max(boost.corroboration_score, corroboration);
         return;
     }
-    try boosts.append(allocator, .{ .path = path, .score = score, .corroboration_score = corroboration });
+    try boosts.append(allocator, .{ .path = path, .score = capped_score, .corroboration_score = corroboration });
 }
 
 fn sortPathBoosts(boosts: []symbol_ranker.PathBoost) void {
@@ -666,7 +727,7 @@ fn canMergeCandidateSources(a: EvidenceCandidate, b: EvidenceCandidate) bool {
 }
 
 fn isStructuralCandidateSource(source: CandidateSource) bool {
-    return source == .symbol_ast or source == .module_entrypoint;
+    return source == .symbol_ast or source == .local_symbol_ast or source == .module_entrypoint;
 }
 
 pub fn adaptiveBudget(total_budget: usize, quality_score: i32, range_count: usize) usize {
@@ -783,12 +844,23 @@ fn trimCandidates(allocator: std.mem.Allocator, candidates: *std.ArrayList(Evide
     }
 
     while (selected < max) : (selected += 1) {
-        var best = selected;
+        var best: ?usize = null;
         i = selected + 1;
         while (i < candidates.items.len) : (i += 1) {
-            if (candidatePrecedes(candidates.items[i], candidates.items[best])) best = i;
+            if (sourceCount(candidates.items[0..selected], candidates.items[i].source) >= preferredSourceLimit(candidates.items[i].source)) continue;
+            if (best == null or candidatePrecedes(candidates.items[i], candidates.items[best.?])) best = i;
         }
-        std.mem.swap(EvidenceCandidate, &candidates.items[selected], &candidates.items[best]);
+        if (sourceCount(candidates.items[0..selected], candidates.items[selected].source) < preferredSourceLimit(candidates.items[selected].source)) {
+            if (best == null or candidatePrecedes(candidates.items[selected], candidates.items[best.?])) best = selected;
+        }
+        if (best == null) {
+            best = selected;
+            i = selected + 1;
+            while (i < candidates.items.len) : (i += 1) {
+                if (candidatePrecedes(candidates.items[i], candidates.items[best.?])) best = i;
+            }
+        }
+        std.mem.swap(EvidenceCandidate, &candidates.items[selected], &candidates.items[best.?]);
     }
 
     while (candidates.items.len > selected) {
@@ -802,6 +874,23 @@ fn sourceAlreadySelected(candidates: []const EvidenceCandidate, source: Candidat
         if (candidate.source == source) return true;
     }
     return false;
+}
+
+fn sourceCount(candidates: []const EvidenceCandidate, source: CandidateSource) usize {
+    var count: usize = 0;
+    for (candidates) |candidate| {
+        if (candidate.source == source) count += 1;
+    }
+    return count;
+}
+
+fn preferredSourceLimit(source: CandidateSource) usize {
+    return switch (source) {
+        .local_symbol_ast => 3,
+        .symbol_ast => 1,
+        .module_entrypoint => 1,
+        else => 1,
+    };
 }
 
 fn rangesTouch(a_start: usize, a_end: usize, b_start: usize, b_end: usize) bool {
@@ -1076,6 +1165,14 @@ test "symbol ranking uses fts corroboration for conceptual renderer query" {
     try std.testing.expect(ranked.fts_indexed_files > 0);
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "fts_indexed_files=") != null);
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "source=symbol_ast") != null);
+}
+
+test "symbol ranking includes local functions from strong matched files" {
+    var ranked = try rankForPrompt(std.testing.allocator, std.testing.io, "no renderer qual funcao faz a tabela aparecer cite evidencia", .symbol, .{ .max_ranges = 6 });
+    defer ranked.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "source=local_symbol_ast") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "flushMarkdownTables") != null);
 }
 
 test "term extraction keeps structured symbols and plain keywords" {

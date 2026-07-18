@@ -115,10 +115,10 @@ pub fn executeCandidates(allocator: std.mem.Allocator, io: std.Io, args: Args) !
 
     for (ranked.candidates.items, 0..) |candidate, idx| {
         const signature_start = candidate.start_line;
-        const signature_max_lines: usize = if (candidate.source == .symbol_ast or candidate.source == .module_entrypoint) 1 else candidate.end_line - candidate.start_line + 1;
+        const signature_max_lines: usize = if (candidate.source == .symbol_ast or candidate.source == .local_symbol_ast or candidate.source == .module_entrypoint) 1 else candidate.end_line - candidate.start_line + 1;
         const signature_range = tools.readFileRange(allocator, candidate.path, signature_start, signature_max_lines, 32 * 1024) catch continue;
         defer signature_range.deinit(allocator);
-        const signature = if (candidate.source == .symbol_ast or candidate.source == .module_entrypoint)
+        const signature = if (candidate.source == .symbol_ast or candidate.source == .local_symbol_ast or candidate.source == .module_entrypoint)
             firstLineAt(signature_range.text, signature_start)
         else
             selectCandidateLine(signature_range.text, signature_start, candidate.start_line, search_terms, candidate.path);

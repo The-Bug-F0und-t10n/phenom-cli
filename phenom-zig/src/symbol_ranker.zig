@@ -119,6 +119,38 @@ pub fn rankEntrypointsForPaths(
     return .{ .candidates = out, .indexed_files = indexed, .symbol_count = symbols };
 }
 
+pub fn rankLocalSymbolsForPaths(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: []const PathBoost,
+    query: []const u8,
+    max_candidates: usize,
+) !Result {
+    var out = std.ArrayList(Candidate).empty;
+    errdefer {
+        for (out.items) |candidate| candidate.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    const root = std.Io.Dir.cwd();
+    var cwd = try root.openDir(io, ".", .{});
+    defer cwd.close(io);
+
+    var indexed: usize = 0;
+    var symbols: usize = 0;
+    for (paths) |boost| {
+        const content = cwd.readFileAlloc(io, boost.path, allocator, .limited(max_file_bytes)) catch continue;
+        defer allocator.free(content);
+        if (!workspace_inventory.isTextBytes(content)) continue;
+        indexed += 1;
+        try collectFileLocalSymbols(allocator, &out, boost.path, content, query, boost.score + boost.corroboration_score, max_candidates, &symbols);
+    }
+
+    sortCandidates(out.items);
+    trimCandidates(allocator, &out, max_candidates);
+    return .{ .candidates = out, .indexed_files = indexed, .symbol_count = symbols };
+}
+
 fn collectFileEntrypoints(
     allocator: std.mem.Allocator,
     out: *std.ArrayList(Candidate),
@@ -150,6 +182,44 @@ fn collectFileEntrypoints(
             .start_line = symbol.line,
             .end_line = symbol.end_line,
             .score = path_score + 360 - @as(i32, @intCast(@min(symbol.line, 260))),
+        });
+    }
+}
+
+fn collectFileLocalSymbols(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(Candidate),
+    path: []const u8,
+    content: []const u8,
+    query: []const u8,
+    path_score: i32,
+    max_candidates: usize,
+    symbol_count: *usize,
+) !void {
+    var offset: usize = 0;
+    var line_no: usize = 1;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        defer {
+            offset += line.len + 1;
+            line_no += 1;
+        }
+        const symbol = parseSymbolLine(path, line, line_no, content[offset..]) orelse continue;
+        symbol_count.* += 1;
+        if (symbol.top_level or symbol.kind != .function) continue;
+        const local_score = scoreSymbolLocal(symbol, query);
+        if (local_score == 0) continue;
+        if (out.items.len >= max_candidates * candidate_headroom) continue;
+        const owned_path = try allocator.dupe(u8, symbol.path);
+        errdefer allocator.free(owned_path);
+        const owned_symbol = try allocator.dupe(u8, symbol.name);
+        errdefer allocator.free(owned_symbol);
+        try out.append(allocator, .{
+            .path = owned_path,
+            .symbol = owned_symbol,
+            .start_line = symbol.line,
+            .end_line = symbol.end_line,
+            .score = local_score + @min(path_score, 320) + 40,
         });
     }
 }
@@ -237,12 +307,30 @@ fn namedJsSymbol(path: []const u8, rest: []const u8, line_no: usize, tail: []con
 }
 
 fn scoreSymbol(symbol: Symbol, query: []const u8) i32 {
+    return scoreSymbolWithOptions(symbol, query, .{ .include_path = true, .skip_path_terms = false });
+}
+
+fn scoreSymbolLocal(symbol: Symbol, query: []const u8) i32 {
+    return scoreSymbolWithOptions(symbol, query, .{ .include_path = false, .skip_path_terms = true });
+}
+
+const ScoreOptions = struct {
+    include_path: bool,
+    skip_path_terms: bool,
+};
+
+fn scoreSymbolWithOptions(symbol: Symbol, query: []const u8, options: ScoreOptions) i32 {
     var score: i32 = 0;
     var it = std.mem.tokenizeAny(u8, query, " \t\r\n\"'`()[]{}<>:;,./\\|");
     var term_index: usize = 0;
     while (it.next()) |raw| : (term_index += 1) {
         const term = std.mem.trim(u8, raw, "-_*");
         if (term.len < 2) continue;
+        const path_score =
+            (if (containsIgnoreCase(symbol.path, term)) @as(usize, @min(term.len * 7, 56)) else 0) +
+            fuzzyTextMatchScore(symbol.path, term) +
+            tokenizedIdentifierMatchScore(symbol.path, term, 10, 3);
+        if (options.skip_path_terms and path_score > 0) continue;
         const positional_weight: usize = if (term_index == 0) 3 else if (term_index < 3) 2 else 1;
         if (std.ascii.eqlIgnoreCase(symbol.name, term)) score += @as(i32, @intCast(@min(term.len * 8, 96)));
         if (containsIgnoreCase(symbol.name, term)) {
@@ -250,16 +338,14 @@ fn scoreSymbol(symbol: Symbol, query: []const u8) i32 {
             score += symbolSpecificityBonus(symbol.name, term);
         }
         if (containsIgnoreCase(symbol.signature, term)) score += @as(i32, @intCast(@min(term.len * 3, 30)));
-        if (containsIgnoreCase(symbol.path, term)) score += @as(i32, @intCast(@min(term.len * 7, 56)));
+        if (options.include_path) score += @as(i32, @intCast(path_score));
         score += @as(i32, @intCast(fuzzyTextMatchScore(symbol.name, term)));
         score += @as(i32, @intCast(fuzzyTextMatchScore(symbol.signature, term) / 2));
-        score += @as(i32, @intCast(fuzzyTextMatchScore(symbol.path, term)));
         score += @as(i32, @intCast(tokenizedIdentifierMatchScore(symbol.name, term, 34, 6)));
         score += @as(i32, @intCast(tokenizedIdentifierMatchScore(symbol.signature, term, 12, 4)));
-        score += @as(i32, @intCast(tokenizedIdentifierMatchScore(symbol.path, term, 10, 3)));
         if (positional_weight > 1) {
             const positional = tokenizedIdentifierMatchScore(symbol.name, term, 18, 3) +
-                tokenizedIdentifierMatchScore(symbol.path, term, 8, 2);
+                if (options.include_path) tokenizedIdentifierMatchScore(symbol.path, term, 8, 2) else 0;
             score += @as(i32, @intCast(positional * (positional_weight - 1)));
         }
     }
@@ -389,6 +475,7 @@ fn tokenAppearedBefore(tokens: []const Token, text: []const u8) bool {
 fn partialTokenMatch(haystack_token: []const u8, query_token: []const u8) bool {
     const common = longestAsciiFoldedTermPrefixInHaystack(haystack_token, query_token);
     if (common >= 4) return true;
+    if (common >= 3 and @max(haystack_token.len, query_token.len) >= 5) return true;
     if (@min(haystack_token.len, query_token.len) < 4) return false;
     return containsIgnoreCase(haystack_token, query_token) or containsIgnoreCase(query_token, haystack_token);
 }
@@ -479,4 +566,20 @@ test "symbol ranker matches snake query terms to camel case symbols" {
     try std.testing.expect(result.candidates.items.len > 0);
     try std.testing.expectEqualStrings("src/tools.zig", result.candidates.items[0].path);
     try std.testing.expectEqualStrings("readFileRange", result.candidates.items[0].symbol);
+}
+
+test "local symbol ranker searches concrete functions inside selected paths" {
+    const paths = [_]PathBoost{.{ .path = "src/render.zig", .score = 180, .corroboration_score = 120 }};
+    var result = try rankLocalSymbolsForPaths(std.testing.allocator, std.testing.io, &paths, "no renderer qual funcao faz a tabela aparecer", 8);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.candidates.items.len > 0);
+    try std.testing.expect(hasSymbol(result.candidates.items, "flushMarkdownTables"));
+}
+
+fn hasSymbol(candidates: []const Candidate, needle: []const u8) bool {
+    for (candidates) |candidate| {
+        if (std.mem.eql(u8, candidate.symbol, needle)) return true;
+    }
+    return false;
 }

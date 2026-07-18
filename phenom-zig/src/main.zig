@@ -1294,6 +1294,9 @@ fn runCollectEvidenceCandidatesStep(
 
 fn selectedCandidateForProtocolFallback(state: *const ToolLoopState) ?[]const u8 {
     for (state.candidates.items) |candidate| {
+        if (std.mem.eql(u8, candidate.source, "local_symbol_ast")) return candidate.id;
+    }
+    for (state.candidates.items) |candidate| {
         if (std.mem.eql(u8, candidate.source, "symbol_ast")) return candidate.id;
     }
     if (state.candidates.items.len == 0) return null;
@@ -2750,6 +2753,7 @@ fn groundingRules() []const []const u8 {
         "Use [RECENT_DIALOGUE] for continuity only; use [SESSION_FOCUS] only as a routing map. Exact claims about what was said or done in prior conversation must cite S# evidence from [SESSION_CONTEXT].",
         "S# entries are retrieved session candidates, not automatically confirmed truth; judge relevance and direct support before using them.",
         "collect_evidence intent states what workspace/source-code evidence to recover; pathless collect_evidence terms are retrieval keys for that intent, not the user's vague wording.",
+        "Do not answer that workspace/source-code context is unavailable while collect_evidence is available; call collect_evidence first when workspace/source-code context is required.",
         "search_session intent states what evidence to recover; search_session terms are retrieval keys for that intent, not the user's vague wording.",
         "Do not answer that conversation history is unavailable while search_session is available; call search_session first when prior conversation context is required.",
         "If no E#/S# supports a workspace or exact prior-session claim, say that claim is not evidenced in the provided context.",
@@ -4338,6 +4342,7 @@ test "grounding rules separate dialogue continuity from exact session evidence" 
     try std.testing.expect(hasGroundingRule(rules, "collect_evidence", "retrieval keys"));
     try std.testing.expect(hasGroundingRule(rules, "search_session", "retrieval keys"));
     try std.testing.expect(hasGroundingRule(rules, "history is unavailable", "search_session"));
+    try std.testing.expect(hasGroundingRule(rules, "workspace/source-code context is unavailable", "collect_evidence"));
     try std.testing.expect(hasGroundingRule(rules, "[CONTRACTS]", "not evidence"));
     try std.testing.expect(hasGroundingRule(rules, "S# entries", "not automatically confirmed truth"));
     try std.testing.expect(hasGroundingRule(rules, "judge relevance", "direct support"));
