@@ -3,6 +3,7 @@ const std = @import("std");
 const audit = @import("audit.zig");
 const apply_patch_tool = @import("apply_patch_tool.zig");
 const cli = @import("cli.zig");
+const code_graph = @import("code_graph.zig");
 const collect_evidence = @import("collect_evidence.zig");
 const context_profile = @import("context_profile.zig");
 const contracts = @import("contracts.zig");
@@ -58,8 +59,15 @@ pub fn main(init: std.process.Init) !void {
         .version => try (fd_writer.FdWriter{ .fd = 1 }).print("phenom-zig 0.2.0-dev\n", .{}),
         .chat => try runChat(allocator, init.io, config),
         .probe => try runProbe(allocator, config),
+        .graph => try runGraph(allocator, init.io),
         .snapshot => try runSnapshot(),
     }
+}
+
+fn runGraph(allocator: std.mem.Allocator, io: std.Io) !void {
+    const path = "graph.html";
+    try code_graph.writeHtml(allocator, io, path);
+    try (fd_writer.FdWriter{ .fd = 1 }).print("wrote {s}\n", .{path});
 }
 
 fn runProbe(allocator: std.mem.Allocator, config: cli.Config) !void {
@@ -3477,6 +3485,7 @@ test {
     _ = audit;
     _ = apply_patch_tool;
     _ = cli;
+    _ = code_graph;
     _ = collect_evidence;
     _ = contracts;
     _ = evidence;

@@ -14,6 +14,7 @@ pub const ThinkingMode = enum {
 pub const Command = enum {
     chat,
     probe,
+    graph,
     snapshot,
     version,
     help,
@@ -52,6 +53,8 @@ pub fn parseArgsWithBase(base: Config, args: []const []const u8) !Config {
         cfg.command = .chat;
     } else if (std.mem.eql(u8, args[1], "probe")) {
         cfg.command = .probe;
+    } else if (std.mem.eql(u8, args[1], "graph")) {
+        cfg.command = .graph;
     } else if (std.mem.eql(u8, args[1], "snapshot")) {
         cfg.command = .snapshot;
     } else if (std.mem.eql(u8, args[1], "version") or std.mem.eql(u8, args[1], "--version")) {
@@ -139,6 +142,7 @@ pub fn printUsage(writer: anytype) !void {
         \\  chat [--prompt TEXT] [--session ID] [--offline]
         \\  chat --backend ollama|llamacpp --host HOST:PORT --model MODEL --prompt TEXT
         \\  probe --backend ollama|llamacpp --host HOST:PORT
+        \\  graph
         \\  snapshot
         \\  version
         \\
@@ -185,6 +189,12 @@ test "parse probe args" {
     try std.testing.expectEqual(Command.probe, cfg.command);
     try std.testing.expectEqual(Backend.llamacpp, cfg.backend);
     try std.testing.expectEqualStrings("192.168.1.122:11434", cfg.host);
+}
+
+test "parse graph args" {
+    const args = &.{ "phenom", "graph" };
+    const cfg = try parseArgs(args);
+    try std.testing.expectEqual(Command.graph, cfg.command);
 }
 
 test "parse chat args" {

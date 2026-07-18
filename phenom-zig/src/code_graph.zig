@@ -69,6 +69,18 @@ const Term = struct {
     text: []const u8,
 };
 
+const Graph = struct {
+    symbols: std.ArrayList(Symbol),
+    edges: std.ArrayList(Edge),
+    indexed_files: usize,
+
+    fn deinit(self: *Graph, allocator: std.mem.Allocator) void {
+        for (self.symbols.items) |symbol| symbol.deinit(allocator);
+        self.symbols.deinit(allocator);
+        self.edges.deinit(allocator);
+    }
+};
+
 pub fn rank(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -83,16 +95,8 @@ pub fn rank(
         \\create table edges(kind text not null, src integer not null, dst integer not null);
     );
 
-    var symbols = std.ArrayList(Symbol).empty;
-    defer {
-        for (symbols.items) |symbol| symbol.deinit(allocator);
-        symbols.deinit(allocator);
-    }
-    var edges = std.ArrayList(Edge).empty;
-    defer edges.deinit(allocator);
-
-    const indexed = try indexWorkspace(allocator, io, db, &symbols);
-    try collectEdges(allocator, io, db, symbols.items, &edges);
+    var graph = try buildGraph(allocator, io, db);
+    defer graph.deinit(allocator);
 
     var candidates = std.ArrayList(Candidate).empty;
     errdefer {
@@ -102,13 +106,13 @@ pub fn rank(
 
     var terms_buf: [max_terms]Term = undefined;
     const terms = terms_buf[0..extractTerms(query, &terms_buf)];
-    for (symbols.items) |symbol| {
-        const scored = scoreSymbol(symbol, terms, edges.items);
+    for (graph.symbols.items) |symbol| {
+        const scored = scoreSymbol(symbol, terms, graph.edges.items);
         if (scored.score == 0) continue;
-        try appendCandidate(allocator, &candidates, symbol, scored.score, relationCount(symbol.id, edges.items), scored.direct_symbol_match);
+        try appendCandidate(allocator, &candidates, symbol, scored.score, relationCount(symbol.id, graph.edges.items), scored.direct_symbol_match);
     }
 
-    addImmediateNeighbors(allocator, &candidates, symbols.items, edges.items) catch |err| switch (err) {
+    addImmediateNeighbors(allocator, &candidates, graph.symbols.items, graph.edges.items) catch |err| switch (err) {
         error.OutOfMemory => return err,
     };
     sortCandidates(candidates.items);
@@ -116,10 +120,167 @@ pub fn rank(
 
     return .{
         .candidates = candidates,
-        .indexed_files = indexed,
-        .nodes = symbols.items.len,
-        .edges = edges.items.len,
+        .indexed_files = graph.indexed_files,
+        .nodes = graph.symbols.items.len,
+        .edges = graph.edges.items.len,
     };
+}
+
+pub fn writeHtml(allocator: std.mem.Allocator, io: std.Io, output_path: []const u8) !void {
+    var graph = try buildGraph(allocator, io, null);
+    defer graph.deinit(allocator);
+
+    var html = std.ArrayList(u8).empty;
+    defer html.deinit(allocator);
+    try renderHtml(allocator, &html, graph);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = html.items });
+}
+
+fn buildGraph(allocator: std.mem.Allocator, io: std.Io, db: ?*c.sqlite3) !Graph {
+    var symbols = std.ArrayList(Symbol).empty;
+    errdefer {
+        for (symbols.items) |symbol| symbol.deinit(allocator);
+        symbols.deinit(allocator);
+    }
+    var edges = std.ArrayList(Edge).empty;
+    errdefer edges.deinit(allocator);
+
+    const indexed = try indexWorkspace(allocator, io, db, &symbols);
+    try collectEdges(allocator, io, db, symbols.items, &edges);
+    return .{ .symbols = symbols, .edges = edges, .indexed_files = indexed };
+}
+
+fn renderHtml(allocator: std.mem.Allocator, out: *std.ArrayList(u8), graph: Graph) !void {
+    try out.appendSlice(allocator,
+        \\<!doctype html>
+        \\<html lang="en">
+        \\<head>
+        \\<meta charset="utf-8">
+        \\<meta name="viewport" content="width=device-width, initial-scale=1">
+        \\<title>Phenom Code Graph</title>
+        \\<style>
+        \\:root{color-scheme:dark;--bg:#101214;--panel:#171b1f;--text:#e6edf3;--muted:#8b949e;--line:#30363d;--accent:#3fb950;--warn:#d29922;--blue:#58a6ff}
+        \\*{box-sizing:border-box}
+        \\body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+        \\header{display:flex;gap:12px;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+        \\h1{font-size:16px;margin:0;font-weight:650}
+        \\main{display:grid;grid-template-columns:minmax(0,1fr) 320px;min-height:calc(100vh - 57px)}
+        \\#graph{width:100%;height:calc(100vh - 57px);display:block;background:#0d1117}
+        \\aside{border-left:1px solid var(--line);background:var(--panel);padding:12px;overflow:auto}
+        \\label{display:block;color:var(--muted);font-size:12px;margin:12px 0 6px}
+        \\input,select{width:100%;border:1px solid var(--line);background:#0d1117;color:var(--text);border-radius:6px;padding:8px}
+        \\button{border:1px solid var(--line);background:#21262d;color:var(--text);border-radius:6px;padding:8px 10px;cursor:pointer}
+        \\button:hover{border-color:var(--blue)}
+        \\dl{display:grid;grid-template-columns:1fr auto;gap:4px 10px;margin:12px 0}
+        \\dt{color:var(--muted)}
+        \\dd{margin:0}
+        \\pre{white-space:pre-wrap;word-break:break-word;background:#0d1117;border:1px solid var(--line);border-radius:6px;padding:10px;min-height:88px}
+        \\.edge{stroke:#38404a;stroke-width:1;opacity:.55}
+        \\.edge.imports{stroke:var(--warn)}
+        \\.node{stroke:#0d1117;stroke-width:1.5;cursor:pointer}
+        \\.node.hit{stroke:#fff;stroke-width:3}
+        \\.label{fill:#c9d1d9;font-size:11px;paint-order:stroke;stroke:#0d1117;stroke-width:3;pointer-events:none}
+        \\@media(max-width:860px){main{grid-template-columns:1fr}aside{border-left:0;border-top:1px solid var(--line)}#graph{height:65vh}}
+        \\</style>
+        \\</head>
+        \\<body>
+        \\<header><h1>Phenom Code Graph</h1><div id="summary"></div></header>
+        \\<main><svg id="graph" role="img" aria-label="Code graph"></svg><aside>
+        \\<label for="q">Search</label><input id="q" autocomplete="off" placeholder="symbol or path">
+        \\<label for="edgeKind">Edges</label><select id="edgeKind"><option value="all">all</option><option value="calls">calls</option><option value="imports">imports</option></select>
+        \\<label for="minDegree">Minimum degree</label><input id="minDegree" type="number" min="0" value="0">
+        \\<p><button id="fit">Fit graph</button></p>
+        \\<dl><dt>Nodes</dt><dd id="nodesCount"></dd><dt>Edges</dt><dd id="edgesCount"></dd><dt>Indexed files</dt><dd id="filesCount"></dd></dl>
+        \\<pre id="details">Click a node.</pre>
+        \\</aside></main>
+        \\<script>
+        \\const graphData =
+    );
+    try appendGraphJson(allocator, out, graph);
+    try out.appendSlice(allocator,
+        \\;
+        \\const svg=document.getElementById("graph");
+        \\const summary=document.getElementById("summary");
+        \\const q=document.getElementById("q");
+        \\const edgeKind=document.getElementById("edgeKind");
+        \\const minDegree=document.getElementById("minDegree");
+        \\const details=document.getElementById("details");
+        \\const nodesById=new Map(graphData.nodes.map(n=>[n.id,n]));
+        \\function hash(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return h>>>0}
+        \\function prepare(){const groups=new Map();for(const n of graphData.nodes){const key=n.path.split("/").slice(0,-1).join("/")||".";if(!groups.has(key))groups.set(key,[]);groups.get(key).push(n)}let gi=0;for(const group of groups.values()){const base=2*Math.PI*gi/Math.max(1,groups.size);const ring=220+80*(gi%5);group.sort((a,b)=>b.degree-a.degree||a.name.localeCompare(b.name));group.forEach((n,i)=>{const spread=(i/group.length-.5)*0.9;const jitter=(hash(n.path+n.name)%100)/600;n.x=Math.cos(base+spread+jitter)*ring;n.y=Math.sin(base+spread+jitter)*ring});gi++}}
+        \\function filtered(){const term=q.value.trim().toLowerCase();const min=Number(minDegree.value)||0;const kind=edgeKind.value;const nodes=graphData.nodes.filter(n=>n.degree>=min&&(!term||n.name.toLowerCase().includes(term)||n.path.toLowerCase().includes(term)));const keep=new Set(nodes.map(n=>n.id));const edges=graphData.edges.filter(e=>(kind==="all"||e.kind===kind)&&keep.has(e.source)&&keep.has(e.target));return{nodes,edges,term}}
+        \\function color(n){if(n.path.endsWith(".zig"))return"#3fb950";if(n.path.endsWith(".ts")||n.path.endsWith(".js"))return"#58a6ff";if(n.path.endsWith(".md"))return"#d29922";return"#a371f7"}
+        \\function render(){const view=filtered();svg.textContent="";const g=document.createElementNS("http://www.w3.org/2000/svg","g");svg.appendChild(g);for(const e of view.edges){const a=nodesById.get(e.source),b=nodesById.get(e.target);const line=document.createElementNS(svg.namespaceURI,"line");line.setAttribute("class","edge "+e.kind);line.setAttribute("x1",a.x);line.setAttribute("y1",a.y);line.setAttribute("x2",b.x);line.setAttribute("y2",b.y);g.appendChild(line)}for(const n of view.nodes){const circle=document.createElementNS(svg.namespaceURI,"circle");circle.setAttribute("class","node"+(view.term&&(n.name.toLowerCase().includes(view.term)||n.path.toLowerCase().includes(view.term))?" hit":""));circle.setAttribute("cx",n.x);circle.setAttribute("cy",n.y);circle.setAttribute("r",Math.min(18,5+n.degree));circle.setAttribute("fill",color(n));circle.addEventListener("click",()=>details.textContent=n.name+"\\n"+n.path+":"+n.line+"-"+n.endLine+"\\ndegree "+n.degree);g.appendChild(circle);if(n.degree>2||view.nodes.length<140){const label=document.createElementNS(svg.namespaceURI,"text");label.setAttribute("class","label");label.setAttribute("x",n.x+9);label.setAttribute("y",n.y+4);label.textContent=n.name;g.appendChild(label)}}document.getElementById("nodesCount").textContent=view.nodes.length+"/"+graphData.nodes.length;document.getElementById("edgesCount").textContent=view.edges.length+"/"+graphData.edges.length;fit()}
+        \\function fit(){const box=svg.getBBox();const pad=80;svg.setAttribute("viewBox",[box.x-pad,box.y-pad,box.width+pad*2||200,box.height+pad*2||200].join(" "))}
+        \\prepare();summary.textContent=graphData.nodes.length+" nodes, "+graphData.edges.length+" edges";document.getElementById("filesCount").textContent=graphData.indexedFiles;q.addEventListener("input",render);edgeKind.addEventListener("change",render);minDegree.addEventListener("input",render);document.getElementById("fit").addEventListener("click",fit);render();
+        \\</script>
+        \\</body>
+        \\</html>
+        \\
+    );
+}
+
+fn appendGraphJson(allocator: std.mem.Allocator, out: *std.ArrayList(u8), graph: Graph) !void {
+    try out.appendSlice(allocator, "{\"indexedFiles\":");
+    try appendFmt(allocator, out, "{}", .{graph.indexed_files});
+    try out.appendSlice(allocator, ",\"nodes\":[");
+    for (graph.symbols.items, 0..) |symbol, index| {
+        if (index > 0) try out.appendSlice(allocator, ",");
+        try out.appendSlice(allocator, "{\"id\":");
+        try appendFmt(allocator, out, "{}", .{symbol.id});
+        try out.appendSlice(allocator, ",\"path\":");
+        try appendJsonString(allocator, out, symbol.path);
+        try out.appendSlice(allocator, ",\"name\":");
+        try appendJsonString(allocator, out, symbol.name);
+        try out.appendSlice(allocator, ",\"line\":");
+        try appendFmt(allocator, out, "{}", .{symbol.start_line});
+        try out.appendSlice(allocator, ",\"endLine\":");
+        try appendFmt(allocator, out, "{}", .{symbol.end_line});
+        try out.appendSlice(allocator, ",\"degree\":");
+        try appendFmt(allocator, out, "{}", .{relationCount(symbol.id, graph.edges.items)});
+        try out.appendSlice(allocator, "}");
+    }
+    try out.appendSlice(allocator, "],\"edges\":[");
+    for (graph.edges.items, 0..) |edge, index| {
+        if (index > 0) try out.appendSlice(allocator, ",");
+        try appendFmt(allocator, out, "{{\"source\":{},\"target\":{},\"kind\":", .{ edge.src, edge.dst });
+        try appendJsonString(allocator, out, @tagName(edge.kind));
+        try out.appendSlice(allocator, "}");
+    }
+    try out.appendSlice(allocator, "]}");
+}
+
+fn appendJsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+    try out.appendSlice(allocator, "\"");
+    for (text) |byte| {
+        switch (byte) {
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => {
+                if (byte < 32 or byte >= 128) {
+                    try appendJsonByteEscape(allocator, out, byte);
+                } else {
+                    try out.append(allocator, byte);
+                }
+            },
+        }
+    }
+    try out.appendSlice(allocator, "\"");
+}
+
+fn appendJsonByteEscape(allocator: std.mem.Allocator, out: *std.ArrayList(u8), byte: u8) !void {
+    const hex = "0123456789abcdef";
+    const escaped = [_]u8{ '\\', 'u', '0', '0', hex[byte >> 4], hex[byte & 0x0f] };
+    try out.appendSlice(allocator, &escaped);
+}
+
+fn appendFmt(allocator: std.mem.Allocator, out: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
+    const text = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(text);
+    try out.appendSlice(allocator, text);
 }
 
 fn indexWorkspace(
@@ -328,11 +489,12 @@ fn appendEdge(allocator: std.mem.Allocator, db: ?*c.sqlite3, edges: *std.ArrayLi
 }
 
 fn insertNode(allocator: std.mem.Allocator, db: ?*c.sqlite3, symbol: Symbol) !void {
+    const handle = db orelse return;
     var stmt: ?*c.sqlite3_stmt = null;
     const sql = "insert into nodes(id, kind, path, name, line, end_line) values (?1, 'symbol', ?2, ?3, ?4, ?5)";
     const z_sql = try allocator.dupeZ(u8, sql);
     defer allocator.free(z_sql);
-    if (c.sqlite3_prepare_v2(db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+    if (c.sqlite3_prepare_v2(handle, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
     defer _ = c.sqlite3_finalize(stmt);
     if (c.sqlite3_bind_int64(stmt, 1, @as(i64, @intCast(symbol.id))) != c.SQLITE_OK) return error.SqliteBindFailed;
     try bindText(allocator, stmt, 2, symbol.path);
@@ -343,11 +505,12 @@ fn insertNode(allocator: std.mem.Allocator, db: ?*c.sqlite3, symbol: Symbol) !vo
 }
 
 fn insertEdge(allocator: std.mem.Allocator, db: ?*c.sqlite3, edge: Edge) !void {
+    const handle = db orelse return;
     var stmt: ?*c.sqlite3_stmt = null;
     const sql = "insert into edges(kind, src, dst) values (?1, ?2, ?3)";
     const z_sql = try allocator.dupeZ(u8, sql);
     defer allocator.free(z_sql);
-    if (c.sqlite3_prepare_v2(db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+    if (c.sqlite3_prepare_v2(handle, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
     defer _ = c.sqlite3_finalize(stmt);
     try bindText(allocator, stmt, 1, @tagName(edge.kind));
     if (c.sqlite3_bind_int64(stmt, 2, @as(i64, @intCast(edge.src))) != c.SQLITE_OK) return error.SqliteBindFailed;
@@ -608,6 +771,21 @@ test "caveman graph resolves local zig imports" {
     try std.testing.expectEqualStrings("src/audit.zig", imports.items[0]);
     try std.testing.expectEqualStrings("src/http.zig", imports.items[1]);
     try std.testing.expectEqualStrings("config.zig", imports.items[2]);
+}
+
+test "caveman graph writes standalone local html" {
+    const path = ".phenom-code-graph-test.html";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    try writeHtml(std.testing.allocator, std.testing.io, path);
+    const html = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(html);
+
+    try std.testing.expect(std.mem.indexOf(u8, html, "<!doctype html>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "const graphData =") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "\"nodes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "\"edges\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "src/code_graph.zig") != null);
 }
 
 fn hasCandidate(candidates: []const Candidate, path: []const u8, symbol: []const u8) bool {

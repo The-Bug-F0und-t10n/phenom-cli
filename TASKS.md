@@ -11102,3 +11102,61 @@ Invariantes afetadas:
 Risco residual:
 
 - Se o modelo emitir um tool_call real dentro de `<think>`, o parser ainda pode executar porque isso e comportamento preservado por testes existentes.
+
+## T315 - Exportar caveman graph local em HTML
+
+Status: implemented-verified.
+
+Prioridade: media.
+
+Motivacao: o grafo caveman ja existia para ranqueamento interno, mas nao havia uma forma local de visualizar as relacoes entre simbolos, imports e chamadas. A visualizacao ajuda a entender onde o modelo/agente esta encontrando estrutura no codigo sem adicionar servidor, dependencia JS ou servico externo.
+
+Regra de negocio preservada:
+
+- Nenhuma heuristica hardcoded por prompt foi adicionada.
+- O ranking caveman existente continua usando a mesma construcao de grafo e SQLite em memoria.
+- A exportacao HTML nao depende de SQLite, rede, CDN ou pacote novo.
+- `graph.html` e artefato gerado pelo comando, nao fonte versionada.
+
+Passos de implementacao:
+
+1. Adicionar comando CLI `graph`.
+2. Reaproveitar a construcao do grafo caveman em uma estrutura interna compartilhada.
+3. Exportar HTML standalone com dados JSON embutidos, SVG local, busca, filtro por tipo de aresta, filtro por grau minimo, detalhes de no e ajuste de viewport.
+4. Garantir escape JSON proprio para nao repetir problemas de UTF-8 invalido em payloads locais.
+5. Rodar testes focados, suite principal, guardrails, build release e smoke real do binario.
+
+Implementacao:
+
+- `phenom-zig/src/cli.zig`: comando `graph` no parser, usage e teste.
+- `phenom-zig/src/main.zig`: branch `.graph` chama `code_graph.writeHtml` e grava `graph.html`.
+- `phenom-zig/src/code_graph.zig`: `Graph` compartilhado entre ranking e exportacao, `writeHtml`, serializacao JSON escapada e teste de HTML standalone.
+
+Criterio de aceite:
+
+- `phenom graph` gera `graph.html` local na raiz do workspace.
+- O arquivo abre sem servidor e contem os dados do grafo embutidos.
+- O HTML permite busca por simbolo/path, filtro por `calls/imports`, filtro por grau minimo e detalhes por clique.
+- O fluxo existente de ranking caveman continua passando nos testes.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/cli.zig --cache-dir /tmp/phenom-graph-cli-test` -> passou; 8 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/code_graph.zig -lc -lsqlite3 --cache-dir /tmp/phenom-graph-code-test` -> passou; 11 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-graph-main-test` -> passou; 310 testes.
+- `bash tools/check_product_guardrails.sh` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom graph` -> passou; gerou `graph.html`.
+- `wc -c graph.html` -> `400460 graph.html`.
+- `rg -n 'const graphData =|"nodes"|"edges"|src/code_graph.zig|function filtered|Minimum degree' graph.html` -> encontrou todos os marcadores.
+
+Invariantes afetadas:
+
+- 1. Tool nao anunciada nunca executa: preservada; comando CLI local nao altera tool loop.
+- 2. Contexto bruto nao vaza para o modelo: preservada; exportacao e fora do prompt/model context.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; nenhuma mudanca no audit de chat.
+
+Risco residual:
+
+- O HTML e snapshot estatico; visualizacao em tempo real exigiria um modo separado com audit tail/SSE ou watcher de arquivo.
+- O grafo ainda usa parser leve existente; mais precisao exigiria Tree-sitter ou AST por linguagem, com custo e dependencia maiores.
