@@ -1116,10 +1116,7 @@ fn runCollectEvidenceExpandStep(
     }
     tool_iterations.* += 1;
 
-    const max_lines = if (call.max_lines == 12)
-        @min(@as(usize, 32), candidate.end_line - candidate.start_line + 1)
-    else
-        call.max_lines;
+    const max_lines = candidateExpansionLineLimit(call.max_lines, candidate.start_line, candidate.end_line);
     if (state.hasExecutedArgs(candidate.path, call.terms, .path, candidate.start_line, max_lines)) {
         try db.recordEvent(config.session, "tool_loop_stop", "duplicate candidate expansion");
         return .stopped;
@@ -1171,6 +1168,12 @@ fn runCollectEvidenceExpandStep(
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
     return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+fn candidateExpansionLineLimit(requested_max_lines: usize, candidate_start_line: usize, candidate_end_line: usize) usize {
+    const candidate_lines = candidate_end_line - candidate_start_line + 1;
+    const requested_lines = if (requested_max_lines == 12) @as(usize, 32) else requested_max_lines;
+    return @min(requested_lines, candidate_lines);
 }
 
 fn firstSelectedCandidate(selected_candidates: ?[]const u8) ?[]const u8 {
@@ -1967,13 +1970,6 @@ fn streamDeferredToolLoopTurnInternal(
         if (required_tool_repair) |repair_message| {
             if (repair_message.len == 0) {
                 try db.recordEvent(config.session, "tool_loop_stop", "required follow-up tool call missing after repair");
-                const fallback_text = std.mem.trim(u8, follow_sink.raw_visible.items, " \t\r\n");
-                if (fallback_text.len > 0) {
-                    try db.recordEvent(config.session, "tool_loop_fallback", "emitted visible answer after missing required tool_call");
-                    try aggregate_sink.emitVisibleText(fallback_text);
-                    follow_sink.raw_visible.clearRetainingCapacity();
-                    return .final_answer;
-                }
                 return .stopped;
             }
             follow_sink.discardDeferredVisible();
@@ -3474,6 +3470,11 @@ test "candidate selection repair reuses temporary candidates only" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "E1:") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
+}
+
+test "candidate expansion stays inside selected candidate range" {
+    try std.testing.expectEqual(@as(usize, 15), candidateExpansionLineLimit(32, 77, 91));
+    try std.testing.expectEqual(@as(usize, 8), candidateExpansionLineLimit(8, 77, 91));
 }
 
 test "structured prompt path repair extracts only one explicit path" {

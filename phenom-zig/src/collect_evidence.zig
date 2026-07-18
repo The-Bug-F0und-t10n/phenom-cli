@@ -111,10 +111,10 @@ pub fn executeCandidates(allocator: std.mem.Allocator, io: std.Io, args: Args) !
 
     for (ranked.candidates.items, 0..) |candidate, idx| {
         const signature_start = candidate.start_line;
-        const signature_max_lines: usize = if (candidate.source == .symbol_ast) 1 else candidate.end_line - candidate.start_line + 1;
+        const signature_max_lines: usize = if (candidate.source == .symbol_ast or candidate.source == .module_entrypoint) 1 else candidate.end_line - candidate.start_line + 1;
         const signature_range = tools.readFileRange(allocator, candidate.path, signature_start, signature_max_lines, 32 * 1024) catch continue;
         defer signature_range.deinit(allocator);
-        const signature = if (candidate.source == .symbol_ast)
+        const signature = if (candidate.source == .symbol_ast or candidate.source == .module_entrypoint)
             firstLineAt(signature_range.text, signature_start)
         else
             selectCandidateLine(signature_range.text, signature_start, candidate.start_line, search_terms, candidate.path);
@@ -591,6 +591,19 @@ test "collect evidence candidates returns definitions without evidence body" {
     try std.testing.expect(std.mem.indexOf(u8, result.text, "C1") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.audit_text, "stage=candidates") != null);
     try std.testing.expect(result.model_bytes == result.text.len);
+}
+
+test "collect evidence candidates render module entrypoint signature" {
+    var result = try executeCandidates(std.testing.allocator, std.testing.io, .{
+        .intent = "find collect_evidence executor",
+        .terms = "collect_evidence funcao responsavel coleta evidencias",
+        .strategy = .symbol,
+        .budget_bytes = 6000,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "source=module_entrypoint") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "def: pub fn execute(") != null);
 }
 
 test "candidate line selection follows model terms inside ranked range" {

@@ -7,6 +7,7 @@ const workspace_inventory = @import("workspace_inventory.zig");
 
 pub const CandidateSource = enum {
     prompt_path,
+    module_entrypoint,
     symbol_ast,
     rg,
     fts_bm25,
@@ -148,17 +149,29 @@ pub fn rankForPrompt(
         if (fts_result) |indexed| fts_indexed_files = indexed;
     }
 
-    // Phase 5: batch file discovery via plain keywords (single rg -l call for all NL-like words)
+    // Phase 5: public module entrypoints from files already selected by path/rg/FTS/symbol evidence.
+    if (strategy == .symbol and candidates.items.len > 0) {
+        const entrypoint_stats = collectModuleEntrypointCandidates(allocator, io, &candidates, budget) catch blk: {
+            symbol_available = false;
+            break :blk null;
+        };
+        if (entrypoint_stats) |stats| {
+            symbol_indexed_files += stats.indexed_files;
+            symbols_seen += stats.symbol_count;
+        }
+    }
+
+    // Phase 6: batch file discovery via plain keywords (single rg -l call for all NL-like words)
     if (candidates.items.len < collectionLimit(budget) and strategy == .auto) {
         try discoverFilesByKeywords(allocator, io, &candidates, terms.items.items, budget);
     }
 
-    // Phase 6: path candidates from prompt text
+    // Phase 7: path candidates from prompt text
     if (candidates.items.len == 0) {
         try addPromptPathCandidates(allocator, &candidates, prompt, strategy, budget);
     }
 
-    // Phase 7: workspace overview fallback
+    // Phase 8: workspace overview fallback
     if (candidates.items.len == 0 and strategy == .auto) {
         try addWorkspaceOverviewCandidates(allocator, io, &candidates, budget);
     }
@@ -487,6 +500,61 @@ fn collectSymbolCandidates(
         });
     }
     return .{ .indexed_files = ranked.indexed_files, .symbol_count = ranked.symbol_count };
+}
+
+fn collectModuleEntrypointCandidates(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    out: *std.ArrayList(EvidenceCandidate),
+    budget: RankBudget,
+) !SymbolStats {
+    var boosts = std.ArrayList(symbol_ranker.PathBoost).empty;
+    defer boosts.deinit(allocator);
+    for (out.items) |candidate| {
+        if (candidate.source == .module_entrypoint) continue;
+        try addPathBoost(allocator, &boosts, candidate.path, candidate.score);
+    }
+    sortPathBoosts(boosts.items);
+    const boost_limit = @min(boosts.items.len, @max(@as(usize, 1), budget.max_ranges));
+    var ranked = try symbol_ranker.rankEntrypointsForPaths(allocator, io, boosts.items[0..boost_limit], budget.max_candidates);
+    defer ranked.deinit(allocator);
+    for (ranked.candidates.items) |candidate| {
+        if (!workspace_inventory.isWorkspacePath(candidate.path)) continue;
+        const reasons = try std.fmt.allocPrint(allocator, "module_entrypoint,symbol={s},indexed_files={},symbols={}", .{ candidate.symbol, ranked.indexed_files, ranked.symbol_count });
+        errdefer allocator.free(reasons);
+        try out.append(allocator, .{
+            .path = try allocator.dupe(u8, candidate.path),
+            .start_line = candidate.start_line,
+            .end_line = @min(candidate.end_line, candidate.start_line + budget.max_lines_per_range - 1),
+            .score = candidate.score,
+            .source = .module_entrypoint,
+            .reasons = reasons,
+        });
+    }
+    return .{ .indexed_files = ranked.indexed_files, .symbol_count = ranked.symbol_count };
+}
+
+fn addPathBoost(
+    allocator: std.mem.Allocator,
+    boosts: *std.ArrayList(symbol_ranker.PathBoost),
+    path: []const u8,
+    score: i32,
+) !void {
+    for (boosts.items) |*boost| {
+        if (!std.mem.eql(u8, boost.path, path)) continue;
+        boost.score = @max(boost.score, score);
+        return;
+    }
+    try boosts.append(allocator, .{ .path = path, .score = score });
+}
+
+fn sortPathBoosts(boosts: []symbol_ranker.PathBoost) void {
+    std.mem.sort(symbol_ranker.PathBoost, boosts, {}, struct {
+        fn lessThan(_: void, a: symbol_ranker.PathBoost, b: symbol_ranker.PathBoost) bool {
+            if (a.score != b.score) return a.score > b.score;
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lessThan);
 }
 
 fn addWorkspaceOverviewCandidates(
@@ -851,6 +919,19 @@ test "merge candidates combines adjacent and overlapping ranges" {
     try std.testing.expectEqual(@as(usize, 1), merged.items.len);
     try std.testing.expectEqual(@as(usize, 10), merged.items[0].start_line);
     try std.testing.expectEqual(@as(usize, 30), merged.items[0].end_line);
+}
+
+test "symbol ranking promotes public entrypoints from relevant modules" {
+    var result = try rankForPrompt(std.testing.allocator, std.testing.io, "collect_evidence funcao responsavel coleta evidencias", .symbol, .{
+        .max_ranges = 6,
+        .max_lines_per_range = 48,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.candidates.items.len > 0);
+    try std.testing.expectEqualStrings("src/collect_evidence.zig", result.candidates.items[0].path);
+    try std.testing.expect(result.candidates.items[0].start_line < 120);
+    try std.testing.expect(std.mem.indexOf(u8, result.candidates.items[0].reasons, "module_entrypoint") != null);
 }
 
 test "trim candidates preserves source diversity before filling by score" {

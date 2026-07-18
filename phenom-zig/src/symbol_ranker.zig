@@ -20,6 +20,11 @@ pub const Candidate = struct {
     }
 };
 
+pub const PathBoost = struct {
+    path: []const u8,
+    score: i32,
+};
+
 pub const Result = struct {
     candidates: std.ArrayList(Candidate),
     indexed_files: usize,
@@ -37,7 +42,15 @@ const Symbol = struct {
     line: usize,
     end_line: usize,
     signature: []const u8,
+    kind: SymbolKind,
+    public: bool,
     top_level: bool,
+};
+
+const SymbolKind = enum {
+    function,
+    container,
+    value,
 };
 
 pub fn rank(
@@ -72,6 +85,72 @@ pub fn rank(
     sortCandidates(out.items);
     trimCandidates(allocator, &out, max_candidates);
     return .{ .candidates = out, .indexed_files = indexed, .symbol_count = symbols };
+}
+
+pub fn rankEntrypointsForPaths(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: []const PathBoost,
+    max_candidates: usize,
+) !Result {
+    var out = std.ArrayList(Candidate).empty;
+    errdefer {
+        for (out.items) |candidate| candidate.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    const root = std.Io.Dir.cwd();
+    var cwd = try root.openDir(io, ".", .{});
+    defer cwd.close(io);
+
+    var indexed: usize = 0;
+    var symbols: usize = 0;
+    for (paths) |boost| {
+        const content = cwd.readFileAlloc(io, boost.path, allocator, .limited(max_file_bytes)) catch continue;
+        defer allocator.free(content);
+        if (!workspace_inventory.isTextBytes(content)) continue;
+        indexed += 1;
+        try collectFileEntrypoints(allocator, &out, boost.path, content, boost.score, max_candidates, &symbols);
+    }
+
+    sortCandidates(out.items);
+    trimCandidates(allocator, &out, max_candidates);
+    return .{ .candidates = out, .indexed_files = indexed, .symbol_count = symbols };
+}
+
+fn collectFileEntrypoints(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(Candidate),
+    path: []const u8,
+    content: []const u8,
+    path_score: i32,
+    max_candidates: usize,
+    symbol_count: *usize,
+) !void {
+    var offset: usize = 0;
+    var line_no: usize = 1;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        defer {
+            offset += line.len + 1;
+            line_no += 1;
+        }
+        const symbol = parseSymbolLine(path, line, line_no, content[offset..]) orelse continue;
+        symbol_count.* += 1;
+        if (!symbol.public or !symbol.top_level or symbol.kind != .function) continue;
+        if (out.items.len >= max_candidates * candidate_headroom) continue;
+        const owned_path = try allocator.dupe(u8, symbol.path);
+        errdefer allocator.free(owned_path);
+        const owned_symbol = try allocator.dupe(u8, symbol.name);
+        errdefer allocator.free(owned_symbol);
+        try out.append(allocator, .{
+            .path = owned_path,
+            .symbol = owned_symbol,
+            .start_line = symbol.line,
+            .end_line = symbol.end_line,
+            .score = path_score + 360 - @as(i32, @intCast(@min(symbol.line, 260))),
+        });
+    }
 }
 
 fn collectFileSymbols(
@@ -119,39 +198,41 @@ fn parseSymbolLine(path: []const u8, line: []const u8, line_no: usize, tail: []c
 }
 
 fn parseZigSymbol(path: []const u8, line: []const u8, line_no: usize, tail: []const u8, top_level: bool) ?Symbol {
+    const public = std.mem.startsWith(u8, line, "pub ") or std.mem.startsWith(u8, line, "export ");
     var text = stripPrefix(line, "pub ") orelse line;
     text = stripPrefix(text, "export ") orelse text;
     if (stripPrefix(text, "fn ")) |rest| {
         const name = takeIdentifier(rest);
         if (name.len == 0) return null;
-        return .{ .path = path, .name = name, .line = line_no, .end_line = estimateEndLine(line_no, tail), .signature = line, .top_level = top_level };
+        return .{ .path = path, .name = name, .line = line_no, .end_line = estimateEndLine(line_no, tail), .signature = line, .kind = .function, .public = public, .top_level = top_level };
     }
     if (stripPrefix(text, "const ")) |rest| {
         const name = takeIdentifier(rest);
         if (name.len == 0) return null;
         const after_name = std.mem.trim(u8, rest[name.len..], " \t");
         if (std.mem.startsWith(u8, after_name, "= @import(") or std.mem.startsWith(u8, after_name, "= @cImport(")) return null;
-        return .{ .path = path, .name = name, .line = line_no, .end_line = estimateEndLine(line_no, tail), .signature = line, .top_level = top_level };
+        return .{ .path = path, .name = name, .line = line_no, .end_line = estimateEndLine(line_no, tail), .signature = line, .kind = .value, .public = public, .top_level = top_level };
     }
     return null;
 }
 
 fn parseJsTsSymbol(path: []const u8, line: []const u8, line_no: usize, tail: []const u8, top_level: bool) ?Symbol {
+    const public = std.mem.startsWith(u8, line, "export ");
     var text = stripPrefix(line, "export ") orelse line;
     text = stripPrefix(text, "default ") orelse text;
-    if (stripPrefix(text, "async function ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level);
-    if (stripPrefix(text, "function ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level);
-    if (stripPrefix(text, "class ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level);
-    if (stripPrefix(text, "const ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level);
-    if (stripPrefix(text, "let ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level);
-    if (stripPrefix(text, "var ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level);
+    if (stripPrefix(text, "async function ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level, .function, public);
+    if (stripPrefix(text, "function ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level, .function, public);
+    if (stripPrefix(text, "class ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level, .container, public);
+    if (stripPrefix(text, "const ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level, .value, public);
+    if (stripPrefix(text, "let ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level, .value, public);
+    if (stripPrefix(text, "var ")) |rest| return namedJsSymbol(path, rest, line_no, tail, line, top_level, .value, public);
     return null;
 }
 
-fn namedJsSymbol(path: []const u8, rest: []const u8, line_no: usize, tail: []const u8, signature: []const u8, top_level: bool) ?Symbol {
+fn namedJsSymbol(path: []const u8, rest: []const u8, line_no: usize, tail: []const u8, signature: []const u8, top_level: bool, kind: SymbolKind, public: bool) ?Symbol {
     const name = takeIdentifier(rest);
     if (name.len == 0) return null;
-    return .{ .path = path, .name = name, .line = line_no, .end_line = estimateEndLine(line_no, tail), .signature = signature, .top_level = top_level };
+    return .{ .path = path, .name = name, .line = line_no, .end_line = estimateEndLine(line_no, tail), .signature = signature, .kind = kind, .public = public, .top_level = top_level };
 }
 
 fn scoreSymbol(symbol: Symbol, query: []const u8) i32 {
