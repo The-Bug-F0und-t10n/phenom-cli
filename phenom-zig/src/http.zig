@@ -16,6 +16,12 @@ pub const LocalModelClient = struct {
     model: []const u8,
     max_tokens: u16 = 4096,
     thinking: cli.ThinkingMode = .auto,
+    last_http_status: ?u16 = null,
+    last_http_body_snippet: ?[]u8 = null,
+
+    pub fn deinit(self: *LocalModelClient) void {
+        self.clearLastHttpFailure();
+    }
 
     pub fn defaultPort(backend: cli.Backend) u16 {
         return if (backend == .ollama) 11434 else 8080;
@@ -48,6 +54,7 @@ pub const LocalModelClient = struct {
         input: InferenceInput,
         sink: anytype,
     ) !void {
+        self.clearLastHttpFailure();
         const parsed = try parseHost(self.allocator, self.host, self.backend);
         defer parsed.deinit(self.allocator);
 
@@ -87,7 +94,7 @@ pub const LocalModelClient = struct {
                 try header_buffer.appendSlice(self.allocator, data);
                 if (findHeaderEnd(header_buffer.items)) |idx| {
                     const headers = header_buffer.items[0..idx];
-                    try ensureStatusOk(headers);
+                    try self.ensureStatusOkWithBody(fd, headers, header_buffer.items[idx + 4 ..]);
                     chunked = hasChunkedTransfer(headers);
                     headers_done = true;
                     data = header_buffer.items[idx + 4 ..];
@@ -109,6 +116,35 @@ pub const LocalModelClient = struct {
 
     fn buildBody(self: *LocalModelClient, prompt: []const u8) ![]u8 {
         return self.buildBodyForInput(.{ .user_prompt = prompt });
+    }
+
+    pub fn httpFailureDetail(self: *LocalModelClient, allocator: std.mem.Allocator) !?[]u8 {
+        const status = self.last_http_status orelse {
+            if (self.last_http_body_snippet) |body| {
+                return try std.fmt.allocPrint(allocator, "body=\"{s}\"", .{body});
+            }
+            return null;
+        };
+        if (self.last_http_body_snippet) |body| {
+            return try std.fmt.allocPrint(allocator, "status={} body=\"{s}\"", .{ status, body });
+        }
+        return try std.fmt.allocPrint(allocator, "status={}", .{status});
+    }
+
+    fn clearLastHttpFailure(self: *LocalModelClient) void {
+        self.last_http_status = null;
+        if (self.last_http_body_snippet) |body| {
+            self.allocator.free(body);
+            self.last_http_body_snippet = null;
+        }
+    }
+
+    fn ensureStatusOkWithBody(self: *LocalModelClient, fd: c_int, headers: []const u8, initial_body: []const u8) !void {
+        const status = try parseHttpStatus(headers);
+        if (status >= 200 and status < 300) return;
+        self.last_http_status = status;
+        self.last_http_body_snippet = try readFailureBodySnippet(self.allocator, fd, initial_body, 512);
+        return error.HttpStatusNotOk;
     }
 
     fn buildBodyForInput(self: *LocalModelClient, input: InferenceInput) ![]u8 {
@@ -487,6 +523,34 @@ fn hasChunkedTransfer(headers: []const u8) bool {
 fn ensureStatusOk(headers: []const u8) !void {
     const status = try parseHttpStatus(headers);
     if (status < 200 or status >= 300) return error.HttpStatusNotOk;
+}
+
+fn readFailureBodySnippet(allocator: std.mem.Allocator, fd: c_int, initial_body: []const u8, max_len: usize) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendSanitizedSnippet(allocator, &out, initial_body, max_len);
+    var buf: [256]u8 = undefined;
+    while (out.items.len < max_len) {
+        const n_raw = c.read(fd, &buf, @min(buf.len, max_len - out.items.len));
+        if (n_raw < 0) return error.SocketReadFailed;
+        const n: usize = @intCast(n_raw);
+        if (n == 0) break;
+        try appendSanitizedSnippet(allocator, &out, buf[0..n], max_len);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendSanitizedSnippet(allocator: std.mem.Allocator, out: *std.ArrayList(u8), bytes: []const u8, max_len: usize) !void {
+    for (bytes) |byte| {
+        if (out.items.len >= max_len) break;
+        const safe = if (byte == '\r' or byte == '\n' or byte == '\t')
+            ' '
+        else switch (byte) {
+            0...31, 127 => '?',
+            else => byte,
+        };
+        try out.append(allocator, safe);
+    }
 }
 
 fn parseHttpStatus(headers: []const u8) !u16 {
@@ -875,6 +939,30 @@ test "json unescape decodes common escapes" {
 test "http status parser rejects non 2xx" {
     try ensureStatusOk("HTTP/1.1 200 OK\r\nContent-Type: application/json");
     try std.testing.expectError(error.HttpStatusNotOk, ensureStatusOk("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain"));
+}
+
+test "http failure detail includes status and body snippet" {
+    var client = LocalModelClient{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1:11434",
+        .backend = .llamacpp,
+        .model = "phenom:latest",
+        .last_http_status = 400,
+        .last_http_body_snippet = try std.testing.allocator.dupe(u8, "{\"error\":\"bad request\"}"),
+    };
+    defer client.deinit();
+
+    const detail = (try client.httpFailureDetail(std.testing.allocator)).?;
+    defer std.testing.allocator.free(detail);
+    try std.testing.expectEqualStrings("status=400 body=\"{\"error\":\"bad request\"}\"", detail);
+}
+
+test "http failure body snippet is sanitized and bounded" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+
+    try appendSanitizedSnippet(std.testing.allocator, &out, "a\nb\tc\x01d", 6);
+    try std.testing.expectEqualStrings("a b c?", out.items);
 }
 
 test "probe backend path avoids inference endpoint" {

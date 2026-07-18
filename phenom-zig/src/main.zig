@@ -237,6 +237,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             .max_tokens = config.max_tokens,
             .thinking = config.thinking,
         };
+        defer client.deinit();
         const enable_tool_loop = true;
         var sink = StreamSink{
             .allocator = allocator,
@@ -291,11 +292,20 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         client.streamInference(inference_input, &sink) catch |err| {
             const endpoint = client.endpointSummary(allocator) catch "unknown-endpoint";
             defer if (!std.mem.eql(u8, endpoint, "unknown-endpoint")) allocator.free(endpoint);
-            const message = try std.fmt.allocPrint(
-                allocator,
-                "model connection failed: {s} endpoint={s}",
-                .{ @errorName(err), endpoint },
-            );
+            const failure_detail = try client.httpFailureDetail(allocator);
+            defer if (failure_detail) |detail| allocator.free(detail);
+            const message = if (failure_detail) |detail|
+                try std.fmt.allocPrint(
+                    allocator,
+                    "model connection failed: {s} endpoint={s} {s}",
+                    .{ @errorName(err), endpoint, detail },
+                )
+            else
+                try std.fmt.allocPrint(
+                    allocator,
+                    "model connection failed: {s} endpoint={s}",
+                    .{ @errorName(err), endpoint },
+                );
             defer allocator.free(message);
             try events.emit(.{ .progress_update = message });
             try db.recordEvent(config.session, "model_error", @errorName(err));

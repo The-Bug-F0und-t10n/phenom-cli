@@ -10693,3 +10693,45 @@ Validacao adicional em 2026-07-15 para patch expandido:
 - O fluxo real executou `set_operational_contract`, `collect_evidence`, `apply_patch operation=edit hunks=2 stale_checked=true`, `validate_syntax status=ok` e resposta final com `PHENOM_EXPANDED_PATCH`.
 - Arquivo do fixture terminou com `add -> return a + b;` e `sub -> return a - b;`.
 - SQLite do smoke registrou `contract_selected`, `tool_start apply_patch operation=edit`, `patch_result hunks=2`, `validation`, `expectation_passed` e `turn_done status=ok quality=confirmed context_tool_missing=false`.
+
+## T307 - Diagnosticar `HttpStatusNotOk` com status e corpo do backend
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: em uso real com `inference.local:11434`, a falha `model connection failed: HttpStatusNotOk endpoint=...` escondia o motivo retornado pelo servidor. Isso violava a invariante 6: falha de modelo nao pode parecer falha generica de infraestrutura. O usuario precisava saber se era backend errado, endpoint errado, payload rejeitado ou servidor indisponivel.
+
+Regra de negocio preservada:
+
+- Nao foi adicionada heuristica por prompt.
+- O backend continua definido por contrato/config: `ollama` usa `/api/chat`; `llamacpp` usa `/completion`.
+- O controller apenas captura diagnostico de protocolo HTTP: status e corpo curto da resposta nao-2xx.
+
+Implementacao:
+
+- `phenom-zig/src/http.zig`: `LocalModelClient` guarda `last_http_status` e `last_http_body_snippet` quando a resposta HTTP nao e 2xx.
+- `phenom-zig/src/http.zig`: corpo de erro e limitado a 512 bytes e sanitizado para uma linha segura.
+- `phenom-zig/src/main.zig`: mensagem `model connection failed` inclui `status=N body="..."` quando o backend retornou resposta HTTP valida de erro.
+- `phenom-zig/src/main.zig`: `LocalModelClient.deinit()` libera o snippet guardado.
+
+Limite residual:
+
+- `--fail-on-model-error` ainda retorna o erro Zig cru para automacao/CI; a mensagem detalhada e emitida no fluxo normal.
+- `thinking=on` com `phenom:latest` ainda pode causar erro de protocolo de tool loop em prompts simples; isso e falha separada de comportamento do modelo/tool loop, nao `HttpStatusNotOk`.
+
+Criterio de aceite:
+
+- Backend errado contra llama.cpp mostra `status=404` e corpo `File Not Found`.
+- Backend correto `llamacpp` conversa com `inference.local:11434`.
+- `probe` confirma `server llama.cpp` sem chamar inferencia.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/http.zig` -> passou; 30 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 283 testes.
+- `bash tools/check_product_guardrails.sh` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
+- `./zig-out/bin/phenom probe --backend llamacpp --host inference.local:11434` com rede liberada -> `tcp success`, `http success status=200`, `server llama.cpp`.
+- `./zig-out/bin/phenom chat --backend llamacpp --host inference.local:11434 --model phenom:latest --thinking off --max-tokens 32 --prompt 'responda somente: ok' --fail-on-model-error --no-color` -> passou; resposta `ok`.
+- Smoke de diagnostico forçado: `./zig-out/bin/phenom chat --backend ollama --host inference.local:11434 --model phenom:latest --thinking off --max-tokens 32 --prompt 'responda somente: ok' --no-color` -> mostrou `model connection failed: HttpStatusNotOk endpoint=http://inference.local:11434/api/chat status=404 body="...File Not Found..."`.
