@@ -10735,3 +10735,37 @@ Validacao executada:
 - `./zig-out/bin/phenom probe --backend llamacpp --host inference.local:11434` com rede liberada -> `tcp success`, `http success status=200`, `server llama.cpp`.
 - `./zig-out/bin/phenom chat --backend llamacpp --host inference.local:11434 --model phenom:latest --thinking off --max-tokens 32 --prompt 'responda somente: ok' --fail-on-model-error --no-color` -> passou; resposta `ok`.
 - Smoke de diagnostico forçado: `./zig-out/bin/phenom chat --backend ollama --host inference.local:11434 --model phenom:latest --thinking off --max-tokens 32 --prompt 'responda somente: ok' --no-color` -> mostrou `model connection failed: HttpStatusNotOk endpoint=http://inference.local:11434/api/chat status=404 body="...File Not Found..."`.
+
+## T308 - Garantir UTF-8 valido no JSON enviado ao backend
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: o servidor llama.cpp retornou `status=500` com `[json.exception.parse_error.101] ... invalid string: ill-formed UTF-8 byte` ao receber `/completion`. A causa estava na fronteira HTTP: `jsonEscape` escapava aspas/controles, mas preservava bytes malformados vindos de prompt, contexto de turno ou historico de sessao. JSON enviado ao backend precisa ser UTF-8 valido sempre.
+
+Regra de negocio preservada:
+
+- Nao foi adicionada heuristica por prompt.
+- A correcao fica na camada de transporte/serializacao JSON.
+- O conteudo malformado nao quebra a chamada; bytes invalidos viram `\uFFFD`.
+
+Implementacao:
+
+- `phenom-zig/src/http.zig`: `jsonEscape` agora valida sequencias UTF-8 multibyte antes de copiar para o JSON.
+- `phenom-zig/src/http.zig`: bytes UTF-8 invalidos, truncados ou com continuação invalida viram `\uFFFD`.
+- `phenom-zig/src/http.zig`: controles abaixo de `0x20` que nao sejam `\n`, `\r` ou `\t` viram escape JSON `\u00XX`.
+
+Criterio de aceite:
+
+- `jsonEscape("ok\xfffim")` retorna `ok\uFFFDfim`.
+- Body llama.cpp com contexto contendo byte invalido continua sendo UTF-8 valido.
+- Smoke real com `/completion` nao retorna mais parse error UTF-8 para o prompt observado.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/http.zig` -> passou; 32 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 285 testes.
+- `bash tools/check_product_guardrails.sh` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
+- `~/.local/bin/phenom chat --backend llamacpp --host inference.local:11434 --model phenom:latest --thinking off --max-tokens 64 --prompt 'olola' --fail-on-model-error --no-color` -> passou; resposta visivel sem `HttpStatusNotOk`.

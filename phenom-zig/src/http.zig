@@ -758,17 +758,69 @@ fn jsonFieldValueStart(line: []const u8, field: []const u8) ?usize {
 fn jsonEscape(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    for (text) |ch| {
+    var i: usize = 0;
+    while (i < text.len) {
+        const ch = text[i];
+        if (ch < 0x20 and ch != '\n' and ch != '\r' and ch != '\t') {
+            try appendJsonByteEscape(allocator, &out, ch);
+            i += 1;
+            continue;
+        }
         switch (ch) {
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, ch),
+            '\\' => {
+                try out.appendSlice(allocator, "\\\\");
+                i += 1;
+            },
+            '"' => {
+                try out.appendSlice(allocator, "\\\"");
+                i += 1;
+            },
+            '\n' => {
+                try out.appendSlice(allocator, "\\n");
+                i += 1;
+            },
+            '\r' => {
+                try out.appendSlice(allocator, "\\r");
+                i += 1;
+            },
+            '\t' => {
+                try out.appendSlice(allocator, "\\t");
+                i += 1;
+            },
+            0x80...0xff => {
+                const len = std.unicode.utf8ByteSequenceLength(ch) catch {
+                    try out.appendSlice(allocator, "\\uFFFD");
+                    i += 1;
+                    continue;
+                };
+                const end = i + len;
+                if (end > text.len) {
+                    try out.appendSlice(allocator, "\\uFFFD");
+                    i += 1;
+                    continue;
+                }
+                _ = std.unicode.utf8Decode(text[i..end]) catch {
+                    try out.appendSlice(allocator, "\\uFFFD");
+                    i += 1;
+                    continue;
+                };
+                try out.appendSlice(allocator, text[i..end]);
+                i = end;
+            },
+            else => {
+                try out.append(allocator, ch);
+                i += 1;
+            },
         }
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn appendJsonByteEscape(allocator: std.mem.Allocator, out: *std.ArrayList(u8), byte: u8) !void {
+    const hex = "0123456789abcdef";
+    try out.appendSlice(allocator, "\\u00");
+    try out.append(allocator, hex[byte >> 4]);
+    try out.append(allocator, hex[byte & 0x0f]);
 }
 
 fn jsonUnescape(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -934,6 +986,33 @@ test "json unescape decodes common escapes" {
     const decoded = try jsonUnescape(std.testing.allocator, "a\\nb\\t\\\"c\\\"");
     defer std.testing.allocator.free(decoded);
     try std.testing.expectEqualStrings("a\nb\t\"c\"", decoded);
+}
+
+test "json escape replaces malformed utf8 before request body" {
+    const escaped = try jsonEscape(std.testing.allocator, "ok\xfffim");
+    defer std.testing.allocator.free(escaped);
+
+    try std.testing.expectEqualStrings("ok\\uFFFDfim", escaped);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(escaped));
+}
+
+test "llamacpp request body is valid utf8 when context has malformed bytes" {
+    var client = LocalModelClient{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1:11434",
+        .backend = .llamacpp,
+        .model = "phenom:latest",
+        .max_tokens = 64,
+        .thinking = .off,
+    };
+    const body = try client.buildBodyForInput(.{
+        .user_prompt = "olola",
+        .model_context = "[TURN_CONTEXT v1]\ntask: a\xffb\n",
+    });
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(body));
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\uFFFD") != null);
 }
 
 test "http status parser rejects non 2xx" {
