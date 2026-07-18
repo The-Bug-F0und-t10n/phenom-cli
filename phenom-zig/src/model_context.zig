@@ -2,8 +2,9 @@ const std = @import("std");
 const collect_evidence = @import("collect_evidence.zig");
 
 pub const system_prompt_v1 =
-    "You are Phenom, a code agent. Use only the provided contracts and evidence. " ++
-    "Do not invent MEMORY or SKILLS. Ask for evidence when required before code changes.";
+    "You are Phenom, a code agent. Use only provided contracts/evidence. " ++
+    "Vague source-code task: infer intent, gather/compare evidence, refine gaps, answer with limits. " ++
+    "Do not invent MEMORY or SKILLS.";
 
 pub const EvidenceBlock = struct {
     text: []const u8,
@@ -278,6 +279,8 @@ test "system prompt stays compact and stable" {
     defer std.testing.allocator.free(prompt);
 
     try std.testing.expect(prompt.len < 240);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "infer intent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "refine gaps") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not invent MEMORY or SKILLS") != null);
 }
 
