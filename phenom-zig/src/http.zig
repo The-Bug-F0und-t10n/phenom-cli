@@ -247,6 +247,16 @@ pub const TokenUsage = struct {
     final: bool = false,
 };
 
+pub const StopReason = enum {
+    stop,
+    length,
+    unknown,
+};
+
+pub const CompletionStop = struct {
+    reason: StopReason = .unknown,
+};
+
 pub const ProbeResult = struct {
     endpoint: []const u8,
     tcp_ok: bool,
@@ -642,8 +652,21 @@ fn processModelLine(allocator: std.mem.Allocator, raw_line: []const u8, sink: an
         try sink.onDelta(decoded);
     }
     const done = jsonBoolTrueField(json_line, "stop") or jsonBoolTrueField(json_line, "done") or hasFinishReason(json_line);
+    if (done) try emitCompletionStop(sink, completionStopFromLine(json_line));
     if (extractTokenUsage(json_line, done)) |usage| try emitTokenUsage(sink, usage);
     return done;
+}
+
+fn emitCompletionStop(sink: anytype, stop: CompletionStop) !void {
+    const Sink = @TypeOf(sink);
+    switch (@typeInfo(Sink)) {
+        .pointer => |ptr| {
+            if (@hasDecl(ptr.child, "onCompletionStop")) try sink.onCompletionStop(stop);
+        },
+        else => {
+            if (@hasDecl(Sink, "onCompletionStop")) try sink.onCompletionStop(stop);
+        },
+    }
 }
 
 fn emitTokenUsage(sink: anytype, usage: TokenUsage) !void {
@@ -685,6 +708,23 @@ fn extractTokenUsage(line: []const u8, final: bool) ?TokenUsage {
 fn hasFinishReason(line: []const u8) bool {
     const value = extractJsonStringField(line, "finish_reason") orelse return false;
     return !std.mem.eql(u8, value, "null") and value.len > 0;
+}
+
+fn completionStopFromLine(line: []const u8) CompletionStop {
+    if (jsonBoolTrueField(line, "stopped_limit") or jsonBoolTrueField(line, "truncated")) return .{ .reason = .length };
+    if (extractJsonStringField(line, "stop_type")) |value| {
+        if (std.ascii.eqlIgnoreCase(value, "limit") or std.ascii.eqlIgnoreCase(value, "length")) return .{ .reason = .length };
+        if (std.ascii.eqlIgnoreCase(value, "eos") or std.ascii.eqlIgnoreCase(value, "word") or std.ascii.eqlIgnoreCase(value, "stop")) return .{ .reason = .stop };
+    }
+    if (extractJsonStringField(line, "done_reason")) |value| return .{ .reason = stopReasonFromText(value) };
+    if (extractJsonStringField(line, "finish_reason")) |value| return .{ .reason = stopReasonFromText(value) };
+    return .{};
+}
+
+fn stopReasonFromText(value: []const u8) StopReason {
+    if (std.ascii.eqlIgnoreCase(value, "length") or std.ascii.eqlIgnoreCase(value, "max_tokens") or std.ascii.eqlIgnoreCase(value, "limit")) return .length;
+    if (std.ascii.eqlIgnoreCase(value, "stop") or std.ascii.eqlIgnoreCase(value, "eos")) return .stop;
+    return .unknown;
 }
 
 fn tokensPerSecondFromEvalDuration(output: usize, duration_ns: ?u64) ?f64 {
@@ -911,6 +951,30 @@ test "llamacpp stop true ends stream after visible content" {
     defer line_buffer.deinit(std.testing.allocator);
     try std.testing.expect(try feedLines(std.testing.allocator, &line_buffer, line, &ctx));
     try std.testing.expectEqualStrings("PHENOM_REAL_7319", seen.items);
+}
+
+test "llamacpp stopped limit exposes completion stop reason" {
+    const line = "data: {\"content\":\"cortado\",\"stop\":true,\"stopped_limit\":true,\"tokens_predicted\":32,\"tokens_evaluated\":10}\n";
+    var seen = std.ArrayList(u8).empty;
+    defer seen.deinit(std.testing.allocator);
+    var reason: StopReason = .unknown;
+    const Ctx = struct {
+        seen: *std.ArrayList(u8),
+        reason: *StopReason,
+        pub fn onDelta(self: *@This(), delta: []const u8) !void {
+            try self.seen.appendSlice(std.testing.allocator, delta);
+        }
+        pub fn onCompletionStop(self: *@This(), stop: CompletionStop) !void {
+            self.reason.* = stop.reason;
+        }
+        pub fn onTokenUsage(_: *@This(), _: TokenUsage) !void {}
+    };
+    var ctx = Ctx{ .seen = &seen, .reason = &reason };
+    var line_buffer = std.ArrayList(u8).empty;
+    defer line_buffer.deinit(std.testing.allocator);
+    try std.testing.expect(try feedLines(std.testing.allocator, &line_buffer, line, &ctx));
+    try std.testing.expectEqualStrings("cortado", seen.items);
+    try std.testing.expectEqual(StopReason.length, reason);
 }
 
 test "ollama done true ends stream without visible content" {

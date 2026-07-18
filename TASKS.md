@@ -10934,3 +10934,64 @@ Invariantes afetadas:
 Risco residual:
 
 - A tool ainda pode executar novamente antes de ser reconhecida como duplicata em rotas que nao fazem precheck. Esta task impede falha fatal e duplicacao de contexto; dedupe antes da execucao dessas rotas pode ser otimizado depois se o custo virar problema.
+
+## T312 - Expor uso de contexto e motivo de corte da geracao no transcript
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: o CLI nao mostrava no canto direito da statusbar quanto do contexto pre-send estava ocupado e respostas podiam terminar no meio sem explicacao visivel. A causa raiz do corte aparente era que o cliente HTTP reduzia `finish_reason`, `done`, `stop`, `stopped_limit`, `truncated` e limite de tokens a um unico booleano de fim. O renderer entao imprimia `Worked for...` como se fosse parada normal.
+
+Regra de negocio preservada:
+
+- Nao foi adicionada heuristica por prompt.
+- O contador de contexto usa bytes reais do `ModelTurnContext` renderizado antes do envio, nao estimativa falsa de tokens.
+- O motivo de parada vem de metadados do backend ou do contador final real de output quando disponivel.
+- Tool output continua sendo evidencia destilada; somente a renderizacao visual ganhou quebra com gutter.
+
+Passos de implementacao:
+
+1. Criar testes de statusbar para `ctx used/limit` alinhado a direita.
+2. Criar teste de renderer para linha longa de tool com gutter em todas as continuacoes.
+3. Criar teste HTTP para propagar parada por limite (`stopped_limit`).
+4. Integrar `showContextUsage` apos `recordModelContextBudget` nos pontos de inferencia inicial, plano e follow-up.
+5. Propagar `CompletionStop` pelo `StreamSink` e pelo sink agregado do tool loop.
+6. Emitir `model_stop` e `progress_update` quando a resposta final parar por limite de output.
+7. Rodar testes focados, guardrails e build release.
+
+Implementacao:
+
+- `phenom-zig/src/tui.zig`: statusbar aceita `status_right` e mostra `ctx {used}/{limit}` no canto direito; quando o contador existe, ele tem prioridade sobre o visualizer.
+- `phenom-zig/src/main.zig`: contexto enviado ao modelo atualiza a UI com `model_context.measureRenderedContextBytes(...).total_context` contra `max_model_context_send_bytes`.
+- `phenom-zig/src/http.zig`: parser de streaming emite `CompletionStop` com motivo `length` para `finish_reason=length`, `done_reason=length`, `stop_type=limit`, `stopped_limit=true` ou `truncated=true`.
+- `phenom-zig/src/main.zig`: `StreamSink` marca `output_limit_hit` tambem quando o uso final real de output alcanca `--max-tokens`.
+- `phenom-zig/src/render.zig`: output de tool quebra linhas longas antes do terminal quebrar, mantendo `    │ ` em cada linha visual.
+
+Criterio de aceite:
+
+- O usuario consegue ver `ctx used/limit` na statusbar sem depender de tokens fabricados.
+- Resposta cortada por limite nao parece sucesso silencioso; o transcript recebe `generation stopped at output limit (--max-tokens N)` e o audit usa `status=output_limit`.
+- Linhas longas de evidence/tool nao invadem a margem esquerda no wrap visual.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/http.zig --cache-dir /tmp/phenom-stop-reason-http` -> passou; 33 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/render.zig --cache-dir /tmp/phenom-tool-wrap-render4` -> passou; 31 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/tui.zig -lc --cache-dir /tmp/phenom-status-context-tui6` -> passou; 14 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-stop-status-main2` -> passou; 296 testes.
+- `bash tools/check_product_guardrails.sh` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
+- Smoke CLI com backend llama.cpp fake deterministico em `127.0.0.1:18088`: `./zig-out/bin/phenom chat --backend llamacpp --host 127.0.0.1:18088 --model fake --thinking off --max-tokens 8 --session output-limit-smoke-20260718b --prompt 'responda com texto longo' --expect-contains 'resposta parcial' --show-expect-status --fail-on-model-error --no-color` -> passou; transcript mostrou `generation stopped at output limit (--max-tokens 8)`.
+- Audit do smoke: `model_stop|generation stopped at output limit (--max-tokens 8)` e `turn_done|status=output_limit ... low_confidence=true`.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; contador mede o contexto renderizado, nao injeta bruto.
+- 6. Falha de modelo nao parece falha de infraestrutura: ampliada; corte por limite agora aparece como parada de geracao, nao sucesso normal.
+- 7. Cada turno consegue ser auditado e reproduzido: ampliada; `model_stop` registra o motivo visivel.
+
+Risco residual:
+
+- O contador da statusbar e em bytes do prompt renderizado, nao janela neural/tokenizada, porque o projeto nao tem tokenizer do modelo local.
+- Backends que nao enviam metadados de parada nem token usage final ainda podem encerrar com motivo desconhecido.

@@ -24,6 +24,7 @@ pub const BottomBarState = struct {
     color: bool = true,
     cols: usize = 80,
     status: ?[]const u8 = null,
+    status_right: ?[]const u8 = null,
     visualizer: ?[]const u8 = null,
     visualizer_mode: ?VisualizerMode = null,
     visualizer_tick: usize = 0,
@@ -232,9 +233,9 @@ pub fn renderBottomBar(writer: anytype, state: BottomBarState) !usize {
 
     if (state.status) |status| {
         if (state.visualizer_mode) |mode| {
-            try writeStatusDynamic(writer, state.color, status, mode, state.visualizer_tick, paint_cols);
+            try writeStatusDynamic(writer, state.color, status, state.status_right, mode, state.visualizer_tick, paint_cols);
         } else {
-            try writeStatus(writer, state.color, status, state.visualizer, paint_cols);
+            try writeStatus(writer, state.color, status, state.status_right, state.visualizer, paint_cols);
         }
     } else {
         try writeSpaces(writer, paint_cols);
@@ -597,6 +598,9 @@ pub fn TerminalUi(comptime Writer: type) type {
         token_output_limit: ?usize = null,
         token_tps: ?f64 = null,
         has_token_usage: bool = false,
+        context_used_bytes: usize = 0,
+        context_limit_bytes: usize = 0,
+        has_context_usage: bool = false,
         visualizer_mode: VisualizerMode = .idle,
         visualizer_tick: usize = 0,
         visualizer: MiniVisualizer,
@@ -705,6 +709,9 @@ pub fn TerminalUi(comptime Writer: type) type {
             self.token_output_limit = null;
             self.token_tps = null;
             self.has_token_usage = false;
+            self.context_used_bytes = 0;
+            self.context_limit_bytes = 0;
+            self.has_context_usage = false;
         }
 
         pub fn setTokenOutputLimit(self: *Self, limit: usize) void {
@@ -717,6 +724,16 @@ pub fn TerminalUi(comptime Writer: type) type {
             self.token_total = total;
             self.token_tps = tokens_per_second;
             self.has_token_usage = true;
+            if (self.last_status) |status| {
+                self.visualizer_tick +%= 1;
+                try self.draw(.{ .status = status, .show_prompt = false, .preserve_cursor = true });
+            }
+        }
+
+        pub fn showContextUsage(self: *Self, used_bytes: usize, limit_bytes: usize) !void {
+            self.context_used_bytes = used_bytes;
+            self.context_limit_bytes = limit_bytes;
+            self.has_context_usage = true;
             if (self.last_status) |status| {
                 self.visualizer_tick +%= 1;
                 try self.draw(.{ .status = status, .show_prompt = false, .preserve_cursor = true });
@@ -799,11 +816,13 @@ pub fn TerminalUi(comptime Writer: type) type {
             defer out.deinit(self.allocator);
             const bw = fd_writer.BufferWriter{ .allocator = self.allocator, .list = &out };
             var status_buf: [192]u8 = undefined;
+            var status_right_buf: [48]u8 = undefined;
             const status_text = if (opts.status) |status| self.formatStatus(status, &status_buf) else null;
+            const status_right = self.formatStatusRight(&status_right_buf);
             var visualizer_buf: [max_visualizer_cols * 4]u8 = undefined;
             var visualizer_text: ?[]const u8 = null;
             if (status_text) |text| {
-                if (opts.status != null and self.visualizer_mode != .idle) {
+                if (opts.status != null and self.visualizer_mode != .idle and status_right == null) {
                     const visual_cols = visualizerWidth(text, paint_cols);
                     if (visual_cols > 0) {
                         self.visualizer.setWidth(visual_cols);
@@ -817,6 +836,7 @@ pub fn TerminalUi(comptime Writer: type) type {
                 .color = self.color,
                 .cols = size.cols,
                 .status = status_text,
+                .status_right = status_right,
                 .visualizer = visualizer_text,
                 .visualizer_mode = null,
                 .visualizer_tick = self.visualizer_tick,
@@ -864,6 +884,15 @@ pub fn TerminalUi(comptime Writer: type) type {
                 return std.fmt.bufPrint(buf, "{s} ({}s · esc to interrupt)", .{ status, seconds }) catch status;
             }
             return std.fmt.bufPrint(buf, "{s} ({}m {}s · esc to interrupt)", .{ status, seconds / 60, seconds % 60 }) catch status;
+        }
+
+        fn formatStatusRight(self: *Self, buf: *[48]u8) ?[]const u8 {
+            if (!self.has_context_usage or self.context_limit_bytes == 0) return null;
+            var used_buf: [24]u8 = undefined;
+            var limit_buf: [24]u8 = undefined;
+            const used = formatByteCount(&used_buf, self.context_used_bytes);
+            const limit = formatByteCount(&limit_buf, self.context_limit_bytes);
+            return std.fmt.bufPrint(buf, "ctx {s}/{s}", .{ used, limit }) catch null;
         }
 
         fn formatOutputTokenCount(self: *Self, buf: *[24]u8) []const u8 {
@@ -922,11 +951,25 @@ pub fn terminalSize() TerminalSize {
     return .{};
 }
 
-fn writeStatus(writer: anytype, color: bool, status: []const u8, visualizer: ?[]const u8, width: usize) !void {
+fn writeStatus(writer: anytype, color: bool, status: []const u8, right: ?[]const u8, visualizer: ?[]const u8, width: usize) !void {
+    if (width == 0) return;
     const visual = visualizer orelse "";
+    const right_text = right orelse "";
+    const right_cols = utf8Columns(right_text);
+    if (right_cols > 0 and right_cols + 1 >= width) {
+        const clipped_right = right_text[0..utf8PrefixBytes(right_text, width)];
+        const clipped_right_cols = utf8Columns(clipped_right);
+        if (clipped_right_cols < width) try writeSpaces(writer, width - clipped_right_cols);
+        if (color) try writer.writeAll(dim);
+        try writer.writeAll(clipped_right);
+        if (color) try writer.writeAll(reset);
+        return;
+    }
     const visual_gap: usize = if (visual.len > 0) 1 else 0;
     const visual_cols = utf8Columns(visual);
-    const status_width = if (width > visual_cols + visual_gap) width - visual_cols - visual_gap else width;
+    const right_gap: usize = if (right_cols > 0) 1 else 0;
+    const reserved_cols = visual_cols + visual_gap + right_cols + right_gap;
+    const status_width = if (width > reserved_cols) width - reserved_cols else width;
     const clipped = status[0..utf8PrefixBytes(status, status_width)];
     const clipped_cols = utf8Columns(clipped);
     if (color) {
@@ -934,17 +977,26 @@ fn writeStatus(writer: anytype, color: bool, status: []const u8, visualizer: ?[]
     }
     try writer.writeAll(clipped);
     if (color) try writer.writeAll(reset);
-    if (visual.len > 0 and width > clipped_cols + visual_cols) {
-        try writeSpaces(writer, width - clipped_cols - visual_cols);
+    if (visual.len > 0 and width > clipped_cols + visual_cols + right_cols + right_gap) {
+        try writeSpaces(writer, width - clipped_cols - visual_cols - right_cols - right_gap);
         if (color) try writer.writeAll(cyan);
         try writer.writeAll(visual);
         if (color) try writer.writeAll(reset);
-    } else if (clipped_cols < width) {
+        if (right_cols > 0) try writeSpaces(writer, right_gap);
+    } else if (right_cols > 0 and width >= clipped_cols + right_cols) {
+        try writeSpaces(writer, width - clipped_cols - right_cols);
+    } else if (right_cols == 0 and clipped_cols < width) {
         try writeSpaces(writer, width - clipped_cols);
+    }
+    if (right_cols > 0 and width >= right_cols) {
+        if (color) try writer.writeAll(dim);
+        try writer.writeAll(right_text);
+        if (color) try writer.writeAll(reset);
     }
 }
 
-fn writeStatusDynamic(writer: anytype, color: bool, status: []const u8, mode: VisualizerMode, tick: usize, width: usize) !void {
+fn writeStatusDynamic(writer: anytype, color: bool, status: []const u8, right: ?[]const u8, mode: VisualizerMode, tick: usize, width: usize) !void {
+    if (right != null) return writeStatus(writer, color, status, right, null, width);
     const min_visual_cols: usize = 4;
     const status_cols = @min(utf8Columns(status), width);
     const visual_cols = if (width > status_cols + 1 + min_visual_cols) width - status_cols - 1 else 0;
@@ -980,6 +1032,18 @@ fn formatTokenCount(buf: *[24]u8, value: usize) []const u8 {
     const m_frac = (value % 1_000_000) / 100_000;
     if (m_frac > 0) return std.fmt.bufPrint(buf, "{}.{}m", .{ m_whole, m_frac }) catch "0";
     return std.fmt.bufPrint(buf, "{}m", .{m_whole}) catch "0";
+}
+
+fn formatByteCount(buf: *[24]u8, value: usize) []const u8 {
+    if (value < 1024) return std.fmt.bufPrint(buf, "{}B", .{value}) catch "0B";
+    const kb = value / 1024;
+    const kb_frac = ((value % 1024) * 10) / 1024;
+    if (kb < 10 and kb_frac > 0) return std.fmt.bufPrint(buf, "{}.{}KiB", .{ kb, kb_frac }) catch "0B";
+    if (kb < 1024) return std.fmt.bufPrint(buf, "{}KiB", .{kb}) catch "0B";
+    const mb = kb / 1024;
+    const mb_frac = ((kb % 1024) * 10) / 1024;
+    if (mb_frac > 0) return std.fmt.bufPrint(buf, "{}.{}MiB", .{ mb, mb_frac }) catch "0B";
+    return std.fmt.bufPrint(buf, "{}MiB", .{mb}) catch "0B";
 }
 
 fn paintInputRow(writer: anytype, color: bool, prefix: []const u8, content: []const u8, width: usize) !void {
@@ -1180,6 +1244,38 @@ test "status bar shows output token limit when known" {
     const status = ui.formatStatus("Responding", &status_buf);
     try std.testing.expect(std.mem.indexOf(u8, status, "↑ 64/64 out") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "max?") != null);
+}
+
+test "status bar shows model context usage on the right" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var ui = TerminalUi(@TypeOf(writer)).init(std.testing.allocator, writer, false);
+    defer ui.deinit();
+    try ui.showContextUsage(8192, 24 * 1024);
+
+    var right_buf: [48]u8 = undefined;
+    const right = ui.formatStatusRight(&right_buf) orelse return error.ExpectedContextUsage;
+    try std.testing.expectEqualStrings("ctx 8KiB/24KiB", right);
+}
+
+test "bottom bar keeps right status inside terminal width" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+
+    _ = try renderBottomBar(writer, .{
+        .color = false,
+        .cols = 30,
+        .status = "Thinking",
+        .status_right = "ctx 8KiB/24KiB",
+        .prompt = "",
+        .cursor = 0,
+        .show_prompt = false,
+    });
+
+    const first_line_end = std.mem.indexOf(u8, buffer.items, "\r\n") orelse return error.ExpectedStatusLine;
+    try std.testing.expectEqualStrings("Thinking       ctx 8KiB/24KiB", buffer.items[0..first_line_end]);
 }
 
 test "prompt view wraps and keeps cursor in visible window" {

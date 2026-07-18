@@ -824,10 +824,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 if (end > start) {
                     seen += 1;
                     if (shown < self.options.max_tool_sample_lines) {
-                        try self.writeContentGutter();
-                        try self.writeDim("    │ ");
-                        try self.writer.writeAll(sample[start..end]);
-                        try self.writer.writeAll("\n");
+                        try self.writeWrappedToolLine(sample[start..end]);
                         shown += 1;
                     }
                 }
@@ -841,6 +838,26 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 try self.writer.print("{} more line{s} truncated", .{ hidden, if (hidden == 1) "" else "s" });
                 try self.writeDim(")");
                 try self.writer.writeAll("\n");
+            }
+        }
+
+        fn writeWrappedToolLine(self: *Self, line: []const u8) !void {
+            const prefix = "    │ ";
+            const width = @max(@as(usize, 1), self.contentWrapWidth() -| utf8Columns(prefix));
+            var start: usize = 0;
+            var wrote = false;
+            while (start < line.len or !wrote) {
+                var end = start;
+                var cols: usize = 0;
+                while (end < line.len and cols < width) : (cols += 1) {
+                    end = @min(line.len, end + utf8ByteLen(line[end]));
+                }
+                try self.writeContentGutter();
+                try self.writeDim(prefix);
+                try self.writer.writeAll(line[start..end]);
+                try self.writer.writeAll("\n");
+                wrote = true;
+                start = end;
             }
         }
 
@@ -1034,6 +1051,14 @@ fn utf8ByteLen(first: u8) usize {
     if ((first & 0xf0) == 0xe0) return 3;
     if ((first & 0xf8) == 0xf0) return 4;
     return 1;
+}
+
+fn utf8Columns(bytes: []const u8) usize {
+    var cols: usize = 0;
+    for (bytes) |byte| {
+        if ((byte & 0b1100_0000) != 0b1000_0000) cols += 1;
+    }
+    return cols;
 }
 
 fn toolLabel(name: []const u8) []const u8 {
@@ -1528,6 +1553,23 @@ test "tool sample uses phenom cli ts tool announcement and output gutter" {
         \\     │ a
         \\     │ b
         \\     └─ (1 more line truncated)
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, buffer.items);
+}
+
+test "tool sample wraps long output lines with gutter on continuations" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 18, .max_tool_sample_lines = 1 });
+    try renderer.toolSample("collect_evidence", "abcdefghijklmnopqrst\n");
+
+    const expected =
+        \\ ▸ collect_evidence
+        \\     │ abcdefghij
+        \\     │ klmnopqrst
         \\
     ;
     try std.testing.expectEqualStrings(expected, buffer.items);

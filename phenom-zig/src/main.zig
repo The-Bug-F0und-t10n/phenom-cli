@@ -251,6 +251,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             .thinking_bytes = 0,
             .defer_visible = enable_tool_loop,
             .trim_visible_leading_whitespace = false,
+            .output_limit = config.max_tokens,
         };
         defer sink.deinit();
         const model_context_text = try buildInitialModelContext(
@@ -264,18 +265,21 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         );
         defer if (model_context_text) |text| allocator.free(text);
         if (model_context_text) |text| try db.recordEvent(config.session, "model_context", text);
-        if (model_context_text) |text| recordModelContextBudget(allocator, &db, config.session, text) catch |err| {
-            const message = if (err == error.ModelContextBudgetExceeded)
-                "context limit exceeded before model call"
-            else
-                @errorName(err);
-            if (ui_ptr) |active_ui| try active_ui.showStatus(message);
-            try events.emit(.{ .progress_update = message });
-            try db.recordEvent(config.session, "model_error", @errorName(err));
-            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "model_context_error", prompt, sink.visible.items);
-            if (config.fail_on_model_error) return err;
-            return;
-        };
+        if (model_context_text) |text| {
+            recordModelContextBudget(allocator, &db, config.session, text) catch |err| {
+                const message = if (err == error.ModelContextBudgetExceeded)
+                    "context limit exceeded before model call"
+                else
+                    @errorName(err);
+                if (ui_ptr) |active_ui| try active_ui.showStatus(message);
+                try events.emit(.{ .progress_update = message });
+                try db.recordEvent(config.session, "model_error", @errorName(err));
+                try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "model_context_error", prompt, sink.visible.items);
+                if (config.fail_on_model_error) return err;
+                return;
+            };
+            try showModelContextUsage(text, ui_ptr);
+        }
         var dialogue_events = if (shouldUseSessionContext(config))
             try db.loadRecentSessionEvents(allocator, config.session, 240)
         else
@@ -355,7 +359,14 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
                 try events.emit(.{ .progress_update = message });
             }
         }
-        try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, sink.visible.items);
+        const final_status = if (sink.hitGenerationLimit()) blk: {
+            const message = try std.fmt.allocPrint(allocator, "generation stopped at output limit (--max-tokens {})", .{config.max_tokens});
+            defer allocator.free(message);
+            try events.emit(.{ .progress_update = message });
+            try db.recordEvent(config.session, "model_stop", message);
+            break :blk "output_limit";
+        } else "ok";
+        try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, final_status, prompt, sink.visible.items);
     }
 }
 
@@ -2416,6 +2427,12 @@ fn recordModelContextBudget(
     try db.recordEvent(session, "model_context_budget", body);
 }
 
+fn showModelContextUsage(rendered: []const u8, ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter)) !void {
+    const active_ui = ui_ptr orelse return;
+    const buckets = model_context.measureRenderedContextBytes(rendered);
+    try active_ui.showContextUsage(buckets.total_context, max_model_context_send_bytes);
+}
+
 fn streamDeferredToolLoopTurn(
     allocator: std.mem.Allocator,
     config: cli.Config,
@@ -2503,6 +2520,7 @@ fn streamSearchPlanTurn(
         .thinking_bytes = 0,
         .defer_visible = true,
         .trim_visible_leading_whitespace = false,
+        .output_limit = config.max_tokens,
     };
     defer plan_sink.deinit();
 
@@ -2510,6 +2528,7 @@ fn streamSearchPlanTurn(
         try db.recordEvent(config.session, "model_error", @errorName(err));
         return .stopped;
     };
+    try showModelContextUsage(plan_context, ui_ptr);
     try client.streamInference(.{ .user_prompt = prompt, .model_context = plan_context }, &plan_sink);
     try plan_sink.flush();
 
@@ -2609,6 +2628,7 @@ fn streamDeferredToolLoopTurnInternal(
         .thinking_bytes = 0,
         .defer_visible = true,
         .trim_visible_leading_whitespace = false,
+        .output_limit = config.max_tokens,
     };
     defer follow_sink.deinit();
     recordModelContextBudget(allocator, db, config.session, follow_context) catch |err| {
@@ -2621,6 +2641,7 @@ fn streamDeferredToolLoopTurnInternal(
         try db.recordEvent(config.session, "model_error", @errorName(err));
         return .stopped;
     };
+    try showModelContextUsage(follow_context, ui_ptr);
     try client.streamInference(.{ .user_prompt = prompt, .model_context = follow_context }, &follow_sink);
     try follow_sink.flush();
 
@@ -2694,6 +2715,7 @@ fn streamDeferredToolLoopTurnInternal(
             }
         }
         if (follow_sink.raw_visible.items.len > 0) {
+            aggregate_sink.mergeGenerationStop(follow_sink);
             try aggregate_sink.emitVisibleText(follow_sink.raw_visible.items);
             follow_sink.raw_visible.clearRetainingCapacity();
         }
@@ -3297,6 +3319,9 @@ const StreamSink = struct {
     thinking_bytes: usize,
     defer_visible: bool = false,
     trim_visible_leading_whitespace: bool = false,
+    output_limit: usize = 0,
+    completion_stop_reason: http.StopReason = .unknown,
+    output_limit_hit: bool = false,
 
     pub fn deinit(ctx: *StreamSink) void {
         ctx.filter.deinit();
@@ -3319,12 +3344,27 @@ const StreamSink = struct {
         } });
         if (ctx.ui) |ui| try ui.showTokenUsage(usage.input, usage.output, usage.total, usage.tokens_per_second);
         if (!usage.final) return;
+        if (ctx.output_limit > 0 and usage.output >= ctx.output_limit) ctx.output_limit_hit = true;
         const body = if (usage.tokens_per_second) |tps|
             try std.fmt.allocPrint(ctx.allocator, "input={} output={} total={} tokens_per_second={d:.2} exact=true final=true", .{ usage.input, usage.output, usage.total, tps })
         else
             try std.fmt.allocPrint(ctx.allocator, "input={} output={} total={} tokens_per_second=null exact=true final=true", .{ usage.input, usage.output, usage.total });
         defer ctx.allocator.free(body);
         try ctx.db.recordEvent(ctx.session, "token_usage", body);
+    }
+
+    pub fn onCompletionStop(ctx: *StreamSink, stop: http.CompletionStop) !void {
+        ctx.completion_stop_reason = stop.reason;
+        if (stop.reason == .length) ctx.output_limit_hit = true;
+    }
+
+    fn mergeGenerationStop(ctx: *StreamSink, other: StreamSink) void {
+        if (other.output_limit_hit) ctx.output_limit_hit = true;
+        if (other.completion_stop_reason != .unknown) ctx.completion_stop_reason = other.completion_stop_reason;
+    }
+
+    fn hitGenerationLimit(ctx: *const StreamSink) bool {
+        return ctx.output_limit_hit or ctx.completion_stop_reason == .length;
     }
 
     pub fn flush(ctx: *StreamSink) !void {
@@ -4026,7 +4066,9 @@ test "deferred follow-up answer emits through aggregate sink" {
     defer follow.deinit();
 
     try follow.writeVisible("resposta final");
+    try follow.onCompletionStop(.{ .reason = .length });
     if (follow.raw_visible.items.len > 0) {
+        aggregate.mergeGenerationStop(follow);
         try aggregate.emitVisibleText(follow.raw_visible.items);
         follow.raw_visible.clearRetainingCapacity();
     }
@@ -4034,6 +4076,7 @@ test "deferred follow-up answer emits through aggregate sink" {
     try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
     try std.testing.expectEqualStrings("resposta final", aggregate.visible.items);
     try std.testing.expectEqual(@as(usize, 0), follow.visible_bytes);
+    try std.testing.expect(aggregate.hitGenerationLimit());
 }
 
 test "deferred stream sink can discard protocol violating prose" {
