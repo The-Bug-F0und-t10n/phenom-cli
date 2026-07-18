@@ -849,15 +849,28 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             while (start < line.len or !wrote) {
                 var end = start;
                 var cols: usize = 0;
+                var last_space: ?usize = null;
                 while (end < line.len and cols < width) : (cols += 1) {
+                    if ((line[end] == ' ' or line[end] == '\t') and end > start) last_space = end;
                     end = @min(line.len, end + utf8ByteLen(line[end]));
                 }
+                const next_start = blk: {
+                    if (end < line.len) {
+                        if (last_space) |space_idx| {
+                            end = space_idx;
+                            var next = space_idx + 1;
+                            while (next < line.len and (line[next] == ' ' or line[next] == '\t')) : (next += 1) {}
+                            break :blk next;
+                        }
+                    }
+                    break :blk end;
+                };
                 try self.writeContentGutter();
                 try self.writeDim(prefix);
                 try self.writer.writeAll(line[start..end]);
                 try self.writer.writeAll("\n");
                 wrote = true;
-                start = end;
+                start = next_start;
             }
         }
 
@@ -1570,6 +1583,23 @@ test "tool sample wraps long output lines with gutter on continuations" {
         \\ ▸ collect_evidence
         \\     │ abcdefghij
         \\     │ klmnopqrst
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, buffer.items);
+}
+
+test "tool sample wraps prose at word boundaries" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 24, .max_tool_sample_lines = 1 });
+    try renderer.toolSample("collect_evidence", "um agente local de terminal\n");
+
+    const expected =
+        \\ ▸ collect_evidence
+        \\     │ um agente local
+        \\     │ de terminal
         \\
     ;
     try std.testing.expectEqualStrings(expected, buffer.items);

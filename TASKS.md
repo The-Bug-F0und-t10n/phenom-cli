@@ -10995,3 +10995,57 @@ Risco residual:
 
 - O contador da statusbar e em bytes do prompt renderizado, nao janela neural/tokenizada, porque o projeto nao tem tokenizer do modelo local.
 - Backends que nao enviam metadados de parada nem token usage final ainda podem encerrar com motivo desconhecido.
+
+## T313 - Corrigir regressao de overview generico e wrap de tool output
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: apos T312, o output de tool ganhou gutter nas continuacoes, mas passou a cortar palavras no meio quando o terminal era estreito. Alem disso, o fluxo `collect_evidence stage=overview` ainda podia deixar o modelo responder com "nao ha evidencia, esclareca" depois de uma evidencia generica de README, mesmo havendo orcamento para uma coleta focada. Isso fazia a coleta parecer quebrada para perguntas ambiguas como "caveman e graph".
+
+Regra de negocio preservada:
+
+- Nao foi adicionada heuristica hardcoded por termo do prompt.
+- `overview` continua sendo mapa estrutural, nao resposta final obrigatoria.
+- O controller apenas valida protocolo, qualidade/estado da evidencia e necessidade de refinamento.
+- A coleta focada continua sendo escolhida pelo modelo via contrato `collect_evidence`.
+
+Passos de implementacao:
+
+1. Criar teste de renderer para prose longa de tool quebrar em fronteira de palavra.
+2. Manter fallback de quebra dura quando uma palavra e maior que a largura disponivel.
+3. Preservar `intent`, `need`, `terms`, `target_files` e `scope_root` quando o modelo chama `stage=overview` com texto de busca.
+4. Fazer `overview` exigir uma coleta focada quando ainda ha orcamento e a evidencia e generica/fraca ou e a primeira exploracao.
+5. Criar teste unitario para a regra de refinamento apos overview.
+6. Rodar teste focado, main, build release e smoke com backend fake que tenta responder com pedido de esclarecimento apos overview.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: `writeWrappedToolLine` agora guarda a ultima fronteira de espaco dentro da largura e quebra ali; se nao houver espaco, quebra pelo limite visual como fallback.
+- `phenom-zig/src/main.zig`: `runCollectEvidenceOverviewStep` passa os campos de busca do tool call para `collect_evidence.execute`.
+- `phenom-zig/src/main.zig`: `shouldRequireOverviewRefinement` alinha `overview` ao comportamento das coletas pathless fracas, usando `renderCollectedEvidenceContextRequiringCollection`.
+
+Criterio de aceite:
+
+- Tool output longo nao quebra palavras normais no meio.
+- Depois de overview generico, uma resposta sem nova tool vira repair, nao resposta final.
+- O modelo recebe obrigacao explicita para emitir uma coleta focada antes de responder.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/render.zig --cache-dir /tmp/phenom-tool-word-wrap-render2` -> passou; 32 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-overview-refine-main` -> passou; 298 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
+- Smoke CLI com backend llama.cpp fake em `127.0.0.1:18089`: primeira resposta do modelo chamou `collect_evidence stage=overview`; segunda tentou responder `Nao ha evidencia clara... esclareca`; o controller descartou a prosa, registrou `tool_repair|required follow-up tool call missing`, executou `collect_evidence stage=candidates terms_bytes=24` e chegou ao marcador final `PHENOM_OVERVIEW_REPAIR_OK`.
+
+Invariantes afetadas:
+
+- 1. Tool nao anunciada nunca executa: preservada; nenhuma tool nova foi adicionada.
+- 2. Contexto bruto nao vaza para o modelo: preservada; apenas evidencia destilada segue no contexto.
+- 6. Falha de modelo nao parece falha de infraestrutura: ampliada; resposta sem coleta obrigatoria vira repair protocolar.
+- 7. Cada turno consegue ser auditado e reproduzido: ampliada; smoke registra `tool_repair`, `tool_start` e `turn_done`.
+
+Risco residual:
+
+- Se o modelo insistir em repetir overview/candidatos sem expandir, o loop ainda depende dos limites de iteracao/reparo existentes.

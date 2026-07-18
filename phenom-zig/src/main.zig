@@ -1454,6 +1454,11 @@ fn runCollectEvidenceOverviewStep(
     try events.emit(.{ .tool_start = .{ .name = "collect_evidence", .detail = "overview" } });
 
     const result = collect_evidence.execute(allocator, io, .{
+        .intent = call.intent,
+        .need = call.need,
+        .terms = call.terms,
+        .target_files = call.target_files,
+        .scope_root = call.scope_root,
         .task = prompt,
         .strategy = .auto,
         .budget_bytes = collectEvidenceExecutionBudget(null, state.remainingBudget()),
@@ -1471,18 +1476,39 @@ fn runCollectEvidenceOverviewStep(
     try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = model_evidence } });
     try state.rememberExecutedArgs(null, null, .auto, call.start_line, call.max_lines, result.context_id, model_evidence, result.model_bytes, result.quality_score);
 
-    const follow_context = try renderCollectedEvidenceContext(
-        allocator,
-        prompt,
-        &state.context,
-        null,
-        null,
-        if (state.shouldAllowMoreEvidence()) activeToolSchema(state) else context_profile.toolSchema(.code_evidence, .after_collect_evidence),
-        "Answer from the structural workspace overview evidence. If it does not cover the user's request, emit a focused collect_evidence call with concrete terms. Do not use C# candidates for this overview answer.",
-    );
+    const require_refinement = shouldRequireOverviewRefinement(state, result.quality_score);
+    if (require_refinement) state.forced_exploratory_refinements += 1;
+    const next_action = if (require_refinement)
+        "The overview is only a workspace map. Emit one focused collect_evidence call using concrete terms from the user task and overview paths before answering. Do not ask clarification."
+    else
+        "Answer from the structural workspace overview evidence. If it does not cover the user's request, emit a focused collect_evidence call with concrete terms. Do not use C# candidates for this overview answer.";
+    const follow_context = if (require_refinement)
+        try renderCollectedEvidenceContextRequiringCollection(
+            allocator,
+            prompt,
+            &state.context,
+            null,
+            null,
+            activeToolSchema(state),
+            next_action,
+        )
+    else
+        try renderCollectedEvidenceContext(
+            allocator,
+            prompt,
+            &state.context,
+            null,
+            null,
+            if (state.shouldAllowMoreEvidence()) activeToolSchema(state) else context_profile.toolSchema(.code_evidence, .after_collect_evidence),
+            next_action,
+        );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
     return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+}
+
+fn shouldRequireOverviewRefinement(state: *const ToolLoopState, quality_score: i32) bool {
+    return state.shouldAllowMoreEvidence() and (quality_score < weak_evidence_quality_score or state.shouldRequireExploratoryRefinement(null));
 }
 
 fn selectedCandidateForProtocolFallback(state: *const ToolLoopState) ?[]const u8 {
@@ -4675,6 +4701,16 @@ test "collected evidence context can require a follow-up collection" {
     try std.testing.expect(initialContextRequiresTool(rendered));
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
+}
+
+test "overview evidence requires focused follow-up while budget remains" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try std.testing.expect(shouldRequireOverviewRefinement(&state, 48));
+    try std.testing.expect(shouldRequireOverviewRefinement(&state, weak_evidence_quality_score));
+    state.forced_exploratory_refinements = 1;
+    try std.testing.expect(!shouldRequireOverviewRefinement(&state, weak_evidence_quality_score));
 }
 
 test "model evidence includes micro context id for patch safety" {
