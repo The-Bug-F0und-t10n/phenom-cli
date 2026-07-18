@@ -398,7 +398,7 @@ pub fn search(allocator: std.mem.Allocator, events: []const audit.AuditEvent, te
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "[SESSION_EVIDENCE]\nsource=sqlite_audit temporary=true raw_context_persisted=false\n");
+    try out.appendSlice(allocator, "[SESSION_EVIDENCE]\nsource=sqlite_audit temporary=true raw_context_persisted=false retrieved_not_verified=true requires_model_judgment=true\n");
 
     const n = @min(candidates.items.len, max_search_entries);
     if (n == 0) {
@@ -424,7 +424,7 @@ pub fn search(allocator: std.mem.Allocator, events: []const audit.AuditEvent, te
 pub fn renderSearchHits(allocator: std.mem.Allocator, hits: []const audit.SessionSearchHit) !SearchResult {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "[SESSION_EVIDENCE]\nsource=sqlite_audit_fts temporary=true raw_context_persisted=false semantic_search=fts5_bm25 unit=turn_context\n");
+    try out.appendSlice(allocator, "[SESSION_EVIDENCE]\nsource=sqlite_audit_fts temporary=true raw_context_persisted=false semantic_search=fts5_bm25 unit=turn_context retrieved_not_verified=true requires_model_judgment=true\n");
 
     var rendered_signatures = std.ArrayList([]u8).empty;
     defer freeOwnedSlices(allocator, &rendered_signatures);
@@ -793,6 +793,8 @@ test "session search uses model provided terms and does not leak raw markers" {
     const result = try search(std.testing.allocator, events.items, "groundedness citacoes");
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), result.matches);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "retrieved_not_verified=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "requires_model_judgment=true") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "groundedness") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "---BEGIN CONTENT---") == null);
 }
@@ -825,6 +827,8 @@ test "session fts hits render as temporary bm25 evidence without raw markers" {
     try std.testing.expect(std.mem.indexOf(u8, result.text, "source=sqlite_audit_fts") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "semantic_search=fts5_bm25") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "unit=turn_context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "retrieved_not_verified=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "requires_model_judgment=true") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "- S1 score=1.2500 session=session-a hit=assistant_delta event_id=7") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "user: falamos de renderer append-only") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "assistant: o assunto amplo era copia direta em terminal") != null);

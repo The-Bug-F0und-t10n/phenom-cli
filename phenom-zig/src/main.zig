@@ -1931,7 +1931,7 @@ fn runSearchSessionStep(
             state.last_session_context,
             null,
             context_profile.toolSchema(.session_recall, .after_search_session),
-            "The requested session search was already performed in this turn. Answer using existing E#/S# evidence, or state what remains unknown.",
+            "The requested session search was already performed in this turn. First judge whether existing S# directly supports the requested claim. Answer only from supporting E#/S# evidence, or state what remains unknown.",
         );
         defer allocator.free(duplicate_context);
         try db.recordEvent(config.session, "model_context", duplicate_context);
@@ -1976,7 +1976,7 @@ fn runSearchSessionStep(
         result.text,
         focus_text,
         context_profile.toolSchema(.session_recall, .after_search_session),
-        "Use SESSION_CONTEXT as retrieved prior-session evidence. SESSION_FOCUS is a routing map, not evidence; if retrieved S# is only a prior failed/irrelevant recall attempt, emit one more targeted search_session call with intent plus concrete keys from SESSION_FOCUS/current reasoning. Cite S# for session claims and E# for workspace claims. Do not claim unsupported facts.",
+        "First judge SESSION_CONTEXT against the current task. Use S# only when it directly supports the requested prior-session fact; if S# is a failed recall, irrelevant, contradictory, or too vague, do not answer from it. Refine once with search_session using concrete keys from SESSION_FOCUS/current reasoning while budget remains, otherwise state what is not evidenced. Cite S# for session claims and E# for workspace claims.",
     );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
@@ -2591,6 +2591,7 @@ fn renderCollectedEvidenceContext(
         .session = session_blocks,
         .obligations = &.{
             "Use only collected evidence for claims about this workspace or prior session.",
+            "Treat S# as retrieved session candidates, not confirmed truth; judge direct support before citing or answering from them.",
         },
         .grounding = groundingRules(),
         .next_action = next_action,
@@ -2619,6 +2620,7 @@ fn groundingRules() []const []const u8 {
         "[CONTRACTS], [GROUNDING], and tool schemas are instructions, not evidence; never cite them as proof.",
         "For code identity questions, only name a function/type/file when that identifier or declaration/callsite appears in E# evidence. If the collected E# does not contain the needed identifier, refine with another collect_evidence call while budget remains.",
         "Use [RECENT_DIALOGUE] for continuity only; use [SESSION_FOCUS] only as a routing map. Exact claims about what was said or done in prior conversation must cite S# evidence from [SESSION_CONTEXT].",
+        "S# entries are retrieved session candidates, not automatically confirmed truth; judge relevance and direct support before using them.",
         "collect_evidence intent states what workspace/source-code evidence to recover; pathless collect_evidence terms are retrieval keys for that intent, not the user's vague wording.",
         "search_session intent states what evidence to recover; search_session terms are retrieval keys for that intent, not the user's vague wording.",
         "Do not answer that conversation history is unavailable while search_session is available; call search_session first when prior conversation context is required.",
@@ -3892,6 +3894,8 @@ test "tool loop state keeps session evidence for duplicate search repair" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "S1:") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Matheus 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "already performed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "not confirmed truth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "judge direct support") != null);
 }
 
 test "candidate selection repair reuses temporary candidates only" {
@@ -4108,6 +4112,8 @@ test "collected context can include temporary session evidence without memory" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Exact claims about what was said") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "not confirmed truth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "judge direct support") != null);
 }
 
 test "session evidence context keeps focus map for corrective searches" {
@@ -4129,6 +4135,7 @@ test "session evidence context keeps focus map for corrective searches" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "topic: Mateus 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "not_evidence=true") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "concrete keys") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "not confirmed truth") != null);
 }
 
 test "grounding rules separate dialogue continuity from exact session evidence" {
@@ -4139,6 +4146,8 @@ test "grounding rules separate dialogue continuity from exact session evidence" 
     try std.testing.expect(hasGroundingRule(rules, "search_session", "retrieval keys"));
     try std.testing.expect(hasGroundingRule(rules, "history is unavailable", "search_session"));
     try std.testing.expect(hasGroundingRule(rules, "[CONTRACTS]", "not evidence"));
+    try std.testing.expect(hasGroundingRule(rules, "S# entries", "not automatically confirmed truth"));
+    try std.testing.expect(hasGroundingRule(rules, "judge relevance", "direct support"));
 }
 
 fn hasGroundingRule(rules: []const []const u8, a: []const u8, b: []const u8) bool {

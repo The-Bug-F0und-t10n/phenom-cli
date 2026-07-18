@@ -79,6 +79,7 @@ pub fn sessionRecallSchema() []const u8 {
     \\[TOOLS v1]
     \\search_session(intent?, terms, scope=current|all, session?)
     \\First output: exactly one search_session tool call, not prose. SESSION_FOCUS is not evidence; use it only to choose retrieval keys.
+    \\search_session returns retrieved candidates, not confirmed truth; judge direct support before using S# in final claims.
     \\intent states what session evidence to recover. terms are concrete keys: names, entities, symbols, paths, errors, decisions, or exact topic words. Do not use the user's vague request as terms.
     \\<tool_call><function=search_session><parameter=intent>recover prior decision</parameter><parameter=terms>TopicName EntityName DecisionKey</parameter><parameter=scope>current</parameter></function></tool_call>
     ;
@@ -90,9 +91,9 @@ pub fn codeEvidenceSchema() []const u8 {
     \\set_operational_contract(requiresInspection, requiresMutation, requiresRuntimeValidation, requiresBrowserDiagnostics, requiresMemoryPromotion?, reason?)
     \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol|diagnostic, stage=minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
     \\search_session(intent?, terms, scope=current|all, session?)
-    \\Model chooses intent/terms; controller only executes. Prior-session claims require search_session and S#.
+    \\Model chooses intent/terms; controller only executes. Prior-session claims require search_session and directly supporting S#.
     \\collect_evidence without path: first decide intent, then terms=concrete code keys from reasoning. For ambiguous workspace/source-code questions and function/type/symbol/file identity use stage=candidates, compare C#, then stage=expand selectedCandidate. Do not use auto overview for identity questions.
-    \\search_session: first decide intent, then terms=concrete keys from SESSION_FOCUS/reasoning. Do not pass generic user words unless they are the remembered content.
+    \\search_session: first decide intent, then terms=concrete keys from SESSION_FOCUS/reasoning. Retrieved S# is not confirmed truth; judge whether it directly answers, contradicts, or is irrelevant before citing it. Do not pass generic user words unless they are the remembered content.
     \\<tool_call><function=set_operational_contract><parameter=requiresInspection>true</parameter><parameter=requiresMutation>false</parameter><parameter=requiresRuntimeValidation>false</parameter><parameter=requiresBrowserDiagnostics>false</parameter><parameter=requiresMemoryPromotion>false</parameter><parameter=reason>short reason</parameter></function></tool_call>
     \\<tool_call><function=collect_evidence><parameter=intent>compare source definitions</parameter><parameter=strategy>symbol</parameter><parameter=stage>candidates</parameter><parameter=terms>SymbolName FileName ErrorCode</parameter></function></tool_call>
     \\<tool_call><function=collect_evidence><parameter=stage>expand</parameter><parameter=selectedCandidate>C#</parameter><parameter=max_lines>32</parameter></function></tool_call>
@@ -211,6 +212,8 @@ test "schemas are state scoped" {
     try std.testing.expect(std.mem.indexOf(u8, recall, "set_operational_contract") == null);
     try std.testing.expect(std.mem.indexOf(u8, recall, "intent states what session evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, recall, "concrete keys") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recall, "not confirmed truth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recall, "judge direct support") != null);
 
     const evidence = toolSchema(.code_evidence, .initial);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "collect_evidence") != null);
@@ -218,6 +221,8 @@ test "schemas are state scoped" {
     try std.testing.expect(std.mem.indexOf(u8, evidence, "first decide intent") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "Do not use auto overview for identity questions") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "generic user words") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "directly supporting S#") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "Retrieved S# is not confirmed truth") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "stage=candidates") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "selectedCandidate") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "need?") != null);
