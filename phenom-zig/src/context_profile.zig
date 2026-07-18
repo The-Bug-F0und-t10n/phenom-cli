@@ -89,10 +89,10 @@ pub fn codeEvidenceSchema() []const u8 {
     return
     \\[TOOLS v1]
     \\set_operational_contract(requiresInspection, requiresMutation, requiresRuntimeValidation, requiresBrowserDiagnostics, requiresMemoryPromotion?, reason?)
-    \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol|diagnostic, stage=minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
+    \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol|diagnostic, stage=overview|minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
     \\search_session(intent?, terms, scope=current|all, session?)
     \\Model chooses intent/terms; controller only executes. Prior-session claims require search_session and directly supporting S#.
-    \\collect_evidence without path: first decide intent, then terms=concrete code keys from reasoning. For ambiguous workspace/source-code questions and function/type/symbol/file identity use stage=candidates, compare C#, then stage=expand selectedCandidate. Do not use auto overview for identity questions.
+    \\Pathless: broad project/workspace map -> stage=overview strategy=auto no terms. Focused lookup -> intent+terms. Function/type/symbol/file identity -> stage=candidates then stage=expand selectedCandidate. Do not use auto overview for identity questions.
     \\search_session: first decide intent, then terms=concrete keys from SESSION_FOCUS/reasoning. Retrieved S# is not confirmed truth; judge whether it directly answers, contradicts, or is irrelevant before citing it. Do not pass generic user words unless they are the remembered content.
     \\<tool_call><function=set_operational_contract><parameter=requiresInspection>true</parameter><parameter=requiresMutation>false</parameter><parameter=requiresRuntimeValidation>false</parameter><parameter=requiresBrowserDiagnostics>false</parameter><parameter=requiresMemoryPromotion>false</parameter><parameter=reason>short reason</parameter></function></tool_call>
     \\<tool_call><function=collect_evidence><parameter=intent>compare source definitions</parameter><parameter=strategy>symbol</parameter><parameter=stage>candidates</parameter><parameter=terms>SymbolName FileName ErrorCode</parameter></function></tool_call>
@@ -105,9 +105,9 @@ pub fn codeEvidenceSchema() []const u8 {
 pub fn activeContractSchema() []const u8 {
     return
     \\[TOOLS v1]
-    \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol|diagnostic, stage=minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
+    \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol|diagnostic, stage=overview|minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
     \\search_session(intent?, terms, scope=current|all, session?)
-    \\Contract active. Do not call set_operational_contract again. Pathless collect_evidence needs intent+terms. For ambiguous workspace/source-code questions and symbol identity use stage=candidates then stage=expand selectedCandidate. Do not use auto overview for identity questions.
+    \\Contract active. Do not call set_operational_contract again. Pathless collect_evidence needs intent+terms unless stage=overview. Broad map -> stage=overview strategy=auto no terms. Symbol identity -> stage=candidates then stage=expand selectedCandidate. Do not use auto overview for identity questions.
     \\<tool_call><function=collect_evidence><parameter=intent>compare source definitions</parameter><parameter=strategy>symbol</parameter><parameter=stage>candidates</parameter><parameter=terms>SymbolName FileName ErrorCode</parameter></function></tool_call>
     \\<tool_call><function=collect_evidence><parameter=stage>expand</parameter><parameter=selectedCandidate>C#</parameter><parameter=max_lines>32</parameter></function></tool_call>
     \\<tool_call><function=search_session><parameter=intent>recover prior decision</parameter><parameter=terms>TopicName EntityName DecisionKey</parameter><parameter=scope>current</parameter></function></tool_call>
@@ -219,17 +219,19 @@ test "schemas are state scoped" {
     const evidence = toolSchema(.code_evidence, .initial);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "collect_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "set_operational_contract") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "first decide intent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "Focused lookup -> intent+terms") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "Do not use auto overview for identity questions") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "generic user words") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "directly supporting S#") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "Retrieved S# is not confirmed truth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "stage=overview") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "broad project/workspace map") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "stage=candidates") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "selectedCandidate") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "need?") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "targetFiles?") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "scopeRoot?") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "stage=minimum") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "minimum") != null);
 
     try std.testing.expectEqualStrings("", toolSchema(.code_evidence, .after_collect_evidence));
     try std.testing.expectEqualStrings("", toolSchema(.session_recall, .after_search_session));

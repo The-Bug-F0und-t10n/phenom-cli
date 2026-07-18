@@ -544,9 +544,9 @@ fn buildInitialModelContext(
             .kind = .collect_context,
             .required_tool_calls = 0,
             .text = if (focus_text != null)
-                "SESSION_FOCUS is routing context, not evidence. If the answer needs prior-session facts, emit search_session; if it needs workspace facts, emit collect_evidence; otherwise answer directly."
+                "SESSION_FOCUS is routing context, not evidence. Do not make project/workspace/code claims without collect_evidence. Broad map uses collect_evidence stage=overview; prior-session facts use search_session; otherwise answer directly."
             else
-                "If the answer needs workspace or prior-session evidence, emit one model-chosen context tool call before prose; otherwise answer directly.",
+                "Do not make project/workspace/code claims without collect_evidence. Broad map uses collect_evidence stage=overview. Prior-session facts use search_session. Otherwise answer directly.",
         } else .{
             .kind = .answer_directly,
             .required_tool_calls = 0,
@@ -638,34 +638,12 @@ fn runToolLoopIterations(
     if (maybe_envelope == null and outputNeedsWorkspaceEvidenceRepair(model_output, initial_context, state.active_contract.allowed_tools)) {
         first_sink.discardDeferredVisible();
         try db.recordEvent(config.session, "tool_repair", "unsupported workspace claim without evidence");
-        const next = try streamSearchPlanTurn(
-            allocator,
-            config,
-            prompt,
-            client,
-            events,
-            db,
-            ui_ptr,
-            first_sink,
-            state.active_contract,
-        );
-        switch (next) {
-            .final_answer => return true,
-            .stopped => {
-                const repair_terms = try evidenceRepairTermsFromOutput(allocator, model_output, prompt, state.active_contract.allowed_tools);
-                errdefer if (repair_terms) |terms| allocator.free(terms);
-                const fallback_call = tool_call.ToolCall{
-                    .name = try allocator.dupe(u8, "collect_evidence"),
-                    .terms = repair_terms,
-                    .stage = try allocator.dupe(u8, "candidates"),
-                    .strategy = .symbol,
-                };
-                maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, fallback_call);
-            },
-            .tool_call => |next_call| {
-                maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
-            },
-        }
+        const fallback_call = tool_call.ToolCall{
+            .name = try allocator.dupe(u8, "collect_evidence"),
+            .stage = try allocator.dupe(u8, "overview"),
+            .strategy = .auto,
+        };
+        maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, fallback_call);
     }
     if (maybe_envelope == null and outputCitesMissingSessionEvidence(model_output, initial_context)) {
         first_sink.discardDeferredVisible();
@@ -894,7 +872,7 @@ fn evidenceRepairTermsFromOutput(
 fn renderInitialToolCallRepairContext(allocator: std.mem.Allocator, initial_context: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{s}\n[PROTOCOL_REPAIR]\nYour previous output was prose, but this turn requires a context tool call before prose. Emit exactly one tool_call now. For collect_evidence/search_session, set <parameter=intent> to the evidence you want to recover and <parameter=terms> to concrete retrieval keys from current reasoning/SESSION_FOCUS; do not copy the user's vague wording or schema placeholders. For code identity, emit collect_evidence with stage=candidates before expanding a selected candidate.\n",
+        "{s}\n[PROTOCOL_REPAIR]\nPrevious output was prose, but this turn requires one context tool call before prose. For broad workspace/project map, emit collect_evidence stage=overview strategy=auto with no terms. For focused collect_evidence/search_session, set intent+concrete terms. For code identity, emit collect_evidence stage=candidates before expanding a selected candidate.\n",
         .{initial_context},
     );
 }
@@ -917,14 +895,14 @@ fn renderUnsupportedWorkspaceClaimRepairContext(allocator: std.mem.Allocator, pr
         .task = prompt,
         .contracts =
         \\[TOOLS v1]
-        \\collect_evidence(intent, terms, strategy=auto|lexical|symbol, stage=candidates)
+        \\collect_evidence(intent?, terms?, strategy=auto|lexical|symbol, stage=overview|candidates)
         ,
         .obligations = &.{
             "The previous visible answer made a workspace/source-code claim without [EVIDENCE].",
-            "For ambiguous function/type/file identity, collect temporary candidates first, then expand one candidate before final answer.",
+            "Broad workspace/project map uses stage=overview. Function/type/file identity uses stage=candidates, then expand one candidate.",
         },
         .grounding = groundingRules(),
-        .next_action = "Emit exactly one collect_evidence tool_call now. Prefer stage=candidates for ambiguous identity; set intent and concrete code terms from your reasoning. No prose.",
+        .next_action = "Emit exactly one collect_evidence tool_call now. Use stage=overview for project map; stage=candidates for identity. No prose.",
     });
 }
 
@@ -1008,6 +986,9 @@ fn runOneToolLoopStep(
 
     if (isCollectEvidenceStage(call, "expand")) {
         return try runCollectEvidenceExpandStep(allocator, io, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
+    }
+    if (isCollectEvidenceStage(call, "overview")) {
+        return try runCollectEvidenceOverviewStep(allocator, io, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
     }
 
     const repaired_path = if (call.path == null) try singleStructuredPathFromPrompt(allocator, prompt) else null;
@@ -1342,6 +1323,11 @@ fn runCollectEvidenceCandidatesStep(
     };
     defer result.deinit(allocator);
 
+    if (pathlessCandidatesAreDiffuse(result.candidates.items)) {
+        try db.recordEvent(config.session, "tool_arg_repair", "diffuse candidates -> overview");
+        return try runCollectEvidenceOverviewStep(allocator, io, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
+    }
+
     try state.rememberCandidates(&result);
     try db.recordEvent(config.session, "tool_event", result.audit_text);
     try db.recordEvent(config.session, "candidate_context", result.text);
@@ -1374,6 +1360,21 @@ fn runCollectEvidenceCandidatesStep(
         .final_answer => return .final_answer,
         .tool_call => |next_call| return .{ .tool_call = next_call },
         .stopped => {
+            if (state.context.entries.items.len > 0) {
+                try db.recordEvent(config.session, "tool_loop_stop", "candidate selection missing; answer with existing evidence");
+                const answer_context = try renderCollectedEvidenceContext(
+                    allocator,
+                    prompt,
+                    &state.context,
+                    null,
+                    null,
+                    context_profile.toolSchema(.code_evidence, .after_collect_evidence),
+                    "Candidate selection failed, but E# evidence already exists. Answer now using only the existing cited E# evidence. Do not call tools again.",
+                );
+                defer allocator.free(answer_context);
+                try db.recordEvent(config.session, "model_context", answer_context);
+                return try streamDeferredToolLoopTurn(allocator, config, prompt, answer_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+            }
             const fallback_selected = selectedCandidateForProtocolFallback(state) orelse return .stopped;
             const fallback_candidate = state.findCandidate(fallback_selected) orelse return .stopped;
             const body = try std.fmt.allocPrint(allocator, "candidate selection missing -> collect range {s}", .{fallback_selected});
@@ -1390,6 +1391,87 @@ fn runCollectEvidenceCandidatesStep(
             return try runCollectEvidenceRangeStep(allocator, io, config, prompt, fallback_call.path.?, fallback_call.start_line, fallback_call.max_lines, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
         },
     }
+}
+
+fn pathlessCandidatesAreDiffuse(candidates: []const collect_evidence.CandidateItem) bool {
+    if (candidates.len < 4) return false;
+    var unique_paths: usize = 0;
+    var dominant_path_count: usize = 0;
+    for (candidates, 0..) |candidate, idx| {
+        var first_for_path = true;
+        for (candidates[0..idx]) |prior| {
+            if (std.mem.eql(u8, prior.path, candidate.path)) {
+                first_for_path = false;
+                break;
+            }
+        }
+        if (first_for_path) unique_paths += 1;
+        var path_count: usize = 0;
+        for (candidates) |other| {
+            if (std.mem.eql(u8, other.path, candidate.path)) path_count += 1;
+        }
+        dominant_path_count = @max(dominant_path_count, path_count);
+    }
+    if (dominant_path_count * 2 >= candidates.len) return false;
+    return unique_paths >= 4;
+}
+
+fn runCollectEvidenceOverviewStep(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: cli.Config,
+    prompt: []const u8,
+    call: *const tool_call.ToolCall,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    tool_iterations: *usize,
+) !ToolLoopNext {
+    if (tool_iterations.* >= max_tool_emergency_iterations or !state.hasBudgetForMoreEvidence()) {
+        try db.recordEvent(config.session, "tool_loop_stop", "overview budget exhausted");
+        return .stopped;
+    }
+    tool_iterations.* += 1;
+
+    if (ui_ptr) |active_ui| try active_ui.showStatus("Reading");
+    const tool_start = try std.fmt.allocPrint(allocator, "collect_evidence\tstage=overview intent_bytes={}", .{if (call.intent) |value| value.len else 0});
+    defer allocator.free(tool_start);
+    try db.recordEvent(config.session, "tool_start", tool_start);
+    try events.emit(.{ .tool_start = .{ .name = "collect_evidence", .detail = "overview" } });
+
+    const result = collect_evidence.execute(allocator, io, .{
+        .task = prompt,
+        .strategy = .auto,
+        .budget_bytes = collectEvidenceExecutionBudget(null, state.remainingBudget()),
+    }) catch |err| {
+        try db.recordEvent(config.session, "tool_error", @errorName(err));
+        try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = @errorName(err) } });
+        return .stopped;
+    };
+    defer result.deinit(allocator);
+
+    const model_evidence = try renderEvidenceAndMicroContext(allocator, result.evidence_text, result.micro_context_text);
+    defer allocator.free(model_evidence);
+    try db.recordEvent(config.session, "tool_event", result.tool_event_audit_text);
+    try db.recordEvent(config.session, "evidence", model_evidence);
+    try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = model_evidence } });
+    try state.rememberExecutedArgs(null, null, .auto, call.start_line, call.max_lines, result.context_id, model_evidence, result.model_bytes, result.quality_score);
+
+    const follow_context = try renderCollectedEvidenceContext(
+        allocator,
+        prompt,
+        &state.context,
+        null,
+        null,
+        if (state.shouldAllowMoreEvidence()) activeToolSchema(state) else context_profile.toolSchema(.code_evidence, .after_collect_evidence),
+        "Answer from the structural workspace overview evidence. If it does not cover the user's request, emit a focused collect_evidence call with concrete terms. Do not use C# candidates for this overview answer.",
+    );
+    defer allocator.free(follow_context);
+    try db.recordEvent(config.session, "model_context", follow_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
 }
 
 fn selectedCandidateForProtocolFallback(state: *const ToolLoopState) ?[]const u8 {
@@ -2452,12 +2534,13 @@ fn renderSearchPlanContext(allocator: std.mem.Allocator, prompt: []const u8) ![]
         .contracts =
         \\[SEARCH_PLAN v1]
         \\Output either:
-        \\1. a collect_evidence XML tool_call with stage=candidates, intent, terms, strategy; or
+        \\1. a collect_evidence XML tool_call with stage=overview for project/workspace map; or stage=candidates, intent, terms, strategy for focused lookup; or
         \\2. one visible line: SEARCH_TERMS: <identifier/API/file/symbol words>
         ,
         .obligations = &.{
             "This is not the final answer.",
-            "Translate the user's ambiguous source-code request into concrete code retrieval terms.",
+            "For broad project/workspace map, use collect_evidence stage=overview instead of inventing search terms.",
+            "Translate focused source-code requests into concrete code retrieval terms.",
             "Include identifier-like variants of the core concept, such as likely noun/verb forms, type names, API nouns, and file stems.",
             "Do not say evidence is unavailable in this planning step.",
         },
@@ -3452,8 +3535,8 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[GROUNDING]") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "required_tool_calls=0") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "SESSION_FOCUS is routing context") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "emit search_session") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "emit collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "search_session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "collect_evidence stage=overview") != null);
     try std.testing.expect(!initialContextRequiresTool(with_tools));
 
     try std.testing.expect((try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test-empty", "analise esse projeto", false, true)) == null);
@@ -3976,9 +4059,9 @@ test "initial context repair preserves context and asks for intent terms split" 
     const repair = try renderInitialToolCallRepairContext(std.testing.allocator, initial);
     defer std.testing.allocator.free(repair);
     try std.testing.expect(std.mem.indexOf(u8, repair, "[PROTOCOL_REPAIR]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, repair, "<parameter=intent>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, repair, "<parameter=terms>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, repair, "do not copy the user's vague wording") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "stage=overview") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "intent+concrete terms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "code identity") != null);
 }
 
 test "missing evidence citation requires repair before visible answer" {
@@ -4012,6 +4095,7 @@ test "missing evidence citation requires repair before visible answer" {
     const workspace_repair = try renderUnsupportedWorkspaceClaimRepairContext(std.testing.allocator, "qual funcao?");
     defer std.testing.allocator.free(workspace_repair);
     try std.testing.expect(std.mem.indexOf(u8, workspace_repair, "stage=candidates") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_repair, "stage=overview") != null);
 
     const terms = (try evidenceRepairTermsFromOutput(
         std.testing.allocator,
@@ -4056,6 +4140,7 @@ test "search plan terms can be parsed from visible model plan" {
     defer std.testing.allocator.free(context);
     try std.testing.expect(std.mem.indexOf(u8, context, "[SEARCH_PLAN v1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, context, "SEARCH_TERMS:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "stage=overview") != null);
     try std.testing.expect(std.mem.indexOf(u8, context, "identifier-like variants") != null);
     try std.testing.expect(std.mem.indexOf(u8, context, "file stems") != null);
 }
@@ -4165,6 +4250,19 @@ test "pathless collect evidence accepts model search text or task fallback" {
     const path = (try tool_call.parseFirst(std.testing.allocator, path_xml)) orelse return error.NoToolCall;
     defer path.deinit(std.testing.allocator);
     try std.testing.expect(!collectEvidenceHasSearchPlaceholder(&path));
+
+    const overview_xml =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=strategy>auto</parameter>
+        \\<parameter=stage>overview</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const overview = (try tool_call.parseFirst(std.testing.allocator, overview_xml)) orelse return error.NoToolCall;
+    defer overview.deinit(std.testing.allocator);
+    try std.testing.expect(!collectEvidenceHasSearchText(&overview));
+    try std.testing.expect(isCollectEvidenceStage(&overview, "overview"));
 }
 
 test "pathless collect evidence uses exploratory budget cap" {
@@ -4317,6 +4415,55 @@ test "candidate selection repair reuses temporary candidates only" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "E1:") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
+}
+
+fn testingCandidate(allocator: std.mem.Allocator, id: []const u8, path: []const u8, source: []const u8) !collect_evidence.CandidateItem {
+    return .{
+        .id = try allocator.dupe(u8, id),
+        .path = try allocator.dupe(u8, path),
+        .start_line = 1,
+        .end_line = 12,
+        .score = 100,
+        .source = try allocator.dupe(u8, source),
+        .signature = try allocator.dupe(u8, "pub fn sample() void"),
+        .preview = try allocator.dupe(u8, "test"),
+    };
+}
+
+test "diffuse pathless candidates are not treated as symbol identity" {
+    var diffuse = [_]collect_evidence.CandidateItem{
+        try testingCandidate(std.testing.allocator, "C1", "src/a.zig", "symbol_ast"),
+        try testingCandidate(std.testing.allocator, "C2", "src/b.zig", "module_entrypoint"),
+        try testingCandidate(std.testing.allocator, "C3", "src/c.zig", "fts_bm25"),
+        try testingCandidate(std.testing.allocator, "C4", "src/d.zig", "prompt_path"),
+    };
+    defer {
+        for (&diffuse) |candidate| candidate.deinit(std.testing.allocator);
+    }
+
+    var focused = [_]collect_evidence.CandidateItem{
+        try testingCandidate(std.testing.allocator, "C1", "src/render.zig", "symbol_ast"),
+        try testingCandidate(std.testing.allocator, "C2", "src/render.zig", "module_entrypoint"),
+        try testingCandidate(std.testing.allocator, "C3", "src/render.zig", "fts_bm25"),
+        try testingCandidate(std.testing.allocator, "C4", "src/other.zig", "symbol_ast"),
+    };
+    defer {
+        for (&focused) |candidate| candidate.deinit(std.testing.allocator);
+    }
+
+    var local = [_]collect_evidence.CandidateItem{
+        try testingCandidate(std.testing.allocator, "C1", "src/a.zig", "local_symbol_ast"),
+        try testingCandidate(std.testing.allocator, "C2", "src/b.zig", "module_entrypoint"),
+        try testingCandidate(std.testing.allocator, "C3", "src/c.zig", "fts_bm25"),
+        try testingCandidate(std.testing.allocator, "C4", "src/d.zig", "prompt_path"),
+    };
+    defer {
+        for (&local) |candidate| candidate.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expect(pathlessCandidatesAreDiffuse(&diffuse));
+    try std.testing.expect(!pathlessCandidatesAreDiffuse(&focused));
+    try std.testing.expect(pathlessCandidatesAreDiffuse(&local));
 }
 
 test "candidate selection protocol fallback prefers structural candidate" {

@@ -10769,3 +10769,49 @@ Validacao executada:
 - `bash tools/check_product_guardrails.sh` -> passou.
 - `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
 - `~/.local/bin/phenom chat --backend llamacpp --host inference.local:11434 --model phenom:latest --thinking off --max-tokens 64 --prompt 'olola' --fail-on-model-error --no-color` -> passou; resposta visivel sem `HttpStatusNotOk`.
+
+## T309 - Separar overview estrutural de selecao C# no reparo de evidencia
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: o fluxo real ainda podia responder perguntas amplas de workspace com evidencia local ruim. O log observado mostrava `collect_evidence stage=candidates`, o modelo falhava em emitir `stage=expand` visivel depois do repair, e o controller terminava com `[MODEL_PROTOCOL_ERROR] required follow-up tool_call missing after repair; no final evidence was selected`. Apos a primeira correcao, o erro de protocolo sumiu, mas o smoke real ainda mostrou resposta mediocre: o fallback expandia C# local de `evidence_ranker`, `workspace_inventory` ou `model_context` e o modelo tratava esse fragmento como se representasse o projeto inteiro.
+
+Regra de negocio preservada:
+
+- Nao foi adicionada classificacao por palavras do prompt do usuario.
+- `stage=overview` e uma opcao model-visible do contrato `collect_evidence`, nao uma tool nova.
+- `stage=candidates -> stage=expand` continua sendo o fluxo correto para identidade de funcao, tipo, simbolo ou arquivo.
+- O controller valida protocolo e qualidade estrutural dos candidatos: se C# pathless vem espalhado por varios arquivos sem alvo dominante, ele nao e tratado como evidencia de identidade.
+- Raw tool output continua fora do contexto model-visible; o modelo recebe apenas `[EVIDENCE]`/`[MICRO_CONTEXT]` destilado.
+
+Implementacao:
+
+- `phenom-zig/src/context_profile.zig`: schema de `collect_evidence` agora anuncia `stage=overview`; instrucoes separam mapa amplo de workspace/projeto de lookup focado e identidade C#.
+- `phenom-zig/src/main.zig`: `runCollectEvidenceOverviewStep` executa overview estrutural diretamente via `collect_evidence.execute(strategy=auto)` e devolve E# ao modelo.
+- `phenom-zig/src/main.zig`: se uma resposta inicial faz claim de workspace sem evidencia, o repair nao pede outro plano ao modelo; ele coleta overview estrutural minimo primeiro.
+- `phenom-zig/src/main.zig`: candidatos pathless difusos sao detectados por distribuicao estrutural de paths. Se nao ha arquivo dominante, o loop converte para overview antes de expor C# como escolha de identidade.
+- `phenom-zig/src/main.zig`: falha de selecao C# depois de E# existente nao vira erro de protocolo; o loop pede resposta final com a evidencia existente ou coleta range/overview quando ainda ha rota segura.
+
+Criterio de aceite:
+
+- Pergunta ampla sobre o projeto coleta `stage=overview` e responde com README/E# em vez de C# local.
+- `thinking=on` pode gerar tool intent dentro de `<think>` ou tentar `candidates`; o controller ainda entrega evidencia final visivel.
+- Candidatos concentrados no mesmo arquivo continuam elegiveis para selecao C#.
+- Candidatos espalhados por varios arquivos nao sao usados como prova de identidade.
+- O erro `[MODEL_PROTOCOL_ERROR] required follow-up tool_call missing after repair; no final evidence was selected` nao aparece nos smokes reais cobertos.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/context_profile.zig` -> passou; 11 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3` -> passou; 286 testes.
+- `bash tools/check_product_guardrails.sh` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
+- Smoke real `thinking off`: `./zig-out/bin/phenom chat --backend llamacpp --host inference.local:11434 --model phenom:latest --thinking off --max-tokens 900 --session overview-real-off-20260718f --prompt 'o que este projeto implementa?' --fail-on-model-error --no-color` -> passou; audit registrou `tool_repair unsupported workspace claim without evidence`, `tool_start collect_evidence stage=overview`, evidencia `README.md L1-L49` e resposta final correta.
+- Smoke real `thinking on`: `./zig-out/bin/phenom chat --backend llamacpp --host inference.local:11434 --model phenom:latest --thinking on --max-tokens 900 --session overview-real-on-20260718f --prompt 'o que este projeto implementa?' --fail-on-model-error --no-color` -> passou; audit registrou `collect_evidence empty search -> candidates_from_task`, `diffuse candidates -> overview`, evidencia `README.md L1-L49` e resposta final correta.
+
+Risco residual:
+
+- Perguntas focadas ainda dependem do modelo fornecer termos uteis ou de candidatos concentrados; esta task evita conclusao ampla baseada em C# difuso, mas nao substitui ranking semantico neural.
+- O criterio de dispersao e estrutural e conservador: candidatos concentrados em um arquivo errado ainda podem exigir refinamento posterior do modelo.
