@@ -1965,11 +1965,18 @@ fn streamDeferredToolLoopTurnInternal(
         return .stopped;
     }) orelse {
         if (required_tool_repair) |repair_message| {
-            follow_sink.discardDeferredVisible();
             if (repair_message.len == 0) {
                 try db.recordEvent(config.session, "tool_loop_stop", "required follow-up tool call missing after repair");
+                const fallback_text = std.mem.trim(u8, follow_sink.raw_visible.items, " \t\r\n");
+                if (fallback_text.len > 0) {
+                    try db.recordEvent(config.session, "tool_loop_fallback", "emitted visible answer after missing required tool_call");
+                    try aggregate_sink.emitVisibleText(fallback_text);
+                    follow_sink.raw_visible.clearRetainingCapacity();
+                    return .final_answer;
+                }
                 return .stopped;
             }
+            follow_sink.discardDeferredVisible();
             try db.recordEvent(config.session, "tool_repair", "required follow-up tool call missing");
             const repair_context = try std.fmt.allocPrint(
                 allocator,
@@ -1992,9 +1999,10 @@ fn streamDeferredToolLoopTurnInternal(
                 active_contract,
             );
         }
-        try follow_sink.flushDeferredVisible();
-        try aggregate_sink.visible.appendSlice(allocator, follow_sink.visible.items);
-        aggregate_sink.visible_bytes += follow_sink.visible_bytes;
+        if (follow_sink.raw_visible.items.len > 0) {
+            try aggregate_sink.emitVisibleText(follow_sink.raw_visible.items);
+            follow_sink.raw_visible.clearRetainingCapacity();
+        }
         return .final_answer;
     };
     defer envelope.deinit(allocator);
@@ -3144,6 +3152,54 @@ test "deferred stream sink flushes normal answer exactly once" {
     try std.testing.expectEqualStrings("resposta final", sink.visible.items);
     try sink.flushDeferredVisible();
     try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
+}
+
+test "deferred follow-up answer emits through aggregate sink" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var recorder = EventRecorder{};
+    try bus.on(&recorder, EventRecorder.handleOpaque);
+
+    var aggregate = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "aggregate-answer-test",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = true,
+    };
+    defer aggregate.deinit();
+
+    var follow = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "aggregate-answer-test",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = true,
+    };
+    defer follow.deinit();
+
+    try follow.writeVisible("resposta final");
+    if (follow.raw_visible.items.len > 0) {
+        try aggregate.emitVisibleText(follow.raw_visible.items);
+        follow.raw_visible.clearRetainingCapacity();
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
+    try std.testing.expectEqualStrings("resposta final", aggregate.visible.items);
+    try std.testing.expectEqual(@as(usize, 0), follow.visible_bytes);
 }
 
 test "deferred stream sink can discard protocol violating prose" {

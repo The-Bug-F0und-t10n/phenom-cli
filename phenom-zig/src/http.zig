@@ -14,7 +14,7 @@ pub const LocalModelClient = struct {
     host: []const u8,
     backend: cli.Backend,
     model: []const u8,
-    max_tokens: u16 = 160,
+    max_tokens: u16 = 4096,
     thinking: cli.ThinkingMode = .auto,
 
     pub fn defaultPort(backend: cli.Backend) u16 {
@@ -647,17 +647,7 @@ fn extractJsonF64Field(line: []const u8, field: []const u8) ?f64 {
 }
 
 fn extractJsonNumberSlice(line: []const u8, field: []const u8) ?[]const u8 {
-    var needle_buf: [64]u8 = undefined;
-    if (field.len + 3 > needle_buf.len) return null;
-    needle_buf[0] = '"';
-    @memcpy(needle_buf[1 .. 1 + field.len], field);
-    needle_buf[1 + field.len] = '"';
-    needle_buf[2 + field.len] = ':';
-    const needle = needle_buf[0 .. field.len + 3];
-
-    const start = std.mem.indexOf(u8, line, needle) orelse return null;
-    var i = start + needle.len;
-    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    var i = jsonFieldValueStart(line, field) orelse return null;
     const value_start = i;
     if (i < line.len and line[i] == '-') return null;
     while (i < line.len) : (i += 1) {
@@ -669,17 +659,9 @@ fn extractJsonNumberSlice(line: []const u8, field: []const u8) ?[]const u8 {
 }
 
 fn extractJsonStringField(line: []const u8, field: []const u8) ?[]const u8 {
-    var needle_buf: [64]u8 = undefined;
-    if (field.len + 4 > needle_buf.len) return null;
-    needle_buf[0] = '"';
-    @memcpy(needle_buf[1 .. 1 + field.len], field);
-    needle_buf[1 + field.len] = '"';
-    needle_buf[2 + field.len] = ':';
-    needle_buf[3 + field.len] = '"';
-    const needle = needle_buf[0 .. field.len + 4];
-
-    const start = std.mem.indexOf(u8, line, needle) orelse return null;
-    var i = start + needle.len;
+    var i = jsonFieldValueStart(line, field) orelse return null;
+    if (i >= line.len or line[i] != '"') return null;
+    i += 1;
     const value_start = i;
     while (i < line.len) : (i += 1) {
         if (line[i] == '"' and (i == value_start or line[i - 1] != '\\')) return line[value_start..i];
@@ -688,18 +670,25 @@ fn extractJsonStringField(line: []const u8, field: []const u8) ?[]const u8 {
 }
 
 fn jsonBoolTrueField(line: []const u8, field: []const u8) bool {
+    const i = jsonFieldValueStart(line, field) orelse return false;
+    return std.mem.startsWith(u8, line[i..], "true");
+}
+
+fn jsonFieldValueStart(line: []const u8, field: []const u8) ?usize {
     var needle_buf: [64]u8 = undefined;
-    if (field.len + 3 > needle_buf.len) return false;
+    if (field.len + 2 > needle_buf.len) return null;
     needle_buf[0] = '"';
     @memcpy(needle_buf[1 .. 1 + field.len], field);
     needle_buf[1 + field.len] = '"';
-    needle_buf[2 + field.len] = ':';
-    const needle = needle_buf[0 .. field.len + 3];
+    const needle = needle_buf[0 .. field.len + 2];
 
-    const start = std.mem.indexOf(u8, line, needle) orelse return false;
+    const start = std.mem.indexOf(u8, line, needle) orelse return null;
     var i = start + needle.len;
-    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
-    return std.mem.startsWith(u8, line[i..], "true");
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\n' or line[i] == '\r')) : (i += 1) {}
+    if (i >= line.len or line[i] != ':') return null;
+    i += 1;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\n' or line[i] == '\r')) : (i += 1) {}
+    return i;
 }
 
 fn jsonEscape(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -763,6 +752,14 @@ test "extract ollama content field" {
     const line = "{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"done\":false}";
     const value = extractJsonStringField(line, "content") orelse return error.NoContent;
     try std.testing.expectEqualStrings("ok", value);
+}
+
+test "extract json fields with protocol whitespace" {
+    const content_line = "data: { \"choices\": [ { \"delta\": { \"content\" : \"ok\" } } ], \"usage\" : { \"prompt_tokens\" : 3, \"completion_tokens\" : 2 } }";
+    const content = extractJsonStringField(content_line, "content") orelse return error.NoContent;
+    try std.testing.expectEqualStrings("ok", content);
+    try std.testing.expectEqual(@as(usize, 3), extractJsonUsizeField(content_line, "prompt_tokens") orelse return error.NoUsage);
+    try std.testing.expect(jsonBoolTrueField("{ \"done\" : true }", "done"));
 }
 
 test "extract llama cpp sse content field" {
@@ -909,6 +906,30 @@ test "llamacpp body uses qwopus chat template with thinking disabled" {
     try std.testing.expect(std.mem.indexOf(u8, body, "<|im_start|>assistant") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "<think>\\n\\n</think>\\n\\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stop\":[\"<|im_end|>\"]") != null);
+}
+
+test "default output budget is not the batch size" {
+    var llama_client = LocalModelClient{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1:11434",
+        .backend = .llamacpp,
+        .model = "phenom:latest",
+        .thinking = .off,
+    };
+    const llama_body = try llama_client.buildBody("explique com detalhes");
+    defer std.testing.allocator.free(llama_body);
+    try std.testing.expect(std.mem.indexOf(u8, llama_body, "\"n_predict\":4096") != null);
+
+    var ollama_client = LocalModelClient{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1:11434",
+        .backend = .ollama,
+        .model = "phenom:latest",
+        .thinking = .off,
+    };
+    const ollama_body = try ollama_client.buildBody("explique com detalhes");
+    defer std.testing.allocator.free(ollama_body);
+    try std.testing.expect(std.mem.indexOf(u8, ollama_body, "\"num_predict\":4096") != null);
 }
 
 test "llamacpp thinking on opens reasoning block" {
