@@ -10815,3 +10815,70 @@ Risco residual:
 
 - Perguntas focadas ainda dependem do modelo fornecer termos uteis ou de candidatos concentrados; esta task evita conclusao ampla baseada em C# difuso, mas nao substitui ranking semantico neural.
 - O criterio de dispersao e estrutural e conservador: candidatos concentrados em um arquivo errado ainda podem exigir refinamento posterior do modelo.
+
+## T310 - Implementar caveman code graph estrutural para ranking de evidencia
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: a coleta de evidencia focada ainda dependia demais de termos lexicais e FTS/BM25. Em perguntas com intencao de fluxo ou funcao, o agente podia devolver trechos concretos mas semanticamente fracos, especialmente quando um simbolo generico ou range adjacente pontuava por path/relacao. A solucao inicial precisa melhorar a estrutura interna sem adicionar dependencia externa, sem hardcode de prompt e sem transformar grafo em contexto bruto model-visible.
+
+Regra de negocio preservada:
+
+- Nao foi adicionada heuristica por pergunta do usuario.
+- Nao foi adicionada dependencia Graphify nesta etapa.
+- O grafo e implementacao interna do `collect_evidence`; a surface model-visible continua sendo o contrato existente.
+- Raw graph/SQLite nao vaza para o prompt; o modelo recebe apenas candidatos/evidencias destiladas.
+- `strategy=symbol` continua priorizando identidade simbolica precisa e nao usa caveman graph como atalho.
+
+Passos de implementacao:
+
+1. Criar teste de grafo nativo que indexa workspace, salva nodes/edges em SQLite `:memory:` e ranqueia `executeCandidates`.
+2. Criar teste de import Zig local para `@import("audit.zig")`, `@import("./http.zig")` e `@import("../config.zig")`.
+3. Implementar `phenom-zig/src/code_graph.zig` com inventario de workspace, extracao simples de simbolos Zig/JS/TS, relacoes diretas de chamada intra-file e imports locais Zig.
+4. Integrar `code_graph.rank` em `phenom-zig/src/evidence_ranker.zig` para `strategy=auto|lexical`, depois de `rg` e antes de FTS/BM25.
+5. Registrar audit de disponibilidade e tamanho do grafo: `graph_available`, `graph_indexed_files`, `graph_nodes`, `graph_edges`.
+6. Marcar candidatos com `source=code_graph` e preview contendo `symbol`, `match=direct|structural`, `indexed_files`, `nodes`, `edges` e `relations`.
+7. Corrigir a normalizacao de score para preservar match direto de simbolo acima de vizinho estrutural/import ruidoso.
+8. Corrigir o loop de expansao duplicada para responder com E# existente em vez de gerar erro de protocolo quando ja ha evidencia selecionada.
+9. Rodar testes unitarios, guardrails, build release e smoke CLI com backend deterministico.
+
+Implementacao:
+
+- `phenom-zig/src/code_graph.zig`: novo grafo caveman em Zig, sem dependencia externa. Usa SQLite em memoria para materializar `nodes` e `edges`, indexa ate 512 arquivos de texto do workspace, extrai simbolos por linhas declarativas e calcula relacoes simples.
+- `phenom-zig/src/code_graph.zig`: imports locais Zig sao normalizados sem permitir path absoluto/traversal no output aceito por `workspace_inventory`.
+- `phenom-zig/src/code_graph.zig`: candidatos carregam `direct_symbol_match`; vizinhos estruturais entram como suporte, nao como prova primaria.
+- `phenom-zig/src/evidence_ranker.zig`: `CandidateSource.code_graph` integrado ao ranking e audit. Score direto pode disputar topo; score estrutural e rebaixado.
+- `phenom-zig/src/main.zig`: fallback de expand duplicado usa evidencia existente para resposta final, evitando `[MODEL_PROTOCOL_ERROR]` quando a expansao ja tinha acontecido.
+
+Criterio de aceite:
+
+- `executeCandidates` aparece como candidato do grafo para termos focados.
+- Match direto de simbolo fica acima de `deinit`/vizinhos estruturais.
+- O grafo aparece no audit como fonte interna, sem expor raw graph ou SQL.
+- `collect_evidence` pathless continua respeitando termos/intencao dados pelo modelo e nao inventa estrategia por keyword do prompt.
+- Perguntas amplas continuam podendo usar `overview`; caveman graph e suporte para busca focada, nao substituto de overview estrutural.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/code_graph.zig -lc -lsqlite3 --cache-dir /tmp/phenom-caveman-code-graph-test3` -> passou; 10 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/evidence_ranker.zig -lc -lsqlite3 --cache-dir /tmp/phenom-caveman-evidence-ranker-test3` -> passou; 39 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-caveman-main-test3` -> passou; 291 testes.
+- `bash tools/check_product_guardrails.sh` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
+- Smoke CLI com backend llama.cpp fake deterministico em `127.0.0.1:18086`: `./zig-out/bin/phenom chat --backend llamacpp --host 127.0.0.1:18086 --model fake --thinking off --max-tokens 1200 --session caveman-fake-flow-20260718d --prompt 'qual funcao executa os candidatos da coleta de evidencia no projeto?' --expect-contains PHENOM_CAVEMAN_GRAPH --show-expect-status --fail-on-model-error --no-color` -> passou. O transcript mostrou `C1 score=1200 source=code_graph path=src/collect_evidence.zig range=93-140 def: pub fn executeCandidates... preview: code_graph,symbol=executeCandidates,match=direct...` e E1 expandido no range correto.
+- Smoke com backend real `inference.local:11434` antes da correcao final de score: o CLI conectou e respondeu sem erro de infraestrutura, mas o modelo escolheu `overview` para uma pergunta focada. Esse resultado fica registrado como limite do comportamento do modelo real, nao como prova do caminho caveman.
+
+Invariantes afetadas:
+
+- 1. Tool nao anunciada nunca executa: preservada; nenhuma tool nova foi adicionada.
+- 2. Contexto bruto nao vaza para o modelo: preservada; grafo bruto/SQL ficam internos, somente candidatos/evidencias entram no prompt.
+- 6. Falha de modelo nao parece falha de infraestrutura: preservada; o reparo de expand duplicado evita falso erro de protocolo quando ha E#.
+- 7. Cada turno consegue ser auditado e reproduzido: ampliada; audit agora registra disponibilidade e tamanho do grafo.
+
+Risco residual:
+
+- O caveman graph nao e tree-sitter, LSP nem embedding neural. Ele cobre simbolos simples, chamadas diretas intra-file e imports Zig locais.
+- Nao ha cache persistente do grafo; ele e reconstruido por ranking.
+- O modelo real ainda pode escolher `stage=overview` em pergunta focada. Esta task melhora a qualidade quando o contrato pathless/focado chega ao ranker, mas nao muda a decisao autonoma do modelo sobre qual stage chamar.

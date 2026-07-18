@@ -1639,7 +1639,19 @@ fn runCollectEvidenceExpandStep(
     const max_lines = candidateExpansionLineLimit(call.max_lines, candidate.start_line, candidate.end_line);
     if (state.hasExecutedArgs(candidate.path, call.terms, .path, candidate.start_line, max_lines)) {
         try db.recordEvent(config.session, "tool_loop_stop", "duplicate candidate expansion");
-        return .stopped;
+        if (state.context.entries.items.len == 0) return .stopped;
+        const answer_context = try renderCollectedEvidenceContext(
+            allocator,
+            prompt,
+            &state.context,
+            null,
+            null,
+            context_profile.toolSchema(.code_evidence, .after_collect_evidence),
+            "The selected candidate was already expanded. Answer now using only the existing cited E# evidence. Do not call tools again.",
+        );
+        defer allocator.free(answer_context);
+        try db.recordEvent(config.session, "model_context", answer_context);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, answer_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
     }
 
     if (ui_ptr) |active_ui| try active_ui.showStatus("Reading");

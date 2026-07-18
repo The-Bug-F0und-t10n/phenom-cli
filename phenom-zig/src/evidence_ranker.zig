@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const code_graph = @import("code_graph.zig");
 const contracts = @import("contracts.zig");
 const fts_ranker = @import("fts_ranker.zig");
 const symbol_ranker = @import("symbol_ranker.zig");
@@ -12,6 +13,7 @@ pub const CandidateSource = enum {
     local_symbol_ast,
     rg,
     fts_bm25,
+    code_graph,
     fallback_scan,
     workspace_overview,
     keyword_discovery,
@@ -49,6 +51,10 @@ pub const RankingResult = struct {
     rg_available: bool,
     fts_available: bool,
     fts_indexed_files: usize,
+    graph_available: bool,
+    graph_indexed_files: usize,
+    graph_nodes: usize,
+    graph_edges: usize,
     symbol_available: bool,
     symbol_indexed_files: usize,
     symbols_seen: usize,
@@ -103,6 +109,10 @@ pub fn rankForPrompt(
     var rg_available = true;
     var fts_available = true;
     var fts_indexed_files: usize = 0;
+    var graph_available = true;
+    var graph_indexed_files: usize = 0;
+    var graph_nodes: usize = 0;
+    var graph_edges: usize = 0;
     var symbol_available = true;
     var symbol_indexed_files: usize = 0;
     var symbols_seen: usize = 0;
@@ -138,7 +148,23 @@ pub fn rankForPrompt(
         rg_invocations += 1;
     }
 
-    // Phase 4: SQLite FTS5/BM25 over current workspace, using model-provided terms only.
+    // Phase 4: caveman code graph over symbols and direct call relations.
+    if (candidates.items.len < collectionLimit(budget) and (strategy == .auto or strategy == .lexical) and prompt.len > 0) {
+        const graph_result = collectCodeGraphCandidates(allocator, io, &candidates, prompt, budget) catch |err| switch (err) {
+            error.SqliteOpenFailed, error.SqliteExecFailed, error.SqlitePrepareFailed, error.SqliteBindFailed, error.SqliteStepFailed => blk: {
+                graph_available = false;
+                break :blk null;
+            },
+            else => return err,
+        };
+        if (graph_result) |stats| {
+            graph_indexed_files = stats.indexed_files;
+            graph_nodes = stats.nodes;
+            graph_edges = stats.edges;
+        }
+    }
+
+    // Phase 5: SQLite FTS5/BM25 over current workspace, using model-provided terms only.
     if ((candidates.items.len < collectionLimit(budget) or strategy == .symbol) and (strategy == .auto or strategy == .lexical or strategy == .symbol) and prompt.len > 0) {
         const fts_result = collectFtsCandidates(allocator, io, &candidates, prompt, budget, strategy == .symbol) catch |err| switch (err) {
             error.SqliteOpenFailed, error.SqliteExecFailed, error.SqlitePrepareFailed, error.SqliteBindFailed, error.SqliteStepFailed => blk: {
@@ -150,7 +176,7 @@ pub fn rankForPrompt(
         if (fts_result) |indexed| fts_indexed_files = indexed;
     }
 
-    // Phase 5: public module entrypoints from files already selected by path/rg/FTS/symbol evidence.
+    // Phase 6: public module entrypoints from files already selected by path/rg/FTS/symbol evidence.
     if (strategy == .symbol and candidates.items.len > 0) {
         const entrypoint_stats = collectModuleEntrypointCandidates(allocator, io, &candidates, budget) catch blk: {
             symbol_available = false;
@@ -162,17 +188,17 @@ pub fn rankForPrompt(
         }
     }
 
-    // Phase 6: batch file discovery via plain keywords (single rg -l call for all NL-like words)
+    // Phase 7: batch file discovery via plain keywords (single rg -l call for all NL-like words)
     if (candidates.items.len < collectionLimit(budget) and strategy == .auto) {
         try discoverFilesByKeywords(allocator, io, &candidates, terms.items.items, budget);
     }
 
-    // Phase 7: path candidates from prompt text
+    // Phase 8: path candidates from prompt text
     if (candidates.items.len == 0) {
         try addPromptPathCandidates(allocator, &candidates, prompt, strategy, budget);
     }
 
-    // Phase 8: workspace overview fallback
+    // Phase 9: workspace overview fallback
     if (candidates.items.len == 0 and strategy == .auto) {
         try addWorkspaceOverviewCandidates(allocator, io, &candidates, budget);
     }
@@ -194,7 +220,7 @@ pub fn rankForPrompt(
     }
     trimCandidates(allocator, &merged, budget.max_ranges);
 
-    const audit = try renderAudit(allocator, merged.items, terms.items.items, strategy, rg_invocations, rg_available, fts_available, fts_indexed_files, symbol_available, symbol_indexed_files, symbols_seen);
+    const audit = try renderAudit(allocator, merged.items, terms.items.items, strategy, rg_invocations, rg_available, fts_available, fts_indexed_files, graph_available, graph_indexed_files, graph_nodes, graph_edges, symbol_available, symbol_indexed_files, symbols_seen);
     errdefer allocator.free(audit);
     return .{
         .candidates = merged,
@@ -203,6 +229,10 @@ pub fn rankForPrompt(
         .rg_available = rg_available,
         .fts_available = fts_available,
         .fts_indexed_files = fts_indexed_files,
+        .graph_available = graph_available,
+        .graph_indexed_files = graph_indexed_files,
+        .graph_nodes = graph_nodes,
+        .graph_edges = graph_edges,
         .symbol_available = symbol_available,
         .symbol_indexed_files = symbol_indexed_files,
         .symbols_seen = symbols_seen,
@@ -519,6 +549,49 @@ fn collectSymbolCandidates(
     return .{ .indexed_files = ranked.indexed_files, .symbol_count = ranked.symbol_count };
 }
 
+const GraphStats = struct {
+    indexed_files: usize,
+    nodes: usize,
+    edges: usize,
+};
+
+fn collectCodeGraphCandidates(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    out: *std.ArrayList(EvidenceCandidate),
+    terms: []const u8,
+    budget: RankBudget,
+) !GraphStats {
+    var ranked = try code_graph.rank(allocator, io, terms, budget.max_candidates);
+    defer ranked.deinit(allocator);
+    for (ranked.candidates.items) |candidate| {
+        if (out.items.len >= collectionLimit(budget)) break;
+        if (!workspace_inventory.isWorkspacePath(candidate.path)) continue;
+        const reasons = try std.fmt.allocPrint(allocator, "code_graph,symbol={s},match={s},indexed_files={},nodes={},edges={},relations={}", .{
+            candidate.symbol,
+            if (candidate.direct_symbol_match) "direct" else "structural",
+            ranked.indexed_files,
+            ranked.nodes,
+            ranked.edges,
+            candidate.relation_count,
+        });
+        errdefer allocator.free(reasons);
+        const score = if (candidate.direct_symbol_match)
+            @min(candidate.score + 80, 1200)
+        else
+            @min(@divTrunc(candidate.score, 3) + 60, 420);
+        try out.append(allocator, .{
+            .path = try allocator.dupe(u8, candidate.path),
+            .start_line = candidate.start_line,
+            .end_line = @min(candidate.end_line, candidate.start_line + budget.max_lines_per_range - 1),
+            .score = score,
+            .source = .code_graph,
+            .reasons = reasons,
+        });
+    }
+    return .{ .indexed_files = ranked.indexed_files, .nodes = ranked.nodes, .edges = ranked.edges };
+}
+
 fn collectModuleEntrypointCandidates(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -727,7 +800,7 @@ fn canMergeCandidateSources(a: EvidenceCandidate, b: EvidenceCandidate) bool {
 }
 
 fn isStructuralCandidateSource(source: CandidateSource) bool {
-    return source == .symbol_ast or source == .local_symbol_ast or source == .module_entrypoint;
+    return source == .symbol_ast or source == .local_symbol_ast or source == .module_entrypoint or source == .code_graph;
 }
 
 pub fn adaptiveBudget(total_budget: usize, quality_score: i32, range_count: usize) usize {
@@ -777,6 +850,10 @@ fn renderAudit(
     rg_available: bool,
     fts_available: bool,
     fts_indexed_files: usize,
+    graph_available: bool,
+    graph_indexed_files: usize,
+    graph_nodes: usize,
+    graph_edges: usize,
     symbol_available: bool,
     symbol_indexed_files: usize,
     symbols_seen: usize,
@@ -785,8 +862,8 @@ fn renderAudit(
     errdefer out.deinit(allocator);
     const header = try std.fmt.allocPrint(
         allocator,
-        "[CANDIDATE_RANKING]\nstrategy={s}\nrg_invocations={}\nrg_available={}\nfts_available={}\nfts_indexed_files={}\nsymbol_available={}\nsymbol_indexed_files={}\nsymbols_seen={}\nterms={}\n",
-        .{ @tagName(strategy), rg_invocations, rg_available, fts_available, fts_indexed_files, symbol_available, symbol_indexed_files, symbols_seen, terms.len },
+        "[CANDIDATE_RANKING]\nstrategy={s}\nrg_invocations={}\nrg_available={}\nfts_available={}\nfts_indexed_files={}\ngraph_available={}\ngraph_indexed_files={}\ngraph_nodes={}\ngraph_edges={}\nsymbol_available={}\nsymbol_indexed_files={}\nsymbols_seen={}\nterms={}\n",
+        .{ @tagName(strategy), rg_invocations, rg_available, fts_available, fts_indexed_files, graph_available, graph_indexed_files, graph_nodes, graph_edges, symbol_available, symbol_indexed_files, symbols_seen, terms.len },
     );
     defer allocator.free(header);
     try out.appendSlice(allocator, header);
@@ -887,6 +964,7 @@ fn sourceCount(candidates: []const EvidenceCandidate, source: CandidateSource) u
 fn preferredSourceLimit(source: CandidateSource) usize {
     return switch (source) {
         .local_symbol_ast => 3,
+        .code_graph => 1,
         .symbol_ast => 1,
         .module_entrypoint => 1,
         else => 1,
@@ -1148,6 +1226,29 @@ test "ranking can use sqlite fts bm25 without semantic model" {
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "fts_available=") != null);
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "fts_indexed_files=") != null);
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "---BEGIN CONTENT---") == null);
+}
+
+test "auto ranking includes caveman code graph candidates" {
+    var ranked = try rankForPrompt(std.testing.allocator, std.testing.io, "executeCandidates collect evidence", .auto, .{ .max_ranges = 6 });
+    defer ranked.deinit(std.testing.allocator);
+
+    try std.testing.expect(ranked.graph_indexed_files > 0);
+    try std.testing.expect(ranked.graph_nodes > 0);
+    try std.testing.expect(ranked.graph_edges > 0);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "source=code_graph") != null);
+}
+
+test "code graph direct symbol match survives evidence score normalization" {
+    var ranked = try rankForPrompt(std.testing.allocator, std.testing.io, "executeCandidates", .lexical, .{ .max_ranges = 4 });
+    defer ranked.deinit(std.testing.allocator);
+
+    try std.testing.expect(ranked.candidates.items.len > 0);
+    try std.testing.expectEqual(CandidateSource.code_graph, ranked.candidates.items[0].source);
+    try std.testing.expectEqualStrings("src/collect_evidence.zig", ranked.candidates.items[0].path);
+    try std.testing.expect(ranked.candidates.items[0].start_line <= 93);
+    try std.testing.expect(ranked.candidates.items[0].end_line >= 93);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.candidates.items[0].reasons, "symbol=executeCandidates") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.candidates.items[0].reasons, "match=direct") != null);
 }
 
 test "ranking uses model terms against workspace paths without preferred file list" {
