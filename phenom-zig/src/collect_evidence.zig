@@ -110,17 +110,17 @@ pub fn executeCandidates(allocator: std.mem.Allocator, io: std.Io, args: Args) !
     }
 
     for (ranked.candidates.items, 0..) |candidate, idx| {
-        const signature_start = if (candidate.source == .symbol_ast) candidate.start_line else 1;
-        const signature_max_lines: usize = if (candidate.source == .symbol_ast) 1 else 512;
+        const signature_start = candidate.start_line;
+        const signature_max_lines: usize = if (candidate.source == .symbol_ast) 1 else candidate.end_line - candidate.start_line + 1;
         const signature_range = tools.readFileRange(allocator, candidate.path, signature_start, signature_max_lines, 32 * 1024) catch continue;
         defer signature_range.deinit(allocator);
         const signature = if (candidate.source == .symbol_ast)
             firstLineAt(signature_range.text, signature_start)
         else
-            selectCandidateLine(signature_range.text, 1, candidate.start_line, search_terms, candidate.path);
+            selectCandidateLine(signature_range.text, signature_start, candidate.start_line, search_terms, candidate.path);
         const preview = candidate.reasons[0..@min(candidate.reasons.len, 160)];
-        const item_start = if (candidate.source == .symbol_ast) candidate.start_line else signature.line;
-        const item_end = if (candidate.source == .symbol_ast) candidate.end_line else @max(signature.line, candidate.end_line);
+        const item_start = candidate.start_line;
+        const item_end = candidate.end_line;
         {
             var item = try makeCandidateItem(
                 allocator,
@@ -458,6 +458,7 @@ fn renderSearchTerms(allocator: std.mem.Allocator, args: Args) ![]u8 {
     try appendSearchPart(&out, allocator, args.need);
     try appendSearchPart(&out, allocator, args.target_files);
     try appendSearchPart(&out, allocator, args.scope_root);
+    try appendSearchPart(&out, allocator, args.intent);
     return out.toOwnedSlice(allocator);
 }
 
@@ -570,7 +571,7 @@ test "collect evidence v2 fields contribute to model-selected search terms" {
     try std.testing.expect(std.mem.indexOf(u8, search_terms, "mutation gate") != null);
     try std.testing.expect(std.mem.indexOf(u8, search_terms, "src/main.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, search_terms, "src") != null);
-    try std.testing.expect(std.mem.indexOf(u8, search_terms, "find contract executor") == null);
+    try std.testing.expect(std.mem.indexOf(u8, search_terms, "find contract executor") != null);
 }
 
 test "collect evidence candidates returns definitions without evidence body" {

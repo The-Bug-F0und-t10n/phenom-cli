@@ -548,6 +548,7 @@ const max_tool_repairs = 1;
 const max_duplicate_tool_repairs = 1;
 const max_pathless_collect_budget: usize = 6 * 1024;
 const max_model_context_send_bytes: usize = 24 * 1024;
+const weak_evidence_quality_score: i32 = 64;
 
 const ToolLoopNext = union(enum) {
     final_answer,
@@ -580,7 +581,19 @@ fn runToolLoopIterations(
         const repair_context = try renderInitialToolCallRepairContext(allocator, initial_context.?);
         defer allocator.free(repair_context);
         try db.recordEvent(config.session, "model_context", repair_context);
-        const next = try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, first_sink, state.active_contract);
+        const next = try streamDeferredRequiredToolLoopTurn(
+            allocator,
+            config,
+            prompt,
+            repair_context,
+            "Your previous output was prose, but this turn requires a visible context tool_call before prose. Output exactly one collect_evidence, search_session, or set_operational_contract tool_call now. No prose.",
+            client,
+            events,
+            db,
+            ui_ptr,
+            first_sink,
+            state.active_contract,
+        );
         switch (next) {
             .final_answer => return true,
             .stopped => return true,
@@ -772,7 +785,19 @@ fn runOneToolLoopStep(
         );
         defer allocator.free(repair_context);
         try db.recordEvent(config.session, "model_context", repair_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+        return try streamDeferredRequiredToolLoopTurn(
+            allocator,
+            config,
+            prompt,
+            repair_context,
+            "Your previous output did not provide the required corrected collect_evidence call. Output exactly one visible collect_evidence tool_call with path, or with intent+terms and strategy=auto|lexical|symbol. No prose.",
+            client,
+            events,
+            db,
+            ui_ptr,
+            aggregate_sink,
+            state.active_contract,
+        );
     }
 
     if (isCollectEvidenceStage(call, "candidates")) {
@@ -880,7 +905,9 @@ fn runOneToolLoopStep(
             activeToolSchema(state)
         else
             context_profile.toolSchema(.code_evidence, .after_collect_evidence),
-        if (state.shouldAllowMoreEvidence())
+        if (state.shouldAllowMoreEvidence() and result.quality_score < weak_evidence_quality_score)
+            "The collected workspace evidence is weak or generic. Emit one refined collect_evidence call before answering: use stage=candidates for ambiguous source-code questions, choose concrete symbol/path/error terms from the evidence and task, and do not request the same terms again."
+        else if (state.shouldAllowMoreEvidence())
             "Answer using only cited evidence above. Cite E# for workspace claims and S# for session claims. Do not add capabilities, files, tools, or architecture not present in evidence. If the user asks which function/type/file and the identifier is not present in E#, emit one refined collect_evidence call with intent+terms instead of guessing. Do not request the same file/range/session terms again."
         else
             "Answer the current user request using only cited evidence above. Do not add capabilities, files, tools, architecture, or prior-session facts not present in evidence. If evidence is insufficient, say what is evidenced and what is not. Do not call tools again in this turn.",
@@ -1136,7 +1163,10 @@ fn runCollectEvidenceExpandStep(
             activeToolSchema(state)
         else
             context_profile.toolSchema(.code_evidence, .after_collect_evidence),
-        "Answer using only cited E# evidence from the expanded candidate. If evidence is insufficient and budget remains, emit one more collect_evidence call with a different selectedCandidate or refined intent+terms.",
+        if (state.shouldAllowMoreEvidence() and result.quality_score < weak_evidence_quality_score)
+            "The expanded candidate evidence is weak or generic. Emit one more collect_evidence call with a different selectedCandidate or refined intent+terms before answering."
+        else
+            "Answer using only cited E# evidence from the expanded candidate. If evidence is insufficient and budget remains, emit one more collect_evidence call with a different selectedCandidate or refined intent+terms.",
     );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);

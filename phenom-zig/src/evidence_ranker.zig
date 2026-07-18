@@ -24,6 +24,8 @@ pub const RankBudget = struct {
     max_rg_bytes: usize = 512 * 1024,
 };
 
+const collection_headroom_factor: usize = 4;
+
 pub const EvidenceCandidate = struct {
     path: []u8,
     start_line: usize,
@@ -122,7 +124,7 @@ pub fn rankForPrompt(
 
     // Phase 3: per-term rg for structured terms only (paths, code symbols, camelCase, etc.)
     for (terms.items.items) |term| {
-        if (candidates.items.len >= budget.max_candidates) break;
+        if (candidates.items.len >= collectionLimit(budget)) break;
         if (!isStructuredSearchTerm(term)) continue;
         collectRgCandidates(allocator, io, &candidates, term, strategy, budget) catch |err| switch (err) {
             error.RgUnavailable => {
@@ -135,7 +137,7 @@ pub fn rankForPrompt(
     }
 
     // Phase 4: SQLite FTS5/BM25 over current workspace, using model-provided terms only.
-    if ((candidates.items.len < budget.max_candidates or strategy == .symbol) and (strategy == .auto or strategy == .lexical or strategy == .symbol) and prompt.len > 0) {
+    if ((candidates.items.len < collectionLimit(budget) or strategy == .symbol) and (strategy == .auto or strategy == .lexical or strategy == .symbol) and prompt.len > 0) {
         const fts_result = collectFtsCandidates(allocator, io, &candidates, prompt, budget, strategy == .symbol) catch |err| switch (err) {
             error.SqliteOpenFailed, error.SqliteExecFailed, error.SqlitePrepareFailed, error.SqliteBindFailed, error.SqliteStepFailed => blk: {
                 fts_available = false;
@@ -147,7 +149,7 @@ pub fn rankForPrompt(
     }
 
     // Phase 5: batch file discovery via plain keywords (single rg -l call for all NL-like words)
-    if (candidates.items.len < budget.max_candidates and strategy == .auto) {
+    if (candidates.items.len < collectionLimit(budget) and strategy == .auto) {
         try discoverFilesByKeywords(allocator, io, &candidates, terms.items.items, budget);
     }
 
@@ -225,7 +227,7 @@ fn collectRgCandidates(
     var lines = std.mem.splitScalar(u8, result.stdout, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
-        if (out.items.len >= budget.max_candidates) break;
+        if (out.items.len >= collectionLimit(budget)) break;
         try parseRgLine(allocator, out, line, term, strategy, budget);
     }
 }
@@ -317,9 +319,9 @@ fn collectPathNameCandidates(
             const fuzzy = fuzzyTextMatchScore(path, term);
             if (!exact and fuzzy == 0) continue;
             const score: i32 = if (exact)
-                140 + @as(i32, @intCast(@min(term.len, 24)))
+                68 + @as(i32, @intCast(@min(term.len, 24)))
             else
-                104 + @as(i32, @intCast(fuzzy));
+                48 + @as(i32, @intCast(fuzzy));
             best_score = @max(best_score, score);
         }
         if (best_score == 0) continue;
@@ -385,7 +387,7 @@ fn discoverFilesByKeywords(
         const count = std.fmt.parseInt(usize, line[colon + 1 ..], 10) catch continue;
         if (count == 0) continue;
         if (!workspace_inventory.isWorkspacePath(path)) continue;
-        if (out.items.len >= budget.max_candidates) break;
+        if (out.items.len >= collectionLimit(budget)) break;
         const score: i32 = 40 + @as(i32, @intCast(@min(count * 3, 15)));
         const reasons = try std.fmt.allocPrint(allocator, "keyword_discovery,plain_keyword_match,count={}", .{count});
         errdefer allocator.free(reasons);
@@ -434,7 +436,8 @@ fn collectFtsCandidates(
 ) !usize {
     var ranked = try fts_ranker.rank(allocator, io, terms, budget.max_candidates);
     defer ranked.deinit(allocator);
-    const max_out = if (allow_extra) budget.max_candidates * 2 else budget.max_candidates;
+    _ = allow_extra;
+    const max_out = collectionLimit(budget);
     for (ranked.candidates.items) |candidate| {
         if (out.items.len >= max_out) break;
         if (!workspace_inventory.isWorkspacePath(candidate.path)) continue;
@@ -468,7 +471,7 @@ fn collectSymbolCandidates(
     var ranked = try symbol_ranker.rank(allocator, io, terms, budget.max_candidates);
     defer ranked.deinit(allocator);
     for (ranked.candidates.items) |candidate| {
-        if (out.items.len >= budget.max_candidates) break;
+        if (out.items.len >= collectionLimit(budget)) break;
         if (!workspace_inventory.isWorkspacePath(candidate.path)) continue;
         const reasons = try std.fmt.allocPrint(allocator, "symbol_ast,symbol={s},indexed_files={},symbols={}", .{ candidate.symbol, ranked.indexed_files, ranked.symbol_count });
         errdefer allocator.free(reasons);
@@ -594,6 +597,10 @@ pub fn adaptiveBudget(total_budget: usize, quality_score: i32, range_count: usiz
     return @min(total_budget, per_range * quality_factor);
 }
 
+fn collectionLimit(budget: RankBudget) usize {
+    return budget.max_candidates * collection_headroom_factor;
+}
+
 pub fn qualityEnough(score: i32) bool {
     return score >= 64;
 }
@@ -663,11 +670,15 @@ fn freeCandidates(allocator: std.mem.Allocator, candidates: *std.ArrayList(Evide
 fn sortCandidates(candidates: []EvidenceCandidate) void {
     std.mem.sort(EvidenceCandidate, candidates, {}, struct {
         fn lessThan(_: void, a: EvidenceCandidate, b: EvidenceCandidate) bool {
-            if (a.score != b.score) return a.score > b.score;
-            if (!std.mem.eql(u8, a.path, b.path)) return std.mem.lessThan(u8, a.path, b.path);
-            return a.start_line < b.start_line;
+            return candidatePrecedes(a, b);
         }
     }.lessThan);
+}
+
+fn candidatePrecedes(a: EvidenceCandidate, b: EvidenceCandidate) bool {
+    if (a.score != b.score) return a.score > b.score;
+    if (!std.mem.eql(u8, a.path, b.path)) return std.mem.lessThan(u8, a.path, b.path);
+    return a.start_line < b.start_line;
 }
 
 fn sortTermsBySpecificity(terms: [][]u8) void {
@@ -682,10 +693,36 @@ fn sortTermsBySpecificity(terms: [][]u8) void {
 }
 
 fn trimCandidates(allocator: std.mem.Allocator, candidates: *std.ArrayList(EvidenceCandidate), max: usize) void {
-    while (candidates.items.len > max) {
+    if (candidates.items.len <= max) return;
+
+    var selected: usize = 0;
+    var i: usize = 0;
+    while (i < candidates.items.len and selected < max) : (i += 1) {
+        if (sourceAlreadySelected(candidates.items[0..selected], candidates.items[i].source)) continue;
+        std.mem.swap(EvidenceCandidate, &candidates.items[selected], &candidates.items[i]);
+        selected += 1;
+    }
+
+    while (selected < max) : (selected += 1) {
+        var best = selected;
+        i = selected + 1;
+        while (i < candidates.items.len) : (i += 1) {
+            if (candidatePrecedes(candidates.items[i], candidates.items[best])) best = i;
+        }
+        std.mem.swap(EvidenceCandidate, &candidates.items[selected], &candidates.items[best]);
+    }
+
+    while (candidates.items.len > selected) {
         const removed = candidates.pop().?;
         removed.deinit(allocator);
     }
+}
+
+fn sourceAlreadySelected(candidates: []const EvidenceCandidate, source: CandidateSource) bool {
+    for (candidates) |candidate| {
+        if (candidate.source == source) return true;
+    }
+    return false;
 }
 
 fn rangesTouch(a_start: usize, a_end: usize, b_start: usize, b_end: usize) bool {
@@ -816,6 +853,42 @@ test "merge candidates combines adjacent and overlapping ranges" {
     try std.testing.expectEqual(@as(usize, 30), merged.items[0].end_line);
 }
 
+test "trim candidates preserves source diversity before filling by score" {
+    var candidates = std.ArrayList(EvidenceCandidate).empty;
+    defer freeCandidates(std.testing.allocator, &candidates);
+
+    try candidates.append(std.testing.allocator, .{
+        .path = try std.testing.allocator.dupe(u8, "a.zig"),
+        .start_line = 1,
+        .end_line = 2,
+        .score = 100,
+        .source = .symbol_ast,
+        .reasons = try std.testing.allocator.dupe(u8, "symbol"),
+    });
+    try candidates.append(std.testing.allocator, .{
+        .path = try std.testing.allocator.dupe(u8, "b.zig"),
+        .start_line = 1,
+        .end_line = 2,
+        .score = 99,
+        .source = .symbol_ast,
+        .reasons = try std.testing.allocator.dupe(u8, "symbol"),
+    });
+    try candidates.append(std.testing.allocator, .{
+        .path = try std.testing.allocator.dupe(u8, "c.zig"),
+        .start_line = 1,
+        .end_line = 2,
+        .score = 10,
+        .source = .rg,
+        .reasons = try std.testing.allocator.dupe(u8, "rg"),
+    });
+
+    trimCandidates(std.testing.allocator, &candidates, 2);
+
+    try std.testing.expectEqual(@as(usize, 2), candidates.items.len);
+    try std.testing.expectEqual(CandidateSource.symbol_ast, candidates.items[0].source);
+    try std.testing.expectEqual(CandidateSource.rg, candidates.items[1].source);
+}
+
 test "ranking with rg finds collect evidence implementation without raw output audit" {
     var ranked = try rankForPrompt(std.testing.allocator, std.testing.io, "collect_evidence execute", .lexical, .{ .max_ranges = 3 });
     defer ranked.deinit(std.testing.allocator);
@@ -823,6 +896,32 @@ test "ranking with rg finds collect evidence implementation without raw output a
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "[CANDIDATE_RANKING]") != null);
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "rg_invocations=") != null);
     try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "---BEGIN CONTENT---") == null);
+}
+
+test "ranking still uses rg when path-name candidates saturate first slots" {
+    const decoys = [_][]const u8{
+        "ambiguous_symbol_decoy_1.txt",
+        "ambiguous_symbol_decoy_2.txt",
+        "ambiguous_symbol_decoy_3.txt",
+        "ambiguous_symbol_decoy_4.txt",
+        "ambiguous_symbol_decoy_5.txt",
+        "ambiguous_symbol_decoy_6.txt",
+    };
+    for (decoys) |path| {
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "decoy\n" });
+    }
+    defer for (decoys) |path| std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    const target = "zz_rg_target.txt";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = target, .data = "fn ambiguous_symbol() void {}\n" });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, target) catch {};
+
+    var ranked = try rankForPrompt(std.testing.allocator, std.testing.io, "ambiguous_symbol", .lexical, .{ .max_candidates = 4, .max_ranges = 4 });
+    defer ranked.deinit(std.testing.allocator);
+
+    try std.testing.expect(ranked.rg_invocations > 0);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, "source=rg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ranked.audit_text, target) != null);
 }
 
 test "auto ranking discovers files via plain keywords when no structured terms exist" {
