@@ -67,22 +67,37 @@ pub fn readFileRange(
     const hash = std.hash.Wyhash.hash(0, raw.items[0..hash_len]);
 
     // ponytail: hash first 64 KiB; upgrade to full-file streaming hash when stale checks need whole-file guarantees.
-    const visible_len = @min(raw.items.len, max_bytes);
-    const visible_items = raw.items[0..visible_len];
+    const visible_items = raw.items;
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
     var line_no: usize = 1;
     var emitted: usize = 0;
+    var truncated = false;
     var iter = std.mem.splitScalar(u8, visible_items, '\n');
     while (iter.next()) |line| : (line_no += 1) {
         if (line_no < start_line) continue;
         if (emitted >= max_lines) break;
-        try out.appendSlice(allocator, line);
+        if (out.items.len >= max_bytes) {
+            truncated = true;
+            break;
+        }
+        const remaining = max_bytes - out.items.len;
+        const line_part = line[0..@min(line.len, remaining)];
+        try out.appendSlice(allocator, line_part);
+        if (out.items.len >= max_bytes) {
+            truncated = true;
+            break;
+        }
         try out.append(allocator, '\n');
         emitted += 1;
+        if (line_part.len < line.len) {
+            truncated = true;
+            break;
+        }
     }
+    if (truncated) try out.appendSlice(allocator, "[TRUNCATED]\n");
 
     const text = try out.toOwnedSlice(allocator);
     return .{
@@ -164,6 +179,29 @@ test "model file reads deny hidden and sensitive paths" {
 
 test "start line is explicitly one based" {
     try std.testing.expectError(error.InvalidStartLine, readFileRange(std.testing.allocator, "README.md", 0, 1, 1024));
+}
+
+test "read file range finds later lines with small byte budget" {
+    const path = "tools-range-budget-test.txt";
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(std.testing.allocator);
+    for (1..90) |i| {
+        const line = try std.fmt.allocPrint(std.testing.allocator, "line {}\n", .{i});
+        defer std.testing.allocator.free(line);
+        try content.appendSlice(std.testing.allocator, line);
+    }
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = content.items,
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    const range = try readFileRange(std.testing.allocator, path, 77, 1, 16);
+    defer range.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 77), range.start_line);
+    try std.testing.expectEqual(@as(usize, 77), range.end_line);
+    try std.testing.expect(std.mem.indexOf(u8, range.text, "line 77") != null);
 }
 
 test "file range owns returned path" {

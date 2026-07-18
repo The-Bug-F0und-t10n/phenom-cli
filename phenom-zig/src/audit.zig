@@ -62,8 +62,14 @@ pub const AuditDb = struct {
             if (db) |handle| _ = c.sqlite3_close(handle);
             return error.SqliteOpenFailed;
         }
+        if (c.sqlite3_busy_timeout(db, 5000) != c.SQLITE_OK) {
+            if (db) |handle| _ = c.sqlite3_close(handle);
+            return error.SqliteOpenFailed;
+        }
 
         var audit = AuditDb{ .allocator = allocator, .db = db };
+        try audit.exec("pragma journal_mode=WAL;");
+        try audit.exec("pragma synchronous=NORMAL;");
         try audit.exec(
             \\create table if not exists events (
             \\  id integer primary key autoincrement,
@@ -164,7 +170,7 @@ pub const AuditDb = struct {
             \\  values (new.id, new.session, new.kind, new.body, new.created_at);
             \\end;
         );
-        try self.exec("insert into events_fts(events_fts) values('rebuild');");
+        self.exec("insert into events_fts(events_fts) values('rebuild');") catch {};
     }
 
     pub fn recordToolEventSummary(self: *AuditDb, session: []const u8, event: tool_event.ToolEvent) !void {
@@ -734,6 +740,30 @@ fn dupeColumnText(allocator: std.mem.Allocator, stmt: ?*c.sqlite3_stmt, column: 
     if (len_raw < 0) return error.SqliteColumnFailed;
     const bytes = @as([*]const u8, @ptrCast(ptr))[0..@as(usize, @intCast(len_raw))];
     return allocator.dupe(u8, bytes);
+}
+
+test "audit db configures file database for concurrent sessions" {
+    const db_path = "phenom-audit-wal-test.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, "phenom-audit-wal-test.db-wal") catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, "phenom-audit-wal-test.db-shm") catch {};
+
+    var db = try AuditDb.open(std.testing.allocator, db_path);
+    defer db.close();
+    const journal = try pragmaText(std.testing.allocator, db.db, "pragma journal_mode;");
+    defer std.testing.allocator.free(journal);
+    try std.testing.expectEqualStrings("wal", journal);
+}
+
+fn pragmaText(allocator: std.mem.Allocator, db: ?*c.sqlite3, sql: []const u8) ![]u8 {
+    const z_sql = try allocator.dupeZ(u8, sql);
+    defer allocator.free(z_sql);
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.SqliteStepFailed;
+    return dupeColumnText(allocator, stmt, 0);
 }
 
 test "input history loads newest distinct sqlite lines" {

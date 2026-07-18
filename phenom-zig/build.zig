@@ -37,7 +37,6 @@ pub fn build(b: *std.Build) void {
     });
     install_local_cmd.addFileArg(exe.getEmittedBin());
     install_local_cmd.step.dependOn(&install_artifact.step);
-    b.getInstallStep().dependOn(&install_local_cmd.step);
     install_local_step.dependOn(&install_local_cmd.step);
 
     const real_backend = b.option([]const u8, "real-backend", "Real backend for smoke test: ollama or llamacpp") orelse "llamacpp";
@@ -279,7 +278,6 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
-    run_unit_tests.step.dependOn(&install_local_cmd.step);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 }

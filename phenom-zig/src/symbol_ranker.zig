@@ -23,6 +23,7 @@ pub const Candidate = struct {
 pub const PathBoost = struct {
     path: []const u8,
     score: i32,
+    corroboration_score: i32 = 0,
 };
 
 pub const Result = struct {
@@ -110,7 +111,7 @@ pub fn rankEntrypointsForPaths(
         defer allocator.free(content);
         if (!workspace_inventory.isTextBytes(content)) continue;
         indexed += 1;
-        try collectFileEntrypoints(allocator, &out, boost.path, content, boost.score, max_candidates, &symbols);
+        try collectFileEntrypoints(allocator, &out, boost.path, content, boost.score + boost.corroboration_score, max_candidates, &symbols);
     }
 
     sortCandidates(out.items);
@@ -238,9 +239,11 @@ fn namedJsSymbol(path: []const u8, rest: []const u8, line_no: usize, tail: []con
 fn scoreSymbol(symbol: Symbol, query: []const u8) i32 {
     var score: i32 = 0;
     var it = std.mem.tokenizeAny(u8, query, " \t\r\n\"'`()[]{}<>:;,./\\|");
-    while (it.next()) |raw| {
+    var term_index: usize = 0;
+    while (it.next()) |raw| : (term_index += 1) {
         const term = std.mem.trim(u8, raw, "-_*");
         if (term.len < 2) continue;
+        const positional_weight: usize = if (term_index == 0) 3 else if (term_index < 3) 2 else 1;
         if (std.ascii.eqlIgnoreCase(symbol.name, term)) score += @as(i32, @intCast(@min(term.len * 8, 96)));
         if (containsIgnoreCase(symbol.name, term)) {
             score += @as(i32, @intCast(@min(term.len * 5, 48)));
@@ -251,8 +254,18 @@ fn scoreSymbol(symbol: Symbol, query: []const u8) i32 {
         score += @as(i32, @intCast(fuzzyTextMatchScore(symbol.name, term)));
         score += @as(i32, @intCast(fuzzyTextMatchScore(symbol.signature, term) / 2));
         score += @as(i32, @intCast(fuzzyTextMatchScore(symbol.path, term)));
+        score += @as(i32, @intCast(tokenizedIdentifierMatchScore(symbol.name, term, 34, 6)));
+        score += @as(i32, @intCast(tokenizedIdentifierMatchScore(symbol.signature, term, 12, 4)));
+        score += @as(i32, @intCast(tokenizedIdentifierMatchScore(symbol.path, term, 10, 3)));
+        if (positional_weight > 1) {
+            const positional = tokenizedIdentifierMatchScore(symbol.name, term, 18, 3) +
+                tokenizedIdentifierMatchScore(symbol.path, term, 8, 2);
+            score += @as(i32, @intCast(positional * (positional_weight - 1)));
+        }
     }
     if (score > 0 and symbol.top_level) score += 80;
+    if (score > 0 and symbol.public and symbol.kind == .function) score += 48;
+    if (score > 0 and symbol.public and symbol.kind == .container) score += 32;
     return score;
 }
 
@@ -327,6 +340,101 @@ fn fuzzyTextMatchScore(haystack: []const u8, term: []const u8) usize {
     return common * 6;
 }
 
+const Token = struct {
+    text: []const u8,
+};
+
+pub fn tokenizedIdentifierMatchScore(haystack: []const u8, term: []const u8, exact_weight: usize, partial_weight: usize) usize {
+    var query_tokens_buf: [16]Token = undefined;
+    const query_tokens = query_tokens_buf[0..splitIdentifierTokens(term, &query_tokens_buf)];
+    if (query_tokens.len == 0) return 0;
+
+    var haystack_tokens_buf: [96]Token = undefined;
+    const haystack_tokens = haystack_tokens_buf[0..splitIdentifierTokens(haystack, &haystack_tokens_buf)];
+    if (haystack_tokens.len == 0) return 0;
+
+    var score: usize = 0;
+    var covered: usize = 0;
+    for (query_tokens, 0..) |query_token, query_index| {
+        if (query_token.text.len < 2) continue;
+        if (tokenAppearedBefore(query_tokens[0..query_index], query_token.text)) continue;
+        var best: usize = 0;
+        for (haystack_tokens) |haystack_token| {
+            if (haystack_token.text.len < 2) continue;
+            if (std.ascii.eqlIgnoreCase(haystack_token.text, query_token.text)) {
+                best = @max(best, @min(query_token.text.len * exact_weight, exact_weight * 8));
+            } else if (partialTokenMatch(haystack_token.text, query_token.text)) {
+                const common = longestAsciiFoldedTermPrefixInHaystack(haystack_token.text, query_token.text);
+                best = @max(best, @min(common * partial_weight, partial_weight * 8));
+            }
+        }
+        if (best > 0) {
+            covered += 1;
+            score += best;
+        }
+    }
+    if (covered == 0) return 0;
+    score += covered * 10;
+    if (query_tokens.len > 1 and covered == query_tokens.len) score += query_tokens.len * 80;
+    return score;
+}
+
+fn tokenAppearedBefore(tokens: []const Token, text: []const u8) bool {
+    for (tokens) |token| {
+        if (std.ascii.eqlIgnoreCase(token.text, text)) return true;
+    }
+    return false;
+}
+
+fn partialTokenMatch(haystack_token: []const u8, query_token: []const u8) bool {
+    const common = longestAsciiFoldedTermPrefixInHaystack(haystack_token, query_token);
+    if (common >= 4) return true;
+    if (@min(haystack_token.len, query_token.len) < 4) return false;
+    return containsIgnoreCase(haystack_token, query_token) or containsIgnoreCase(query_token, haystack_token);
+}
+
+fn splitIdentifierTokens(text: []const u8, out: []Token) usize {
+    var count: usize = 0;
+    var token_start: ?usize = null;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const byte = text[i];
+        if (!std.ascii.isAlphanumeric(byte)) {
+            if (token_start) |start| count = appendToken(text[start..i], out, count);
+            token_start = null;
+            continue;
+        }
+        if (token_start) |start| {
+            if (isIdentifierBoundary(text, i)) {
+                count = appendToken(text[start..i], out, count);
+                token_start = i;
+            }
+        } else {
+            token_start = i;
+        }
+    }
+    if (token_start) |start| count = appendToken(text[start..], out, count);
+    return count;
+}
+
+fn appendToken(text: []const u8, out: []Token, count: usize) usize {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0 or count >= out.len) return count;
+    out[count] = .{ .text = trimmed };
+    return count + 1;
+}
+
+fn isIdentifierBoundary(text: []const u8, index: usize) bool {
+    if (index == 0 or index >= text.len) return false;
+    const prev = text[index - 1];
+    const curr = text[index];
+    if (!std.ascii.isAlphanumeric(prev) or !std.ascii.isAlphanumeric(curr)) return false;
+    if (std.ascii.isDigit(prev) != std.ascii.isDigit(curr)) return true;
+    if (std.ascii.isLower(prev) and std.ascii.isUpper(curr)) return true;
+    if (std.ascii.isUpper(prev) and std.ascii.isUpper(curr) and index + 1 < text.len and std.ascii.isLower(text[index + 1])) return true;
+    return false;
+}
+
 fn longestAsciiFoldedTermPrefixInHaystack(haystack: []const u8, term: []const u8) usize {
     var best: usize = 0;
     var i: usize = 0;
@@ -363,4 +471,12 @@ test "symbol ranker uses generic fuzzy definition matching" {
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.candidates.items.len > 0);
     try std.testing.expectEqualStrings("src/render.zig", result.candidates.items[0].path);
+}
+
+test "symbol ranker matches snake query terms to camel case symbols" {
+    var result = try rank(std.testing.allocator, std.testing.io, "read_file line_by_line readline iter_lines", 5);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.candidates.items.len > 0);
+    try std.testing.expectEqualStrings("src/tools.zig", result.candidates.items[0].path);
+    try std.testing.expectEqualStrings("readFileRange", result.candidates.items[0].symbol);
 }

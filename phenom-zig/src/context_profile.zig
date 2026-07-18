@@ -95,7 +95,7 @@ pub fn codeEvidenceSchema() []const u8 {
     \\search_session: first decide intent, then terms=concrete keys from SESSION_FOCUS/reasoning. Do not pass generic user words unless they are the remembered content.
     \\<tool_call><function=set_operational_contract><parameter=requiresInspection>true</parameter><parameter=requiresMutation>false</parameter><parameter=requiresRuntimeValidation>false</parameter><parameter=requiresBrowserDiagnostics>false</parameter><parameter=requiresMemoryPromotion>false</parameter><parameter=reason>short reason</parameter></function></tool_call>
     \\<tool_call><function=collect_evidence><parameter=intent>compare source definitions</parameter><parameter=strategy>symbol</parameter><parameter=stage>candidates</parameter><parameter=terms>SymbolName FileName ErrorCode</parameter></function></tool_call>
-    \\<tool_call><function=collect_evidence><parameter=stage>expand</parameter><parameter=selectedCandidate>C1</parameter><parameter=max_lines>32</parameter></function></tool_call>
+    \\<tool_call><function=collect_evidence><parameter=stage>expand</parameter><parameter=selectedCandidate>C#</parameter><parameter=max_lines>32</parameter></function></tool_call>
     \\<tool_call><function=collect_evidence><parameter=path>relative/path</parameter><parameter=strategy>path</parameter><parameter=start_line>1</parameter><parameter=max_lines>12</parameter></function></tool_call>
     \\<tool_call><function=search_session><parameter=intent>recover prior decision</parameter><parameter=terms>TopicName EntityName DecisionKey</parameter><parameter=scope>current</parameter></function></tool_call>
     ;
@@ -108,7 +108,7 @@ pub fn activeContractSchema() []const u8 {
     \\search_session(intent?, terms, scope=current|all, session?)
     \\Contract active. Do not call set_operational_contract again. Pathless collect_evidence needs intent+terms. For ambiguous workspace/source-code questions and symbol identity use stage=candidates then stage=expand selectedCandidate. Do not use auto overview for identity questions.
     \\<tool_call><function=collect_evidence><parameter=intent>compare source definitions</parameter><parameter=strategy>symbol</parameter><parameter=stage>candidates</parameter><parameter=terms>SymbolName FileName ErrorCode</parameter></function></tool_call>
-    \\<tool_call><function=collect_evidence><parameter=stage>expand</parameter><parameter=selectedCandidate>C1</parameter><parameter=max_lines>32</parameter></function></tool_call>
+    \\<tool_call><function=collect_evidence><parameter=stage>expand</parameter><parameter=selectedCandidate>C#</parameter><parameter=max_lines>32</parameter></function></tool_call>
     \\<tool_call><function=search_session><parameter=intent>recover prior decision</parameter><parameter=terms>TopicName EntityName DecisionKey</parameter><parameter=scope>current</parameter></function></tool_call>
     ;
 }
@@ -190,8 +190,8 @@ pub fn candidateExpandSchema() []const u8 {
     return
     \\[TOOLS v1]
     \\collect_evidence(stage=expand, selectedCandidate, max_lines=32)
-    \\Only valid output in this state is the XML tool_call below with one visible C# candidate. No prose. No analysis. C# candidates are not E# evidence.
-    \\<tool_call><function=collect_evidence><parameter=stage>expand</parameter><parameter=selectedCandidate>C1</parameter><parameter=max_lines>32</parameter></function></tool_call>
+    \\Only valid output in this state is one XML tool_call, or one visible line SELECTED_CANDIDATE: C#. Choose the best visible C# candidate for the task. Replace C# with that candidate ID. No prose. No analysis. C# candidates are not E# evidence.
+    \\<tool_call><function=collect_evidence><parameter=stage>expand</parameter><parameter=selectedCandidate>C#</parameter><parameter=max_lines>32</parameter></function></tool_call>
     ;
 }
 
@@ -230,6 +230,8 @@ test "schemas are state scoped" {
 
     const expand = candidateExpandSchema();
     try std.testing.expect(std.mem.indexOf(u8, expand, "stage=expand") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expand, "best visible C# candidate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expand, "selectedCandidate>C1") == null);
     try std.testing.expect(std.mem.indexOf(u8, expand, "search_session") == null);
     try std.testing.expect(std.mem.indexOf(u8, expand, "strategy=auto") == null);
 }

@@ -330,11 +330,13 @@ fn collectPathNameCandidates(
             if (term.len < 3) continue;
             const exact = containsIgnoreCase(path, term);
             const fuzzy = fuzzyTextMatchScore(path, term);
-            if (!exact and fuzzy == 0) continue;
-            const score: i32 = if (exact)
+            const tokenized = symbol_ranker.tokenizedIdentifierMatchScore(path, term, 6, 2);
+            if (!exact and fuzzy == 0 and tokenized == 0) continue;
+            var score: i32 = if (exact)
                 68 + @as(i32, @intCast(@min(term.len, 24)))
             else
                 48 + @as(i32, @intCast(fuzzy));
+            if (tokenized > 0) score = @max(score, 100 + @as(i32, @intCast(@min(tokenized, 160))));
             best_score = @max(best_score, score);
         }
         if (best_score == 0) continue;
@@ -512,7 +514,7 @@ fn collectModuleEntrypointCandidates(
     defer boosts.deinit(allocator);
     for (out.items) |candidate| {
         if (candidate.source == .module_entrypoint) continue;
-        try addPathBoost(allocator, &boosts, candidate.path, candidate.score);
+        try addPathBoost(allocator, &boosts, candidate.path, candidate.score, candidate.source);
     }
     sortPathBoosts(boosts.items);
     const boost_limit = @min(boosts.items.len, @max(@as(usize, 1), budget.max_ranges));
@@ -539,19 +541,24 @@ fn addPathBoost(
     boosts: *std.ArrayList(symbol_ranker.PathBoost),
     path: []const u8,
     score: i32,
+    source: CandidateSource,
 ) !void {
+    const corroboration = if (source == .prompt_path) @min(score, 240) else 0;
     for (boosts.items) |*boost| {
         if (!std.mem.eql(u8, boost.path, path)) continue;
         boost.score = @max(boost.score, score);
+        boost.corroboration_score = @max(boost.corroboration_score, corroboration);
         return;
     }
-    try boosts.append(allocator, .{ .path = path, .score = score });
+    try boosts.append(allocator, .{ .path = path, .score = score, .corroboration_score = corroboration });
 }
 
 fn sortPathBoosts(boosts: []symbol_ranker.PathBoost) void {
     std.mem.sort(symbol_ranker.PathBoost, boosts, {}, struct {
         fn lessThan(_: void, a: symbol_ranker.PathBoost, b: symbol_ranker.PathBoost) bool {
-            if (a.score != b.score) return a.score > b.score;
+            const a_score = a.score + a.corroboration_score;
+            const b_score = b.score + b.corroboration_score;
+            if (a_score != b_score) return a_score > b_score;
             return std.mem.lessThan(u8, a.path, b.path);
         }
     }.lessThan);
@@ -652,10 +659,14 @@ pub fn mergeCandidates(
 }
 
 fn canMergeCandidateSources(a: EvidenceCandidate, b: EvidenceCandidate) bool {
-    if (a.source == .symbol_ast or b.source == .symbol_ast) {
+    if (isStructuralCandidateSource(a.source) or isStructuralCandidateSource(b.source)) {
         return a.source == b.source and a.start_line == b.start_line;
     }
     return true;
+}
+
+fn isStructuralCandidateSource(source: CandidateSource) bool {
+    return source == .symbol_ast or source == .module_entrypoint;
 }
 
 pub fn adaptiveBudget(total_budget: usize, quality_score: i32, range_count: usize) usize {
@@ -921,6 +932,33 @@ test "merge candidates combines adjacent and overlapping ranges" {
     try std.testing.expectEqual(@as(usize, 30), merged.items[0].end_line);
 }
 
+test "merge candidates preserves module entrypoint range" {
+    const input = [_]EvidenceCandidate{
+        .{
+            .path = try std.testing.allocator.dupe(u8, "src/fts_ranker.zig"),
+            .start_line = 1,
+            .end_line = 48,
+            .score = 100,
+            .source = .fts_bm25,
+            .reasons = try std.testing.allocator.dupe(u8, "fts"),
+        },
+        .{
+            .path = try std.testing.allocator.dupe(u8, "src/fts_ranker.zig"),
+            .start_line = 49,
+            .end_line = 96,
+            .score = 300,
+            .source = .module_entrypoint,
+            .reasons = try std.testing.allocator.dupe(u8, "module_entrypoint,symbol=rank"),
+        },
+    };
+    defer for (input) |candidate| candidate.deinit(std.testing.allocator);
+    var merged = try mergeCandidates(std.testing.allocator, &input, .{ .max_lines_per_range = 80 });
+    defer freeCandidates(std.testing.allocator, &merged);
+    try std.testing.expectEqual(@as(usize, 2), merged.items.len);
+    try std.testing.expectEqual(CandidateSource.module_entrypoint, merged.items[0].source);
+    try std.testing.expectEqual(@as(usize, 49), merged.items[0].start_line);
+}
+
 test "symbol ranking promotes public entrypoints from relevant modules" {
     var result = try rankForPrompt(std.testing.allocator, std.testing.io, "collect_evidence funcao responsavel coleta evidencias", .symbol, .{
         .max_ranges = 6,
@@ -980,24 +1018,24 @@ test "ranking with rg finds collect evidence implementation without raw output a
 }
 
 test "ranking still uses rg when path-name candidates saturate first slots" {
-    const decoys = [_][]const u8{
-        "ambiguous_symbol_decoy_1.txt",
-        "ambiguous_symbol_decoy_2.txt",
-        "ambiguous_symbol_decoy_3.txt",
-        "ambiguous_symbol_decoy_4.txt",
-        "ambiguous_symbol_decoy_5.txt",
-        "ambiguous_symbol_decoy_6.txt",
-    };
+    const term = "ambiguous" ++ "_" ++ "symbol";
+    var decoy_bufs: [6][64]u8 = undefined;
+    var decoys: [6][]const u8 = undefined;
+    for (&decoy_bufs, 0..) |*buf, i| {
+        decoys[i] = try std.fmt.bufPrint(buf, "{s}_decoy_{}.txt", .{ term, i + 1 });
+    }
     for (decoys) |path| {
         try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "decoy\n" });
     }
     defer for (decoys) |path| std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
     const target = "zz_rg_target.txt";
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = target, .data = "fn ambiguous_symbol() void {}\n" });
+    var target_data_buf: [96]u8 = undefined;
+    const target_data = try std.fmt.bufPrint(&target_data_buf, "fn {s}() void {{}}\n", .{term});
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = target, .data = target_data });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, target) catch {};
 
-    var ranked = try rankForPrompt(std.testing.allocator, std.testing.io, "ambiguous_symbol", .lexical, .{ .max_candidates = 4, .max_ranges = 4 });
+    var ranked = try rankForPrompt(std.testing.allocator, std.testing.io, term, .lexical, .{ .max_candidates = 4, .max_ranges = 4 });
     defer ranked.deinit(std.testing.allocator);
 
     try std.testing.expect(ranked.rg_invocations > 0);

@@ -22,17 +22,20 @@ pub const Command = enum {
 pub const Config = struct {
     command: Command = .help,
     session: []const u8 = "default",
+    session_provided: bool = false,
     prompt: []const u8 = "",
     prompt_provided: bool = false,
     host: []const u8 = "127.0.0.1:11434",
     model: []const u8 = "llama3.2",
     backend: Backend = .ollama,
-    max_tokens: u16 = 512,
+    max_tokens: u16 = 4096,
     thinking: ThinkingMode = .auto,
     no_color: bool = false,
     offline: bool = false,
     fail_on_model_error: bool = false,
     expect_contains: ?[]const u8 = null,
+    expect_contains_all: [8]?[]const u8 = [_]?[]const u8{null} ** 8,
+    expect_contains_count: usize = 0,
     show_expect_status: bool = false,
     demo_read_file: ?[]const u8 = null,
 };
@@ -66,6 +69,7 @@ pub fn parseArgsWithBase(base: Config, args: []const []const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingSession;
             cfg.session = args[i];
+            cfg.session_provided = true;
         } else if (std.mem.eql(u8, arg, "--prompt")) {
             i += 1;
             if (i >= args.len) return error.MissingPrompt;
@@ -109,6 +113,9 @@ pub fn parseArgsWithBase(base: Config, args: []const []const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingExpectedText;
             cfg.expect_contains = args[i];
+            if (cfg.expect_contains_count >= cfg.expect_contains_all.len) return error.TooManyExpectedText;
+            cfg.expect_contains_all[cfg.expect_contains_count] = args[i];
+            cfg.expect_contains_count += 1;
         } else if (std.mem.eql(u8, arg, "--show-expect-status")) {
             cfg.show_expect_status = true;
         } else if (std.mem.eql(u8, arg, "--demo-read-file")) {
@@ -185,6 +192,7 @@ test "parse chat args" {
     const cfg = try parseArgs(args);
     try std.testing.expectEqual(Command.chat, cfg.command);
     try std.testing.expect(std.mem.eql(u8, cfg.session, "s1"));
+    try std.testing.expect(cfg.session_provided);
     try std.testing.expect(std.mem.eql(u8, cfg.prompt, "ola"));
     try std.testing.expect(cfg.prompt_provided);
     try std.testing.expectEqual(Backend.llamacpp, cfg.backend);
@@ -198,6 +206,7 @@ test "parse chat without prompt enables interactive mode" {
     const cfg = try parseArgs(args);
     try std.testing.expectEqual(Command.chat, cfg.command);
     try std.testing.expect(cfg.offline);
+    try std.testing.expect(!cfg.session_provided);
     try std.testing.expect(!cfg.prompt_provided);
     try std.testing.expectEqualStrings("", cfg.prompt);
 }
@@ -207,6 +216,17 @@ test "parse expected visible output assertion" {
     const cfg = try parseArgs(args);
     try std.testing.expectEqual(Command.chat, cfg.command);
     try std.testing.expectEqualStrings("PHENOM_REAL_7319", cfg.expect_contains.?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.expect_contains_count);
+    try std.testing.expectEqualStrings("PHENOM_REAL_7319", cfg.expect_contains_all[0].?);
+}
+
+test "parse repeated expected visible output assertions" {
+    const args = &.{ "phenom", "chat", "--prompt", "ola", "--expect-contains", "one", "--expect-contains", "two" };
+    const cfg = try parseArgs(args);
+    try std.testing.expectEqualStrings("two", cfg.expect_contains.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.expect_contains_count);
+    try std.testing.expectEqualStrings("one", cfg.expect_contains_all[0].?);
+    try std.testing.expectEqualStrings("two", cfg.expect_contains_all[1].?);
 }
 
 test "parse visible expectation status flag" {

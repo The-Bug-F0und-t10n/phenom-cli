@@ -93,8 +93,12 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: Args) !Result {
 pub fn executeCandidates(allocator: std.mem.Allocator, io: std.Io, args: Args) !CandidateResult {
     if (args.budget_bytes == 0) return error.InvalidEvidenceBudget;
     const strategy = contracts.resolveCollectEvidenceStrategy(args.strategy) orelse return error.InvalidStrategy;
-    const search_terms = try renderSearchTerms(allocator, args);
+    var search_terms = try renderSearchTerms(allocator, args);
     defer allocator.free(search_terms);
+    if (search_terms.len == 0) {
+        allocator.free(search_terms);
+        search_terms = try allocator.dupe(u8, std.mem.trim(u8, args.task, " \t\r\n"));
+    }
     if (search_terms.len == 0) return error.MissingTerms;
     var ranked = try evidence_ranker.rankForPrompt(allocator, io, search_terms, strategy, .{
         .max_ranges = 6,
@@ -597,6 +601,18 @@ test "collect evidence candidates render module entrypoint signature" {
     var result = try executeCandidates(std.testing.allocator, std.testing.io, .{
         .intent = "find collect_evidence executor",
         .terms = "collect_evidence funcao responsavel coleta evidencias",
+        .strategy = .symbol,
+        .budget_bytes = 6000,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "source=module_entrypoint") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "def: pub fn execute(") != null);
+}
+
+test "collect evidence candidates can fall back to task when model omits terms" {
+    var result = try executeCandidates(std.testing.allocator, std.testing.io, .{
+        .task = "collect_evidence funcao responsavel coleta evidencias",
         .strategy = .symbol,
         .budget_bytes = 6000,
     });
