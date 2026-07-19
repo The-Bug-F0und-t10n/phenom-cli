@@ -34,7 +34,7 @@ Flags:
 - `--backend ollama|llamacpp`: seleciona backend HTTP.
 - `--host HOST:PORT`: host do backend.
 - `--model MODEL`: nome do modelo enviado ao backend.
-- `--max-tokens N`: limite de geracao. Default: `512`.
+- `--max-tokens N`: limite de geracao visivel. Default: `4096`.
 - `--thinking auto|on|off`: controla template/filtro de reasoning.
 - `--no-color`: desativa ANSI colorido.
 - `--fail-on-model-error`: retorna erro se o modelo/backend falhar.
@@ -139,7 +139,7 @@ Chaves aceitas:
 - `server = "http://127.0.0.1:8080"`
 - `model = "llama3.2"`
 - `thinking = "auto"` ou `"on"` ou `"off"`
-- `max_tokens = 512`
+- `max_tokens = 4096`
 - `no_color = true|false`
 - `offline = true|false`
 - `fail_on_model_error = true|false`
@@ -156,7 +156,7 @@ host = "127.0.0.1"
 port = 8080
 model = "local"
 thinking = "auto"
-max_tokens = 512
+max_tokens = 4096
 session = "dev"
 no_color = false
 ```

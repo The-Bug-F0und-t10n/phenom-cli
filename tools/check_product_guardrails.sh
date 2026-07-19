@@ -10,7 +10,14 @@ run() {
   ZIG_GLOBAL_CACHE_DIR="$CACHE" "$@"
 }
 
-sh "$ROOT/../tools/check_alignment_tasks.sh"
+if [ -x "$ROOT/tools/check_alignment_tasks.sh" ]; then
+  sh "$ROOT/tools/check_alignment_tasks.sh"
+elif [ -x "$ROOT/../tools/check_alignment_tasks.sh" ]; then
+  sh "$ROOT/../tools/check_alignment_tasks.sh"
+elif [ -f "$ROOT/TASKS.md" ]; then
+  printf 'guardrail: missing tools/check_alignment_tasks.sh\n' >&2
+  exit 1
+fi
 run "$ZIG" test "$ROOT/src/contracts.zig"
 run "$ZIG" test "$ROOT/src/context_profile.zig"
 run "$ZIG" test "$ROOT/src/model_context.zig" -lc -lsqlite3

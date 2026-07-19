@@ -6,6 +6,11 @@ package-lock.json
 dist/
 zig-out/
 .zig-cache/
+zig-cache/
+bin/zig-index.json
+bin/zig-x86_64-linux-0.16.0/
+bin/zig-cache/
+graph.html
 phenom-zig/zig-out/
 phenom-zig/.zig-cache/
 

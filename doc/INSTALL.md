@@ -92,7 +92,7 @@ host = "127.0.0.1"
 port = 8080
 model = "local"
 thinking = "auto"
-max_tokens = 512
+max_tokens = 4096
 session = "default"
 ```
 
