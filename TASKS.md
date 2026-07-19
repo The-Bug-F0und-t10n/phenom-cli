@@ -11216,3 +11216,56 @@ Invariantes afetadas:
 Risco residual:
 
 - O reparo de prosa ainda usa sinais textuais conservadores para bloquear claims sem evidencia; novas frases ambiguas podem exigir mais um teste de regressao.
+
+## T317 - Permitir resposta final apos overview suficiente
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: perguntas amplas como `o que o projeto em cwd implementa ?` continuavam falhando com `[MODEL_PROTOCOL_ERROR] required follow-up tool_call missing after repair` mesmo depois de `collect_evidence stage=overview` retornar README.md com descricao direta do projeto. A causa raiz era a politica `shouldRequireOverviewRefinement`: todo overview inicial com budget restante virava `required_tool_calls=1`, mesmo quando a evidencia de overview era exatamente a resposta correta para uma pergunta de mapa geral.
+
+Regra de negocio preservada:
+
+- Workspace/code claims ainda exigem E#.
+- Overview continua sendo mapa estrutural.
+- Se o overview nao cobrir a pergunta, o modelo ainda pode emitir coleta focada.
+- Se o overview vier vazio/sem qualidade, o controller ainda exige nova coleta quando houver budget.
+- Nao foi adicionada heuristica por texto do usuario.
+
+Passos de implementacao:
+
+1. Remover a obrigacao cega `state.shouldRequireExploratoryRefinement(null)` do fluxo de overview.
+2. Fazer `shouldRequireOverviewRefinement` exigir follow-up somente quando `quality_score <= 0` e ainda houver budget.
+3. Atualizar o teste que codificava o bug para validar que `quality_score=48` pode responder.
+4. Rodar suite principal, build release, guardrails e smoke real com o prompt exato reportado.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: `shouldRequireOverviewRefinement` agora bloqueia apenas overview sem qualidade util, nao overview normal com README/doc/build.
+- `phenom-zig/src/main.zig`: teste renomeado para `overview evidence can answer broad workspace map without forced follow-up`.
+
+Criterio de aceite:
+
+- `collect_evidence stage=overview` com evidencia media deve gerar contexto com `required_tool_calls=0`.
+- O modelo pode responder com base em E# sem segunda tool obrigatoria.
+- O erro `[MODEL_PROTOCOL_ERROR] required follow-up tool_call missing after repair` nao deve aparecer no prompt `o que o projeto em cwd implementa ?`.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-overview-answer-main` -> passou; 310 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
+- `bash tools/check_product_guardrails.sh` -> passou.
+- Smoke real: `./zig-out/bin/phenom chat --session overview-answer-20260719 --prompt "o que o projeto em cwd implementa ?" --max-tokens 500 --no-color --fail-on-model-error` -> passou; respondeu sobre Phenom Zig com base no overview.
+- Audit do smoke: `tool_start=1` (`collect_evidence stage=overview`), `tool_repair=0`, `tool_loop_stop=0`, `empty_visible_answer=0`, `required_tool_calls=1` no contexto = 0.
+
+Invariantes afetadas:
+
+- 1. Tool nao anunciada nunca executa: preservada.
+- 2. Contexto bruto nao vaza para o modelo: preservada.
+- 6. Falha de modelo nao parece falha de infraestrutura: corrigida; resposta direta apos overview nao vira erro protocolar.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; smoke registra eventos limpos.
+
+Risco residual:
+
+- Overview pode responder perguntas amplas; perguntas de identidade simbolica ainda dependem do modelo obedecer `stage=candidates` ou do reparo posterior detectar resposta sem suporte.

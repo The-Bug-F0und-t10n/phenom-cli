@@ -1533,7 +1533,7 @@ fn runCollectEvidenceOverviewStep(
 }
 
 fn shouldRequireOverviewRefinement(state: *const ToolLoopState, quality_score: i32) bool {
-    return state.shouldAllowMoreEvidence() and (quality_score < weak_evidence_quality_score or state.shouldRequireExploratoryRefinement(null));
+    return state.shouldAllowMoreEvidence() and quality_score <= 0;
 }
 
 fn selectedCandidateForProtocolFallback(state: *const ToolLoopState) ?[]const u8 {
@@ -4785,14 +4785,15 @@ test "collected evidence context can require a follow-up collection" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
 }
 
-test "overview evidence requires focused follow-up while budget remains" {
+test "overview evidence can answer broad workspace map without forced follow-up" {
     var state = ToolLoopState.init(std.testing.allocator);
     defer state.deinit();
 
-    try std.testing.expect(shouldRequireOverviewRefinement(&state, 48));
-    try std.testing.expect(shouldRequireOverviewRefinement(&state, weak_evidence_quality_score));
-    state.forced_exploratory_refinements = 1;
+    try std.testing.expect(shouldRequireOverviewRefinement(&state, 0));
+    try std.testing.expect(!shouldRequireOverviewRefinement(&state, 48));
     try std.testing.expect(!shouldRequireOverviewRefinement(&state, weak_evidence_quality_score));
+    state.forced_exploratory_refinements = 1;
+    try std.testing.expect(!shouldRequireOverviewRefinement(&state, 48));
 }
 
 test "model evidence includes micro context id for patch safety" {
