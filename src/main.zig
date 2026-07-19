@@ -335,14 +335,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             if (!handled_by_tool_loop) try sink.flushDeferredVisible();
         }
         if (sink.visible_bytes == 0) {
-            if (ui_ptr) |active_ui| try active_ui.showStatus("no visible answer; server stopped before visible content or unclosed thinking");
-            if (sink.completion_stop_reason == .length) {
-                try sink.emitVisibleText("[MODEL_STOP] server ended generation before a visible final answer.");
-                try db.recordEvent(config.session, "empty_visible_answer", "server_length_stop_before_visible_answer");
-            } else {
-                try sink.emitVisibleText(required_tool_missing_answer);
-                try db.recordEvent(config.session, "empty_visible_answer", "reasoning_suppressed_or_unclosed");
-            }
+            try emitEmptyVisibleAnswer(&sink);
         }
         for (0..config.expect_contains_count) |expect_idx| {
             const expected = config.expect_contains_all[expect_idx] orelse continue;
@@ -602,6 +595,36 @@ const max_pathless_collect_budget: usize = 6 * 1024;
 const max_model_context_send_bytes: usize = 24 * 1024;
 const weak_evidence_quality_score: i32 = 64;
 const required_tool_missing_answer = "[MODEL_PROTOCOL_ERROR] required follow-up tool_call missing after repair; no final evidence was selected.";
+
+fn emitEmptyVisibleAnswer(sink: *StreamSink) !void {
+    if (sink.ui) |active_ui| try active_ui.showStatus("no visible final answer; see diagnostic");
+    const message = try renderEmptyVisibleAnswerMessage(sink.allocator, sink);
+    defer sink.allocator.free(message);
+    try sink.emitVisibleText(message);
+    try sink.db.recordEvent(sink.session, "empty_visible_answer", message);
+}
+
+fn renderEmptyVisibleAnswerMessage(allocator: std.mem.Allocator, sink: *const StreamSink) ![]u8 {
+    if (sink.completion_stop_reason == .length) {
+        return std.fmt.allocPrint(
+            allocator,
+            "[MODEL_STOP] server_stop=length before visible final answer; hidden_reasoning_bytes={} raw_model_bytes={}",
+            .{ sink.thinking_bytes, sink.raw_model.items.len },
+        );
+    }
+    if (sink.thinking_bytes > 0) {
+        return std.fmt.allocPrint(
+            allocator,
+            "[MODEL_EMPTY_ANSWER] no visible final answer; hidden_reasoning_bytes={} raw_model_bytes={} stop_reason={s}",
+            .{ sink.thinking_bytes, sink.raw_model.items.len, @tagName(sink.completion_stop_reason) },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "[MODEL_EMPTY_ANSWER] no visible final answer; raw_model_bytes={} stop_reason={s}",
+        .{ sink.raw_model.items.len, @tagName(sink.completion_stop_reason) },
+    );
+}
 
 const ToolLoopNext = union(enum) {
     final_answer,
@@ -2706,6 +2729,7 @@ fn streamDeferredToolLoopTurnInternal(
             }
             if (repair_message.len == 0) {
                 try db.recordEvent(config.session, "tool_loop_stop", "required follow-up tool call missing after repair");
+                try aggregate_sink.emitVisibleText(required_tool_missing_answer);
                 return .stopped;
             }
             follow_sink.discardDeferredVisible();
@@ -3188,7 +3212,7 @@ fn renderRestoredSession(
             restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "empty_visible_answer")) {
             try flushRestoredAssistant(&bus, &restored_assistant);
-            try bus.emit(.{ .progress_update = "model emitted no visible final answer; reasoning was suppressed or generation ended inside <think>" });
+            try bus.emit(.{ .progress_update = event.body });
             restored_turn_open = true;
         } else if (std.mem.eql(u8, event.kind, "expectation_failed")) {
             try flushRestoredAssistant(&bus, &restored_assistant);
@@ -4146,6 +4170,70 @@ test "deferred stream sink can discard protocol violating prose" {
     try std.testing.expectEqual(@as(usize, 0), sink.raw_visible.items.len);
     try sink.flushDeferredVisible();
     try std.testing.expectEqual(@as(usize, 0), sink.visible_bytes);
+}
+
+test "empty visible answer reports root cause without protocol error" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var recorder = EventRecorder{};
+    try bus.on(&recorder, EventRecorder.handleOpaque);
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "empty-visible",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, true),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = true,
+    };
+    defer sink.deinit();
+
+    try sink.raw_model.appendSlice(std.testing.allocator, "<think>only hidden reasoning");
+    sink.thinking_bytes = 27;
+    try emitEmptyVisibleAnswer(&sink);
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
+    try std.testing.expect(std.mem.indexOf(u8, sink.visible.items, "[MODEL_EMPTY_ANSWER]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.visible.items, "hidden_reasoning_bytes=27") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.visible.items, "[MODEL_PROTOCOL_ERROR]") == null);
+}
+
+test "server length stop reports server stop not protocol error" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "server-length",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, true),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 12,
+        .defer_visible = true,
+        .completion_stop_reason = .length,
+    };
+    defer sink.deinit();
+
+    try sink.raw_model.appendSlice(std.testing.allocator, "<think>cut");
+    const message = try renderEmptyVisibleAnswerMessage(std.testing.allocator, &sink);
+    defer std.testing.allocator.free(message);
+
+    try std.testing.expect(std.mem.indexOf(u8, message, "[MODEL_STOP]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "server_stop=length") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "[MODEL_PROTOCOL_ERROR]") == null);
 }
 
 test "initial context repair preserves context and asks for intent terms split" {
