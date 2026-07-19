@@ -761,6 +761,7 @@ fn outputCitesMissingWorkspaceEvidence(output: []const u8, context: ?[]const u8)
 fn outputNeedsWorkspaceEvidenceRepair(output: []const u8, context: ?[]const u8, allowed_tools: []const []const u8) bool {
     if (contextHasSection(context, "[EVIDENCE]")) return false;
     if (outputDefersAvailableInitialWorkspaceCollection(output, context, allowed_tools)) return true;
+    if (outputDeclinesAvailableWorkspaceEvidence(output, allowed_tools)) return true;
     if (containsCitation(output, 'E')) return true;
     if (outputClaimsEvidenceWithoutBlock(output)) return true;
     return outputMentionsAllowedTool(output, allowed_tools);
@@ -813,10 +814,25 @@ fn outputRequestsMoreEvidence(output: []const u8) bool {
         containsAsciiIgnoreCase(output, "additional");
 }
 
+fn outputDeclinesAvailableWorkspaceEvidence(output: []const u8, allowed_tools: []const []const u8) bool {
+    if (!toolAllowed(allowed_tools, "collect_evidence")) return false;
+    const denies =
+        containsAsciiIgnoreCase(output, "nao ha") or
+        containsAsciiIgnoreCase(output, "não há") or
+        containsAsciiIgnoreCase(output, "sem") or
+        containsAsciiIgnoreCase(output, "no ") or
+        containsAsciiIgnoreCase(output, "not ");
+    if (!denies) return false;
+    const missing_context =
+        containsAsciiIgnoreCase(output, "evid") or
+        containsAsciiIgnoreCase(output, "contexto") or
+        containsAsciiIgnoreCase(output, "context");
+    return missing_context;
+}
+
 fn outputClaimsEvidenceWithoutBlock(output: []const u8) bool {
     return std.mem.indexOf(u8, output, "[EVIDENCE]") != null or
         std.mem.indexOf(u8, output, "EVIDENCE:") != null or
-        containsAsciiIgnoreCase(output, "evid") or
         containsCitation(output, 'L') or
         containsPathLikeToken(output);
 }
@@ -4186,6 +4202,7 @@ test "missing evidence citation requires repair before visible answer" {
         &.{"collect_evidence"},
     ));
     try std.testing.expect(!outputNeedsWorkspaceEvidenceRepair("Exemplo direto sem path nem citacao.", null, &.{"collect_evidence"}));
+    try std.testing.expect(!outputNeedsWorkspaceEvidenceRepair("Sou um assistente de IA projetado para ajudar com analise de codigo, coleta de evidencias e explicacoes tecnicas.", null, &.{"collect_evidence"}));
     const workspace_repair = try renderUnsupportedWorkspaceClaimRepairContext(std.testing.allocator, "qual funcao?");
     defer std.testing.allocator.free(workspace_repair);
     try std.testing.expect(std.mem.indexOf(u8, workspace_repair, "stage=candidates") != null);

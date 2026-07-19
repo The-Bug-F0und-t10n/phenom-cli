@@ -11160,3 +11160,59 @@ Risco residual:
 
 - O HTML e snapshot estatico; visualizacao em tempo real exigiria um modo separado com audit tail/SSE ou watcher de arquivo.
 - O grafo ainda usa parser leve existente; mais precisao exigiria Tree-sitter ou AST por linguagem, com custo e dependencia maiores.
+
+## T316 - Corrigir falso reparo de evidencia em pergunta conversacional
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: a pergunta conversacional `quem e voce?` caiu indevidamente no reparo `unsupported workspace claim without evidence`. A resposta visivel do modelo mencionava `code analysis` e `evidence collection` como capacidade do assistente; o controller tratava qualquer ocorrencia de `evid` como claim de workspace sem [EVIDENCE], disparava `collect_evidence overview`, incluia `graph.html` no overview e terminava em `[MODEL_PROTOCOL_ERROR] required follow-up tool_call missing after repair`.
+
+Regra de negocio preservada:
+
+- Perguntas de workspace/codigo ainda exigem E# antes de claims.
+- Respostas que citam E#/L# ou paths sem evidencia continuam reparadas.
+- Negar contexto/evidencia quando `collect_evidence` esta disponivel continua reparado.
+- Perguntas conversacionais simples podem ser respondidas sem tool.
+
+Passos de implementacao:
+
+1. Remover `containsAsciiIgnoreCase(output, "evid")` como gatilho generico de claim.
+2. Criar gatilho mais estreito para negativa de evidencia/contexto disponivel.
+3. Adicionar teste com a frase real do bug: assistente falando de analise de codigo/coleta de evidencias como capacidade.
+4. Marcar `graph.html` como artefato gerado do Phenom para nao entrar no inventario/coleta.
+5. Ignorar `phenom-zig/graph.html` no `.gitignore` raiz.
+6. Rodar testes, build, guardrails e smoke real com a pergunta quebrada.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: `outputNeedsWorkspaceEvidenceRepair` agora separa claim de evidencia de negativa de evidencia/contexto; mencao comum a “evidencia” nao dispara reparo sozinha.
+- `phenom-zig/src/workspace_inventory.zig`: `graph.html` rejeitado como artefato gerado local.
+- `.gitignore`: `phenom-zig/graph.html` ignorado.
+
+Criterio de aceite:
+
+- `quem e voce?` nao deve executar `collect_evidence`.
+- O turno nao deve gerar `[MODEL_PROTOCOL_ERROR]`.
+- `graph.html` gerado nao deve aparecer em overview/inventario de workspace.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/workspace_inventory.zig --cache-dir /tmp/phenom-inventory-artifact-test` -> passou; 2 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-identity-repair-main` -> passou; 310 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
+- `bash tools/check_product_guardrails.sh` -> passou.
+- Smoke real: `./zig-out/bin/phenom chat --session identity-fix-20260718 --prompt "quem e voce?" --max-tokens 160 --no-color` -> passou sem erro protocolar.
+- Audit do smoke: eventos da sessao `identity-fix-20260718` tiveram `tool_start=0`, `tool_repair=0`, `used_evidence=false`, `turn_done status=ok`.
+
+Invariantes afetadas:
+
+- 1. Tool nao anunciada nunca executa: ampliada; pergunta conversacional nao ganha tool synthetic por falso positivo.
+- 2. Contexto bruto nao vaza para o modelo: preservada.
+- 6. Falha de modelo nao parece falha de infraestrutura: corrigida para o caso conversacional.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; smoke tem audit claro.
+
+Risco residual:
+
+- O reparo de prosa ainda usa sinais textuais conservadores para bloquear claims sem evidencia; novas frases ambiguas podem exigir mais um teste de regressao.

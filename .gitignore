@@ -60,5 +60,6 @@ passou
 phenom-zig/.phenom-zig/
 phenom-zig/.phenom-history
 phenom-zig/phenom.db
+phenom-zig/graph.html
 phenom-zig/bin/
 phenom-zig/zig-cache/

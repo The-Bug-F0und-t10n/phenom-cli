@@ -133,6 +133,7 @@ pub fn isWorkspacePath(path: []const u8) bool {
     if (path.len == 0) return false;
     if (std.fs.path.isAbsolute(path)) return false;
     if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
+    if (isPhenomGeneratedArtifactPath(path)) return false;
     var it = std.mem.tokenizeAny(u8, path, "/\\");
     while (it.next()) |part| {
         if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
@@ -146,6 +147,10 @@ fn isPhenomOperationalPart(part: []const u8) bool {
         std.mem.eql(u8, part, ".phenom-context") or
         std.mem.eql(u8, part, ".phenom-sessions") or
         std.mem.eql(u8, part, ".phenom-history");
+}
+
+fn isPhenomGeneratedArtifactPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "graph.html");
 }
 
 pub fn isTextBytes(bytes: []const u8) bool {
@@ -164,6 +169,7 @@ test "workspace path policy rejects only unsafe or phenom operational paths" {
     try std.testing.expect(isWorkspacePath("vendor/package/lib.rs"));
     try std.testing.expect(isWorkspacePath("node_modules/pkg/index.js"));
     try std.testing.expect(isWorkspacePath("zig-cache/o.zig"));
+    try std.testing.expect(!isWorkspacePath("graph.html"));
     try std.testing.expect(!isWorkspacePath("../secret.txt"));
     try std.testing.expect(!isWorkspacePath(".phenom-zig/phenom.db"));
 }
