@@ -92,7 +92,7 @@ host = "127.0.0.1"
 port = 8080
 model = "local"
 thinking = "auto"
-max_tokens = 4096
+max_tokens = 4096 # legado/no-op no cliente; configure limites no servidor
 session = "default"
 ```
 

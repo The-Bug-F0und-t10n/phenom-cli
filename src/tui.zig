@@ -595,7 +595,6 @@ pub fn TerminalUi(comptime Writer: type) type {
         token_input: usize = 0,
         token_output: usize = 0,
         token_total: usize = 0,
-        token_output_limit: ?usize = null,
         token_tps: ?f64 = null,
         has_token_usage: bool = false,
         context_used_bytes: usize = 0,
@@ -706,16 +705,11 @@ pub fn TerminalUi(comptime Writer: type) type {
             self.token_input = 0;
             self.token_output = 0;
             self.token_total = 0;
-            self.token_output_limit = null;
             self.token_tps = null;
             self.has_token_usage = false;
             self.context_used_bytes = 0;
             self.context_limit_bytes = 0;
             self.has_context_usage = false;
-        }
-
-        pub fn setTokenOutputLimit(self: *Self, limit: usize) void {
-            self.token_output_limit = limit;
         }
 
         pub fn showTokenUsage(self: *Self, input: usize, output: usize, total: usize, tokens_per_second: ?f64) !void {
@@ -868,17 +862,16 @@ pub fn TerminalUi(comptime Writer: type) type {
                 var out_buf: [24]u8 = undefined;
                 const in_text = formatTokenCount(&in_buf, self.token_input);
                 const out_text = self.formatOutputTokenCount(&out_buf);
-                const limit_text = if (self.tokenOutputAtLimit()) " · max?" else "";
                 if (self.token_tps) |tps| {
                     if (seconds < 60) {
-                        return std.fmt.bufPrint(buf, "{s} ({}s · ↓ {s} in · ↑ {s} out{s} · {d:.1} tok/s · esc to interrupt)", .{ status, seconds, in_text, out_text, limit_text, tps }) catch status;
+                        return std.fmt.bufPrint(buf, "{s} ({}s · ↓ {s} in · ↑ {s} out · {d:.1} tok/s · esc to interrupt)", .{ status, seconds, in_text, out_text, tps }) catch status;
                     }
-                    return std.fmt.bufPrint(buf, "{s} ({}m {}s · ↓ {s} in · ↑ {s} out{s} · {d:.1} tok/s · esc to interrupt)", .{ status, seconds / 60, seconds % 60, in_text, out_text, limit_text, tps }) catch status;
+                    return std.fmt.bufPrint(buf, "{s} ({}m {}s · ↓ {s} in · ↑ {s} out · {d:.1} tok/s · esc to interrupt)", .{ status, seconds / 60, seconds % 60, in_text, out_text, tps }) catch status;
                 }
                 if (seconds < 60) {
-                    return std.fmt.bufPrint(buf, "{s} ({}s · ↓ {s} in · ↑ {s} out{s} · esc to interrupt)", .{ status, seconds, in_text, out_text, limit_text }) catch status;
+                    return std.fmt.bufPrint(buf, "{s} ({}s · ↓ {s} in · ↑ {s} out · esc to interrupt)", .{ status, seconds, in_text, out_text }) catch status;
                 }
-                return std.fmt.bufPrint(buf, "{s} ({}m {}s · ↓ {s} in · ↑ {s} out{s} · esc to interrupt)", .{ status, seconds / 60, seconds % 60, in_text, out_text, limit_text }) catch status;
+                return std.fmt.bufPrint(buf, "{s} ({}m {}s · ↓ {s} in · ↑ {s} out · esc to interrupt)", .{ status, seconds / 60, seconds % 60, in_text, out_text }) catch status;
             }
             if (seconds < 60) {
                 return std.fmt.bufPrint(buf, "{s} ({}s · esc to interrupt)", .{ status, seconds }) catch status;
@@ -898,17 +891,7 @@ pub fn TerminalUi(comptime Writer: type) type {
         fn formatOutputTokenCount(self: *Self, buf: *[24]u8) []const u8 {
             var used_buf: [24]u8 = undefined;
             const used = formatTokenCount(&used_buf, self.token_output);
-            if (self.token_output_limit) |limit| {
-                var limit_buf: [24]u8 = undefined;
-                const max = formatTokenCount(&limit_buf, limit);
-                return std.fmt.bufPrint(buf, "{s}/{s}", .{ used, max }) catch "?";
-            }
             return std.fmt.bufPrint(buf, "{s}", .{used}) catch "?";
-        }
-
-        fn tokenOutputAtLimit(self: *Self) bool {
-            const limit = self.token_output_limit orelse return false;
-            return limit > 0 and self.token_output >= limit;
         }
 
         fn resyncScrollRegion(self: *Self) !void {
@@ -1229,7 +1212,7 @@ test "status bar formats real token usage without accumulating" {
     try std.testing.expect(std.mem.indexOf(u8, updated, "3.9k") == null);
 }
 
-test "status bar shows output token limit when known" {
+test "status bar does not fabricate output token limit" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
     const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
@@ -1237,13 +1220,12 @@ test "status bar shows output token limit when known" {
     defer ui.deinit();
     ui.status_running.store(true, .release);
     ui.status_started_ms = monotonicMs() - 1000;
-    ui.setTokenOutputLimit(64);
     try ui.showTokenUsage(1200, 64, 1264, null);
 
     var status_buf: [192]u8 = undefined;
     const status = ui.formatStatus("Responding", &status_buf);
-    try std.testing.expect(std.mem.indexOf(u8, status, "↑ 64/64 out") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "max?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "↑ 64 out") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "max?") == null);
 }
 
 test "status bar shows model context usage on the right" {

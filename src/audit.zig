@@ -78,6 +78,8 @@ pub const AuditDb = struct {
             \\  body text not null,
             \\  created_at text not null default current_timestamp
             \\);
+            \\create index if not exists events_session_id_idx on events(session, id);
+            \\create index if not exists events_session_kind_id_idx on events(session, kind, id);
         );
         try audit.exec(
             \\create table if not exists input_history (
@@ -146,6 +148,10 @@ pub const AuditDb = struct {
 
     fn ensureSessionFts(self: *AuditDb) !void {
         try self.exec(
+            \\create table if not exists audit_meta (
+            \\  key text primary key,
+            \\  value text not null
+            \\);
             \\create virtual table if not exists events_fts using fts5(
             \\  session,
             \\  kind,
@@ -170,7 +176,40 @@ pub const AuditDb = struct {
             \\  values (new.id, new.session, new.kind, new.body, new.created_at);
             \\end;
         );
-        self.exec("insert into events_fts(events_fts) values('rebuild');") catch {};
+        if (!try self.hasMeta("events_fts_rebuild_v1")) {
+            self.exec("insert into events_fts(events_fts) values('rebuild');") catch {};
+            try self.setMeta("events_fts_rebuild_v1", "done");
+        }
+    }
+
+    fn hasMeta(self: *AuditDb, key: []const u8) !bool {
+        const sql = "select 1 from audit_meta where key = ?1 limit 1";
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        try bindText(stmt, 1, key);
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) return true;
+        if (rc == c.SQLITE_DONE) return false;
+        return error.SqliteStepFailed;
+    }
+
+    fn setMeta(self: *AuditDb, key: []const u8, value: []const u8) !void {
+        const sql = "insert or replace into audit_meta(key, value) values (?1, ?2)";
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        try bindText(stmt, 1, key);
+        try bindText(stmt, 2, value);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteStepFailed;
     }
 
     pub fn recordToolEventSummary(self: *AuditDb, session: []const u8, event: tool_event.ToolEvent) !void {
@@ -445,9 +484,27 @@ pub const AuditDb = struct {
             \\  select coalesce(min(id), (select coalesce(max(id) + 1, 0) from events where session = ?1))
             \\  from recent_turns
             \\)
-            \\select kind, body, cast(strftime('%s', created_at) as integer)
+            \\select kind,
+            \\  case
+            \\    when kind = 'evidence' and length(body) > 8192 then substr(body, 1, 8192) || char(10) || '[restore truncated]'
+            \\    else body
+            \\  end,
+            \\  cast(strftime('%s', created_at) as integer)
             \\from events, lower_bound
-            \\where session = ?1 and events.id >= lower_bound.id and kind != 'assistant_thinking_delta'
+            \\where session = ?1
+            \\  and events.id >= lower_bound.id
+            \\  and kind in (
+            \\    'turn_start',
+            \\    'assistant_delta',
+            \\    'assistant_offline_stub',
+            \\    'tool_start',
+            \\    'evidence',
+            \\    'model_error',
+            \\    'empty_visible_answer',
+            \\    'expectation_failed',
+            \\    'expectation_passed',
+            \\    'turn_done'
+            \\  )
             \\order by events.id asc
         ;
         const z_sql = try self.allocator.dupeZ(u8, sql);
@@ -925,6 +982,37 @@ test "recent session turn events restore newest turns despite old event flood" {
     try std.testing.expectEqualStrings("pergunta nova depois de reabrir", events.items[0].body);
     try std.testing.expectEqualStrings("resposta nova recuperavel", events.items[1].body);
     try std.testing.expectEqualStrings("turn_done", events.items[2].kind);
+}
+
+test "recent session turn events skip non-rendered payload and truncate evidence" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordEvent("s1", "turn_start", "pergunta");
+    try db.recordEvent("s1", "model_context", "contexto operacional grande que nao aparece no restore");
+    try db.recordEvent("s1", "candidate_context", "candidatos internos");
+    try db.recordEvent("s1", "assistant_delta", "resposta");
+
+    var evidence_body = std.ArrayList(u8).empty;
+    defer evidence_body.deinit(std.testing.allocator);
+    try evidence_body.appendSlice(std.testing.allocator, "[EVIDENCE]\n");
+    while (evidence_body.items.len <= 9000) {
+        try evidence_body.appendSlice(std.testing.allocator, "linha de evidencia muito longa\n");
+    }
+    try db.recordEvent("s1", "evidence", evidence_body.items);
+    try db.recordEvent("s1", "turn_done", "status=ok");
+
+    var events = try db.loadRecentSessionTurnEvents(std.testing.allocator, "s1", 1);
+    defer freeAuditEvents(std.testing.allocator, &events);
+
+    try std.testing.expectEqual(@as(usize, 4), events.items.len);
+    try std.testing.expectEqualStrings("turn_start", events.items[0].kind);
+    try std.testing.expectEqualStrings("assistant_delta", events.items[1].kind);
+    try std.testing.expectEqualStrings("evidence", events.items[2].kind);
+    try std.testing.expectEqualStrings("turn_done", events.items[3].kind);
+    try std.testing.expect(events.items[2].body.len < evidence_body.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, events.items[2].body, "[restore truncated]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events.items[2].body, "contexto operacional") == null);
 }
 
 test "session fts searches body by session and excludes current prompt" {

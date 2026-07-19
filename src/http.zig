@@ -14,7 +14,6 @@ pub const LocalModelClient = struct {
     host: []const u8,
     backend: cli.Backend,
     model: []const u8,
-    max_tokens: u16 = 4096,
     thinking: cli.ThinkingMode = .auto,
     last_http_status: ?u16 = null,
     last_http_body_snippet: ?[]u8 = null,
@@ -169,8 +168,8 @@ pub const LocalModelClient = struct {
                 defer self.allocator.free(escaped_chat_prompt);
                 break :blk try std.fmt.allocPrint(
                     self.allocator,
-                    "{{\"stream\":true,\"prompt\":\"{s}\",\"temperature\":0.2,\"n_predict\":{},\"stop\":[\"<|im_end|>\"]}}",
-                    .{ escaped_chat_prompt, self.max_tokens },
+                    "{{\"stream\":true,\"prompt\":\"{s}\",\"temperature\":0.2,\"stop\":[\"<|im_end|>\"]}}",
+                    .{escaped_chat_prompt},
                 );
             },
         };
@@ -199,8 +198,8 @@ pub const LocalModelClient = struct {
         try messages.appendSlice(self.allocator, "\"}");
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"model\":\"{s}\",\"stream\":true,\"messages\":[{s}],\"options\":{{\"temperature\":0.2,\"num_predict\":{}}}}}",
-            .{ escaped_model, messages.items, self.max_tokens },
+            "{{\"model\":\"{s}\",\"stream\":true,\"messages\":[{s}],\"options\":{{\"temperature\":0.2}}}}",
+            .{ escaped_model, messages.items },
         );
     }
 
@@ -1066,7 +1065,6 @@ test "llamacpp request body is valid utf8 when context has malformed bytes" {
         .host = "127.0.0.1:11434",
         .backend = .llamacpp,
         .model = "phenom:latest",
-        .max_tokens = 64,
         .thinking = .off,
     };
     const body = try client.buildBodyForInput(.{
@@ -1127,7 +1125,6 @@ test "llamacpp body uses qwopus chat template with thinking disabled" {
         .host = "127.0.0.1:11434",
         .backend = .llamacpp,
         .model = "phenom:latest",
-        .max_tokens = 64,
         .thinking = .off,
     };
     const body = try client.buildBody("ola");
@@ -1139,7 +1136,7 @@ test "llamacpp body uses qwopus chat template with thinking disabled" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stop\":[\"<|im_end|>\"]") != null);
 }
 
-test "default output budget is not the batch size" {
+test "request body does not set generation token limit" {
     var llama_client = LocalModelClient{
         .allocator = std.testing.allocator,
         .host = "127.0.0.1:11434",
@@ -1149,7 +1146,7 @@ test "default output budget is not the batch size" {
     };
     const llama_body = try llama_client.buildBody("explique com detalhes");
     defer std.testing.allocator.free(llama_body);
-    try std.testing.expect(std.mem.indexOf(u8, llama_body, "\"n_predict\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llama_body, "\"n_predict\"") == null);
 
     var ollama_client = LocalModelClient{
         .allocator = std.testing.allocator,
@@ -1160,7 +1157,7 @@ test "default output budget is not the batch size" {
     };
     const ollama_body = try ollama_client.buildBody("explique com detalhes");
     defer std.testing.allocator.free(ollama_body);
-    try std.testing.expect(std.mem.indexOf(u8, ollama_body, "\"num_predict\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ollama_body, "\"num_predict\"") == null);
 }
 
 test "llamacpp thinking on opens reasoning block" {
@@ -1169,7 +1166,6 @@ test "llamacpp thinking on opens reasoning block" {
         .host = "127.0.0.1:11434",
         .backend = .llamacpp,
         .model = "phenom:latest",
-        .max_tokens = 64,
         .thinking = .on,
     };
     const body = try client.buildBody("analise este bug");
@@ -1184,7 +1180,6 @@ test "ollama body includes model context in system message" {
         .host = "127.0.0.1:11434",
         .backend = .ollama,
         .model = "phenom:latest",
-        .max_tokens = 64,
         .thinking = .off,
     };
     const body = try client.buildBodyForInput(.{
@@ -1208,7 +1203,6 @@ test "ollama body includes recent dialogue as real chat roles" {
         .host = "127.0.0.1:11434",
         .backend = .ollama,
         .model = "phenom:latest",
-        .max_tokens = 64,
         .thinking = .off,
     };
     const dialogue = [_]ChatMessage{
@@ -1239,7 +1233,6 @@ test "llamacpp body can include model context before user request" {
         .host = "127.0.0.1:11434",
         .backend = .llamacpp,
         .model = "phenom:latest",
-        .max_tokens = 64,
         .thinking = .off,
     };
     const body = try client.buildBodyForInput(.{
@@ -1261,7 +1254,6 @@ test "llamacpp body includes recent dialogue before current user request" {
         .host = "127.0.0.1:11434",
         .backend = .llamacpp,
         .model = "phenom:latest",
-        .max_tokens = 64,
         .thinking = .off,
     };
     const dialogue = [_]ChatMessage{

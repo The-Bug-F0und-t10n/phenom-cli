@@ -203,7 +203,6 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
 
     if (ui_ptr) |active_ui| {
         active_ui.clearTokenUsage();
-        active_ui.setTokenOutputLimit(config.max_tokens);
     }
     const turn_started_ms = ui_events.monotonicMillis();
     try db.recordEvent(config.session, "turn_start", prompt);
@@ -242,7 +241,6 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             .host = config.host,
             .backend = config.backend,
             .model = config.model,
-            .max_tokens = config.max_tokens,
             .thinking = config.thinking,
         };
         defer client.deinit();
@@ -259,7 +257,6 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             .thinking_bytes = 0,
             .defer_visible = enable_tool_loop,
             .trim_visible_leading_whitespace = false,
-            .output_limit = config.max_tokens,
         };
         defer sink.deinit();
         const model_context_text = try buildInitialModelContext(
@@ -338,9 +335,14 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             if (!handled_by_tool_loop) try sink.flushDeferredVisible();
         }
         if (sink.visible_bytes == 0) {
-            if (ui_ptr) |active_ui| try active_ui.showStatus("no visible answer; thinking or max tokens");
-            try sink.emitVisibleText(required_tool_missing_answer);
-            try db.recordEvent(config.session, "empty_visible_answer", "reasoning_suppressed_or_unclosed");
+            if (ui_ptr) |active_ui| try active_ui.showStatus("no visible answer; server stopped before visible content or unclosed thinking");
+            if (sink.completion_stop_reason == .length) {
+                try sink.emitVisibleText("[MODEL_STOP] server ended generation before a visible final answer.");
+                try db.recordEvent(config.session, "empty_visible_answer", "server_length_stop_before_visible_answer");
+            } else {
+                try sink.emitVisibleText(required_tool_missing_answer);
+                try db.recordEvent(config.session, "empty_visible_answer", "reasoning_suppressed_or_unclosed");
+            }
         }
         for (0..config.expect_contains_count) |expect_idx| {
             const expected = config.expect_contains_all[expect_idx] orelse continue;
@@ -367,13 +369,12 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
                 try events.emit(.{ .progress_update = message });
             }
         }
-        const final_status = if (sink.hitGenerationLimit()) blk: {
-            const message = try std.fmt.allocPrint(allocator, "generation stopped at output limit (--max-tokens {})", .{config.max_tokens});
+        if (sink.completion_stop_reason != .unknown) {
+            const message = try std.fmt.allocPrint(allocator, "server_stop reason={s}", .{@tagName(sink.completion_stop_reason)});
             defer allocator.free(message);
-            try events.emit(.{ .progress_update = message });
             try db.recordEvent(config.session, "model_stop", message);
-            break :blk "output_limit";
-        } else "ok";
+        }
+        const final_status = "ok";
         try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, final_status, prompt, sink.visible.items);
     }
 }
@@ -563,9 +564,9 @@ fn buildInitialModelContext(
             .kind = .collect_context,
             .required_tool_calls = 0,
             .text = if (focus_text != null)
-                "SESSION_FOCUS is routing context, not evidence. Do not make project/workspace/code claims without collect_evidence. Broad map uses collect_evidence stage=overview; prior-session facts use search_session; otherwise answer directly."
+                "SESSION_FOCUS routes only. Cite collect_evidence for workspace/code claims; stage=overview for broad maps. Use search_session for prior-session facts. Otherwise answer."
             else
-                "Do not make project/workspace/code claims without collect_evidence. Broad map uses collect_evidence stage=overview. Prior-session facts use search_session. Otherwise answer directly.",
+                "Cite collect_evidence for workspace/code claims; stage=overview for broad maps. Use search_session for prior-session facts. Otherwise answer.",
         } else .{
             .kind = .answer_directly,
             .required_tool_calls = 0,
@@ -763,8 +764,7 @@ fn outputNeedsWorkspaceEvidenceRepair(output: []const u8, context: ?[]const u8, 
     if (outputDefersAvailableInitialWorkspaceCollection(output, context, allowed_tools)) return true;
     if (outputDeclinesAvailableWorkspaceEvidence(output, allowed_tools)) return true;
     if (containsCitation(output, 'E')) return true;
-    if (outputClaimsEvidenceWithoutBlock(output)) return true;
-    return outputMentionsAllowedTool(output, allowed_tools);
+    return outputClaimsEvidenceWithoutBlock(output);
 }
 
 fn outputDefersAvailableInitialWorkspaceCollection(output: []const u8, context: ?[]const u8, allowed_tools: []const []const u8) bool {
@@ -2571,7 +2571,6 @@ fn streamSearchPlanTurn(
         .thinking_bytes = 0,
         .defer_visible = true,
         .trim_visible_leading_whitespace = false,
-        .output_limit = config.max_tokens,
     };
     defer plan_sink.deinit();
 
@@ -2664,7 +2663,6 @@ fn streamDeferredToolLoopTurnInternal(
     active_contract: contracts.ActiveContract,
 ) !ToolLoopNext {
     if (ui_ptr) |active_ui| {
-        active_ui.setTokenOutputLimit(config.max_tokens);
         try active_ui.showStatus("Thinking");
     }
     var follow_sink = StreamSink{
@@ -2679,7 +2677,6 @@ fn streamDeferredToolLoopTurnInternal(
         .thinking_bytes = 0,
         .defer_visible = true,
         .trim_visible_leading_whitespace = false,
-        .output_limit = config.max_tokens,
     };
     defer follow_sink.deinit();
     recordModelContextBudget(allocator, db, config.session, follow_context) catch |err| {
@@ -3106,17 +3103,18 @@ fn activeToolSchema(state: *const ToolLoopState) []const u8 {
 
 fn groundingRules() []const []const u8 {
     return &.{
-        "Workspace/source-code claims must cite E# evidence from [EVIDENCE].",
-        "When quoting E#/S# excerpts, copy only text present in the evidence; put explanations outside quoted code or transcript blocks.",
-        "[CONTRACTS], [GROUNDING], and tool schemas are instructions, not evidence; never cite them as proof.",
-        "For code identity questions, only name a function/type/file when that identifier or declaration/callsite appears in E# evidence. If the collected E# does not contain the needed identifier, refine with another collect_evidence call while budget remains.",
-        "Use [RECENT_DIALOGUE] for continuity only; use [SESSION_FOCUS] only as a routing map. Exact claims about what was said or done in prior conversation must cite S# evidence from [SESSION_CONTEXT].",
-        "S# entries are retrieved session candidates, not automatically confirmed truth; judge relevance and direct support before using them.",
-        "For vague workspace/source-code tasks, infer intent, split evidence targets, and use collect_evidence terms as retrieval keys for that intent, not the user's vague wording.",
-        "Do not answer that workspace/source-code context is unavailable while collect_evidence is available; call collect_evidence first when workspace/source-code context is required.",
-        "search_session intent states what evidence to recover; search_session terms are retrieval keys for that intent, not the user's vague wording.",
-        "Do not answer that conversation history is unavailable while search_session is available; call search_session first when prior conversation context is required.",
-        "If no E#/S# supports a workspace or exact prior-session claim, say that claim is not evidenced in the provided context.",
+        "Workspace/source-code claims must cite E# from [EVIDENCE].",
+        "Quote only text present in E#/S#; explain outside quote/code blocks.",
+        "[CONTRACTS], [GROUNDING], and tool schemas are instructions, not evidence.",
+        "Code identity claims need identifier/declaration/callsite in E#; refine with collect_evidence while budget remains.",
+        "[RECENT_DIALOGUE] gives continuity; [SESSION_FOCUS] routes only. Exact prior-session claims need S# from [SESSION_CONTEXT].",
+        "S# entries are candidates; judge relevance and direct support before using them.",
+        "For vague workspace/code tasks, infer intent, split targets, and use collect_evidence terms as retrieval keys.",
+        "If workspace/code context is required and collect_evidence is available, call it before saying context is unavailable.",
+        "search_session intent says what to recover; terms are retrieval keys.",
+        "If prior conversation context is required and search_session is available, call it before saying history is unavailable.",
+        "If no E#/S# supports a workspace or exact prior-session claim, say it is not evidenced.",
+        "Non-workspace technical answers may be unverified estimates; do not collect workspace evidence for them.",
     };
 }
 
@@ -3370,9 +3368,7 @@ const StreamSink = struct {
     thinking_bytes: usize,
     defer_visible: bool = false,
     trim_visible_leading_whitespace: bool = false,
-    output_limit: usize = 0,
     completion_stop_reason: http.StopReason = .unknown,
-    output_limit_hit: bool = false,
 
     pub fn deinit(ctx: *StreamSink) void {
         ctx.filter.deinit();
@@ -3395,7 +3391,6 @@ const StreamSink = struct {
         } });
         if (ctx.ui) |ui| try ui.showTokenUsage(usage.input, usage.output, usage.total, usage.tokens_per_second);
         if (!usage.final) return;
-        if (ctx.output_limit > 0 and usage.output >= ctx.output_limit) ctx.output_limit_hit = true;
         const body = if (usage.tokens_per_second) |tps|
             try std.fmt.allocPrint(ctx.allocator, "input={} output={} total={} tokens_per_second={d:.2} exact=true final=true", .{ usage.input, usage.output, usage.total, tps })
         else
@@ -3406,16 +3401,10 @@ const StreamSink = struct {
 
     pub fn onCompletionStop(ctx: *StreamSink, stop: http.CompletionStop) !void {
         ctx.completion_stop_reason = stop.reason;
-        if (stop.reason == .length) ctx.output_limit_hit = true;
     }
 
     fn mergeGenerationStop(ctx: *StreamSink, other: StreamSink) void {
-        if (other.output_limit_hit) ctx.output_limit_hit = true;
         if (other.completion_stop_reason != .unknown) ctx.completion_stop_reason = other.completion_stop_reason;
-    }
-
-    fn hitGenerationLimit(ctx: *const StreamSink) bool {
-        return ctx.output_limit_hit or ctx.completion_stop_reason == .length;
     }
 
     pub fn flush(ctx: *StreamSink) !void {
@@ -3641,9 +3630,9 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "S1:") == null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[GROUNDING]") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "required_tool_calls=0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "SESSION_FOCUS is routing context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "SESSION_FOCUS routes only") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "search_session") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "collect_evidence stage=overview") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "stage=overview") != null);
     try std.testing.expect(!initialContextRequiresTool(with_tools));
 
     try std.testing.expect((try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test-empty", "analise esse projeto", false, true)) == null);
@@ -4128,7 +4117,7 @@ test "deferred follow-up answer emits through aggregate sink" {
     try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
     try std.testing.expectEqualStrings("resposta final", aggregate.visible.items);
     try std.testing.expectEqual(@as(usize, 0), follow.visible_bytes);
-    try std.testing.expect(aggregate.hitGenerationLimit());
+    try std.testing.expectEqual(http.StopReason.length, aggregate.completion_stop_reason);
 }
 
 test "deferred stream sink can discard protocol violating prose" {
@@ -4182,10 +4171,15 @@ test "missing evidence citation requires repair before visible answer" {
     ));
     try std.testing.expect(!outputCitesMissingContextEvidence("Resposta sem citacao numerada.", null));
     try std.testing.expect(outputCitesMissingContextEvidence("Resposta cita S2 sem sessao.", "[TURN_CONTEXT v1]\n"));
-    try std.testing.expect(outputNeedsWorkspaceEvidenceRepair("A funcao e collect_evidence.", null, &.{"collect_evidence"}));
+    try std.testing.expect(!outputNeedsWorkspaceEvidenceRepair("A funcao e collect_evidence.", null, &.{"collect_evidence"}));
     try std.testing.expect(outputNeedsWorkspaceEvidenceRepair("EVIDENCE:\n- L4: chamada inventada", null, &.{"collect_evidence"}));
     try std.testing.expect(outputNeedsWorkspaceEvidenceRepair("A funcao esta em src/clangd/SourceCode.cpp.", null, &.{"collect_evidence"}));
     try std.testing.expect(outputNeedsWorkspaceEvidenceRepair("Nao ha evidencia no contexto fornecido.", null, &.{"collect_evidence"}));
+    try std.testing.expect(!outputNeedsWorkspaceEvidenceRepair(
+        "Estimativa nao verificada: em 4-bit deve ficar acima de 16 GB de VRAM, dependendo do servidor.",
+        "[TURN_CONTEXT v1]\n\n[CONTRACTS]\ncollect_evidence(intent, terms, strategy=auto|lexical|symbol)\n",
+        &.{"collect_evidence"},
+    ));
     try std.testing.expect(outputNeedsWorkspaceEvidenceRepair(
         "Preciso que voce forneca os arquivos principais para analisar.",
         "[TURN_CONTEXT v1]\n\n[CONTRACTS]\ncollect_evidence(intent, terms, strategy=auto|lexical|symbol)\n",
@@ -4250,7 +4244,6 @@ test "tool loop prose repairs ignore hidden reasoning text" {
         .host = "127.0.0.1:1",
         .backend = .llamacpp,
         .model = "fake",
-        .max_tokens = 16,
         .thinking = .off,
     };
     defer client.deinit();
@@ -4885,9 +4878,9 @@ test "collected context can include temporary session evidence without memory" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "combinamos groundedness") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Exact claims about what was said") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "not confirmed truth") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "judge direct support") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Exact prior-session claims need S#") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "S# entries are candidates") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "direct support") != null);
 }
 
 test "session evidence context keeps focus map for corrective searches" {
@@ -4909,7 +4902,7 @@ test "session evidence context keeps focus map for corrective searches" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "topic: Mateus 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "not_evidence=true") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "concrete keys") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "not confirmed truth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "S# entries are candidates") != null);
 }
 
 test "grounding rules separate dialogue continuity from exact session evidence" {
@@ -4918,13 +4911,13 @@ test "grounding rules separate dialogue continuity from exact session evidence" 
     try std.testing.expect(hasGroundingRule(rules, "[RECENT_DIALOGUE]", "S#"));
     try std.testing.expect(hasGroundingRule(rules, "collect_evidence", "retrieval keys"));
     try std.testing.expect(hasGroundingRule(rules, "search_session", "retrieval keys"));
-    try std.testing.expect(hasGroundingRule(rules, "vague workspace/source-code tasks", "split evidence targets"));
+    try std.testing.expect(hasGroundingRule(rules, "vague workspace/code tasks", "split targets"));
     try std.testing.expect(hasGroundingRule(rules, "history is unavailable", "search_session"));
-    try std.testing.expect(hasGroundingRule(rules, "workspace/source-code context is unavailable", "collect_evidence"));
+    try std.testing.expect(hasGroundingRule(rules, "workspace/code context is required", "collect_evidence"));
     try std.testing.expect(hasGroundingRule(rules, "[CONTRACTS]", "not evidence"));
-    try std.testing.expect(hasGroundingRule(rules, "S# entries", "not automatically confirmed truth"));
+    try std.testing.expect(hasGroundingRule(rules, "S# entries", "candidates"));
     try std.testing.expect(hasGroundingRule(rules, "judge relevance", "direct support"));
-    try std.testing.expect(hasGroundingRule(rules, "copy only text present in the evidence", "outside quoted code"));
+    try std.testing.expect(hasGroundingRule(rules, "Quote only text present", "outside quote/code blocks"));
 }
 
 fn hasGroundingRule(rules: []const []const u8, a: []const u8, b: []const u8) bool {

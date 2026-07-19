@@ -148,7 +148,7 @@ pub fn printUsage(writer: anytype) !void {
         \\
         \\options:
         \\  --no-color
-        \\  --max-tokens N
+        \\  --max-tokens N (compat no-op; generation limits belong to the model server)
         \\  --thinking auto|on|off
         \\  --fail-on-model-error
         \\  --expect-contains TEXT
