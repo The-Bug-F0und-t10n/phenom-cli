@@ -557,9 +557,9 @@ fn buildInitialModelContext(
             .kind = .collect_context,
             .required_tool_calls = 0,
             .text = if (focus_text != null)
-                "SESSION_FOCUS routes only. Cite collect_evidence for workspace/code claims; stage=overview for broad maps. Use search_session for prior-session facts. Otherwise answer."
+                "SESSION_FOCUS routes only. Select an operational contract before workspace/code claims. Use search_session for prior-session facts. Otherwise answer."
             else
-                "Cite collect_evidence for workspace/code claims; stage=overview for broad maps. Use search_session for prior-session facts. Otherwise answer.",
+                "Select an operational contract before workspace/code claims. Use search_session for prior-session facts. Otherwise answer.",
         } else .{
             .kind = .answer_directly,
             .required_tool_calls = 0,
@@ -663,7 +663,7 @@ fn runToolLoopIterations(
             config,
             prompt,
             repair_context,
-            "Your previous output was prose, but this turn requires a visible context tool_call before prose. Output exactly one collect_evidence, search_session, or set_operational_contract tool_call now. No prose.",
+            "Your previous output was prose, but this turn requires a visible context tool_call before prose. Output exactly one allowed tool_call now. No prose.",
             client,
             events,
             db,
@@ -731,6 +731,22 @@ fn runToolLoopIterations(
             const body = try std.fmt.allocPrint(allocator, "{s}\t{s}", .{ envelope.raw_name, envelope.auditText() });
             defer allocator.free(body);
             try db.recordEvent(config.session, "tool_rejected", body);
+            if (state.active_contract.name == .workflow and envelope.rejection_reason == .tool_not_advertised) {
+                first_sink.discardDeferredVisible();
+                const repair_context = try renderInitialRejectedToolContext(allocator, prompt, envelope.raw_name);
+                defer allocator.free(repair_context);
+                try db.recordEvent(config.session, "model_context", repair_context);
+                const next = try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, first_sink, state.active_contract);
+                switch (next) {
+                    .final_answer => return true,
+                    .stopped => return true,
+                    .tool_call => |next_call| {
+                        maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
+                        continue;
+                    },
+                }
+            }
+            try emitRejectedToolAnswer(allocator, first_sink, envelope.raw_name, envelope.auditText());
             return true;
         }
 
@@ -934,6 +950,32 @@ fn renderInitialToolCallRepairContext(allocator: std.mem.Allocator, initial_cont
         "{s}\n[PROTOCOL_REPAIR]\nPrevious output was prose, but this turn requires one context tool call before prose. For broad workspace/project map, emit collect_evidence stage=overview strategy=auto with no terms. For focused collect_evidence/search_session, set intent+concrete terms. For code identity, emit collect_evidence stage=candidates before expanding a selected candidate.\n",
         .{initial_context},
     );
+}
+
+fn renderInitialRejectedToolContext(allocator: std.mem.Allocator, prompt: []const u8, raw_tool: []const u8) ![]u8 {
+    const reason = try std.fmt.allocPrint(allocator, "The previous tool `{s}` is not active in the initial router contract.", .{raw_tool});
+    defer allocator.free(reason);
+    return model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = context_profile.toolSchema(.code_evidence, .initial),
+        .obligations = &.{
+            reason,
+            "Initial router allows only set_operational_contract and search_session.",
+            "For local workspace/source-code claims, select an operational contract first. For general answers, answer directly.",
+        },
+        .grounding = groundingRules(),
+        .next_action = "Answer directly if no local workspace state is needed, or emit one allowed set_operational_contract/search_session tool_call.",
+    });
+}
+
+fn emitRejectedToolAnswer(allocator: std.mem.Allocator, sink: *StreamSink, raw_tool: []const u8, reason: []const u8) !void {
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "[MODEL_PROTOCOL_ERROR] tool `{s}` was rejected by the active contract: {s}",
+        .{ raw_tool, reason },
+    );
+    defer allocator.free(message);
+    try sink.emitVisibleText(message);
 }
 
 fn renderMissingCitationRepairContext(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
@@ -1898,11 +1940,11 @@ fn runSetOperationalContractStep(
         try db.recordEvent(config.session, "tool_repair", "set_operational_contract missing required booleans");
         const repair_context = try model_context.renderModelTurnContext(allocator, .{
             .task = prompt,
-            .contracts = context_profile.toolSchema(.code_evidence, .initial),
+            .contracts = activeToolSchema(state),
             .obligations = &.{
                 "set_operational_contract requires requiresInspection, requiresMutation, requiresRuntimeValidation, and requiresBrowserDiagnostics.",
             },
-            .next_action = "Emit one corrected set_operational_contract call with all required boolean fields, or call collect_evidence if inspection is enough.",
+            .next_action = "Emit one corrected set_operational_contract call with all required boolean fields, or answer directly if no operational contract is needed.",
         });
         defer allocator.free(repair_context);
         try db.recordEvent(config.session, "model_context", repair_context);
@@ -1949,7 +1991,10 @@ fn runSetOperationalContractStep(
             "Only advertised tools may be called. The controller rejects tools outside the selected contract.",
         },
         .grounding = groundingRules(),
-        .next_action = "Proceed inside the active contract. If workspace evidence is needed, call collect_evidence with model-chosen terms/path. If mutating from collected context, include contextId in apply_patch.",
+        .next_action = if (selected.name == .answer_only)
+            "Answer directly now. No tools are active for this no-op contract."
+        else
+            "Proceed inside the active contract. If workspace evidence is needed, call collect_evidence with model-chosen terms/path. If mutating from collected context, include contextId in apply_patch.",
     });
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
@@ -2802,6 +2847,7 @@ fn streamDeferredToolLoopTurnInternal(
         const body = try std.fmt.allocPrint(allocator, "{s}\t{s}", .{ envelope.raw_name, envelope.auditText() });
         defer allocator.free(body);
         try db.recordEvent(config.session, "tool_rejected", body);
+        try emitRejectedToolAnswer(allocator, aggregate_sink, envelope.raw_name, envelope.auditText());
         return .stopped;
     }
     if (envelope.takeCall()) |call| return .{ .tool_call = call };
@@ -2842,7 +2888,7 @@ fn isCandidateId(text: []const u8) bool {
 }
 
 fn currentActiveContract() contracts.ActiveContract {
-    return contracts.activeContract(.collect_evidence).?;
+    return contracts.activeContract(.workflow).?;
 }
 
 fn singleStructuredPathFromPrompt(allocator: std.mem.Allocator, prompt: []const u8) !?[]u8 {
@@ -3618,19 +3664,19 @@ test "tool loop schema is compact and offered without linguistic gating" {
     const schema = collectEvidenceToolSchema(true);
     try std.testing.expect(std.mem.indexOf(u8, schema, "set_operational_contract") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "requiresRuntimeValidation") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "collect_evidence") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=auto") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "lexical") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "symbol") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "collect_evidence(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=auto") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "lexical") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "symbol") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "semantic") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "diagnostic") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=runtime") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=diff") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "scope=current|all") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "Model chooses intent/terms") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "stage=candidates") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "selectedCandidate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "Initial router") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "stage=candidates") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "selectedCandidate") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "apply_patch") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "grep_file") == null);
     const post_contract_schema = collectEvidenceToolSchema(false);
@@ -3645,7 +3691,7 @@ test "tool loop schema is compact and offered without linguistic gating" {
     defer std.testing.allocator.free(with_tools);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "mode: code_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[SESSION_FOCUS]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "collect_evidence(") == null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[CONTRACTS]") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[RECENT_DIALOGUE]") != null);
@@ -3656,7 +3702,7 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "required_tool_calls=0") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "SESSION_FOCUS routes only") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "search_session") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "stage=overview") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "stage=overview") == null);
     try std.testing.expect(!initialContextRequiresTool(with_tools));
 
     try std.testing.expect((try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test-empty", "analise esse projeto", false, true)) == null);
@@ -4249,6 +4295,36 @@ test "initial context repair preserves context and asks for intent terms split" 
     try std.testing.expect(std.mem.indexOf(u8, repair, "stage=overview") != null);
     try std.testing.expect(std.mem.indexOf(u8, repair, "intent+concrete terms") != null);
     try std.testing.expect(std.mem.indexOf(u8, repair, "code identity") != null);
+}
+
+test "initial rejected executor repair keeps router contract and visible diagnostic" {
+    const repair = try renderInitialRejectedToolContext(std.testing.allocator, "o que o projeto implementa?", "collect_evidence");
+    defer std.testing.allocator.free(repair);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "Initial router") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "set_operational_contract") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "collect_evidence(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "not active") != null);
+
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "rejected-tool",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+    };
+    defer sink.deinit();
+    try emitRejectedToolAnswer(std.testing.allocator, &sink, "collect_evidence", "rejected/tool_not_advertised");
+    try std.testing.expect(std.mem.indexOf(u8, sink.visible.items, "[MODEL_PROTOCOL_ERROR]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.visible.items, "tool `collect_evidence`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.visible.items, "tool_not_advertised") != null);
 }
 
 test "missing evidence citation requires repair before visible answer" {
@@ -4892,9 +4968,9 @@ test "model evidence includes micro context id for patch safety" {
 test "tool loop state starts with model-visible operational contract gate" {
     var state = ToolLoopState.init(std.testing.allocator);
     defer state.deinit();
-    try std.testing.expectEqual(contracts.ContractName.collect_evidence, state.active_contract.name);
+    try std.testing.expectEqual(contracts.ContractName.workflow, state.active_contract.name);
     try std.testing.expect(state.active_contract.allows("set_operational_contract"));
-    try std.testing.expect(state.active_contract.allows("collect_evidence"));
+    try std.testing.expect(!state.active_contract.allows("collect_evidence"));
     try std.testing.expect(!state.active_contract.allows("apply_patch"));
 }
 

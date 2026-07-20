@@ -188,7 +188,7 @@ test "announced session search is accepted" {
 }
 
 test "set operational contract is accepted as model-visible controller tool" {
-    const active = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
+    const active = contracts.activeContract(.workflow) orelse return error.MissingContract;
     const output =
         \\<tool_call>
         \\<function=set_operational_contract>
@@ -209,7 +209,7 @@ test "set operational contract is accepted as model-visible controller tool" {
 }
 
 test "mutation executor is rejected before contract and accepted by mutation contract" {
-    const initial = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
+    const initial = contracts.activeContract(.workflow) orelse return error.MissingContract;
     const output =
         \\<tool_call>
         \\<function=apply_patch>

@@ -86,18 +86,19 @@ pub fn sessionRecallSchema() []const u8 {
 }
 
 pub fn codeEvidenceSchema() []const u8 {
+    return initialRouterSchema();
+}
+
+pub fn initialRouterSchema() []const u8 {
     return
     \\[TOOLS v1]
     \\set_operational_contract(requiresInspection, requiresMutation, requiresRuntimeValidation, requiresBrowserDiagnostics, requiresMemoryPromotion?, reason?)
-    \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol|diagnostic, stage=overview|minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
     \\search_session(intent?, terms, scope=current|all, session?)
-    \\Model chooses intent/terms; controller only executes. Prior-session claims require search_session and directly supporting S#.
-    \\Pathless: broad project/workspace map -> stage=overview strategy=auto no terms. Focused lookup -> intent+terms. Function/type/symbol/file identity -> stage=candidates then stage=expand selectedCandidate. Do not use auto overview for identity questions.
-    \\search_session: first decide intent, then terms=concrete keys from SESSION_FOCUS/reasoning. Retrieved S# is not confirmed truth; judge whether it directly answers, contradicts, or is irrelevant before citing it. Do not pass generic user words unless they are the remembered content.
+    \\Initial router. Direct final answer is valid when the request does not need local workspace state, prior-session facts, mutation, validation, runtime diagnostics, or memory promotion.
+    \\For local workspace/source-code claims, call set_operational_contract with requiresInspection=true before answering. For edits use requiresMutation=true. For validation use requiresRuntimeValidation=true. For runtime/browser diagnostics use requiresBrowserDiagnostics=true. For persistent memory/skill promotion use requiresMemoryPromotion=true.
+    \\Do not call collect_evidence in this initial router state; the controller exposes it only after an inspection/mutation/validation contract is selected.
+    \\search_session: first decide intent, then terms=concrete keys from SESSION_FOCUS/reasoning. Prior-session claims require directly supporting S#. Retrieved S# is not confirmed truth; judge whether it directly answers, contradicts, or is irrelevant before citing it. Do not pass generic user words unless they are the remembered content.
     \\<tool_call><function=set_operational_contract><parameter=requiresInspection>true</parameter><parameter=requiresMutation>false</parameter><parameter=requiresRuntimeValidation>false</parameter><parameter=requiresBrowserDiagnostics>false</parameter><parameter=requiresMemoryPromotion>false</parameter><parameter=reason>short reason</parameter></function></tool_call>
-    \\<tool_call><function=collect_evidence><parameter=intent>compare source definitions</parameter><parameter=strategy>symbol</parameter><parameter=stage>candidates</parameter><parameter=terms>SymbolName FileName ErrorCode</parameter></function></tool_call>
-    \\<tool_call><function=collect_evidence><parameter=stage>expand</parameter><parameter=selectedCandidate>C#</parameter><parameter=max_lines>32</parameter></function></tool_call>
-    \\<tool_call><function=collect_evidence><parameter=path>relative/path</parameter><parameter=strategy>path</parameter><parameter=start_line>1</parameter><parameter=max_lines>12</parameter></function></tool_call>
     \\<tool_call><function=search_session><parameter=intent>recover prior decision</parameter><parameter=terms>TopicName EntityName DecisionKey</parameter><parameter=scope>current</parameter></function></tool_call>
     ;
 }
@@ -116,12 +117,21 @@ pub fn activeContractSchema() []const u8 {
 
 pub fn activeContractSchemaFor(contract: contracts.ContractName) []const u8 {
     return switch (contract) {
+        .workflow => initialRouterSchema(),
+        .answer_only => answerOnlySchema(),
         .mutate_file => mutateFileSchema(),
         .validate_work => validateWorkSchema(),
         .inspect_runtime => inspectRuntimeSchema(),
         .memory => memorySchema(),
         else => activeContractSchema(),
     };
+}
+
+pub fn answerOnlySchema() []const u8 {
+    return
+    \\[TOOLS v1]
+    \\No tool schema is active. Answer directly from the current conversation and clearly mark non-verified technical estimates when applicable.
+    ;
 }
 
 pub fn mutateFileSchema() []const u8 {
@@ -217,21 +227,20 @@ test "schemas are state scoped" {
     try std.testing.expect(std.mem.indexOf(u8, recall, "judge direct support") != null);
 
     const evidence = toolSchema(.code_evidence, .initial);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "collect_evidence(") == null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "set_operational_contract") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "Focused lookup -> intent+terms") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "Do not use auto overview for identity questions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "Initial router") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "requiresInspection=true") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "generic user words") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "directly supporting S#") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "Retrieved S# is not confirmed truth") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "stage=overview") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "broad project/workspace map") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "stage=candidates") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "selectedCandidate") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "need?") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "targetFiles?") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "scopeRoot?") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "minimum") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "stage=overview") == null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "stage=candidates") == null);
+
+    const active_evidence = toolSchema(.code_evidence, .active_contract);
+    try std.testing.expect(std.mem.indexOf(u8, active_evidence, "collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, active_evidence, "stage=candidates") != null);
+    try std.testing.expect(std.mem.indexOf(u8, active_evidence, "selectedCandidate") != null);
 
     try std.testing.expectEqualStrings("", toolSchema(.code_evidence, .after_collect_evidence));
     try std.testing.expectEqualStrings("", toolSchema(.session_recall, .after_search_session));

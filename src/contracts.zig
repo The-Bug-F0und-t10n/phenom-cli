@@ -13,6 +13,7 @@ pub const ToolSpec = struct {
 pub const manifest_version = "contracts.v1";
 
 pub const ContractName = enum {
+    answer_only,
     collect_evidence,
     mutate_file,
     validate_work,
@@ -132,9 +133,19 @@ pub const all_tools = [_]ToolSpec{
 
 pub const contract_specs = [_]ContractSpec{
     .{
+        .name = .answer_only,
+        .endpoint = "set_operational_contract",
+        .allowed_tools = &.{},
+    },
+    .{
+        .name = .workflow,
+        .endpoint = "set_operational_contract",
+        .allowed_tools = &.{ "set_operational_contract", "search_session" },
+    },
+    .{
         .name = .collect_evidence,
         .endpoint = "collect_evidence",
-        .allowed_tools = &.{ "set_operational_contract", "collect_evidence", "search_session" },
+        .allowed_tools = &.{ "collect_evidence", "search_session" },
     },
     .{
         .name = .mutate_file,
@@ -222,7 +233,8 @@ pub fn selectOperationalContract(request: OperationalContractRequest) ContractNa
     if (request.requires_mutation) return .mutate_file;
     if (request.requires_runtime_validation) return .validate_work;
     if (request.requires_browser_diagnostics) return .inspect_runtime;
-    return .collect_evidence;
+    if (request.requires_inspection) return .collect_evidence;
+    return .answer_only;
 }
 
 pub fn compactModelVisibleTools(allocator: std.mem.Allocator) ![]u8 {
@@ -272,11 +284,31 @@ test "collect evidence accepts bounded strategies without expanding tool surface
 test "active collect evidence contract comes from manifest allowlist" {
     const active = activeContract(.collect_evidence) orelse return error.MissingContract;
     try std.testing.expectEqualStrings(manifest_version, active.version);
-    try std.testing.expect(active.allows("set_operational_contract"));
+    try std.testing.expect(!active.allows("set_operational_contract"));
     try std.testing.expect(active.allows("collect_evidence"));
     try std.testing.expect(active.allows("search_session"));
     try std.testing.expect(!active.allows("content"));
     try std.testing.expect(!active.allows("grep_file"));
+}
+
+test "workflow router exposes contract selection without evidence executor" {
+    const active = activeContract(.workflow) orelse return error.MissingContract;
+    try std.testing.expect(active.allows("set_operational_contract"));
+    try std.testing.expect(active.allows("search_session"));
+    try std.testing.expect(!active.allows("collect_evidence"));
+    try std.testing.expect(!active.allows("apply_patch"));
+
+    const no_op = selectOperationalContract(.{
+        .requires_inspection = false,
+        .requires_mutation = false,
+        .requires_runtime_validation = false,
+        .requires_browser_diagnostics = false,
+    });
+    try std.testing.expectEqual(ContractName.answer_only, no_op);
+    const answer = activeContract(no_op) orelse return error.MissingContract;
+    try std.testing.expect(!answer.allows("set_operational_contract"));
+    try std.testing.expect(!answer.allows("collect_evidence"));
+    try std.testing.expect(!answer.allows("search_session"));
 }
 
 test "compact model visible tools excludes internal collectors" {

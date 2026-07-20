@@ -64,10 +64,15 @@ test "guardrail preserves contract scoped tool execution" {
     try std.testing.expect(!contracts.isModelVisible("apply_patch"));
     try std.testing.expect(!contracts.isModelVisible("validate_syntax"));
 
-    const initial = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
+    const initial = contracts.activeContract(.workflow) orelse return error.MissingContract;
     try std.testing.expect(initial.allows("set_operational_contract"));
+    try std.testing.expect(!initial.allows("collect_evidence"));
     try std.testing.expect(!initial.allows("apply_patch"));
     try std.testing.expect(!initial.allows("validate_syntax"));
+
+    const evidence = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
+    try std.testing.expect(evidence.allows("collect_evidence"));
+    try std.testing.expect(!evidence.allows("set_operational_contract"));
 
     const mutation = contracts.activeContract(.mutate_file) orelse return error.MissingContract;
     try std.testing.expect(mutation.allows("apply_patch"));
@@ -85,8 +90,13 @@ test "guardrail preserves contract scoped tool execution" {
 
 test "guardrail preserves context profile boundaries" {
     const code = context_profile.toolSchema(.code_evidence, .initial);
-    try std.testing.expect(std.mem.indexOf(u8, code, "collect_evidence") != null);
-    try std.testing.expect(std.mem.indexOf(u8, code, "stage=candidates") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "set_operational_contract") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "collect_evidence(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "stage=candidates") == null);
+
+    const active_code = context_profile.toolSchema(.code_evidence, .active_contract);
+    try std.testing.expect(std.mem.indexOf(u8, active_code, "collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, active_code, "stage=candidates") != null);
 
     const news = context_profile.toolSchema(.news_doc_log, .initial);
     try std.testing.expect(std.mem.indexOf(u8, news, "structured dossier") != null);
