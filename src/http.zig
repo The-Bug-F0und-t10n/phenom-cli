@@ -149,7 +149,11 @@ pub const LocalModelClient = struct {
     fn buildBodyForInput(self: *LocalModelClient, input: InferenceInput) ![]u8 {
         const escaped_prompt = try jsonEscape(self.allocator, input.user_prompt);
         defer self.allocator.free(escaped_prompt);
-        const escaped_context = if (input.model_context) |context| try jsonEscape(self.allocator, context) else null;
+        const stable_context = if (input.model_context) |context| try stripVolatileTurnContextForPrompt(self.allocator, context) else null;
+        defer if (stable_context) |context| self.allocator.free(context);
+        var stable_input = input;
+        stable_input.model_context = stable_context;
+        const escaped_context = if (stable_context) |context| try jsonEscape(self.allocator, context) else null;
         defer if (escaped_context) |context| self.allocator.free(context);
         const escaped_model = try jsonEscape(self.allocator, self.model);
         defer self.allocator.free(escaped_model);
@@ -162,13 +166,13 @@ pub const LocalModelClient = struct {
                     "<think>\n"
                 else
                     "<think>\n\n</think>\n\n";
-                const chat_prompt = try self.buildLlamaCppPrompt(input, generation_prefix);
+                const chat_prompt = try self.buildLlamaCppPrompt(stable_input, generation_prefix);
                 defer self.allocator.free(chat_prompt);
                 const escaped_chat_prompt = try jsonEscape(self.allocator, chat_prompt);
                 defer self.allocator.free(escaped_chat_prompt);
                 break :blk try std.fmt.allocPrint(
                     self.allocator,
-                    "{{\"stream\":true,\"prompt\":\"{s}\",\"temperature\":0.2,\"stop\":[\"<|im_end|>\"]}}",
+                    "{{\"stream\":true,\"prompt\":\"{s}\",\"temperature\":0.2,\"cache_prompt\":true,\"stop\":[\"<|im_end|>\"]}}",
                     .{escaped_chat_prompt},
                 );
             },
@@ -221,6 +225,61 @@ pub const LocalModelClient = struct {
         return out.toOwnedSlice(self.allocator);
     }
 };
+
+fn stripVolatileTurnContextForPrompt(allocator: std.mem.Allocator, context: []const u8) ![]u8 {
+    const without_task = try stripTurnContextTaskLine(allocator, context);
+    defer allocator.free(without_task);
+    const without_focus = try removeTurnContextSection(allocator, without_task, "\n[SESSION_FOCUS]\n");
+    defer allocator.free(without_focus);
+    return removeTurnContextSection(allocator, without_focus, "\n[RECENT_DIALOGUE]\n");
+}
+
+fn stripTurnContextTaskLine(allocator: std.mem.Allocator, context: []const u8) ![]u8 {
+    const marker = "[TURN_CONTEXT v1]\n";
+    if (!std.mem.startsWith(u8, context, marker)) return allocator.dupe(u8, context);
+    if (!std.mem.startsWith(u8, context[marker.len..], "task: ")) return allocator.dupe(u8, context);
+    const mode_marker = "\nmode: ";
+    const mode_at = std.mem.indexOfPos(u8, context, marker.len, mode_marker) orelse {
+        const next_line = std.mem.indexOfPos(u8, context, marker.len, "\n") orelse return allocator.dupe(u8, context);
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(allocator);
+        try out.appendSlice(allocator, marker);
+        try out.appendSlice(allocator, context[next_line + 1 ..]);
+        return out.toOwnedSlice(allocator);
+    };
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, marker);
+    try out.appendSlice(allocator, context[mode_at + 1 ..]);
+    return out.toOwnedSlice(allocator);
+}
+
+fn removeTurnContextSection(allocator: std.mem.Allocator, context: []const u8, marker: []const u8) ![]u8 {
+    const start = std.mem.indexOf(u8, context, marker) orelse return allocator.dupe(u8, context);
+    const markers = [_][]const u8{
+        "\n[CONTRACTS]\n",
+        "\n[SKILLS]\n",
+        "\n[MEMORY]\n",
+        "\n[CANDIDATES_CONTEXT]\n",
+        "\n[EVIDENCE]\n",
+        "\n[SESSION_FOCUS]\n",
+        "\n[RECENT_DIALOGUE]\n",
+        "\n[SESSION_CONTEXT]\n",
+        "\n[OBLIGATIONS]\n",
+        "\n[GROUNDING]\n",
+        "\n[NEXT_ACTION]\n",
+    };
+    var end = context.len;
+    for (markers) |next_marker| {
+        const idx = std.mem.indexOfPos(u8, context, start + marker.len, next_marker) orelse continue;
+        end = @min(end, idx);
+    }
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, context[0..start]);
+    try out.appendSlice(allocator, context[end..]);
+    return out.toOwnedSlice(allocator);
+}
 
 pub const ChatRole = enum {
     user,
@@ -1069,7 +1128,7 @@ test "llamacpp request body is valid utf8 when context has malformed bytes" {
     };
     const body = try client.buildBodyForInput(.{
         .user_prompt = "olola",
-        .model_context = "[TURN_CONTEXT v1]\ntask: a\xffb\n",
+        .model_context = "[TURN_CONTEXT v1]\ntask: removido\nmode: a\xffb\n",
     });
     defer std.testing.allocator.free(body);
 
@@ -1134,6 +1193,55 @@ test "llamacpp body uses qwopus chat template with thinking disabled" {
     try std.testing.expect(std.mem.indexOf(u8, body, "<|im_start|>assistant") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "<think>\\n\\n</think>\\n\\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stop\":[\"<|im_end|>\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_prompt\":true") != null);
+}
+
+test "llamacpp prompt cache prefix excludes volatile current task" {
+    var client = LocalModelClient{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1:11434",
+        .backend = .llamacpp,
+        .model = "phenom:latest",
+        .thinking = .off,
+    };
+    const context_a =
+        "[TURN_CONTEXT v1]\n" ++
+        "task: primeira pergunta\n" ++
+        "mode: code_evidence\n" ++
+        "budget: small\n\n" ++
+        "[CONTRACTS]\nrouter\n\n" ++
+        "[SESSION_FOCUS]\nF1:\n  old focus A\n\n" ++
+        "[RECENT_DIALOGUE]\nD1:\n  user: old A\n\n" ++
+        "[NEXT_ACTION]\nanswer\n";
+    const context_b =
+        "[TURN_CONTEXT v1]\n" ++
+        "task: segunda pergunta\n" ++
+        "mode: code_evidence\n" ++
+        "budget: small\n\n" ++
+        "[CONTRACTS]\nrouter\n\n" ++
+        "[SESSION_FOCUS]\nF1:\n  old focus B\n\n" ++
+        "[RECENT_DIALOGUE]\nD1:\n  user: old B\n\n" ++
+        "[NEXT_ACTION]\nanswer\n";
+    const body_a = try client.buildBodyForInput(.{
+        .user_prompt = "primeira pergunta",
+        .model_context = context_a,
+    });
+    defer std.testing.allocator.free(body_a);
+    const body_b = try client.buildBodyForInput(.{
+        .user_prompt = "segunda pergunta",
+        .model_context = context_b,
+    });
+    defer std.testing.allocator.free(body_b);
+
+    try std.testing.expect(std.mem.indexOf(u8, body_a, "task: primeira pergunta") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body_b, "task: segunda pergunta") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body_a, "[SESSION_FOCUS]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body_a, "[RECENT_DIALOGUE]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body_a, "mode: code_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body_a, "\"cache_prompt\":true") != null);
+
+    const user_idx = std.mem.indexOf(u8, body_a, "<|im_start|>user") orelse return error.MissingUser;
+    try std.testing.expect(commonPrefixLen(body_a, body_b) >= user_idx);
 }
 
 test "request body does not set generation token limit" {
@@ -1190,6 +1298,7 @@ test "ollama body includes model context in system message" {
 
     try std.testing.expect(std.mem.indexOf(u8, body, "Responda de forma direta") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "[TURN_CONTEXT v1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "task: corrigir") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "corrija") != null);
     try std.testing.expectEqual(@as(usize, 1), countNeedle(body, "\"role\":\"user\""));
     const context_idx = std.mem.indexOf(u8, body, "[TURN_CONTEXT v1]") orelse return error.MissingContext;
@@ -1237,7 +1346,7 @@ test "llamacpp body can include model context before user request" {
     };
     const body = try client.buildBodyForInput(.{
         .user_prompt = "corrija",
-        .model_context = "[TURN_CONTEXT v1]\\ntask: corrigir\\n",
+        .model_context = "[TURN_CONTEXT v1]\ntask: corrigir\nmode: code_evidence\n",
     });
     defer std.testing.allocator.free(body);
 
@@ -1245,6 +1354,8 @@ test "llamacpp body can include model context before user request" {
     const user_idx = std.mem.indexOf(u8, body, "corrija") orelse return error.MissingPrompt;
     try std.testing.expectEqual(@as(usize, 1), countNeedle(body, "<|im_start|>user"));
     try std.testing.expect(context_idx < user_idx);
+    try std.testing.expect(std.mem.indexOf(u8, body, "task: corrigir") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "mode: code_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n") != null);
 }
 
@@ -1288,6 +1399,13 @@ fn countNeedle(haystack: []const u8, needle: []const u8) usize {
         start += idx + needle.len;
     }
     return count;
+}
+
+fn commonPrefixLen(a: []const u8, b: []const u8) usize {
+    const limit = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < limit and a[i] == b[i]) : (i += 1) {}
+    return i;
 }
 
 test "thinking auto resolves simple prompt off and code prompt on" {

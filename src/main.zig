@@ -556,10 +556,7 @@ fn buildInitialModelContext(
         .next_action_v1 = if (enable_tool_loop) .{
             .kind = .collect_context,
             .required_tool_calls = 0,
-            .text = if (focus_text != null)
-                "SESSION_FOCUS routes only. Select an operational contract before workspace/code claims. Use search_session for prior-session facts. Otherwise answer."
-            else
-                "Select an operational contract before workspace/code claims. Use search_session for prior-session facts. Otherwise answer.",
+            .text = "Select an operational contract before workspace/code claims. Use search_session for prior-session facts. Otherwise answer.",
         } else .{
             .kind = .answer_directly,
             .required_tool_calls = 0,
@@ -3700,7 +3697,7 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "S1:") == null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[GROUNDING]") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "required_tool_calls=0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "SESSION_FOCUS routes only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "Select an operational contract before workspace/code claims") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "stage=overview") == null);
     try std.testing.expect(!initialContextRequiresTool(with_tools));
