@@ -298,7 +298,14 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             .model_context = model_context_text,
             .dialogue = dialogue_messages.items,
         };
-        client.streamInference(inference_input, &sink) catch |err| {
+        streamInferenceWithUiCancel(&client, inference_input, ui_ptr, &sink) catch |err| {
+            if (err == error.Cancelled) {
+                try events.emit(.{ .inference_cancel = "cancelled by user" });
+                try db.recordEvent(config.session, "inference_cancel", "cancelled by user");
+                try sink.flush();
+                try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "cancelled", prompt, sink.visible.items);
+                return;
+            }
             const endpoint = client.endpointSummary(allocator) catch "unknown-endpoint";
             defer if (!std.mem.eql(u8, endpoint, "unknown-endpoint")) allocator.free(endpoint);
             const failure_detail = try client.httpFailureDetail(allocator);
@@ -325,6 +332,13 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         try sink.flush();
         if (enable_tool_loop) {
             const handled_by_tool_loop = runToolLoopIterations(allocator, io, config, prompt, sink.raw_model.items, sink.raw_visible.items, model_context_text, &client, &events, &db, ui_ptr, &sink) catch |err| blk: {
+                if (err == error.Cancelled) {
+                    try events.emit(.{ .inference_cancel = "cancelled by user" });
+                    try db.recordEvent(config.session, "inference_cancel", "cancelled by user");
+                    try sink.flush();
+                    try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "cancelled", prompt, sink.visible.items);
+                    return;
+                }
                 const message = try std.fmt.allocPrint(allocator, "tool loop failed: {s}", .{@errorName(err)});
                 defer allocator.free(message);
                 try events.emit(.{ .progress_update = message });
@@ -2598,6 +2612,23 @@ fn showModelContextUsage(rendered: []const u8, ui_ptr: ?*tui.TerminalUi(fd_write
     try active_ui.showContextUsage(buckets.total_context, max_model_context_send_bytes);
 }
 
+fn streamInferenceWithUiCancel(
+    client: *http.LocalModelClient,
+    input: http.InferenceInput,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    sink: anytype,
+) !void {
+    var cancel = std.atomic.Value(bool).init(false);
+    var cancelable_input = input;
+    cancelable_input.cancel = &cancel;
+    if (ui_ptr) |active_ui| {
+        try active_ui.startInferenceCancelInput(&cancel);
+        cancelable_input.cancel_fd = active_ui.inferenceCancelFd();
+        defer active_ui.stopInferenceCancelInput();
+    }
+    return client.streamInference(cancelable_input, sink);
+}
+
 fn streamDeferredToolLoopTurn(
     allocator: std.mem.Allocator,
     config: cli.Config,
@@ -2697,7 +2728,7 @@ fn streamSearchPlanTurn(
         return .stopped;
     };
     try showModelContextUsage(plan_context, ui_ptr);
-    try client.streamInference(.{ .user_prompt = prompt, .model_context = plan_context }, &plan_sink);
+    try streamInferenceWithUiCancel(client, .{ .user_prompt = prompt, .model_context = plan_context }, ui_ptr, &plan_sink);
     try plan_sink.flush();
 
     if (try tool_envelope.parseFirst(allocator, plan_sink.raw_model.items, active_contract)) |envelope| {
@@ -2810,7 +2841,7 @@ fn streamDeferredToolLoopTurnInternal(
         return .stopped;
     };
     try showModelContextUsage(follow_context, ui_ptr);
-    try client.streamInference(.{ .user_prompt = prompt, .model_context = follow_context }, &follow_sink);
+    try streamInferenceWithUiCancel(client, .{ .user_prompt = prompt, .model_context = follow_context }, ui_ptr, &follow_sink);
     try follow_sink.flush();
 
     var envelope = (tool_envelope.parseFirst(allocator, follow_sink.raw_model.items, active_contract) catch |err| {

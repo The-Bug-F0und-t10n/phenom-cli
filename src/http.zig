@@ -5,7 +5,9 @@ const c = @cImport({
     @cInclude("arpa/inet.h");
     @cInclude("netdb.h");
     @cInclude("netinet/in.h");
+    @cInclude("poll.h");
     @cInclude("sys/socket.h");
+    @cInclude("time.h");
     @cInclude("unistd.h");
 });
 
@@ -82,7 +84,9 @@ pub const LocalModelClient = struct {
         var headers_done = false;
         var chunked = false;
         var buf: [4096]u8 = undefined;
+        var cancel_input = StreamCancelInput{};
         while (true) {
+            try waitReadableOrCancelled(fd, input.cancel, input.cancel_fd, &cancel_input);
             const n_raw = c.read(fd, &buf, buf.len);
             if (n_raw < 0) return error.SocketReadFailed;
             const n: usize = @intCast(n_raw);
@@ -295,6 +299,8 @@ pub const InferenceInput = struct {
     user_prompt: []const u8,
     model_context: ?[]const u8 = null,
     dialogue: []const ChatMessage = &.{},
+    cancel: ?*std.atomic.Value(bool) = null,
+    cancel_fd: ?c_int = null,
 };
 
 pub const TokenUsage = struct {
@@ -619,6 +625,97 @@ fn appendSanitizedSnippet(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
         };
         try out.append(allocator, safe);
     }
+}
+
+fn isCancelled(cancel: ?*std.atomic.Value(bool)) bool {
+    const token = cancel orelse return false;
+    return token.load(.acquire);
+}
+
+const stream_esc_cancel_delay_ms: i64 = 100;
+
+const StreamCancelInput = struct {
+    pending_esc: bool = false,
+    pending_started_ms: i64 = 0,
+
+    fn feed(self: *StreamCancelInput, data: []const u8, now_ms: i64) bool {
+        if (self.flushExpired(now_ms)) return true;
+        var i: usize = 0;
+        while (i < data.len) : (i += 1) {
+            const ch = data[i];
+            if (self.pending_esc) {
+                self.pending_esc = false;
+                if (ch == '[' or ch == 'O') continue;
+                return true;
+            }
+            if (ch == 0x03) return true;
+            if (ch != '\x1b') continue;
+            if (i + 1 >= data.len) {
+                self.pending_esc = true;
+                self.pending_started_ms = now_ms;
+                return false;
+            }
+            const next = data[i + 1];
+            if (next == '[' or next == 'O') {
+                i += 1;
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn flushExpired(self: *StreamCancelInput, now_ms: i64) bool {
+        if (!self.pending_esc) return false;
+        if (now_ms - self.pending_started_ms < stream_esc_cancel_delay_ms) return false;
+        self.pending_esc = false;
+        return true;
+    }
+};
+
+fn waitReadableOrCancelled(fd: c_int, cancel: ?*std.atomic.Value(bool), cancel_fd: ?c_int, cancel_input: *StreamCancelInput) !void {
+    var cancel_buf: [32]u8 = undefined;
+    while (true) {
+        if (isCancelled(cancel)) return error.Cancelled;
+        if (cancel_input.flushExpired(monotonicMs())) return error.Cancelled;
+        var pfds = [_]c.pollfd{
+            .{
+                .fd = fd,
+                .events = c.POLLIN,
+                .revents = 0,
+            },
+            .{
+                .fd = cancel_fd orelse -1,
+                .events = c.POLLIN,
+                .revents = 0,
+            },
+        };
+        const count: c.nfds_t = if (cancel_fd == null) 1 else 2;
+        const rc = c.poll(&pfds, count, 25);
+        if (rc < 0) return error.SocketReadFailed;
+        if (rc == 0) continue;
+        if (cancel_fd != null and (pfds[1].revents & c.POLLIN) != 0) {
+            const n_raw = c.read(pfds[1].fd, &cancel_buf, cancel_buf.len);
+            if (n_raw > 0) {
+                const n: usize = @intCast(n_raw);
+                if (cancel_input.feed(cancel_buf[0..n], monotonicMs())) return error.Cancelled;
+            }
+        }
+        if (isCancelled(cancel)) return error.Cancelled;
+        if ((pfds[0].revents & c.POLLIN) != 0) return;
+        if ((pfds[0].revents & (c.POLLHUP | c.POLLERR)) != 0) return;
+    }
+}
+
+fn monotonicMs() i64 {
+    var ts: c.struct_timespec = undefined;
+    if (c.clock_gettime(c.CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
+}
+
+fn waitReadableOrCancelledForTest(fd: c_int, cancel: ?*std.atomic.Value(bool)) !void {
+    var cancel_input = StreamCancelInput{};
+    return waitReadableOrCancelled(fd, cancel, null, &cancel_input);
 }
 
 fn parseHttpStatus(headers: []const u8) !u16 {
@@ -1411,4 +1508,44 @@ fn commonPrefixLen(a: []const u8, b: []const u8) usize {
 test "thinking auto resolves simple prompt off and code prompt on" {
     try std.testing.expectEqual(cli.ThinkingMode.off, resolveThinking(.auto, "ola"));
     try std.testing.expectEqual(cli.ThinkingMode.on, resolveThinking(.auto, "analise este bug no codigo"));
+}
+
+test "cancel token stops socket wait before polling fd" {
+    var cancel = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, waitReadableOrCancelledForTest(-1, &cancel));
+}
+
+test "stream cancel input distinguishes esc from csi keys" {
+    var input = StreamCancelInput{};
+    try std.testing.expect(input.feed(&.{0x03}, 0));
+
+    input = .{};
+    try std.testing.expect(!input.feed("\x1b[A", 0));
+    try std.testing.expect(!input.flushExpired(200));
+
+    input = .{};
+    try std.testing.expect(!input.feed("\x1b", 1000));
+    try std.testing.expect(!input.flushExpired(1099));
+    try std.testing.expect(input.flushExpired(1100));
+
+    input = .{};
+    try std.testing.expect(!input.feed("\x1b", 2000));
+    try std.testing.expect(!input.feed("[A", 2001));
+    try std.testing.expect(!input.flushExpired(2200));
+
+    input = .{};
+    try std.testing.expect(input.feed("\x1bx", 0));
+}
+
+test "cancel fd interrupts socket wait" {
+    var fds: [2]c_int = undefined;
+    if (c.pipe(&fds) != 0) return error.PipeFailed;
+    defer _ = c.close(fds[0]);
+    defer _ = c.close(fds[1]);
+
+    const byte = [_]u8{0x03};
+    try std.testing.expect(c.write(fds[1], &byte, byte.len) == byte.len);
+
+    var input = StreamCancelInput{};
+    try std.testing.expectError(error.Cancelled, waitReadableOrCancelled(-1, null, fds[0], &input));
 }

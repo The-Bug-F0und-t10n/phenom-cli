@@ -2,6 +2,7 @@ const std = @import("std");
 const fd_writer = @import("fd_writer.zig");
 
 const c = @cImport({
+    @cInclude("fcntl.h");
     @cInclude("termios.h");
     @cInclude("unistd.h");
     @cInclude("sys/ioctl.h");
@@ -606,6 +607,8 @@ pub fn TerminalUi(comptime Writer: type) type {
         show_prompt: bool = true,
         status_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         status_thread: ?std.Thread = null,
+        cancel_input_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        cancel_input_stdin_flags: c_int = -1,
         write_mutex: std.atomic.Mutex = .unlocked,
 
         const Self = @This();
@@ -648,6 +651,7 @@ pub fn TerminalUi(comptime Writer: type) type {
 
         pub fn detach(self: *Self) !void {
             if (!self.attached and !self.raw_enabled) return;
+            self.stopInferenceCancelInput();
             self.stopStatusTicker();
             lockTerminal(&self.write_mutex);
             defer self.write_mutex.unlock();
@@ -759,10 +763,41 @@ pub fn TerminalUi(comptime Writer: type) type {
             try self.draw(.{ .status = null, .show_prompt = true, .preserve_cursor = false });
         }
 
+        pub fn startInferenceCancelInput(self: *Self, token: *std.atomic.Value(bool)) !void {
+            if (!self.attached or !self.raw_enabled) return;
+            if (self.cancel_input_running.load(.acquire)) return;
+            token.store(false, .release);
+            try self.enableRawNow();
+            self.cancel_input_stdin_flags = c.fcntl(self.stdin_fd, c.F_GETFL, @as(c_int, 0));
+            if (self.cancel_input_stdin_flags >= 0) {
+                _ = c.fcntl(self.stdin_fd, c.F_SETFL, self.cancel_input_stdin_flags | c.O_NONBLOCK);
+            }
+            self.cancel_input_running.store(true, .release);
+        }
+
+        pub fn inferenceCancelFd(self: *Self) ?c_int {
+            if (!self.cancel_input_running.load(.acquire)) return null;
+            return self.stdin_fd;
+        }
+
+        pub fn stopInferenceCancelInput(self: *Self) void {
+            if (!self.cancel_input_running.swap(false, .acq_rel)) return;
+            if (self.cancel_input_stdin_flags >= 0) {
+                _ = c.fcntl(self.stdin_fd, c.F_SETFL, self.cancel_input_stdin_flags);
+                self.cancel_input_stdin_flags = -1;
+            }
+        }
+
         fn startStatusTicker(self: *Self) !void {
             if (self.status_running.swap(true, .acq_rel)) return;
             self.status_started_ms = monotonicMs();
             self.status_thread = try std.Thread.spawn(.{}, statusThreadMain, .{self});
+        }
+
+        fn enableRawNow(self: *Self) !void {
+            var raw = self.original_termios;
+            c.cfmakeraw(&raw);
+            if (c.tcsetattr(self.stdin_fd, c.TCSANOW, &raw) != 0) return error.TermiosSetFailed;
         }
 
         fn stopStatusTicker(self: *Self) void {
