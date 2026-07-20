@@ -880,7 +880,10 @@ fn outputDefersAvailableWorkspaceCollection(output: []const u8, context: ?[]cons
 fn contextRequiresMoreWorkspaceCollection(context: []const u8) bool {
     return std.mem.indexOf(u8, context, "required_tool_calls=1") != null or
         std.mem.indexOf(u8, context, "do not ask permission") != null or
-        std.mem.indexOf(u8, context, "weak or generic") != null;
+        std.mem.indexOf(u8, context, "weak or generic") != null or
+        std.mem.indexOf(u8, context, "emit a focused collect_evidence") != null or
+        std.mem.indexOf(u8, context, "emit focused collect_evidence") != null or
+        std.mem.indexOf(u8, context, "Do not ask clarification") != null;
 }
 
 fn outputRequestsMoreEvidence(output: []const u8) bool {
@@ -4603,6 +4606,19 @@ test "required workspace refinement defers uncited prose while collection is ava
         "[TURN_CONTEXT v1]\n\n[EVIDENCE]\nE1:\npacket_version=v1\n\n[NEXT_ACTION]\nAnswer now. Do not call tools again.\n",
         &.{"collect_evidence"},
     ));
+}
+
+test "optional workspace refinement rejects clarification-only answer" {
+    const context =
+        "[TURN_CONTEXT v1]\n\n" ++
+        "[CONTRACTS]\ncollect_evidence(intent, terms, strategy=auto|lexical|symbol)\n\n" ++
+        "[EVIDENCE]\nE1:\npacket_version=v1\n- E1 kind=file_range source=README.md range=L1-L4 status=ok confidence=medium hash=1\n\n" ++
+        "[NEXT_ACTION]\nAnswer from the structural workspace overview evidence. If it does not cover the user's request, emit a focused collect_evidence call with concrete terms.\n";
+    const clarification =
+        "Preciso saber sobre o que voce quer mais detalhes. Especifique qual topico, codigo ou assunto.";
+
+    try std.testing.expect(outputDefersAvailableWorkspaceCollection(clarification, context, &.{"collect_evidence"}));
+    try std.testing.expect(!outputDefersAvailableWorkspaceCollection("E1 mostra que o projeto implementa um agente local.", context, &.{"collect_evidence"}));
 }
 
 test "tool loop prose repairs ignore hidden reasoning text" {
