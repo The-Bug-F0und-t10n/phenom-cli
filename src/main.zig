@@ -592,6 +592,7 @@ const max_pathless_collect_budget: usize = 6 * 1024;
 const max_model_context_send_bytes: usize = 24 * 1024;
 const weak_evidence_quality_score: i32 = 64;
 const required_tool_missing_answer = "[MODEL_PROTOCOL_ERROR] required follow-up tool_call missing after repair; no final evidence was selected.";
+const required_work_missing_answer = "[MODEL_FINALIZATION_BLOCKED] required operational work was not completed; no final answer accepted.";
 
 fn emitEmptyVisibleAnswer(sink: *StreamSink) !void {
     if (sink.ui) |active_ui| try active_ui.showStatus("no visible final answer; see diagnostic");
@@ -679,12 +680,38 @@ fn runToolLoopIterations(
     if (maybe_envelope == null and outputNeedsWorkspaceEvidenceRepair(visible_output, initial_context, state.active_contract.allowed_tools)) {
         first_sink.discardDeferredVisible();
         try db.recordEvent(config.session, "tool_repair", "unsupported workspace claim without evidence");
-        const fallback_call = tool_call.ToolCall{
-            .name = try allocator.dupe(u8, "collect_evidence"),
-            .stage = try allocator.dupe(u8, "overview"),
-            .strategy = .auto,
-        };
-        maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, fallback_call);
+        if (toolAllowed(state.active_contract.allowed_tools, "collect_evidence")) {
+            const fallback_call = tool_call.ToolCall{
+                .name = try allocator.dupe(u8, "collect_evidence"),
+                .stage = try allocator.dupe(u8, "overview"),
+                .strategy = .auto,
+            };
+            maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, fallback_call);
+        } else if (toolAllowed(state.active_contract.allowed_tools, "set_operational_contract")) {
+            const repair_context = try renderWorkspaceClaimRouterRepairContext(allocator, prompt);
+            defer allocator.free(repair_context);
+            try db.recordEvent(config.session, "model_context", repair_context);
+            const next = try streamDeferredRequiredToolLoopTurn(
+                allocator,
+                config,
+                prompt,
+                repair_context,
+                "Your previous answer made a workspace/source-code claim without evidence. Output exactly one set_operational_contract tool_call with requiresInspection=true, or answer without workspace/source-code claims. No prose.",
+                client,
+                events,
+                db,
+                ui_ptr,
+                first_sink,
+                state.active_contract,
+            );
+            switch (next) {
+                .final_answer => return true,
+                .stopped => return true,
+                .tool_call => |next_call| {
+                    maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
+                },
+            }
+        }
     }
     if (maybe_envelope == null and outputCitesMissingSessionEvidence(visible_output, initial_context)) {
         first_sink.discardDeferredVisible();
@@ -733,7 +760,7 @@ fn runToolLoopIterations(
                 const repair_context = try renderInitialRejectedToolContext(allocator, prompt, envelope.raw_name);
                 defer allocator.free(repair_context);
                 try db.recordEvent(config.session, "model_context", repair_context);
-                const next = try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, first_sink, state.active_contract);
+                const next = try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, first_sink, &state);
                 switch (next) {
                     .final_answer => return true,
                     .stopped => return true,
@@ -1004,6 +1031,20 @@ fn renderUnsupportedWorkspaceClaimRepairContext(allocator: std.mem.Allocator, pr
     });
 }
 
+fn renderWorkspaceClaimRouterRepairContext(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
+    return model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = context_profile.toolSchema(.code_evidence, .initial),
+        .obligations = &.{
+            "The previous visible answer made a workspace/source-code claim before selecting an operational contract.",
+            "The initial router cannot execute collect_evidence directly.",
+            "Direct final answer remains valid only if it avoids local workspace/source-code claims.",
+        },
+        .grounding = groundingRules(),
+        .next_action = "Emit set_operational_contract with requiresInspection=true for workspace/source-code claims, or answer directly without those claims. No prose before a required tool call.",
+    });
+}
+
 fn renderCollectEvidenceSearchIntentRepairContext(
     allocator: std.mem.Allocator,
     prompt: []const u8,
@@ -1116,7 +1157,7 @@ fn runOneToolLoopStep(
             );
             defer allocator.free(answer_context);
             try db.recordEvent(config.session, "model_context", answer_context);
-            return try streamDeferredToolLoopTurn(allocator, config, prompt, answer_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+            return try streamDeferredToolLoopTurn(allocator, config, prompt, answer_context, client, events, db, ui_ptr, aggregate_sink, state);
         }
         repairs.* += 1;
         try db.recordEvent(config.session, "tool_repair", "collect_evidence missing path");
@@ -1229,7 +1270,7 @@ fn runOneToolLoopStep(
         );
         defer allocator.free(duplicate_context);
         try db.recordEvent(config.session, "model_context", duplicate_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink, state);
     }
 
     if (tool_iterations.* >= max_tool_emergency_iterations or !state.hasBudgetForMoreEvidence()) {
@@ -1271,7 +1312,7 @@ fn runOneToolLoopStep(
         );
         defer allocator.free(follow_context);
         try db.recordEvent(config.session, "model_context", follow_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
     };
     defer result.deinit(allocator);
 
@@ -1281,6 +1322,7 @@ fn runOneToolLoopStep(
     try db.recordEvent(config.session, "evidence", model_evidence);
     try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = model_evidence } });
     try state.rememberExecutedArgs(path, call.terms, strategy, call.start_line, call.max_lines, result.context_id, model_evidence, result.model_bytes, result.quality_score);
+    state.recordObservation();
     const working_add = try std.fmt.allocPrint(
         allocator,
         "path={s} terms_bytes={} strategy={s} compact={} model_bytes={} quality={}",
@@ -1325,7 +1367,7 @@ fn runOneToolLoopStep(
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
 
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
 fn collectEvidenceHasSearchText(call: *const tool_call.ToolCall) bool {
@@ -1471,7 +1513,7 @@ fn runCollectEvidenceCandidatesStep(
                 );
                 defer allocator.free(answer_context);
                 try db.recordEvent(config.session, "model_context", answer_context);
-                return try streamDeferredToolLoopTurn(allocator, config, prompt, answer_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+                return try streamDeferredToolLoopTurn(allocator, config, prompt, answer_context, client, events, db, ui_ptr, aggregate_sink, state);
             }
             const fallback_selected = selectedCandidateForProtocolFallback(state) orelse return .stopped;
             const fallback_candidate = state.findCandidate(fallback_selected) orelse return .stopped;
@@ -1562,6 +1604,7 @@ fn runCollectEvidenceOverviewStep(
     try db.recordEvent(config.session, "evidence", model_evidence);
     try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = model_evidence } });
     try state.rememberExecutedArgs(null, null, .auto, call.start_line, call.max_lines, result.context_id, model_evidence, result.model_bytes, result.quality_score);
+    state.recordObservation();
 
     const require_refinement = shouldRequireOverviewRefinement(state, result.quality_score);
     if (require_refinement) state.forced_exploratory_refinements += 1;
@@ -1591,7 +1634,7 @@ fn runCollectEvidenceOverviewStep(
         );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
 fn shouldRequireOverviewRefinement(state: *const ToolLoopState, quality_score: i32) bool {
@@ -1661,6 +1704,7 @@ fn runCollectEvidenceRangeStep(
     try db.recordEvent(config.session, "evidence", model_evidence);
     try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = model_evidence } });
     try state.rememberExecutedArgs(path, null, .path, start_line, max_lines, result.context_id, model_evidence, result.model_bytes, result.quality_score);
+    state.recordObservation();
 
     const next_action = if (state.shouldAllowMoreEvidence() and result.quality_score < weak_evidence_quality_score)
         "The fallback candidate range evidence is weak or generic. Emit one refined collect_evidence call before answering."
@@ -1688,7 +1732,7 @@ fn runCollectEvidenceRangeStep(
         );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
 fn runCollectEvidenceExpandStep(
@@ -1775,7 +1819,7 @@ fn runCollectEvidenceExpandStep(
         );
         defer allocator.free(answer_context);
         try db.recordEvent(config.session, "model_context", answer_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, answer_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, answer_context, client, events, db, ui_ptr, aggregate_sink, state);
     }
 
     if (ui_ptr) |active_ui| try active_ui.showStatus("Reading");
@@ -1805,6 +1849,7 @@ fn runCollectEvidenceExpandStep(
     try db.recordEvent(config.session, "evidence", model_evidence);
     try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = model_evidence } });
     try state.rememberExecutedArgs(candidate.path, call.terms, .path, candidate.start_line, max_lines, result.context_id, model_evidence, result.model_bytes, result.quality_score);
+    state.recordObservation();
 
     const require_refinement = state.shouldAllowMoreEvidence() and result.quality_score < weak_evidence_quality_score;
     const next_action = if (require_refinement)
@@ -1833,7 +1878,7 @@ fn runCollectEvidenceExpandStep(
         );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
 fn expandedCandidateNextAction(allow_more_evidence: bool, weak_evidence: bool) []const u8 {
@@ -1926,7 +1971,7 @@ fn runSetOperationalContractStep(
         });
         defer allocator.free(duplicate_context);
         try db.recordEvent(config.session, "model_context", duplicate_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink, state);
     }
 
     if (call.requires_inspection == null or
@@ -1945,7 +1990,7 @@ fn runSetOperationalContractStep(
         });
         defer allocator.free(repair_context);
         try db.recordEvent(config.session, "model_context", repair_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
     }
 
     const request = contracts.OperationalContractRequest{
@@ -1957,8 +2002,7 @@ fn runSetOperationalContractStep(
     };
     const selected_name = contracts.selectOperationalContract(request);
     const selected = contracts.activeContract(selected_name) orelse return error.MissingContract;
-    state.active_contract = selected;
-    state.contract_selected = true;
+    state.selectContract(selected, request);
 
     const allowed = try renderAllowedTools(allocator, selected.allowed_tools);
     defer allocator.free(allowed);
@@ -1995,7 +2039,7 @@ fn runSetOperationalContractStep(
     });
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
 fn runApplyPatchStep(
@@ -2043,13 +2087,14 @@ fn runApplyPatchStep(
         });
         defer allocator.free(repair_context);
         try db.recordEvent(config.session, "model_context", repair_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
     };
     defer result.deinit(allocator);
 
     try db.recordEvent(config.session, "tool_event", result.audit_text);
     try db.recordEvent(config.session, "patch_result", result.text);
     try events.emit(.{ .tool_result = .{ .name = "apply_patch", .output = result.text } });
+    state.recordMutation();
 
     const follow_context = try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
@@ -2063,7 +2108,7 @@ fn runApplyPatchStep(
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
     state.active_contract = contracts.activeContract(.validate_work).?;
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
 fn repairPatchCall(
@@ -2088,7 +2133,7 @@ fn repairPatchCall(
     });
     defer allocator.free(repair_context);
     try db.recordEvent(config.session, "model_context", repair_context);
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
 fn parsePatchOperation(value: ?[]const u8) !apply_patch_tool.Operation {
@@ -2192,6 +2237,7 @@ fn runValidateSyntaxStep(
     try db.recordEvent(config.session, "tool_event", diagnostic.audit_text);
     try db.recordEvent(config.session, "validation", evidence_text);
     try events.emit(.{ .tool_result = .{ .name = "validate_syntax", .output = evidence_text } });
+    state.recordRuntimeValidation();
 
     const validation_block = [_]model_context.EvidenceBlock{.{ .text = evidence_text }};
     const follow_context = try model_context.renderModelTurnContext(allocator, .{
@@ -2202,7 +2248,7 @@ fn runValidateSyntaxStep(
     });
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
 fn repairValidationCall(
@@ -2225,7 +2271,7 @@ fn repairValidationCall(
     });
     defer allocator.free(repair_context);
     try db.recordEvent(config.session, "model_context", repair_context);
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
 fn runInspectRuntimeStep(
@@ -2251,6 +2297,7 @@ fn runInspectRuntimeStep(
     ;
     try db.recordEvent(config.session, "tool_event", result);
     try events.emit(.{ .tool_result = .{ .name = "inspect_runtime", .output = result } });
+    state.recordBrowserDiagnostics();
     const follow_context = try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
         .obligations = &.{"Runtime/browser inspection is unavailable in this controller pass; do not claim it ran."},
@@ -2259,7 +2306,7 @@ fn runInspectRuntimeStep(
     });
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
 fn runPromoteContextStep(
@@ -2305,12 +2352,13 @@ fn runPromoteContextStep(
         });
         defer allocator.free(repair_context);
         try db.recordEvent(config.session, "model_context", repair_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
     };
     defer allocator.free(result);
 
     try db.recordEvent(config.session, "persistent_promotion", result);
     try events.emit(.{ .tool_result = .{ .name = "promote_context", .output = result } });
+    state.recordMemoryPromotion();
     const follow_context = try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
         .grounding = groundingRules(),
@@ -2318,7 +2366,7 @@ fn runPromoteContextStep(
     });
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
 fn repairPromoteContextCall(
@@ -2343,7 +2391,7 @@ fn repairPromoteContextCall(
     });
     defer allocator.free(repair_context);
     try db.recordEvent(config.session, "model_context", repair_context);
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
 fn runSearchSessionStep(
@@ -2373,7 +2421,7 @@ fn runSearchSessionStep(
         );
         defer allocator.free(repair_context);
         try db.recordEvent(config.session, "model_context", repair_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
     }
     const scope = resolveSessionSearchScope(call.scope, call.session) catch {
         try db.recordEvent(config.session, "tool_repair", "search_session invalid scope");
@@ -2388,7 +2436,7 @@ fn runSearchSessionStep(
         );
         defer allocator.free(repair_context);
         try db.recordEvent(config.session, "model_context", repair_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
     };
     const search_key = try renderSessionSearchKey(allocator, scope, call.session, terms);
     defer allocator.free(search_key);
@@ -2405,7 +2453,7 @@ fn runSearchSessionStep(
         );
         defer allocator.free(duplicate_context);
         try db.recordEvent(config.session, "model_context", duplicate_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink, state);
     }
     if (tool_iterations.* >= max_tool_emergency_iterations or !state.hasBudgetForMoreEvidence()) {
         try db.recordEvent(config.session, "tool_loop_stop", "session/evidence budget exhausted");
@@ -2433,6 +2481,7 @@ fn runSearchSessionStep(
     try db.recordEvent(config.session, "session_context", result.text);
     try events.emit(.{ .tool_result = .{ .name = "search_session", .output = result.text } });
     try state.rememberSessionContext(result.text);
+    state.recordObservation();
 
     var session_events = try db.loadRecentSessionEvents(allocator, config.session, 240);
     defer audit.freeAuditEvents(allocator, &session_events);
@@ -2450,7 +2499,7 @@ fn runSearchSessionStep(
     );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state.active_contract);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
 const SessionSearchScope = enum {
@@ -2559,7 +2608,7 @@ fn streamDeferredToolLoopTurn(
     db: *audit.AuditDb,
     ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
     aggregate_sink: *StreamSink,
-    active_contract: contracts.ActiveContract,
+    state: *ToolLoopState,
 ) !ToolLoopNext {
     const repair_message: ?[]const u8 = if (initialContextRequiresTool(follow_context))
         "The current NEXT_ACTION requires one visible tool_call before prose. Output exactly one allowed context tool_call now. No prose."
@@ -2576,7 +2625,9 @@ fn streamDeferredToolLoopTurn(
         db,
         ui_ptr,
         aggregate_sink,
-        active_contract,
+        state.active_contract,
+        state,
+        required_work_missing_answer,
     );
 }
 
@@ -2605,6 +2656,8 @@ fn streamDeferredRequiredToolLoopTurn(
         ui_ptr,
         aggregate_sink,
         active_contract,
+        null,
+        required_tool_missing_answer,
     );
 }
 
@@ -2726,6 +2779,8 @@ fn streamDeferredToolLoopTurnInternal(
     ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
     aggregate_sink: *StreamSink,
     active_contract: contracts.ActiveContract,
+    finalization_state: ?*ToolLoopState,
+    required_tool_missing_visible: []const u8,
 ) !ToolLoopNext {
     if (ui_ptr) |active_ui| {
         try active_ui.showStatus("Thinking");
@@ -2771,7 +2826,7 @@ fn streamDeferredToolLoopTurnInternal(
             }
             if (repair_message.len == 0) {
                 try db.recordEvent(config.session, "tool_loop_stop", "required follow-up tool call missing after repair");
-                try aggregate_sink.emitVisibleText(required_tool_missing_answer);
+                try aggregate_sink.emitVisibleText(required_tool_missing_visible);
                 return .stopped;
             }
             follow_sink.discardDeferredVisible();
@@ -2795,6 +2850,8 @@ fn streamDeferredToolLoopTurnInternal(
                 ui_ptr,
                 aggregate_sink,
                 active_contract,
+                finalization_state,
+                required_tool_missing_visible,
             );
         }
         if (outputDefersAvailableWorkspaceCollection(follow_sink.raw_visible.items, follow_context, active_contract.allowed_tools)) {
@@ -2829,6 +2886,36 @@ fn streamDeferredToolLoopTurnInternal(
             }
         }
         if (follow_sink.raw_visible.items.len > 0) {
+            if (finalization_state) |state| {
+                if (state.finalizationBlocker()) |blocker| {
+                    follow_sink.discardDeferredVisible();
+                    if (state.finalization_repairs >= max_tool_repairs) {
+                        try db.recordEvent(config.session, "finalization_blocked", blocker);
+                        try aggregate_sink.emitVisibleText(required_work_missing_answer);
+                        return .stopped;
+                    }
+                    state.finalization_repairs += 1;
+                    try db.recordEvent(config.session, "finalization_repair", blocker);
+                    const repair_context = try renderFinalizationRepairContext(allocator, prompt, state, blocker);
+                    defer allocator.free(repair_context);
+                    try db.recordEvent(config.session, "model_context", repair_context);
+                    return streamDeferredToolLoopTurnInternal(
+                        allocator,
+                        config,
+                        prompt,
+                        repair_context,
+                        "The visible final answer is blocked by unmet operational state. Output exactly one allowed tool_call that satisfies the blocker. No prose.",
+                        client,
+                        events,
+                        db,
+                        ui_ptr,
+                        aggregate_sink,
+                        state.active_contract,
+                        state,
+                        required_work_missing_answer,
+                    );
+                }
+            }
             aggregate_sink.mergeGenerationStop(follow_sink);
             try aggregate_sink.emitVisibleText(follow_sink.raw_visible.items);
             follow_sink.raw_visible.clearRetainingCapacity();
@@ -2850,6 +2937,39 @@ fn streamDeferredToolLoopTurnInternal(
     if (envelope.takeCall()) |call| return .{ .tool_call = call };
     try db.recordEvent(config.session, "tool_rejected", "accepted envelope without call");
     return .stopped;
+}
+
+fn renderFinalizationRepairContext(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    state: *const ToolLoopState,
+    blocker: []const u8,
+) ![]u8 {
+    const operational_state = try std.fmt.allocPrint(
+        allocator,
+        "contract={s} observations={} mutations={} runtime_validations={} browser_diagnostics={} memory_promotions={} blocker={s}",
+        .{
+            @tagName(state.active_contract.name),
+            state.observations,
+            state.mutations,
+            state.runtime_validations,
+            state.browser_diagnostics,
+            state.memory_promotions,
+            blocker,
+        },
+    );
+    defer allocator.free(operational_state);
+    return model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = activeToolSchema(state),
+        .obligations = &.{
+            operational_state,
+            "The previous visible answer was not accepted because the selected operational contract is not satisfied.",
+            "Choose the smallest allowed tool call that satisfies the blocker. Do not answer in prose before that tool result.",
+        },
+        .grounding = groundingRules(),
+        .next_action = "Emit exactly one allowed tool_call now. No prose.",
+    });
 }
 
 fn visibleCandidateSelectionToToolCall(allocator: std.mem.Allocator, visible: []const u8, follow_context: []const u8) !?tool_call.ToolCall {
@@ -2943,9 +3063,22 @@ const ToolLoopState = struct {
     last_candidate_context: ?[]u8 = null,
     last_session_context: ?[]u8 = null,
     active_contract: contracts.ActiveContract,
+    requirements: contracts.OperationalContractRequest = .{
+        .requires_inspection = false,
+        .requires_mutation = false,
+        .requires_runtime_validation = false,
+        .requires_browser_diagnostics = false,
+        .requires_memory_promotion = false,
+    },
+    observations: usize = 0,
+    mutations: usize = 0,
+    runtime_validations: usize = 0,
+    browser_diagnostics: usize = 0,
+    memory_promotions: usize = 0,
     duplicate_repairs: usize = 0,
     contract_selected: bool = false,
     duplicate_contract_repairs: usize = 0,
+    finalization_repairs: usize = 0,
     forced_exploratory_refinements: usize = 0,
 
     fn init(allocator: std.mem.Allocator) ToolLoopState {
@@ -2995,6 +3128,49 @@ const ToolLoopState = struct {
             error.DuplicateWorkingEvidence => return,
             else => return err,
         };
+    }
+
+    fn selectContract(self: *ToolLoopState, selected: contracts.ActiveContract, request: contracts.OperationalContractRequest) void {
+        self.active_contract = selected;
+        self.contract_selected = true;
+        self.requirements = request;
+        self.finalization_repairs = 0;
+    }
+
+    fn recordObservation(self: *ToolLoopState) void {
+        self.observations += 1;
+        self.finalization_repairs = 0;
+    }
+
+    fn recordMutation(self: *ToolLoopState) void {
+        self.mutations += 1;
+        self.finalization_repairs = 0;
+    }
+
+    fn recordRuntimeValidation(self: *ToolLoopState) void {
+        self.runtime_validations += 1;
+        self.finalization_repairs = 0;
+    }
+
+    fn recordBrowserDiagnostics(self: *ToolLoopState) void {
+        self.browser_diagnostics += 1;
+        self.finalization_repairs = 0;
+    }
+
+    fn recordMemoryPromotion(self: *ToolLoopState) void {
+        self.memory_promotions += 1;
+        self.finalization_repairs = 0;
+    }
+
+    fn finalizationBlocker(self: *const ToolLoopState) ?[]const u8 {
+        if (!self.contract_selected) return null;
+        if (self.active_contract.name == .answer_only) return null;
+        if (self.requirements.requires_inspection and self.observations == 0) return "inspection evidence is required before finalization";
+        if (self.requirements.requires_mutation and self.mutations == 0) return "a successful mutation is required before finalization";
+        if (self.requirements.requires_runtime_validation and self.runtime_validations == 0) return "runtime validation is required before finalization";
+        if (self.requirements.requires_browser_diagnostics and self.browser_diagnostics == 0) return "browser/runtime diagnostics are required before finalization";
+        if (self.requirements.requires_memory_promotion and self.memory_promotions == 0) return "memory or skills promotion is required before finalization";
+        return null;
     }
 
     fn hasBudgetForMoreEvidence(self: ToolLoopState) bool {
@@ -4362,6 +4538,11 @@ test "missing evidence citation requires repair before visible answer" {
     defer std.testing.allocator.free(workspace_repair);
     try std.testing.expect(std.mem.indexOf(u8, workspace_repair, "stage=candidates") != null);
     try std.testing.expect(std.mem.indexOf(u8, workspace_repair, "stage=overview") != null);
+    const router_repair = try renderWorkspaceClaimRouterRepairContext(std.testing.allocator, "qual funcao?");
+    defer std.testing.allocator.free(router_repair);
+    try std.testing.expect(std.mem.indexOf(u8, router_repair, "set_operational_contract") != null);
+    try std.testing.expect(std.mem.indexOf(u8, router_repair, "collect_evidence(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, router_repair, "requiresInspection=true") != null);
 
     const terms = (try evidenceRepairTermsFromOutput(
         std.testing.allocator,
@@ -4969,6 +5150,75 @@ test "tool loop state starts with model-visible operational contract gate" {
     try std.testing.expect(state.active_contract.allows("set_operational_contract"));
     try std.testing.expect(!state.active_contract.allows("collect_evidence"));
     try std.testing.expect(!state.active_contract.allows("apply_patch"));
+}
+
+test "turn progress blocks finalization until selected contract is satisfied" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+
+    state.selectContract(contracts.activeContract(.answer_only).?, .{
+        .requires_inspection = false,
+        .requires_mutation = false,
+        .requires_runtime_validation = false,
+        .requires_browser_diagnostics = false,
+        .requires_memory_promotion = false,
+    });
+    try std.testing.expect(state.finalizationBlocker() == null);
+
+    state.selectContract(contracts.activeContract(.collect_evidence).?, .{
+        .requires_inspection = true,
+        .requires_mutation = false,
+        .requires_runtime_validation = false,
+        .requires_browser_diagnostics = false,
+        .requires_memory_promotion = false,
+    });
+    try std.testing.expectEqualStrings("inspection evidence is required before finalization", state.finalizationBlocker().?);
+    state.recordObservation();
+    try std.testing.expect(state.finalizationBlocker() == null);
+
+    state.selectContract(contracts.activeContract(.mutate_file).?, .{
+        .requires_inspection = false,
+        .requires_mutation = true,
+        .requires_runtime_validation = false,
+        .requires_browser_diagnostics = false,
+        .requires_memory_promotion = false,
+    });
+    try std.testing.expectEqualStrings("a successful mutation is required before finalization", state.finalizationBlocker().?);
+    state.recordMutation();
+    try std.testing.expect(state.finalizationBlocker() == null);
+
+    state.selectContract(contracts.activeContract(.validate_work).?, .{
+        .requires_inspection = false,
+        .requires_mutation = false,
+        .requires_runtime_validation = true,
+        .requires_browser_diagnostics = false,
+        .requires_memory_promotion = false,
+    });
+    try std.testing.expectEqualStrings("runtime validation is required before finalization", state.finalizationBlocker().?);
+    state.recordRuntimeValidation();
+    try std.testing.expect(state.finalizationBlocker() == null);
+}
+
+test "finalization repair context exposes only active contract tools" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+    state.selectContract(contracts.activeContract(.collect_evidence).?, .{
+        .requires_inspection = true,
+        .requires_mutation = false,
+        .requires_runtime_validation = false,
+        .requires_browser_diagnostics = false,
+        .requires_memory_promotion = false,
+    });
+
+    const blocker = state.finalizationBlocker() orelse return error.MissingBlocker;
+    const rendered = try renderFinalizationRepairContext(std.testing.allocator, "qual funcao coleta evidencia?", &state, blocker);
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[CONTRACTS]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "collect_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "set_operational_contract(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "inspection evidence is required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, required_work_missing_answer, "[MODEL_PROTOCOL_ERROR]") == null);
 }
 
 test "allowed tools render compact audit list" {

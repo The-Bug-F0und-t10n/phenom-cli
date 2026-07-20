@@ -231,8 +231,8 @@ pub fn activeContract(name: ContractName) ?ActiveContract {
 pub fn selectOperationalContract(request: OperationalContractRequest) ContractName {
     if (request.requires_memory_promotion) return .memory;
     if (request.requires_mutation) return .mutate_file;
-    if (request.requires_runtime_validation) return .validate_work;
     if (request.requires_browser_diagnostics) return .inspect_runtime;
+    if (request.requires_runtime_validation) return .validate_work;
     if (request.requires_inspection) return .collect_evidence;
     return .answer_only;
 }
@@ -360,6 +360,14 @@ test "memory contract opens only explicit persistent promotion" {
 }
 
 test "validation and runtime contracts do not unlock mutation" {
+    const selected_runtime = selectOperationalContract(.{
+        .requires_inspection = false,
+        .requires_mutation = false,
+        .requires_runtime_validation = true,
+        .requires_browser_diagnostics = true,
+    });
+    try std.testing.expectEqual(ContractName.inspect_runtime, selected_runtime);
+
     const validation = activeContract(.validate_work) orelse return error.MissingContract;
     try std.testing.expect(validation.allows("validate_syntax"));
     try std.testing.expect(!validation.allows("apply_patch"));
