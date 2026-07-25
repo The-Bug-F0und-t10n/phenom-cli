@@ -128,7 +128,7 @@ fn rejectedParse(
     reason: RejectionReason,
 ) !?ToolCallEnvelope {
     return .{
-        .raw_name = try allocator.dupe(u8, "<parse_error>"),
+        .raw_name = try allocator.dupe(u8, "tool_call"),
         .source = .text_protocol,
         .parse_strategy = .qwopus_xml,
         .state = .rejected,
@@ -242,6 +242,23 @@ test "invalid strategy is a rejected envelope" {
     defer envelope.deinit(std.testing.allocator);
     try std.testing.expectEqual(State.rejected, envelope.state);
     try std.testing.expectEqual(RejectionReason.invalid_strategy, envelope.rejection_reason.?);
+}
+
+test "invalid contract parameter is a format rejection not a pseudo tool" {
+    const active = contracts.activeContract(.workflow) orelse return error.MissingContract;
+    const output =
+        \\<tool_call>
+        \\<function=set_operational_contract>
+        \\<parameter=contract>made_up</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.rejected, envelope.state);
+    try std.testing.expectEqual(RejectionReason.parse_error, envelope.rejection_reason.?);
+    try std.testing.expect(envelope.call == null);
+    try std.testing.expectEqualStrings("tool_call", envelope.raw_name);
 }
 
 test "inactive collect evidence strategy is rejected by active contract" {

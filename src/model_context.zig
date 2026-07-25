@@ -2,9 +2,14 @@ const std = @import("std");
 const collect_evidence = @import("collect_evidence.zig");
 
 pub const system_prompt_v1 =
-    "You are Phenom, a code agent. Use only provided contracts/evidence. " ++
-    "Vague source-code task: infer intent, gather/compare evidence, refine gaps, answer with limits. " ++
-    "Do not invent MEMORY or SKILLS.";
+    "You are Phenom, a local operational agent. The model decides when contracts/tools are needed; the controller only executes accepted calls. " ++
+    "Answer directly for social turns, grounded dialogue, stable general knowledge, or explanations that need no external state. " ++
+    "For workspace/project/source-code claims, declare collect_evidence before making the claim. " ++
+    "For factual claims not grounded in current dialogue, MEMORY/SKILLS, SESSION_CONTEXT, E# evidence, or stable general knowledge, declare search_web or rag_web with a narrow model-selected query. " ++
+    "For prior-task continuity, use search_session with concrete retrieval keys. " ++
+    "If you say you will inspect, search, verify, edit, validate, or run something, emit the matching tool_call in that same turn. " ++
+    "Similar names, adjacent topics, partial matches, and probably-the-same matches are not evidence. " ++
+    "Do not invent MEMORY/SKILLS or cite evidence that is not present.";
 
 pub const EvidenceBlock = struct {
     text: []const u8,
@@ -36,7 +41,6 @@ pub const NextActionKind = enum {
 pub const NextAction = struct {
     kind: NextActionKind,
     text: []const u8,
-    required_tool_calls: u8 = 0,
 };
 
 pub const ContextByteBuckets = struct {
@@ -170,7 +174,7 @@ pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContex
 
     if (ctx.next_action_v1) |action| {
         try out.appendSlice(allocator, "\n[NEXT_ACTION]\n");
-        const line = try std.fmt.allocPrint(allocator, "kind={s} required_tool_calls={} action={s}\n", .{ @tagName(action.kind), action.required_tool_calls, action.text });
+        const line = try std.fmt.allocPrint(allocator, "kind={s} action={s}\n", .{ @tagName(action.kind), action.text });
         defer allocator.free(line);
         try out.appendSlice(allocator, line);
     } else if (ctx.next_action.len > 0) {
@@ -278,10 +282,10 @@ test "system prompt stays compact and stable" {
     const prompt = try renderSystemPrompt(std.testing.allocator);
     defer std.testing.allocator.free(prompt);
 
-    try std.testing.expect(prompt.len < 240);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "infer intent") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "refine gaps") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not invent MEMORY or SKILLS") != null);
+    try std.testing.expect(prompt.len < 1200);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "The model decides when contracts/tools are needed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Answer directly for social turns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not invent MEMORY/SKILLS") != null);
 }
 
 test "model context omits absent memory skills and evidence blocks" {
@@ -328,14 +332,13 @@ test "model context renders typed next action and byte buckets" {
         .evidence = &evidence_blocks,
         .next_action_v1 = .{
             .kind = .collect_context,
-            .required_tool_calls = 1,
-            .text = "emit one collect_evidence call before prose",
+            .text = "emit collect_evidence if more context is needed",
         },
     });
     defer std.testing.allocator.free(rendered);
 
     const buckets = measureRenderedContextBytes(rendered);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "kind=collect_context required_tool_calls=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "kind=collect_context action=emit collect_evidence if more context is needed") != null);
     try std.testing.expect(buckets.system == system_prompt_v1.len);
     try std.testing.expect(buckets.contracts > 0);
     try std.testing.expect(buckets.evidence > 0);
@@ -443,4 +446,11 @@ test "model context accepts collect evidence output without raw tail" {
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "alpha") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "SECRET_RAW_TAIL") == null);
+}
+
+test "system prompt delegates evidence decisions to model contracts" {
+    try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "The model decides when contracts/tools are needed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "controller only executes accepted calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "declare search_web or rag_web with a narrow model-selected query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "Similar names, adjacent topics, partial matches") != null);
 }

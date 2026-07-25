@@ -239,9 +239,13 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         }
 
         pub fn doneWithElapsed(self: *Self, elapsed: []const u8) !void {
+            try self.doneWithElapsedAndContext(elapsed, null);
+        }
+
+        pub fn doneWithElapsedAndContext(self: *Self, elapsed: []const u8, context_status: ?[]const u8) !void {
             try self.closeOpenBlocks();
             try self.blockGap(.done);
-            try self.writeWorkedLine(elapsed);
+            try self.writeWorkedLine(elapsed, context_status);
             try self.writer.writeAll("\n");
             self.last_block = .done;
         }
@@ -920,11 +924,21 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             }
         }
 
-        fn writeWorkedLine(self: *Self, elapsed: []const u8) !void {
+        fn writeWorkedLine(self: *Self, elapsed: []const u8, context_status: ?[]const u8) !void {
             const paint_cols = self.paintCols();
             var prefix_buf: [96]u8 = undefined;
-            const prefix = try std.fmt.bufPrint(&prefix_buf, "─ Worked for {s} ", .{elapsed});
+            const prefix = try std.fmt.bufPrint(&prefix_buf, "  ─ Worked for {s} ", .{elapsed});
             const shown_cols = try self.writeDimColumns(prefix, paint_cols);
+            const right = context_status orelse "";
+            const right_cols = utf8Columns(right);
+            const right_gap: usize = 2;
+            if (right_cols > 0 and paint_cols > shown_cols + right_gap + right_cols) {
+                var i: usize = shown_cols;
+                while (i < paint_cols - right_gap - right_cols) : (i += 1) try self.writeDim("─");
+                try self.writeDim("  ");
+                try self.writeDim(right);
+                return;
+            }
             var i: usize = shown_cols;
             while (i < paint_cols) : (i += 1) try self.writeDim("─");
         }
@@ -1527,7 +1541,7 @@ test "append only snapshot matches phenom cli ts plain surface" {
     try renderer.assistantDelta("ok");
     try renderer.done();
 
-    const expected = "\n                 \n > [user] ola    \n                 \n\n ok\n\n─ Worked for 0s ─\n";
+    const expected = "\n                 \n > [user] ola    \n                 \n\n ok\n\n  ─ Worked for 0s\n";
     try std.testing.expectEqualStrings(expected, buffer.items);
 }
 
@@ -1547,7 +1561,7 @@ test "status after assistant delta starts on separate block" {
         \\
         \\ success expected visible text found: PHENOM_REAL_7319
         \\
-        \\─ Worked for 0s ───────────────────────────────────────────────────────────────
+        \\  ─ Worked for 0s ─────────────────────────────────────────────────────────────
         \\
     ;
     try std.testing.expectEqualStrings(expected, buffer.items);
@@ -1742,7 +1756,7 @@ test "codex style append only turn snapshot covers core blocks" {
         "\n" ++
         " Corrigido.\n" ++
         "\n" ++
-        "─ Worked for 0s ─────────────────────────\n";
+        "  ─ Worked for 0s ───────────────────────\n";
     try std.testing.expectEqualStrings(expected, buffer.items);
 }
 
@@ -1808,6 +1822,26 @@ test "assistant markdown renders code agent structure" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, " │ try run();") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, " │ ```") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "─ Worked for 1s") != null);
+}
+
+test "done line can carry model context usage on the right" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 42 });
+    try renderer.assistantStart();
+    try renderer.assistantDelta("ok");
+    try renderer.doneWithElapsedAndContext("2s", "ctx 1.1% 737/65k tok");
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "─ Worked for 2s ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "  ctx 1.1% 737/65k tok") != null);
+
+    var start: usize = 0;
+    while (nextLine(buffer.items, &start)) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(visibleTextWidth(line) <= 41);
+    }
 }
 
 test "assistant markdown renders diff fences without saturated backgrounds" {
@@ -2042,4 +2076,51 @@ test "assistant markdown spaced fence language renders once" {
 
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, " │ ``` ts\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "tss") == null);
+}
+
+test "broad visual transcript fixture fits small and wide terminals" {
+    const widths = [_]usize{ 40, 80, 120, 180 };
+    for (widths) |columns| {
+        var buffer = std.ArrayList(u8).empty;
+        defer buffer.deinit(std.testing.allocator);
+
+        const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+        var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{
+            .color = false,
+            .terminal_columns = columns,
+            .max_tool_sample_lines = 3,
+            .max_diff_lines = 10,
+        });
+        try renderer.user("analise o patch\ncom duas linhas");
+        try renderer.assistantStart();
+        try renderer.thinkingDelta("planejar fases e evidencias sem vazar contexto bruto");
+        try renderer.thinkingEnd();
+        try renderer.assistantDelta(
+            \\# Resultado
+            \\- Usa `collect_evidence`.
+            \\```zig
+            \\const ok = true;
+            \\```
+        );
+        try renderer.toolSampleWithDetail("collect_evidence", "src/main.zig", "E1 src/main.zig L1-L2\nE2 src/http.zig L3-L4\nE3 src/audit.zig L5-L6\nE4 escondido");
+        try renderer.diff("src/main.zig", "edit", "@@ -1 +1 @@\n-old\n+new\n context");
+        try renderer.toolFailure("PatchContextStale\nraw tail must not render");
+        try renderer.doneWithElapsed("2s");
+
+        try std.testing.expect(std.mem.indexOf(u8, buffer.items, "> [user] analise") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buffer.items, "thinking") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buffer.items, " # Resultado") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buffer.items, "collect_evidence: src/main.zig") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buffer.items, "more line truncated") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buffer.items, "+ │ new") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buffer.items, "PatchContextStale") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buffer.items, "raw tail must not render") == null);
+        try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Worked for 2s") != null);
+
+        var start: usize = 0;
+        while (nextLine(buffer.items, &start)) |line| {
+            if (line.len == 0) continue;
+            try std.testing.expect(visibleTextWidth(line) <= columns - 1);
+        }
+    }
 }

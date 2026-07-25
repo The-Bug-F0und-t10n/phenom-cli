@@ -238,6 +238,8 @@ pub fn renderBottomBar(writer: anytype, state: BottomBarState) !usize {
         } else {
             try writeStatus(writer, state.color, status, state.status_right, state.visualizer, paint_cols);
         }
+    } else if (state.status_right) |right| {
+        try writeStatus(writer, state.color, "", right, null, paint_cols);
     } else {
         try writeSpaces(writer, paint_cols);
     }
@@ -598,8 +600,8 @@ pub fn TerminalUi(comptime Writer: type) type {
         token_total: usize = 0,
         token_tps: ?f64 = null,
         has_token_usage: bool = false,
-        context_used_bytes: usize = 0,
-        context_limit_bytes: usize = 0,
+        context_used_tokens: usize = 0,
+        context_limit_tokens: usize = 0,
         has_context_usage: bool = false,
         visualizer_mode: VisualizerMode = .idle,
         visualizer_tick: usize = 0,
@@ -711,8 +713,8 @@ pub fn TerminalUi(comptime Writer: type) type {
             self.token_total = 0;
             self.token_tps = null;
             self.has_token_usage = false;
-            self.context_used_bytes = 0;
-            self.context_limit_bytes = 0;
+            self.context_used_tokens = 0;
+            self.context_limit_tokens = 0;
             self.has_context_usage = false;
         }
 
@@ -728,14 +730,20 @@ pub fn TerminalUi(comptime Writer: type) type {
             }
         }
 
-        pub fn showContextUsage(self: *Self, used_bytes: usize, limit_bytes: usize) !void {
-            self.context_used_bytes = used_bytes;
-            self.context_limit_bytes = limit_bytes;
+        pub fn showContextUsage(self: *Self, used_tokens: usize, limit_tokens: usize) !void {
+            self.context_used_tokens = used_tokens;
+            self.context_limit_tokens = limit_tokens;
             self.has_context_usage = true;
-            if (self.last_status) |status| {
-                self.visualizer_tick +%= 1;
-                try self.draw(.{ .status = status, .show_prompt = false, .preserve_cursor = true });
+            if (self.last_status == null) {
+                self.last_status = "Thinking";
+                self.visualizer_mode = .thinking;
+                self.visualizer.setMode(.thinking, monotonicMs());
+                self.show_prompt = false;
+                try self.startStatusTicker();
             }
+            const status = self.last_status orelse return;
+            self.visualizer_tick +%= 1;
+            try self.draw(.{ .status = status, .show_prompt = false, .preserve_cursor = true });
         }
 
         pub fn pulseStatus(self: *Self) !void {
@@ -915,12 +923,14 @@ pub fn TerminalUi(comptime Writer: type) type {
         }
 
         fn formatStatusRight(self: *Self, buf: *[48]u8) ?[]const u8 {
-            if (!self.has_context_usage or self.context_limit_bytes == 0) return null;
+            if (!self.has_context_usage or self.context_limit_tokens == 0) return null;
             var used_buf: [24]u8 = undefined;
             var limit_buf: [24]u8 = undefined;
-            const used = formatByteCount(&used_buf, self.context_used_bytes);
-            const limit = formatByteCount(&limit_buf, self.context_limit_bytes);
-            return std.fmt.bufPrint(buf, "ctx {s}/{s}", .{ used, limit }) catch null;
+            const used = formatTokenCount(&used_buf, self.context_used_tokens);
+            const limit = formatTokenCount(&limit_buf, self.context_limit_tokens);
+            const raw_pct = (@as(f64, @floatFromInt(self.context_used_tokens)) * 100.0) / @as(f64, @floatFromInt(self.context_limit_tokens));
+            const pct = @min(raw_pct, 100.0);
+            return std.fmt.bufPrint(buf, "ctx {d:.1}% {s}/{s} tok", .{ pct, used, limit }) catch null;
         }
 
         fn formatOutputTokenCount(self: *Self, buf: *[24]u8) []const u8 {
@@ -1273,7 +1283,22 @@ test "status bar shows model context usage on the right" {
 
     var right_buf: [48]u8 = undefined;
     const right = ui.formatStatusRight(&right_buf) orelse return error.ExpectedContextUsage;
-    try std.testing.expectEqualStrings("ctx 8KiB/24KiB", right);
+    try std.testing.expectEqualStrings("ctx 33.3% 8.1k/24k tok", right);
+}
+
+test "context usage starts thinking status when shown before model tokens" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var ui = TerminalUi(@TypeOf(writer)).init(std.testing.allocator, writer, false);
+    defer ui.deinit();
+
+    try ui.showContextUsage(737, 65_536);
+
+    try std.testing.expectEqualStrings("Thinking", ui.last_status orelse return error.ExpectedStatus);
+    var right_buf: [48]u8 = undefined;
+    const right = ui.formatStatusRight(&right_buf) orelse return error.ExpectedContextUsage;
+    try std.testing.expectEqualStrings("ctx 1.1% 737/65k tok", right);
 }
 
 test "bottom bar keeps right status inside terminal width" {
@@ -1283,16 +1308,35 @@ test "bottom bar keeps right status inside terminal width" {
 
     _ = try renderBottomBar(writer, .{
         .color = false,
-        .cols = 30,
+        .cols = 40,
         .status = "Thinking",
-        .status_right = "ctx 8KiB/24KiB",
+        .status_right = "ctx 33.3% 8.1k/24k tok",
         .prompt = "",
         .cursor = 0,
         .show_prompt = false,
     });
 
     const first_line_end = std.mem.indexOf(u8, buffer.items, "\r\n") orelse return error.ExpectedStatusLine;
-    try std.testing.expectEqualStrings("Thinking       ctx 8KiB/24KiB", buffer.items[0..first_line_end]);
+    try std.testing.expectEqualStrings("Thinking         ctx 33.3% 8.1k/24k tok", buffer.items[0..first_line_end]);
+}
+
+test "bottom bar shows context usage while prompt is idle" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+
+    _ = try renderBottomBar(writer, .{
+        .color = false,
+        .cols = 40,
+        .status = null,
+        .status_right = "ctx 1.1% 737/65k tok",
+        .prompt = "proxima query",
+        .cursor = 12,
+        .show_prompt = true,
+    });
+
+    const first_line_end = std.mem.indexOf(u8, buffer.items, "\r\n") orelse return error.ExpectedStatusLine;
+    try std.testing.expectEqualStrings("                   ctx 1.1% 737/65k tok", buffer.items[0..first_line_end]);
 }
 
 test "prompt view wraps and keeps cursor in visible window" {

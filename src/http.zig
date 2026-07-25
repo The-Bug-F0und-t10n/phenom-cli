@@ -19,6 +19,8 @@ pub const LocalModelClient = struct {
     thinking: cli.ThinkingMode = .auto,
     last_http_status: ?u16 = null,
     last_http_body_snippet: ?[]u8 = null,
+    context_window: ?usize = null,
+    tokenizer_available: bool = false,
 
     pub fn deinit(self: *LocalModelClient) void {
         self.clearLastHttpFailure();
@@ -40,6 +42,31 @@ pub const LocalModelClient = struct {
             "http://{s}:{}{s}",
             .{ parsed.host, parsed.port, pathForBackend(self.backend) },
         );
+    }
+
+    pub fn probeMetadata(self: *LocalModelClient, allocator: std.mem.Allocator, baseline_text: []const u8) BackendMetadata {
+        return switch (self.backend) {
+            .llamacpp => probeLlamaCppMetadata(self, allocator, baseline_text),
+            .ollama => probeOllamaMetadata(self, allocator),
+        };
+    }
+
+    pub fn rememberMetadata(self: *LocalModelClient, metadata: BackendMetadata) void {
+        self.context_window = metadata.context_window;
+        self.tokenizer_available = std.mem.eql(u8, metadata.tokenizer, "available");
+    }
+
+    pub fn countInputTokens(self: *LocalModelClient, input: InferenceInput) ?usize {
+        if (self.backend != .llamacpp or !self.tokenizer_available) return null;
+        const stable_context = if (input.model_context) |context| stripVolatileTurnContextForPrompt(self.allocator, context) catch return null else null;
+        defer if (stable_context) |context| self.allocator.free(context);
+        var stable_input = input;
+        stable_input.model_context = stable_context;
+        const resolved_thinking = resolveThinking(self.thinking, input.user_prompt);
+        const generation_prefix = if (resolved_thinking == .on) "<think>\n" else "<think>\n\n</think>\n\n";
+        const chat_prompt = self.buildLlamaCppPrompt(stable_input, generation_prefix) catch return null;
+        defer self.allocator.free(chat_prompt);
+        return self.countTextTokens(chat_prompt);
     }
 
     pub fn streamChat(
@@ -121,6 +148,19 @@ pub const LocalModelClient = struct {
         return self.buildBodyForInput(.{ .user_prompt = prompt });
     }
 
+    fn countTextTokens(self: *LocalModelClient, text: []const u8) ?usize {
+        const parsed = parseHost(self.allocator, self.host, self.backend) catch return null;
+        defer parsed.deinit(self.allocator);
+        const escaped = jsonEscape(self.allocator, text) catch return null;
+        defer self.allocator.free(escaped);
+        const body = std.fmt.allocPrint(self.allocator, "{{\"content\":\"{s}\"}}", .{escaped}) catch return null;
+        defer self.allocator.free(body);
+        const response = requestHttp(self.allocator, parsed.host, parsed.port, "POST", "/tokenize", body, tokenizeResponseLimit(self.context_window)) catch return null;
+        defer response.deinit(self.allocator);
+        if (response.status < 200 or response.status >= 300) return null;
+        return parseTokenizeCount(response.body);
+    }
+
     pub fn httpFailureDetail(self: *LocalModelClient, allocator: std.mem.Allocator) !?[]u8 {
         const status = self.last_http_status orelse {
             if (self.last_http_body_snippet) |body| {
@@ -163,7 +203,7 @@ pub const LocalModelClient = struct {
         defer self.allocator.free(escaped_model);
 
         return switch (self.backend) {
-            .ollama => try self.buildOllamaBody(escaped_model, escaped_context, escaped_prompt, input.dialogue),
+            .ollama => try self.buildOllamaBody(escaped_model, escaped_context, escaped_prompt, input.dialogue, input.max_tokens),
             .llamacpp => blk: {
                 const resolved_thinking = resolveThinking(self.thinking, input.user_prompt);
                 const generation_prefix = if (resolved_thinking == .on)
@@ -176,14 +216,14 @@ pub const LocalModelClient = struct {
                 defer self.allocator.free(escaped_chat_prompt);
                 break :blk try std.fmt.allocPrint(
                     self.allocator,
-                    "{{\"stream\":true,\"prompt\":\"{s}\",\"temperature\":0.2,\"cache_prompt\":true,\"stop\":[\"<|im_end|>\"]}}",
-                    .{escaped_chat_prompt},
+                    "{{\"stream\":true,\"prompt\":\"{s}\",\"temperature\":0.2,\"cache_prompt\":true,\"n_predict\":{},\"stop\":[\"<|im_end|>\"]}}",
+                    .{ escaped_chat_prompt, input.max_tokens },
                 );
             },
         };
     }
 
-    fn buildOllamaBody(self: *LocalModelClient, escaped_model: []const u8, escaped_context: ?[]const u8, escaped_prompt: []const u8, dialogue: []const ChatMessage) ![]u8 {
+    fn buildOllamaBody(self: *LocalModelClient, escaped_model: []const u8, escaped_context: ?[]const u8, escaped_prompt: []const u8, dialogue: []const ChatMessage, max_tokens: u16) ![]u8 {
         var messages = std.ArrayList(u8).empty;
         defer messages.deinit(self.allocator);
         try messages.appendSlice(self.allocator, "{\"role\":\"system\",\"content\":\"Responda de forma direta, curta e no idioma do usuario. Nao mostre raciocinio.");
@@ -206,8 +246,8 @@ pub const LocalModelClient = struct {
         try messages.appendSlice(self.allocator, "\"}");
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"model\":\"{s}\",\"stream\":true,\"messages\":[{s}],\"options\":{{\"temperature\":0.2}}}}",
-            .{ escaped_model, messages.items },
+            "{{\"model\":\"{s}\",\"stream\":true,\"messages\":[{s}],\"options\":{{\"temperature\":0.2,\"num_predict\":{}}}}}",
+            .{ escaped_model, messages.items, max_tokens },
         );
     }
 
@@ -230,12 +270,76 @@ pub const LocalModelClient = struct {
     }
 };
 
+pub const RuntimeHttpResult = struct {
+    target: []const u8,
+    status: ?u16,
+    server: ?[]const u8,
+    body_snippet: []const u8,
+    error_name: ?[]const u8 = null,
+
+    pub fn deinit(self: RuntimeHttpResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.target);
+        if (self.server) |server| allocator.free(server);
+        allocator.free(self.body_snippet);
+    }
+};
+
+pub const BackendMetadata = struct {
+    source: []const u8,
+    tokenizer: []const u8,
+    schema_baseline_tokens: ?usize,
+    context_window: ?usize,
+    detail: []const u8,
+
+    pub fn deinit(self: BackendMetadata, allocator: std.mem.Allocator) void {
+        allocator.free(self.source);
+        allocator.free(self.tokenizer);
+        allocator.free(self.detail);
+    }
+};
+
+pub fn inspectHttpGet(allocator: std.mem.Allocator, target: []const u8) RuntimeHttpResult {
+    return inspectHttpGetLimit(allocator, target, 2048);
+}
+
+pub fn inspectHttpGetLimit(allocator: std.mem.Allocator, target: []const u8, body_limit: usize) RuntimeHttpResult {
+    const parsed = parseHttpTarget(allocator, target) catch |err| {
+        const normalized_target = if (std.mem.startsWith(u8, target, "http://") or std.mem.startsWith(u8, target, "https://"))
+            allocator.dupe(u8, target) catch unreachable
+        else
+            std.fmt.allocPrint(allocator, "http://{s}", .{target}) catch unreachable;
+        return .{
+            .target = normalized_target,
+            .status = null,
+            .server = null,
+            .body_snippet = allocator.dupe(u8, "") catch unreachable,
+            .error_name = @errorName(err),
+        };
+    };
+    defer parsed.deinit(allocator);
+    const normalized = parsed.render(allocator) catch unreachable;
+    const response = requestHttp(allocator, parsed.host, parsed.port, "GET", parsed.path, null, body_limit) catch |err| {
+        return .{
+            .target = normalized,
+            .status = null,
+            .server = null,
+            .body_snippet = allocator.dupe(u8, "") catch unreachable,
+            .error_name = @errorName(err),
+        };
+    };
+    return .{
+        .target = normalized,
+        .status = response.status,
+        .server = response.server,
+        .body_snippet = response.body,
+        .error_name = null,
+    };
+}
+
 fn stripVolatileTurnContextForPrompt(allocator: std.mem.Allocator, context: []const u8) ![]u8 {
     const without_task = try stripTurnContextTaskLine(allocator, context);
     defer allocator.free(without_task);
-    const without_focus = try removeTurnContextSection(allocator, without_task, "\n[SESSION_FOCUS]\n");
-    defer allocator.free(without_focus);
-    return removeTurnContextSection(allocator, without_focus, "\n[RECENT_DIALOGUE]\n");
+    return removeTurnContextSection(allocator, without_task, "\n[RECENT_DIALOGUE]\n");
 }
 
 fn stripTurnContextTaskLine(allocator: std.mem.Allocator, context: []const u8) ![]u8 {
@@ -299,6 +403,7 @@ pub const InferenceInput = struct {
     user_prompt: []const u8,
     model_context: ?[]const u8 = null,
     dialogue: []const ChatMessage = &.{},
+    max_tokens: u16 = 4096,
     cancel: ?*std.atomic.Value(bool) = null,
     cancel_fd: ?c_int = null,
 };
@@ -334,6 +439,52 @@ pub const ProbeResult = struct {
         if (self.server) |server| allocator.free(server);
     }
 };
+
+pub const BackendFailureKind = enum {
+    connect,
+    http_status,
+    protocol_parse,
+    model_empty,
+    model_think_only,
+    stream_cancelled,
+    stream_read,
+    stream_write,
+    unknown,
+};
+
+pub fn classifyStreamFailure(err: anyerror, status: ?u16) BackendFailureKind {
+    if (status != null or err == error.HttpStatusNotOk) return .http_status;
+    return switch (err) {
+        error.GetAddrInfoFailed,
+        error.ConnectFailed,
+        error.SocketCreateFailed,
+        error.InvalidIpv4Address,
+        => .connect,
+
+        error.SocketReadFailed,
+        error.HttpHeadersMissing,
+        error.HttpHeadersTooLarge,
+        => .stream_read,
+
+        error.SocketWriteFailed => .stream_write,
+
+        error.InvalidHttpResponse,
+        error.InvalidCharacter,
+        error.Overflow,
+        error.UnexpectedEndOfInput,
+        => .protocol_parse,
+
+        error.Cancelled => .stream_cancelled,
+        else => .unknown,
+    };
+}
+
+pub fn classifyModelOutput(stop_reason: StopReason, visible_bytes: usize, thinking_bytes: usize) ?BackendFailureKind {
+    if (visible_bytes > 0) return null;
+    if (thinking_bytes > 0) return .model_think_only;
+    _ = stop_reason;
+    return .model_empty;
+}
 
 pub fn probeBackend(allocator: std.mem.Allocator, host: []const u8, backend: cli.Backend) ProbeResult {
     const parsed = parseHost(allocator, host, backend) catch |err| {
@@ -511,6 +662,21 @@ const ParsedHost = struct {
     }
 };
 
+const ParsedHttpTarget = struct {
+    host: []const u8,
+    port: u16,
+    path: []const u8,
+
+    fn deinit(self: ParsedHttpTarget, allocator: std.mem.Allocator) void {
+        allocator.free(self.host);
+        allocator.free(self.path);
+    }
+
+    fn render(self: ParsedHttpTarget, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "http://{s}:{}{s}", .{ self.host, self.port, self.path });
+    }
+};
+
 fn parseHost(allocator: std.mem.Allocator, host: []const u8, backend: cli.Backend) !ParsedHost {
     var normalized = host;
     if (std.mem.startsWith(u8, normalized, "http://")) {
@@ -526,6 +692,227 @@ fn parseHost(allocator: std.mem.Allocator, host: []const u8, backend: cli.Backen
         };
     }
     return .{ .host = try allocator.dupe(u8, normalized), .port = LocalModelClient.defaultPort(backend) };
+}
+
+fn parseHttpTarget(allocator: std.mem.Allocator, raw_target: []const u8) !ParsedHttpTarget {
+    var target = std.mem.trim(u8, raw_target, " \t\r\n");
+    if (target.len == 0) return error.InvalidRuntimeTarget;
+    if (std.mem.startsWith(u8, target, "https://")) return error.TlsRuntimeInspectionUnsupported;
+    if (std.mem.startsWith(u8, target, "http://")) target = target["http://".len..];
+    const slash = std.mem.indexOfScalar(u8, target, '/') orelse target.len;
+    const authority = target[0..slash];
+    if (authority.len == 0) return error.InvalidRuntimeTarget;
+    const path_raw = if (slash < target.len) target[slash..] else "/";
+    var port: u16 = 80;
+    const host_part = if (std.mem.indexOfScalar(u8, authority, ':')) |idx| blk: {
+        port = try std.fmt.parseInt(u16, authority[idx + 1 ..], 10);
+        break :blk authority[0..idx];
+    } else authority;
+    if (host_part.len == 0) return error.InvalidRuntimeTarget;
+    return .{
+        .host = try allocator.dupe(u8, host_part),
+        .port = port,
+        .path = try allocator.dupe(u8, path_raw),
+    };
+}
+
+const HttpResponse = struct {
+    status: u16,
+    server: ?[]const u8,
+    body: []const u8,
+
+    fn deinit(self: HttpResponse, allocator: std.mem.Allocator) void {
+        if (self.server) |server| allocator.free(server);
+        allocator.free(self.body);
+    }
+};
+
+fn requestHttp(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    method: []const u8,
+    path: []const u8,
+    body: ?[]const u8,
+    body_limit: usize,
+) !HttpResponse {
+    const fd = try tcpConnect(allocator, host, port);
+    defer _ = c.close(fd);
+    const request = if (body) |payload|
+        try std.fmt.allocPrint(
+            allocator,
+            "{s} {s} HTTP/1.1\r\nHost: {s}\r\nContent-Type: application/json\r\nAccept: */*\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{s}",
+            .{ method, path, host, payload.len, payload },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "{s} {s} HTTP/1.1\r\nHost: {s}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            .{ method, path, host },
+        );
+    defer allocator.free(request);
+    try writeAll(fd, request);
+
+    var response = std.ArrayList(u8).empty;
+    defer response.deinit(allocator);
+    var buf: [2048]u8 = undefined;
+    while (response.items.len < body_limit + 32 * 1024) {
+        const n_raw = c.read(fd, &buf, buf.len);
+        if (n_raw < 0) return error.SocketReadFailed;
+        const n: usize = @intCast(n_raw);
+        if (n == 0) break;
+        try response.appendSlice(allocator, buf[0..n]);
+    }
+    const header_end = findHeaderEnd(response.items) orelse return error.HttpHeadersMissing;
+    const headers = response.items[0..header_end];
+    const status = try parseHttpStatus(headers);
+    const server = extractHeaderValue(allocator, headers, "Server") catch null;
+    errdefer if (server) |value| allocator.free(value);
+    var body_out = std.ArrayList(u8).empty;
+    errdefer body_out.deinit(allocator);
+    try appendSanitizedSnippet(allocator, &body_out, response.items[header_end + 4 ..], body_limit);
+    return .{ .status = status, .server = server, .body = try body_out.toOwnedSlice(allocator) };
+}
+
+fn probeLlamaCppMetadata(client: *LocalModelClient, allocator: std.mem.Allocator, baseline_text: []const u8) BackendMetadata {
+    const parsed = parseHost(allocator, client.host, client.backend) catch |err| {
+        return metadataUnavailable(allocator, "llamacpp", @errorName(err));
+    };
+    defer parsed.deinit(allocator);
+
+    var context_window: ?usize = null;
+    var detail = std.ArrayList(u8).empty;
+    defer detail.deinit(allocator);
+    if (requestHttp(allocator, parsed.host, parsed.port, "GET", "/props", null, 8192)) |props| {
+        defer props.deinit(allocator);
+        context_window = firstJsonUnsigned(props.body, &.{ "n_ctx", "n_ctx_train", "context_length" });
+        detail.appendSlice(allocator, "props=ok") catch {};
+    } else |err| {
+        appendFmt(allocator, &detail, "props_error={s}", .{@errorName(err)}) catch {};
+    }
+
+    const escaped = jsonEscape(allocator, baseline_text) catch return metadataUnavailable(allocator, "llamacpp", "json_escape_failed");
+    defer allocator.free(escaped);
+    const body = std.fmt.allocPrint(allocator, "{{\"content\":\"{s}\"}}", .{escaped}) catch return metadataUnavailable(allocator, "llamacpp", "alloc_failed");
+    defer allocator.free(body);
+    var tokenizer: []const u8 = "unavailable";
+    var baseline_tokens: ?usize = null;
+    if (requestHttp(allocator, parsed.host, parsed.port, "POST", "/tokenize", body, tokenizeResponseLimit(context_window))) |tok| {
+        defer tok.deinit(allocator);
+        if (tok.status >= 200 and tok.status < 300) {
+            baseline_tokens = parseTokenizeCount(tok.body);
+            tokenizer = if (baseline_tokens != null) "available" else "unavailable";
+            detail.appendSlice(allocator, " tokenize=ok") catch {};
+        } else {
+            appendFmt(allocator, &detail, " tokenize_status={}", .{tok.status}) catch {};
+        }
+    } else |err| {
+        appendFmt(allocator, &detail, " tokenize_error={s}", .{@errorName(err)}) catch {};
+    }
+
+    return .{
+        .source = allocator.dupe(u8, "llamacpp") catch unreachable,
+        .tokenizer = allocator.dupe(u8, tokenizer) catch unreachable,
+        .schema_baseline_tokens = baseline_tokens,
+        .context_window = context_window,
+        .detail = detail.toOwnedSlice(allocator) catch unreachable,
+    };
+}
+
+fn probeOllamaMetadata(client: *LocalModelClient, allocator: std.mem.Allocator) BackendMetadata {
+    const parsed = parseHost(allocator, client.host, client.backend) catch |err| {
+        return metadataUnavailable(allocator, "ollama", @errorName(err));
+    };
+    defer parsed.deinit(allocator);
+    const escaped_model = jsonEscape(allocator, client.model) catch return metadataUnavailable(allocator, "ollama", "json_escape_failed");
+    defer allocator.free(escaped_model);
+    const body = std.fmt.allocPrint(allocator, "{{\"model\":\"{s}\"}}", .{escaped_model}) catch return metadataUnavailable(allocator, "ollama", "alloc_failed");
+    defer allocator.free(body);
+    var context_window: ?usize = null;
+    var detail = std.ArrayList(u8).empty;
+    defer detail.deinit(allocator);
+    if (requestHttp(allocator, parsed.host, parsed.port, "POST", "/api/show", body, 8192)) |show| {
+        defer show.deinit(allocator);
+        context_window = firstJsonUnsigned(show.body, &.{ "context_length", "num_ctx", "llama.context_length" });
+        appendFmt(allocator, &detail, "show_status={}", .{show.status}) catch {};
+    } else |err| {
+        appendFmt(allocator, &detail, "show_error={s}", .{@errorName(err)}) catch {};
+    }
+    return .{
+        .source = allocator.dupe(u8, "ollama") catch unreachable,
+        .tokenizer = allocator.dupe(u8, "unavailable") catch unreachable,
+        .schema_baseline_tokens = null,
+        .context_window = context_window,
+        .detail = detail.toOwnedSlice(allocator) catch unreachable,
+    };
+}
+
+fn appendFmt(allocator: std.mem.Allocator, out: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
+    const text = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(text);
+    try out.appendSlice(allocator, text);
+}
+
+fn metadataUnavailable(allocator: std.mem.Allocator, source: []const u8, detail: []const u8) BackendMetadata {
+    return .{
+        .source = allocator.dupe(u8, source) catch unreachable,
+        .tokenizer = allocator.dupe(u8, "unavailable") catch unreachable,
+        .schema_baseline_tokens = null,
+        .context_window = null,
+        .detail = allocator.dupe(u8, detail) catch unreachable,
+    };
+}
+
+fn firstJsonUnsigned(json: []const u8, comptime keys: []const []const u8) ?usize {
+    inline for (keys) |key| {
+        if (jsonUnsignedAfterKey(json, key)) |value| return value;
+    }
+    return null;
+}
+
+fn jsonUnsignedAfterKey(json: []const u8, key: []const u8) ?usize {
+    const idx = std.mem.indexOf(u8, json, key) orelse return null;
+    const colon_rel = std.mem.indexOfScalar(u8, json[idx + key.len ..], ':') orelse return null;
+    var pos = idx + key.len + colon_rel + 1;
+    while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t' or json[pos] == '"')) : (pos += 1) {}
+    const start = pos;
+    while (pos < json.len and std.ascii.isDigit(json[pos])) : (pos += 1) {}
+    if (pos == start) return null;
+    return std.fmt.parseInt(usize, json[start..pos], 10) catch null;
+}
+
+fn parseTokenizeCount(json: []const u8) ?usize {
+    if (jsonUnsignedAfterKey(json, "n_tokens")) |value| return value;
+    const marker = "\"tokens\"";
+    const idx = std.mem.indexOf(u8, json, marker) orelse return null;
+    const open_rel = std.mem.indexOfScalar(u8, json[idx + marker.len ..], '[') orelse return null;
+    var pos = idx + marker.len + open_rel + 1;
+    var count: usize = 0;
+    var in_number = false;
+    while (pos < json.len) : (pos += 1) {
+        const byte = json[pos];
+        if (byte == ']') {
+            if (in_number) count += 1;
+            return count;
+        }
+        if (std.ascii.isDigit(byte) or byte == '-') {
+            in_number = true;
+            continue;
+        }
+        if (in_number) {
+            count += 1;
+            in_number = false;
+        }
+    }
+    return null;
+}
+
+fn tokenizeResponseLimit(context_window: ?usize) usize {
+    const floor: usize = 64 * 1024;
+    const ceiling: usize = 16 * 1024 * 1024;
+    const window = context_window orelse 4096;
+    if (window > (ceiling / 16)) return ceiling;
+    return @max(floor, @min(ceiling, window * 16));
 }
 
 fn tcpConnect(allocator: std.mem.Allocator, host: []const u8, port: u16) !c_int {
@@ -1275,6 +1662,28 @@ test "parse http status and server header for probe" {
     try std.testing.expectEqualStrings("llama.cpp", server);
 }
 
+test "runtime target parser accepts local http url and rejects https" {
+    const parsed = try parseHttpTarget(std.testing.allocator, "http://127.0.0.1:18080/health");
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("127.0.0.1", parsed.host);
+    try std.testing.expectEqual(@as(u16, 18080), parsed.port);
+    try std.testing.expectEqualStrings("/health", parsed.path);
+    try std.testing.expectError(error.TlsRuntimeInspectionUnsupported, parseHttpTarget(std.testing.allocator, "https://example.com/"));
+}
+
+test "backend metadata parsers extract context and tokenize count without estimates" {
+    try std.testing.expectEqual(@as(?usize, 4096), firstJsonUnsigned("{\"default_generation_settings\":{\"n_ctx\":4096}}", &.{"n_ctx"}));
+    try std.testing.expectEqual(@as(?usize, 5), parseTokenizeCount("{\"tokens\":[1,2,3,4,5]}"));
+    try std.testing.expectEqual(@as(?usize, 7), parseTokenizeCount("{\"n_tokens\":7}"));
+    try std.testing.expectEqual(@as(?usize, 8192), firstJsonUnsigned("{\"model_info\":{\"llama.context_length\":8192}}", &.{"llama.context_length"}));
+}
+
+test "tokenize response limit fits real prompt token arrays" {
+    try std.testing.expectEqual(@as(usize, 64 * 1024), tokenizeResponseLimit(null));
+    try std.testing.expect(tokenizeResponseLimit(65_536) > 8192);
+    try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), tokenizeResponseLimit(2_000_000));
+}
+
 test "llamacpp body uses qwopus chat template with thinking disabled" {
     var client = LocalModelClient{
         .allocator = std.testing.allocator,
@@ -1293,7 +1702,7 @@ test "llamacpp body uses qwopus chat template with thinking disabled" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_prompt\":true") != null);
 }
 
-test "llamacpp prompt cache prefix excludes volatile current task" {
+test "llamacpp prompt keeps persistent session focus and excludes volatile current task" {
     var client = LocalModelClient{
         .allocator = std.testing.allocator,
         .host = "127.0.0.1:11434",
@@ -1332,16 +1741,14 @@ test "llamacpp prompt cache prefix excludes volatile current task" {
 
     try std.testing.expect(std.mem.indexOf(u8, body_a, "task: primeira pergunta") == null);
     try std.testing.expect(std.mem.indexOf(u8, body_b, "task: segunda pergunta") == null);
-    try std.testing.expect(std.mem.indexOf(u8, body_a, "[SESSION_FOCUS]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body_a, "[SESSION_FOCUS]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body_a, "old focus A") != null);
     try std.testing.expect(std.mem.indexOf(u8, body_a, "[RECENT_DIALOGUE]") == null);
     try std.testing.expect(std.mem.indexOf(u8, body_a, "mode: code_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, body_a, "\"cache_prompt\":true") != null);
-
-    const user_idx = std.mem.indexOf(u8, body_a, "<|im_start|>user") orelse return error.MissingUser;
-    try std.testing.expect(commonPrefixLen(body_a, body_b) >= user_idx);
 }
 
-test "request body does not set generation token limit" {
+test "request body sets generation token limit for supported backends" {
     var llama_client = LocalModelClient{
         .allocator = std.testing.allocator,
         .host = "127.0.0.1:11434",
@@ -1349,9 +1756,9 @@ test "request body does not set generation token limit" {
         .model = "phenom:latest",
         .thinking = .off,
     };
-    const llama_body = try llama_client.buildBody("explique com detalhes");
+    const llama_body = try llama_client.buildBodyForInput(.{ .user_prompt = "explique com detalhes", .max_tokens = 128 });
     defer std.testing.allocator.free(llama_body);
-    try std.testing.expect(std.mem.indexOf(u8, llama_body, "\"n_predict\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, llama_body, "\"n_predict\":128") != null);
 
     var ollama_client = LocalModelClient{
         .allocator = std.testing.allocator,
@@ -1360,9 +1767,9 @@ test "request body does not set generation token limit" {
         .model = "phenom:latest",
         .thinking = .off,
     };
-    const ollama_body = try ollama_client.buildBody("explique com detalhes");
+    const ollama_body = try ollama_client.buildBodyForInput(.{ .user_prompt = "explique com detalhes", .max_tokens = 96 });
     defer std.testing.allocator.free(ollama_body);
-    try std.testing.expect(std.mem.indexOf(u8, ollama_body, "\"num_predict\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ollama_body, "\"num_predict\":96") != null);
 }
 
 test "llamacpp thinking on opens reasoning block" {
@@ -1498,13 +1905,6 @@ fn countNeedle(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
-fn commonPrefixLen(a: []const u8, b: []const u8) usize {
-    const limit = @min(a.len, b.len);
-    var i: usize = 0;
-    while (i < limit and a[i] == b[i]) : (i += 1) {}
-    return i;
-}
-
 test "thinking auto resolves simple prompt off and code prompt on" {
     try std.testing.expectEqual(cli.ThinkingMode.off, resolveThinking(.auto, "ola"));
     try std.testing.expectEqual(cli.ThinkingMode.on, resolveThinking(.auto, "analise este bug no codigo"));
@@ -1548,4 +1948,16 @@ test "cancel fd interrupts socket wait" {
 
     var input = StreamCancelInput{};
     try std.testing.expectError(error.Cancelled, waitReadableOrCancelled(-1, null, fds[0], &input));
+}
+
+test "backend failure classifier separates transport status protocol and model output" {
+    try std.testing.expectEqual(BackendFailureKind.connect, classifyStreamFailure(error.ConnectFailed, null));
+    try std.testing.expectEqual(BackendFailureKind.connect, classifyStreamFailure(error.GetAddrInfoFailed, null));
+    try std.testing.expectEqual(BackendFailureKind.http_status, classifyStreamFailure(error.HttpStatusNotOk, 404));
+    try std.testing.expectEqual(BackendFailureKind.protocol_parse, classifyStreamFailure(error.InvalidHttpResponse, null));
+    try std.testing.expectEqual(BackendFailureKind.stream_read, classifyStreamFailure(error.SocketReadFailed, null));
+    try std.testing.expectEqual(BackendFailureKind.stream_cancelled, classifyStreamFailure(error.Cancelled, null));
+    try std.testing.expectEqual(BackendFailureKind.model_empty, classifyModelOutput(.stop, 0, 0).?);
+    try std.testing.expectEqual(BackendFailureKind.model_think_only, classifyModelOutput(.length, 0, 12).?);
+    try std.testing.expect(classifyModelOutput(.stop, 1, 12) == null);
 }

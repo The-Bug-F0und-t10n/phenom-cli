@@ -1,0 +1,655 @@
+const std = @import("std");
+
+const evidence = @import("evidence.zig");
+const http = @import("http.zig");
+
+const c = @cImport({
+    @cInclude("stdlib.h");
+});
+
+const default_fetch_limit: usize = 64 * 1024;
+pub const default_search_template = "https://html.duckduckgo.com/html/?q={query}";
+
+pub const Result = struct {
+    target: []u8,
+    evidence_text: []u8,
+    audit_text: []u8,
+    context_id: []u8,
+    raw_bytes_read: usize,
+    model_bytes: usize,
+    quality_score: i32,
+
+    pub fn deinit(self: Result, allocator: std.mem.Allocator) void {
+        allocator.free(self.target);
+        allocator.free(self.evidence_text);
+        allocator.free(self.audit_text);
+        allocator.free(self.context_id);
+    }
+};
+
+pub fn fetch(allocator: std.mem.Allocator, io: std.Io, target: []const u8, query: ?[]const u8, budget_bytes: usize) !Result {
+    if (!isHttpTarget(target)) return error.InvalidWebTarget;
+    if (budget_bytes == 0) return error.InvalidEvidenceBudget;
+
+    const body_limit = @min(@max(budget_bytes * 4, @as(usize, 4096)), default_fetch_limit);
+    const inspected = if (std.mem.startsWith(u8, std.mem.trim(u8, target, " \t\r\n"), "https://"))
+        inspectHttpsGetLimit(allocator, io, target, body_limit)
+    else
+        http.inspectHttpGetLimit(allocator, target, body_limit);
+    defer inspected.deinit(allocator);
+
+    const title = try extractTitle(allocator, inspected.body_snippet);
+    defer allocator.free(title);
+    const plain_text = try distillText(allocator, inspected.body_snippet, inspected.body_snippet.len);
+    defer allocator.free(plain_text);
+    const searchable_text = try structuredTextForDistillation(allocator, inspected.body_snippet, plain_text);
+    defer allocator.free(searchable_text);
+    const distilled = try distillTextForQuery(allocator, searchable_text, query, budget_bytes);
+    defer allocator.free(distilled);
+    const web_block = try renderWebEvidenceBlock(allocator, inspected, title, distilled, query, budget_bytes);
+    defer allocator.free(web_block);
+    const status_text = try renderStatusText(allocator, inspected.status);
+    defer allocator.free(status_text);
+
+    var packet = evidence.EvidencePacket.init(allocator);
+    defer packet.deinit();
+    try packet.add(.{
+        .source = try allocator.dupe(u8, inspected.target),
+        .kind = try allocator.dupe(u8, "web_http_get"),
+        .range = try renderRange(allocator, inspected.status),
+        .hash = std.hash.Wyhash.hash(0, web_block),
+        .excerpt = try allocator.dupe(u8, web_block),
+    });
+    const evidence_text = try packet.render(allocator);
+    errdefer allocator.free(evidence_text);
+
+    const http_ok = successfulHttpStatus(inspected.status, inspected.error_name);
+    const audit_text = try std.fmt.allocPrint(
+        allocator,
+        "[TOOL_EVENT]\ntool=web_search\nsuccess={}\nargs=target={s} status={s} query_bytes={} raw_bytes={} model_bytes={} budget_bytes={} error={s}\n",
+        .{
+            http_ok,
+            inspected.target,
+            status_text,
+            if (query) |value| value.len else 0,
+            inspected.body_snippet.len,
+            evidence_text.len,
+            budget_bytes,
+            inspected.error_name orelse "",
+        },
+    );
+    errdefer allocator.free(audit_text);
+    const context_id = try std.fmt.allocPrint(allocator, "web_{x}", .{std.hash.Wyhash.hash(0, evidence_text)});
+    errdefer allocator.free(context_id);
+
+    return .{
+        .target = try allocator.dupe(u8, inspected.target),
+        .evidence_text = evidence_text,
+        .audit_text = audit_text,
+        .context_id = context_id,
+        .raw_bytes_read = inspected.body_snippet.len,
+        .model_bytes = evidence_text.len,
+        .quality_score = if (http_ok and distilled.len > 0) 82 else 30,
+    };
+}
+
+fn inspectHttpsGetLimit(allocator: std.mem.Allocator, io: std.Io, target: []const u8, body_limit: usize) http.RuntimeHttpResult {
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    defer body.deinit();
+
+    const response = client.fetch(.{
+        .location = .{ .url = target },
+        .response_writer = &body.writer,
+        .keep_alive = false,
+    }) catch |err| {
+        return .{
+            .target = allocator.dupe(u8, target) catch unreachable,
+            .status = null,
+            .server = null,
+            .body_snippet = allocator.dupe(u8, "") catch unreachable,
+            .error_name = @errorName(err),
+        };
+    };
+
+    const written = body.written();
+    return .{
+        .target = allocator.dupe(u8, target) catch unreachable,
+        .status = @intCast(@intFromEnum(response.status)),
+        .server = null,
+        .body_snippet = allocator.dupe(u8, written[0..@min(written.len, body_limit)]) catch unreachable,
+        .error_name = null,
+    };
+}
+
+fn successfulHttpStatus(status: ?u16, error_name: ?[]const u8) bool {
+    if (error_name != null) return false;
+    const value = status orelse return false;
+    return value >= 200 and value < 300;
+}
+
+pub fn resolveSearchTarget(allocator: std.mem.Allocator, target: ?[]const u8, query: ?[]const u8) ![]u8 {
+    return resolveSearchTargetWithTemplate(allocator, target, query, null);
+}
+
+pub fn resolveSearchTargetWithTemplate(allocator: std.mem.Allocator, target: ?[]const u8, query: ?[]const u8, configured_template: ?[]const u8) ![]u8 {
+    if (target) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (!isHttpTarget(trimmed)) return error.InvalidWebTarget;
+            return allocator.dupe(u8, trimmed);
+        }
+    }
+    const intent = std.mem.trim(u8, query orelse "", " \t\r\n");
+    if (intent.len == 0) return error.MissingWebSearchQuery;
+    const template = webSearchTemplate(configured_template) orelse return error.MissingWebSearchTarget;
+    return resolveSearchTargetFromTemplate(allocator, template, intent);
+}
+
+fn webSearchTemplate(configured_template: ?[]const u8) ?[]const u8 {
+    if (c.getenv("PHENOM_WEB_SEARCH_URL")) |template_z| {
+        const template = std.mem.trim(u8, std.mem.span(template_z), " \t\r\n");
+        if (template.len > 0) return template;
+    }
+    if (configured_template) |value| {
+        const template = std.mem.trim(u8, value, " \t\r\n");
+        if (template.len > 0) return template;
+    }
+    return default_search_template;
+}
+
+pub fn resolveSearchTargetFromTemplate(allocator: std.mem.Allocator, template: []const u8, query: []const u8) ![]u8 {
+    if (std.mem.indexOf(u8, template, "{query}")) |idx| {
+        const encoded = try percentEncodeQuery(allocator, query);
+        defer allocator.free(encoded);
+        const resolved = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ template[0..idx], encoded, template[idx + "{query}".len ..] });
+        errdefer allocator.free(resolved);
+        if (!isHttpTarget(resolved)) return error.InvalidWebTarget;
+        return resolved;
+    }
+    return error.InvalidWebSearchTemplate;
+}
+
+pub fn isHttpTarget(target: []const u8) bool {
+    const trimmed = std.mem.trim(u8, target, " \t\r\n");
+    return std.mem.startsWith(u8, trimmed, "http://") or std.mem.startsWith(u8, trimmed, "https://");
+}
+
+fn percentEncodeQuery(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (text) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.' or ch == '~') {
+            try out.append(allocator, ch);
+        } else if (ch == ' ') {
+            try out.appendSlice(allocator, "%20");
+        } else {
+            var buf: [3]u8 = undefined;
+            _ = try std.fmt.bufPrint(&buf, "%{X:0>2}", .{ch});
+            try out.appendSlice(allocator, &buf);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn renderRange(allocator: std.mem.Allocator, status: ?u16) ![]u8 {
+    if (status) |value| return std.fmt.allocPrint(allocator, "status={}", .{value});
+    return allocator.dupe(u8, "status=unavailable");
+}
+
+fn renderStatusText(allocator: std.mem.Allocator, status: ?u16) ![]u8 {
+    if (status) |value| return std.fmt.allocPrint(allocator, "{}", .{value});
+    return allocator.dupe(u8, "unavailable");
+}
+
+fn renderWebEvidenceBlock(
+    allocator: std.mem.Allocator,
+    inspected: http.RuntimeHttpResult,
+    title: []const u8,
+    excerpt: []const u8,
+    query: ?[]const u8,
+    budget_bytes: usize,
+) ![]u8 {
+    const status_text = try renderStatusText(allocator, inspected.status);
+    defer allocator.free(status_text);
+    return std.fmt.allocPrint(
+        allocator,
+        "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=query_chunks target={s}\nstatus={s}\nserver={s}\nerror={s}\nquery={s}\ntitle={s}\nexcerpt_budget_bytes={}\nexcerpt={s}\n",
+        .{
+            inspected.target,
+            status_text,
+            inspected.server orelse "",
+            inspected.error_name orelse "",
+            query orelse "",
+            title,
+            budget_bytes,
+            excerpt,
+        },
+    );
+}
+
+pub fn distillText(allocator: std.mem.Allocator, input: []const u8, budget_bytes: usize) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var in_tag = false;
+    var pending_space = false;
+    var i: usize = 0;
+    while (i < input.len and out.items.len < budget_bytes) {
+        const ch = input[i];
+        if (ch == '<') {
+            in_tag = true;
+            pending_space = out.items.len > 0;
+            i += 1;
+            continue;
+        }
+        if (in_tag) {
+            if (ch == '>') in_tag = false;
+            i += 1;
+            continue;
+        }
+        if (std.ascii.isWhitespace(ch)) {
+            pending_space = out.items.len > 0;
+            i += 1;
+            continue;
+        }
+        if (pending_space and out.items.len < budget_bytes) {
+            try out.append(allocator, ' ');
+            pending_space = false;
+        }
+        if (ch == '&') {
+            if (try appendEntity(allocator, &out, input[i..], budget_bytes)) |consumed| {
+                i += consumed;
+                continue;
+            }
+        }
+        try out.append(allocator, ch);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn distillTextForQuery(allocator: std.mem.Allocator, text: []const u8, query: ?[]const u8, budget_bytes: usize) ![]u8 {
+    if (budget_bytes == 0) return allocator.dupe(u8, "");
+    const intent = std.mem.trim(u8, query orelse "", " \t\r\n");
+    if (intent.len == 0) return budgetedCopy(allocator, text, budget_bytes);
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var cursor: usize = 0;
+    while (cursor < text.len and out.items.len < budget_bytes) {
+        const chunk = nextChunk(text, &cursor);
+        const trimmed = std.mem.trim(u8, chunk, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (!queryCoverageSufficient(trimmed, intent)) continue;
+        try appendBudgetedSlice(allocator, &out, trimmed, budget_bytes);
+    }
+    if (out.items.len == 0) return allocator.dupe(u8, "");
+    return out.toOwnedSlice(allocator);
+}
+
+fn structuredTextForDistillation(allocator: std.mem.Allocator, raw: []const u8, plain_fallback: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or (trimmed[0] != '{' and trimmed[0] != '[')) return allocator.dupe(u8, plain_fallback);
+    const json_text = try jsonStringValuesToText(allocator, trimmed, trimmed.len);
+    defer allocator.free(json_text);
+    if (std.mem.trim(u8, json_text, " \t\r\n").len == 0) return allocator.dupe(u8, plain_fallback);
+    return distillText(allocator, json_text, @max(json_text.len, plain_fallback.len));
+}
+
+fn jsonStringValuesToText(allocator: std.mem.Allocator, json: []const u8, budget_bytes: usize) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < json.len and out.items.len < budget_bytes) {
+        if (json[i] != '"') {
+            i += 1;
+            continue;
+        }
+        const value_start = i + 1;
+        const string_end = jsonStringEnd(json, value_start) orelse break;
+        var after = string_end + 1;
+        while (after < json.len and std.ascii.isWhitespace(json[after])) : (after += 1) {}
+        if (after >= json.len or json[after] != ':') {
+            if (out.items.len > 0 and out.items[out.items.len - 1] != ' ') try out.append(allocator, ' ');
+            try appendJsonDecodedBudgeted(allocator, &out, json[value_start..string_end], budget_bytes);
+        }
+        i = string_end + 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn jsonStringEnd(json: []const u8, start: usize) ?usize {
+    var i = start;
+    var escaped = false;
+    while (i < json.len) : (i += 1) {
+        const ch = json[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (ch == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == '"') return i;
+    }
+    return null;
+}
+
+fn appendJsonDecodedBudgeted(allocator: std.mem.Allocator, out: *std.ArrayList(u8), encoded: []const u8, budget_bytes: usize) !void {
+    var i: usize = 0;
+    while (i < encoded.len and out.items.len < budget_bytes) {
+        const ch = encoded[i];
+        if (ch != '\\') {
+            try out.append(allocator, ch);
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= encoded.len) break;
+        const esc = encoded[i + 1];
+        switch (esc) {
+            '"', '\\', '/' => {
+                try out.append(allocator, esc);
+                i += 2;
+            },
+            'b' => {
+                try out.append(allocator, ' ');
+                i += 2;
+            },
+            'f' => {
+                try out.append(allocator, ' ');
+                i += 2;
+            },
+            'n', 'r', 't' => {
+                try out.append(allocator, ' ');
+                i += 2;
+            },
+            'u' => {
+                if (i + 6 <= encoded.len) {
+                    const codepoint = parseHexCodepoint(encoded[i + 2 .. i + 6]) orelse {
+                        i += 2;
+                        continue;
+                    };
+                    var buf: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(codepoint, &buf) catch 0;
+                    try out.appendSlice(allocator, buf[0..@min(len, budget_bytes - out.items.len)]);
+                    i += 6;
+                } else {
+                    i += 2;
+                }
+            },
+            else => {
+                try out.append(allocator, esc);
+                i += 2;
+            },
+        }
+    }
+}
+
+fn parseHexCodepoint(bytes: []const u8) ?u21 {
+    if (bytes.len != 4) return null;
+    var value: u21 = 0;
+    for (bytes) |byte| {
+        const digit: u21 = if (byte >= '0' and byte <= '9')
+            byte - '0'
+        else if (byte >= 'a' and byte <= 'f')
+            byte - 'a' + 10
+        else if (byte >= 'A' and byte <= 'F')
+            byte - 'A' + 10
+        else
+            return null;
+        value = value * 16 + digit;
+    }
+    return value;
+}
+
+fn nextChunk(text: []const u8, cursor: *usize) []const u8 {
+    const start = cursor.*;
+    var end = start;
+    while (end < text.len) : (end += 1) {
+        const ch = text[end];
+        if (ch == '.' or ch == '!' or ch == '?' or ch == '\n') {
+            end += 1;
+            break;
+        }
+        if (end - start >= 360 and ch == ' ') {
+            end += 1;
+            break;
+        }
+    }
+    cursor.* = end;
+    return text[start..end];
+}
+
+fn queryCoverageScore(chunk: []const u8, query: []const u8) usize {
+    var score: usize = 0;
+    var it = std.mem.tokenizeAny(u8, query, " \t\r\n\"'`()[]{}<>:;,./\\|+-_*=");
+    while (it.next()) |raw| {
+        const term = std.mem.trim(u8, raw, " \t\r\n");
+        if (term.len < 3) continue;
+        if (containsIgnoreCase(chunk, term)) score += term.len;
+    }
+    return score;
+}
+
+fn queryCoverageTotal(query: []const u8) struct { bytes: usize, terms: usize } {
+    var bytes: usize = 0;
+    var terms: usize = 0;
+    var it = std.mem.tokenizeAny(u8, query, " \t\r\n\"'`()[]{}<>:;,./\\|+-_*=");
+    while (it.next()) |raw| {
+        const term = std.mem.trim(u8, raw, " \t\r\n");
+        if (term.len < 3) continue;
+        bytes += term.len;
+        terms += 1;
+    }
+    return .{ .bytes = bytes, .terms = terms };
+}
+
+fn queryCoverageSufficient(chunk: []const u8, query: []const u8) bool {
+    const total = queryCoverageTotal(query);
+    if (total.terms == 0) return true;
+    const score = queryCoverageScore(chunk, query);
+    if (total.terms == 1) return score > 0;
+    return score * 2 >= total.bytes;
+}
+
+fn appendBudgetedSlice(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8, budget_bytes: usize) !void {
+    if (out.items.len >= budget_bytes) return;
+    if (out.items.len > 0 and out.items[out.items.len - 1] != ' ') try out.append(allocator, ' ');
+    const remaining = budget_bytes - out.items.len;
+    try out.appendSlice(allocator, text[0..@min(text.len, remaining)]);
+}
+
+fn budgetedCopy(allocator: std.mem.Allocator, text: []const u8, budget_bytes: usize) ![]u8 {
+    return allocator.dupe(u8, text[0..@min(text.len, budget_bytes)]);
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn appendEntity(allocator: std.mem.Allocator, out: *std.ArrayList(u8), input: []const u8, budget_bytes: usize) !?usize {
+    const semicolon = std.mem.indexOfScalar(u8, input, ';') orelse return null;
+    if (semicolon > 8) return null;
+    const entity = input[0 .. semicolon + 1];
+    const decoded: ?u8 = if (std.mem.eql(u8, entity, "&amp;"))
+        '&'
+    else if (std.mem.eql(u8, entity, "&lt;"))
+        '<'
+    else if (std.mem.eql(u8, entity, "&gt;"))
+        '>'
+    else if (std.mem.eql(u8, entity, "&quot;"))
+        '"'
+    else if (std.mem.eql(u8, entity, "&#39;"))
+        '\''
+    else
+        null;
+    if (decoded) |value| {
+        if (out.items.len < budget_bytes) try out.append(allocator, value);
+        return semicolon + 1;
+    }
+    return null;
+}
+
+pub fn extractTitle(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const start = indexOfIgnoreCase(input, "<title>") orelse return allocator.dupe(u8, "");
+    const content_start = start + "<title>".len;
+    const end_rel = indexOfIgnoreCase(input[content_start..], "</title>") orelse return allocator.dupe(u8, "");
+    return distillText(allocator, input[content_start .. content_start + end_rel], 256);
+}
+
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
+test "distill strips html and decodes common entities" {
+    const out = try distillText(std.testing.allocator, "<html><title>A &amp; B</title><body>Texto <b>forte</b> &lt;x&gt;</body></html>", 1024);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("A & B Texto forte <x>", out);
+}
+
+test "title extraction is case insensitive and budgeted" {
+    const title = try extractTitle(std.testing.allocator, "<HTML><TITLE> Phenom &amp; Web </TITLE></HTML>");
+    defer std.testing.allocator.free(title);
+    try std.testing.expectEqualStrings("Phenom & Web", title);
+}
+
+test "query distillation keeps matching chunks and drops unrelated text" {
+    const input = "Abertura irrelevante longa. Horario de Brasilia agora aparece nesta frase importante. Outra frase sobre clima sem relacao.";
+    const out = try distillTextForQuery(std.testing.allocator, input, "horario de brasilia", 96);
+    defer std.testing.allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "Horario de Brasilia") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Abertura irrelevante") == null);
+    try std.testing.expect(out.len <= 96);
+}
+
+test "query distillation does not fall back to similar unrelated text" {
+    const input = "Resultado sobre Wesley Silva, musico local. Outro resultado sobre Behemoth, banda polonesa.";
+    const out = try distillTextForQuery(std.testing.allocator, input, "Wesley Beehmot biografia perfil", 256);
+    defer std.testing.allocator.free(out);
+
+    try std.testing.expectEqualStrings("", out);
+}
+
+test "json search payload is converted to readable evidence before query ranking" {
+    const raw =
+        \\{"pages":[{"key":"Linux_(n\u00facleo)","title":"Linux (n\u00facleo)","excerpt":"O <span class=\"searchmatch\">kernel</span> Linux foi criado por <span class=\"searchmatch\">Linus</span> <span class=\"searchmatch\">Torvalds</span> em 1991.","description":"nucleo Unix"}]}
+    ;
+    const fallback = try distillText(std.testing.allocator, raw, raw.len);
+    defer std.testing.allocator.free(fallback);
+    const text = try structuredTextForDistillation(std.testing.allocator, raw, fallback);
+    defer std.testing.allocator.free(text);
+    const out = try distillTextForQuery(std.testing.allocator, text, "criador kernel Linux Linus Torvalds", 512);
+    defer std.testing.allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "{") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "searchmatch") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Linus") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Torvalds") != null);
+}
+
+test "rejects non http targets" {
+    try std.testing.expect(!isHttpTarget("README.md"));
+    try std.testing.expect(isHttpTarget("http://127.0.0.1:8080/"));
+    try std.testing.expect(isHttpTarget("https://example.com/"));
+}
+
+test "query-only web search resolves through configured template" {
+    const target = try resolveSearchTargetFromTemplate(std.testing.allocator, "http://127.0.0.1:8080/search?q={query}&format=html", "horario de brasilia");
+    defer std.testing.allocator.free(target);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/search?q=horario%20de%20brasilia&format=html", target);
+}
+
+test "query-only web search can use config template without env" {
+    var saved_env: ?[:0]u8 = null;
+    if (c.getenv("PHENOM_WEB_SEARCH_URL")) |value| {
+        saved_env = try std.testing.allocator.dupeZ(u8, std.mem.span(value));
+    }
+    _ = c.unsetenv("PHENOM_WEB_SEARCH_URL");
+    defer {
+        if (saved_env) |value| {
+            _ = c.setenv("PHENOM_WEB_SEARCH_URL", value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = c.unsetenv("PHENOM_WEB_SEARCH_URL");
+        }
+    }
+
+    const target = try resolveSearchTargetWithTemplate(std.testing.allocator, null, "horario de brasilia", "http://127.0.0.1:8080/search?q={query}");
+    defer std.testing.allocator.free(target);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/search?q=horario%20de%20brasilia", target);
+}
+
+test "query-only web search has built-in default when env and config are absent" {
+    var saved_env: ?[:0]u8 = null;
+    if (c.getenv("PHENOM_WEB_SEARCH_URL")) |value| {
+        saved_env = try std.testing.allocator.dupeZ(u8, std.mem.span(value));
+    }
+    _ = c.unsetenv("PHENOM_WEB_SEARCH_URL");
+    defer {
+        if (saved_env) |value| {
+            _ = c.setenv("PHENOM_WEB_SEARCH_URL", value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = c.unsetenv("PHENOM_WEB_SEARCH_URL");
+        }
+    }
+
+    const target = try resolveSearchTargetWithTemplate(std.testing.allocator, null, "Linus Torvalds Linux", null);
+    defer std.testing.allocator.free(target);
+    try std.testing.expectEqualStrings("https://html.duckduckgo.com/html/?q=Linus%20Torvalds%20Linux", target);
+}
+
+test "query-only web search env overrides config template" {
+    var saved_env: ?[:0]u8 = null;
+    if (c.getenv("PHENOM_WEB_SEARCH_URL")) |value| {
+        saved_env = try std.testing.allocator.dupeZ(u8, std.mem.span(value));
+    }
+    _ = c.setenv("PHENOM_WEB_SEARCH_URL", "http://127.0.0.1:9000/env?q={query}", 1);
+    defer {
+        if (saved_env) |value| {
+            _ = c.setenv("PHENOM_WEB_SEARCH_URL", value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = c.unsetenv("PHENOM_WEB_SEARCH_URL");
+        }
+    }
+
+    const target = try resolveSearchTargetWithTemplate(std.testing.allocator, null, "horario de brasilia", "http://127.0.0.1:8080/config?q={query}");
+    defer std.testing.allocator.free(target);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9000/env?q=horario%20de%20brasilia", target);
+}
+
+test "query-only web search requires template placeholder" {
+    try std.testing.expectError(error.InvalidWebSearchTemplate, resolveSearchTargetFromTemplate(std.testing.allocator, "http://127.0.0.1:8080/search", "horario de brasilia"));
+}
+
+test "http status success excludes server errors" {
+    try std.testing.expect(successfulHttpStatus(200, null));
+    try std.testing.expect(successfulHttpStatus(204, null));
+    try std.testing.expect(!successfulHttpStatus(301, null));
+    try std.testing.expect(!successfulHttpStatus(500, null));
+    try std.testing.expect(!successfulHttpStatus(null, "ConnectFailed"));
+}
+
+test "https web fetch uses std client path instead of legacy runtime rejection" {
+    const result = try fetch(std.testing.allocator, std.testing.io, "https://", "external evidence", 256);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "[WEB_EVIDENCE]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.audit_text, "tool=web_search") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.audit_text, "TlsRuntimeInspectionUnsupported") == null);
+}

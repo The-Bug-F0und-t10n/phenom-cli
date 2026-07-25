@@ -196,6 +196,14 @@ pub fn isFailedTurnDone(body: []const u8) bool {
 }
 
 pub fn renderSessionFocus(allocator: std.mem.Allocator, focus_rows: []const audit.SessionFocus) !?[]u8 {
+    return renderSessionFocusInternal(allocator, focus_rows, null);
+}
+
+pub fn renderSessionFocusForPrompt(allocator: std.mem.Allocator, focus_rows: []const audit.SessionFocus, current_prompt: []const u8) !?[]u8 {
+    return renderSessionFocusInternal(allocator, focus_rows, current_prompt);
+}
+
+fn renderSessionFocusInternal(allocator: std.mem.Allocator, focus_rows: []const audit.SessionFocus, current_prompt: ?[]const u8) !?[]u8 {
     if (focus_rows.len == 0) return null;
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -203,6 +211,11 @@ pub fn renderSessionFocus(allocator: std.mem.Allocator, focus_rows: []const audi
 
     const start = if (focus_rows.len > max_topic_entries) focus_rows.len - max_topic_entries else 0;
     for (focus_rows[start..], 0..) |row, idx| {
+        const absolute_idx = start + idx;
+        if (current_prompt) |prompt| {
+            if (std.mem.eql(u8, row.topic, prompt)) continue;
+        }
+        if (std.mem.eql(u8, row.user_intent, "turn_checkpoint") and hasLaterCompletedFocus(focus_rows, absolute_idx)) continue;
         if (std.mem.indexOf(u8, row.flags, "low_confidence=true") != null) continue;
         const topic = try compactOneLine(allocator, row.topic, max_entry_bytes);
         defer allocator.free(topic);
@@ -236,6 +249,16 @@ pub fn renderSessionFocus(allocator: std.mem.Allocator, focus_rows: []const audi
     errdefer allocator.free(rendered);
     try model_context.assertNoRawContextLeak(rendered);
     return rendered;
+}
+
+fn hasLaterCompletedFocus(rows: []const audit.SessionFocus, idx: usize) bool {
+    const row = rows[idx];
+    for (rows[idx + 1 ..]) |later| {
+        if (!std.mem.eql(u8, later.topic, row.topic)) continue;
+        if (std.mem.eql(u8, later.user_intent, "turn_checkpoint")) continue;
+        return true;
+    }
+    return false;
 }
 
 pub fn renderFallbackSessionFocusFromEvents(allocator: std.mem.Allocator, events: []const audit.AuditEvent, current_prompt: []const u8) !?[]u8 {
@@ -991,6 +1014,46 @@ test "session focus renders confirmed summaries and skips low confidence rows" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "operational_summary=true") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Matheus 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "negativa ruim") == null);
+}
+
+test "session focus renders resumable checkpoints without current or completed duplicates" {
+    var rows = std.ArrayList(audit.SessionFocus).empty;
+    defer audit.freeSessionFocus(std.testing.allocator, &rows);
+    try rows.append(std.testing.allocator, .{
+        .topic = try std.testing.allocator.dupe(u8, "tarefa concluida"),
+        .user_intent = try std.testing.allocator.dupe(u8, "turn_checkpoint"),
+        .useful_facts = try std.testing.allocator.dupe(u8, "source=turn_checkpoint_v1\nactive_task: tarefa concluida\n"),
+        .quality = try std.testing.allocator.dupe(u8, "in_progress"),
+        .flags = try std.testing.allocator.dupe(u8, "answered=false in_progress=true low_confidence=false"),
+    });
+    try rows.append(std.testing.allocator, .{
+        .topic = try std.testing.allocator.dupe(u8, "tarefa concluida"),
+        .user_intent = try std.testing.allocator.dupe(u8, "turn_memory"),
+        .useful_facts = try std.testing.allocator.dupe(u8, "source=turn_memory_v1\nuser_goal: tarefa concluida\n"),
+        .quality = try std.testing.allocator.dupe(u8, "confirmed"),
+        .flags = try std.testing.allocator.dupe(u8, "answered=true low_confidence=false"),
+    });
+    try rows.append(std.testing.allocator, .{
+        .topic = try std.testing.allocator.dupe(u8, "tarefa interrompida"),
+        .user_intent = try std.testing.allocator.dupe(u8, "turn_checkpoint"),
+        .useful_facts = try std.testing.allocator.dupe(u8, "source=turn_checkpoint_v1\nactive_task: tarefa interrompida\n"),
+        .quality = try std.testing.allocator.dupe(u8, "in_progress"),
+        .flags = try std.testing.allocator.dupe(u8, "answered=false in_progress=true low_confidence=false"),
+    });
+    try rows.append(std.testing.allocator, .{
+        .topic = try std.testing.allocator.dupe(u8, "pedido atual"),
+        .user_intent = try std.testing.allocator.dupe(u8, "turn_checkpoint"),
+        .useful_facts = try std.testing.allocator.dupe(u8, "source=turn_checkpoint_v1\nactive_task: pedido atual\n"),
+        .quality = try std.testing.allocator.dupe(u8, "in_progress"),
+        .flags = try std.testing.allocator.dupe(u8, "answered=false in_progress=true low_confidence=false"),
+    });
+
+    const rendered = (try renderSessionFocusForPrompt(std.testing.allocator, rows.items, "pedido atual")) orelse return error.MissingFocus;
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "source=turn_memory_v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "active_task: tarefa interrompida") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "active_task: tarefa concluida") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "active_task: pedido atual") == null);
 }
 
 test "session focus merge keeps stored focus and legacy topics" {

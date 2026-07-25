@@ -142,6 +142,8 @@ fn applyKey(
         cfg.offline = try parseBool(value);
     } else if (std.mem.eql(u8, key, "fail_on_model_error")) {
         cfg.fail_on_model_error = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "web_search_url")) {
+        cfg.web_search_url = value;
     } else if (std.mem.eql(u8, key, "expect_contains")) {
         cfg.expect_contains = value;
     } else if (std.mem.eql(u8, key, "show_expect_status")) {
@@ -216,6 +218,7 @@ test "config file applies host port and flags override" {
         \\model = "phenom:latest"
         \\thinking = "on"
         \\max_tokens = 256
+        \\web_search_url = "http://127.0.0.1:8080/search?q={query}"
         \\no_color = true
     .*;
     var loaded = LoadedConfig{};
@@ -229,6 +232,7 @@ test "config file applies host port and flags override" {
     try std.testing.expectEqualStrings("phenom:latest", cfg.model);
     try std.testing.expectEqual(cli.ThinkingMode.off, cfg.thinking);
     try std.testing.expectEqual(@as(u16, 256), cfg.max_tokens);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/search?q={query}", cfg.web_search_url.?);
     try std.testing.expect(cfg.no_color);
 }
 

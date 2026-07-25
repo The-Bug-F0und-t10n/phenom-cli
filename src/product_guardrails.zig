@@ -1,7 +1,9 @@
 const std = @import("std");
 
+const audit = @import("audit.zig");
 const contracts = @import("contracts.zig");
 const context_profile = @import("context_profile.zig");
+const http = @import("http.zig");
 const model_context = @import("model_context.zig");
 
 const Criterion = struct {
@@ -12,10 +14,15 @@ const Criterion = struct {
 pub const final_alignment_criteria = [_]Criterion{
     .{ .id = "A0_contract_model_driven", .evidence = "set_operational_contract is model-visible and contract-scoped" },
     .{ .id = "A1_tool_surface_by_contract", .evidence = "internal tools remain hidden until selected contract allows executor" },
+    .{ .id = "A2_operational_phase_loop", .evidence = "turn phases are typed and replayable through SQLite audit events" },
     .{ .id = "A3_evidence_no_raw_leak", .evidence = "ModelTurnContext rejects raw tool markers" },
     .{ .id = "A5_memory_skills_separated", .evidence = "MEMORY/SKILLS are explicit persistent blocks only" },
+    .{ .id = "A6_error_taxonomy_replay", .evidence = "turn_error classifies model_protocol/tool_contract/tool_runtime/infrastructure/insufficient_evidence/validation_failed" },
+    .{ .id = "A7_renderer_restore", .evidence = "render tests cover broad transcript widths and SQLite restore path" },
+    .{ .id = "A8_backend_failures", .evidence = "HTTP stream failures classify connect/http_status/protocol_parse/model_empty/model_think_only" },
     .{ .id = "A9_context_profiles", .evidence = "news/document/runtime profiles do not use code_micro schema" },
     .{ .id = "A10_patch_validation", .evidence = "mutate_file unlocks apply_patch while validate_work does not" },
+    .{ .id = "A11_alignment_suite", .evidence = "offline guardrail script executes contracts/context/model/audit/http/render/main product tests" },
 };
 
 pub const preserved_zig_assertions = [_][]const u8{
@@ -67,6 +74,7 @@ test "guardrail preserves contract scoped tool execution" {
     const initial = contracts.activeContract(.workflow) orelse return error.MissingContract;
     try std.testing.expect(initial.allows("set_operational_contract"));
     try std.testing.expect(!initial.allows("collect_evidence"));
+    try std.testing.expect(!initial.allows("web_search"));
     try std.testing.expect(!initial.allows("apply_patch"));
     try std.testing.expect(!initial.allows("validate_syntax"));
 
@@ -123,4 +131,15 @@ test "guardrail preserves raw leak rejection" {
     try model_context.assertNoRawContextLeak(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
+}
+
+test "guardrail covers typed phases replay and backend failure classification" {
+    try std.testing.expect(audit.validPhaseTransition(.intent, .contract));
+    try std.testing.expect(audit.validPhaseTransition(.contract, .evidence));
+    try std.testing.expect(audit.validPhaseTransition(.evidence, .mutation));
+    try std.testing.expect(!audit.validPhaseTransition(.final, .evidence));
+
+    try std.testing.expectEqual(http.BackendFailureKind.connect, http.classifyStreamFailure(error.ConnectFailed, null));
+    try std.testing.expectEqual(http.BackendFailureKind.http_status, http.classifyStreamFailure(error.HttpStatusNotOk, 500));
+    try std.testing.expectEqual(http.BackendFailureKind.model_think_only, http.classifyModelOutput(.length, 0, 20).?);
 }
