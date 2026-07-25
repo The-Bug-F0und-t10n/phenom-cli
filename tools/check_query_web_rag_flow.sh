@@ -125,7 +125,7 @@ PORT=$(cat "$PORT_FILE")
     --host "127.0.0.1:$PORT" \
     --model scripted \
     --session "$SESSION" \
-    --prompt "Pergunta simples sem URL que requer dado externo: qual e o horario de Brasilia agora? Responda contendo $EXPECT." \
+    --prompt "Qual e o horario de Brasilia agora? Responda contendo $EXPECT." \
     --max-tokens 512 \
     --thinking on \
     --expect-contains "$EXPECT" \

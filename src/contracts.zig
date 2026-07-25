@@ -161,32 +161,32 @@ pub const contract_specs = [_]ContractSpec{
     .{
         .name = .collect_evidence,
         .endpoint = "collect_evidence",
-        .allowed_tools = &.{ "collect_evidence", "search_session", "web_search" },
+        .allowed_tools = &.{ "set_operational_contract", "collect_evidence", "search_session", "web_search" },
     },
     .{
         .name = .mutate_file,
         .endpoint = "set_operational_contract",
-        .allowed_tools = &.{ "collect_evidence", "search_session", "apply_patch" },
+        .allowed_tools = &.{ "set_operational_contract", "collect_evidence", "search_session", "apply_patch" },
     },
     .{
         .name = .validate_work,
         .endpoint = "set_operational_contract",
-        .allowed_tools = &.{ "collect_evidence", "search_session", "validate_syntax" },
+        .allowed_tools = &.{ "set_operational_contract", "collect_evidence", "search_session", "validate_syntax" },
     },
     .{
         .name = .inspect_runtime,
         .endpoint = "set_operational_contract",
-        .allowed_tools = &.{ "collect_evidence", "search_session", "inspect_runtime", "web_search" },
+        .allowed_tools = &.{ "set_operational_contract", "collect_evidence", "search_session", "inspect_runtime", "web_search" },
     },
     .{
         .name = .search_web,
         .endpoint = "web_search",
-        .allowed_tools = &.{"web_search"},
+        .allowed_tools = &.{ "set_operational_contract", "web_search" },
     },
     .{
         .name = .memory,
         .endpoint = "set_operational_contract",
-        .allowed_tools = &.{ "collect_evidence", "search_session", "promote_context" },
+        .allowed_tools = &.{ "set_operational_contract", "collect_evidence", "search_session", "promote_context" },
     },
 };
 
@@ -317,7 +317,7 @@ test "collect evidence accepts bounded strategies without expanding tool surface
 test "active collect evidence contract comes from manifest allowlist" {
     const active = activeContract(.collect_evidence) orelse return error.MissingContract;
     try std.testing.expectEqualStrings(manifest_version, active.version);
-    try std.testing.expect(!active.allows("set_operational_contract"));
+    try std.testing.expect(active.allows("set_operational_contract"));
     try std.testing.expect(active.allows("collect_evidence"));
     try std.testing.expect(active.allows("search_session"));
     try std.testing.expect(active.allows("web_search"));
@@ -327,6 +327,7 @@ test "active collect evidence contract comes from manifest allowlist" {
 
 test "search web contract owns web search executor" {
     const active = activeContract(.search_web) orelse return error.MissingContract;
+    try std.testing.expect(active.allows("set_operational_contract"));
     try std.testing.expect(active.allows("web_search"));
     try std.testing.expect(!active.allows("collect_evidence"));
     try std.testing.expect(strategyAllowed(.search_web, .document_summary));
@@ -388,7 +389,7 @@ test "operational contract selection opens only selected executor family" {
     try std.testing.expect(active.allows("collect_evidence"));
     try std.testing.expect(active.allows("search_session"));
     try std.testing.expect(active.allows("apply_patch"));
-    try std.testing.expect(!active.allows("set_operational_contract"));
+    try std.testing.expect(active.allows("set_operational_contract"));
     try std.testing.expect(!active.allows("validate_syntax"));
     try std.testing.expect(!active.allows("inspect_runtime"));
     try std.testing.expect(strategyAllowed(selected, .path));

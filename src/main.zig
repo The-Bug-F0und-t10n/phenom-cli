@@ -741,7 +741,7 @@ fn buildInitialModelContext(
         .grounding = groundingRules(),
         .next_action_v1 = if (enable_tool_loop) .{
             .kind = .collect_context,
-            .text = "Decide whether the current request needs tool-backed context. Facts not grounded in current dialogue, MEMORY/SKILLS, SESSION_CONTEXT, E#, or stable knowledge need search_web|rag_web with model-selected query. Otherwise answer directly.",
+            .text = "First choose route. If you cannot identify a requested name/entity from grounded context, emit set_operational_contract(contract=search_web, query=exact requested name/entity). Never answer no-records/fictional/similar first.",
         } else .{
             .kind = .answer_directly,
             .text = "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
@@ -902,12 +902,6 @@ fn runToolLoopIterations(
             try db.recordTurnError(config.session, .tool_contract, "tool_envelope", body);
             if (state.active_contract.name == .workflow and envelope.rejection_reason == .tool_not_advertised) {
                 first_sink.discardDeferredVisible();
-                if (promptRequestsMutation(prompt) and initialRejectedToolCanStartMutation(envelope.raw_name)) {
-                    try db.recordEvent(config.session, "tool_repair", "synthetic mutation contract from rejected initial executor");
-                    const synthetic_call = try syntheticMutationContractCall(allocator);
-                    maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, synthetic_call);
-                    continue;
-                }
                 const repair_context = try renderInitialRejectedToolContext(allocator, prompt, envelope.raw_name);
                 defer allocator.free(repair_context);
                 try db.recordEvent(config.session, "model_context", repair_context);
@@ -980,124 +974,6 @@ fn syntheticInitialSessionSearchCall(allocator: std.mem.Allocator, prompt: []con
     };
 }
 
-fn selectSyntheticInspectionContract(
-    allocator: std.mem.Allocator,
-    session: []const u8,
-    events: *ui_events.EventBus,
-    db: *audit.AuditDb,
-    state: *ToolLoopState,
-) !void {
-    const request = contracts.OperationalContractRequest{
-        .requires_inspection = true,
-        .requires_mutation = false,
-        .requires_runtime_validation = false,
-        .requires_browser_diagnostics = false,
-        .requires_memory_promotion = false,
-    };
-    const selected = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
-    state.selectContract(selected, request);
-    const allowed = try renderAllowedTools(allocator, selected.allowed_tools);
-    defer allocator.free(allowed);
-    const audit_body = try std.fmt.allocPrint(
-        allocator,
-        "contract={s} requiresInspection=true requiresMutation=false requiresRuntimeValidation=false requiresBrowserDiagnostics=false allowed_tools={s} reason=legacy synthetic inspection",
-        .{ @tagName(selected.name), allowed },
-    );
-    defer allocator.free(audit_body);
-    try db.recordEvent(session, "contract_selected", audit_body);
-    try events.emit(.{ .tool_start = .{ .name = "set_operational_contract", .detail = @tagName(selected.name) } });
-    try events.emit(.{ .tool_result = .{ .name = "set_operational_contract", .output = audit_body } });
-}
-
-fn syntheticWorkspaceOverviewCall(allocator: std.mem.Allocator) !tool_call.ToolCall {
-    return .{
-        .name = try allocator.dupe(u8, "collect_evidence"),
-        .stage = try allocator.dupe(u8, "overview"),
-        .strategy = .auto,
-    };
-}
-
-fn syntheticRuntimeContractCall(allocator: std.mem.Allocator) !tool_call.ToolCall {
-    return .{
-        .name = try allocator.dupe(u8, "set_operational_contract"),
-        .requires_inspection = false,
-        .requires_mutation = false,
-        .requires_runtime_validation = false,
-        .requires_browser_diagnostics = true,
-        .requires_memory_promotion = false,
-        .reason = try allocator.dupe(u8, "explicit runtime inspection requested"),
-    };
-}
-
-fn syntheticMutationContractCall(allocator: std.mem.Allocator) !tool_call.ToolCall {
-    return .{
-        .name = try allocator.dupe(u8, "set_operational_contract"),
-        .requires_inspection = true,
-        .requires_mutation = true,
-        .requires_runtime_validation = false,
-        .requires_browser_diagnostics = false,
-        .requires_memory_promotion = false,
-        .reason = try allocator.dupe(u8, "explicit code mutation requested"),
-    };
-}
-
-fn syntheticInspectRuntimeCall(allocator: std.mem.Allocator, prompt: []const u8) !tool_call.ToolCall {
-    const target = try firstHttpTargetFromText(allocator, prompt);
-    errdefer if (target) |value| allocator.free(value);
-    return .{
-        .name = try allocator.dupe(u8, "inspect_runtime"),
-        .target = target,
-    };
-}
-
-fn firstHttpTargetFromText(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
-    const start = std.mem.indexOf(u8, text, "http://") orelse return null;
-    var end = start;
-    while (end < text.len) : (end += 1) {
-        const ch = text[end];
-        if (std.ascii.isWhitespace(ch) or ch == '"' or ch == '\'' or ch == '`' or ch == '<' or ch == ')' or ch == ']') break;
-    }
-    var target_end = end;
-    while (target_end > start and (text[target_end - 1] == '.' or text[target_end - 1] == ',' or text[target_end - 1] == ';' or text[target_end - 1] == ':')) {
-        target_end -= 1;
-    }
-    var target = text[start..target_end];
-    if (std.mem.endsWith(u8, target, "/.")) target = target[0 .. target.len - 1];
-    if (target.len == 0) return null;
-    return try allocator.dupe(u8, target);
-}
-
-fn initialRejectedToolCanStartMutation(name: []const u8) bool {
-    return std.mem.eql(u8, name, "collect_evidence") or
-        std.mem.eql(u8, name, "apply_patch") or
-        std.mem.eql(u8, name, "write_file") or
-        std.mem.eql(u8, name, "create_file") or
-        std.mem.eql(u8, name, "delete_file") or
-        std.mem.eql(u8, name, "delete_dir");
-}
-
-fn promptRequestsMutation(prompt: []const u8) bool {
-    return containsAsciiIgnoreCase(prompt, "apply_patch") or
-        containsAsciiIgnoreCase(prompt, "contextId") or
-        containsAsciiIgnoreCase(prompt, "requiresMutation=true") or
-        containsAsciiIgnoreCase(prompt, "requiresMutation") or
-        containsAsciiIgnoreCase(prompt, "mutate_file") or
-        containsAsciiIgnoreCase(prompt, "write_file") or
-        containsAsciiIgnoreCase(prompt, "create_file") or
-        containsAsciiIgnoreCase(prompt, "delete_file") or
-        containsAsciiIgnoreCase(prompt, "patch");
-}
-
-fn promptRequestsValidation(prompt: []const u8) bool {
-    return containsAsciiIgnoreCase(prompt, "validate_syntax") or
-        containsAsciiIgnoreCase(prompt, "run_validation") or
-        containsAsciiIgnoreCase(prompt, "requiresRuntimeValidation=true") or
-        containsAsciiIgnoreCase(prompt, "requiresRuntimeValidation") or
-        containsAsciiIgnoreCase(prompt, "validate_work") or
-        containsAsciiIgnoreCase(prompt, "run_tests") or
-        containsAsciiIgnoreCase(prompt, "run_code");
-}
-
 fn syntheticSessionSearchTerms(allocator: std.mem.Allocator, prompt: []const u8, initial_context: []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -1167,50 +1043,8 @@ fn outputCitesMissingWorkspaceEvidence(output: []const u8, context: ?[]const u8)
 fn outputNeedsWorkspaceEvidenceRepair(output: []const u8, context: ?[]const u8, allowed_tools: []const []const u8) bool {
     if (contextHasSection(context, "[EVIDENCE]")) return false;
     if (containsCitation(output, 'E')) return true;
-    if (!toolAllowed(allowed_tools, "collect_evidence")) return false;
-    if (outputDefersAvailableInitialWorkspaceCollection(output, context, allowed_tools)) return true;
-    if (outputDeclinesAvailableWorkspaceEvidence(output, allowed_tools)) return true;
+    _ = allowed_tools;
     return outputClaimsEvidenceWithoutBlock(output);
-}
-
-fn outputNeedsRuntimeContractRepair(prompt: []const u8, output: []const u8, context: ?[]const u8, allowed_tools: []const []const u8) bool {
-    _ = context;
-    if (!toolAllowed(allowed_tools, "set_operational_contract")) return false;
-    if (!promptRequestsRuntimeInspection(prompt, null)) return false;
-    return outputDeclinesAvailableRuntimeInspection(output, allowed_tools);
-}
-
-fn outputNeedsRuntimeToolRepair(prompt: []const u8, output: []const u8, context: []const u8, allowed_tools: []const []const u8) bool {
-    if (!toolAllowed(allowed_tools, "inspect_runtime")) return false;
-    if (!promptRequestsRuntimeInspection(prompt, context)) return false;
-    return outputDeclinesAvailableRuntimeInspection(output, allowed_tools);
-}
-
-fn promptRequestsRuntimeInspection(prompt: []const u8, context: ?[]const u8) bool {
-    const text = context orelse "";
-    if (containsAsciiIgnoreCase(prompt, "inspect_runtime") or containsAsciiIgnoreCase(text, "inspect_runtime")) return true;
-    if (containsAsciiIgnoreCase(prompt, "requiresBrowserDiagnostics=true")) return true;
-    if (!containsAsciiIgnoreCase(prompt, "runtime") and !containsAsciiIgnoreCase(prompt, "browser")) return false;
-    return containsAsciiIgnoreCase(prompt, "diagnost") or containsAsciiIgnoreCase(prompt, "inspec");
-}
-
-fn outputDeclinesAvailableRuntimeInspection(output: []const u8, allowed_tools: []const []const u8) bool {
-    if (!toolAllowed(allowed_tools, "set_operational_contract") and !toolAllowed(allowed_tools, "inspect_runtime")) return false;
-    const runtime =
-        containsAsciiIgnoreCase(output, "inspect_runtime") or
-        containsAsciiIgnoreCase(output, "runtime") or
-        containsAsciiIgnoreCase(output, "browser") or
-        containsAsciiIgnoreCase(output, "diagnost");
-    if (!runtime) return false;
-    return containsAsciiIgnoreCase(output, "nao esta disponivel") or
-        containsAsciiIgnoreCase(output, "não está disponível") or
-        containsAsciiIgnoreCase(output, "indispon") or
-        containsAsciiIgnoreCase(output, "unavailable") or
-        containsAsciiIgnoreCase(output, "not available") or
-        containsAsciiIgnoreCase(output, "cannot") or
-        containsAsciiIgnoreCase(output, "can't") or
-        containsAsciiIgnoreCase(output, "nao posso") or
-        containsAsciiIgnoreCase(output, "não posso");
 }
 
 fn outputContradictsRuntimeInspection(output: []const u8, context: []const u8) bool {
@@ -1252,74 +1086,17 @@ fn outputContradictsRuntimeInspection(output: []const u8, context: []const u8) b
         containsAsciiIgnoreCase(output, "was not executed");
 }
 
-fn outputDefersAvailableInitialWorkspaceCollection(output: []const u8, context: ?[]const u8, allowed_tools: []const []const u8) bool {
-    const text = context orelse return false;
-    if (!toolAllowed(allowed_tools, "collect_evidence")) return false;
-    if (std.mem.indexOf(u8, text, "collect_evidence") == null) return false;
-    const asks_user_for_input =
-        containsAsciiIgnoreCase(output, "precis") or
-        containsAsciiIgnoreCase(output, "forne") or
-        containsAsciiIgnoreCase(output, "envie") or
-        containsAsciiIgnoreCase(output, "provide") or
-        containsAsciiIgnoreCase(output, "send") or
-        containsAsciiIgnoreCase(output, "share");
-    const workspace_input =
-        containsAsciiIgnoreCase(output, "arquivo") or
-        containsAsciiIgnoreCase(output, "file") or
-        containsAsciiIgnoreCase(output, "code") or
-        containsAsciiIgnoreCase(output, "repos") or
-        containsAsciiIgnoreCase(output, "workspace") or
-        containsAsciiIgnoreCase(output, "base de");
-    return asks_user_for_input and workspace_input;
-}
-
 fn outputDefersAvailableWorkspaceCollection(output: []const u8, context: ?[]const u8, allowed_tools: []const []const u8) bool {
-    const text = context orelse return false;
-    if (!contextHasSection(context, "[EVIDENCE]")) return false;
-    if (std.mem.indexOf(u8, text, "Do not call tools again") != null) return false;
-    if (!toolAllowed(allowed_tools, "collect_evidence")) return false;
-    if (std.mem.indexOf(u8, text, "collect_evidence") == null) return false;
-    if (!contextRequiresMoreWorkspaceCollection(text)) return false;
-    return !containsCitation(output, 'E') or outputRequestsMoreEvidence(output);
-}
-
-fn contextRequiresMoreWorkspaceCollection(context: []const u8) bool {
-    return std.mem.indexOf(u8, context, "do not ask permission") != null or
-        std.mem.indexOf(u8, context, "weak or generic") != null or
-        std.mem.indexOf(u8, context, "emit a focused collect_evidence") != null or
-        std.mem.indexOf(u8, context, "emit focused collect_evidence") != null or
-        std.mem.indexOf(u8, context, "Do not ask clarification") != null;
-}
-
-fn outputRequestsMoreEvidence(output: []const u8) bool {
-    if (!containsAsciiIgnoreCase(output, "evid")) return false;
-    return containsAsciiIgnoreCase(output, "adicion") or
-        containsAsciiIgnoreCase(output, "mais") or
-        containsAsciiIgnoreCase(output, "more") or
-        containsAsciiIgnoreCase(output, "additional");
-}
-
-fn outputDeclinesAvailableWorkspaceEvidence(output: []const u8, allowed_tools: []const []const u8) bool {
-    if (!toolAllowed(allowed_tools, "collect_evidence")) return false;
-    const denies =
-        containsAsciiIgnoreCase(output, "nao ha") or
-        containsAsciiIgnoreCase(output, "não há") or
-        containsAsciiIgnoreCase(output, "sem") or
-        containsAsciiIgnoreCase(output, "no ") or
-        containsAsciiIgnoreCase(output, "not ");
-    if (!denies) return false;
-    const missing_context =
-        containsAsciiIgnoreCase(output, "evid") or
-        containsAsciiIgnoreCase(output, "contexto") or
-        containsAsciiIgnoreCase(output, "context");
-    return missing_context;
+    _ = output;
+    _ = context;
+    _ = allowed_tools;
+    return false;
 }
 
 fn outputClaimsEvidenceWithoutBlock(output: []const u8) bool {
     return std.mem.indexOf(u8, output, "[EVIDENCE]") != null or
         std.mem.indexOf(u8, output, "EVIDENCE:") != null or
-        containsCitation(output, 'L') or
-        containsPathLikeToken(output);
+        containsCitation(output, 'L');
 }
 
 fn outputMentionsAllowedTool(output: []const u8, allowed_tools: []const []const u8) bool {
@@ -2653,28 +2430,6 @@ fn runSetOperationalContractStep(
     }
     tool_iterations.* += 1;
 
-    if (state.contract_selected) {
-        if (state.duplicate_contract_repairs >= max_duplicate_tool_repairs) {
-            try db.recordEvent(config.session, "tool_loop_stop", "duplicate set_operational_contract repeated after repair");
-            return .stopped;
-        }
-        state.duplicate_contract_repairs += 1;
-        try db.recordEvent(config.session, "contract_duplicate", "set_operational_contract");
-        const duplicate_context = try model_context.renderModelTurnContext(allocator, .{
-            .task = prompt,
-            .contracts = activeToolSchema(state),
-            .obligations = &.{
-                "The operational contract was already selected in this turn.",
-                "Do not call set_operational_contract again unless a later tool result changes the operational need.",
-            },
-            .grounding = groundingRules(),
-            .next_action = "Continue inside the existing contract. Call collect_evidence/search_session if evidence is needed, otherwise answer the user now.",
-        });
-        defer allocator.free(duplicate_context);
-        try db.recordEvent(config.session, "model_context", duplicate_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink, state);
-    }
-
     if (call.contract == null and (call.requires_inspection == null or
         call.requires_mutation == null or
         call.requires_runtime_validation == null or
@@ -2695,27 +2450,39 @@ fn runSetOperationalContractStep(
         return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
     }
 
-    const explicit_contract = call.contract != null;
-    const prompt_requires_mutation = if (explicit_contract) false else promptRequestsMutation(prompt);
-    const prompt_requires_validation = if (explicit_contract) false else promptRequestsValidation(prompt);
-    if (prompt_requires_mutation and !(call.requires_mutation orelse false)) {
-        try db.recordEvent(config.session, "tool_arg_repair", "set_operational_contract requiresMutation<-prompt");
-    }
-    if (prompt_requires_validation and !(call.requires_runtime_validation orelse false)) {
-        try db.recordEvent(config.session, "tool_arg_repair", "set_operational_contract requiresRuntimeValidation<-prompt");
-    }
-
-    const effective_requires_mutation = (call.requires_mutation orelse false) or prompt_requires_mutation;
+    const effective_requires_mutation = call.requires_mutation orelse false;
     const request = contracts.OperationalContractRequest{
         .requested_contract = call.contract,
         .requires_inspection = (call.requires_inspection orelse false) or effective_requires_mutation,
         .requires_mutation = effective_requires_mutation,
-        .requires_runtime_validation = (call.requires_runtime_validation orelse false) or prompt_requires_validation,
+        .requires_runtime_validation = call.requires_runtime_validation orelse false,
         .requires_browser_diagnostics = call.requires_browser_diagnostics orelse false,
         .requires_memory_promotion = call.requires_memory_promotion orelse false,
     };
     const selected_name = contracts.selectOperationalContract(request);
+    if (state.contract_selected and selected_name == state.active_contract.name) {
+        if (state.duplicate_contract_repairs >= max_duplicate_tool_repairs) {
+            try db.recordEvent(config.session, "tool_loop_stop", "duplicate set_operational_contract repeated after repair");
+            return .stopped;
+        }
+        state.duplicate_contract_repairs += 1;
+        try db.recordEvent(config.session, "contract_duplicate", "set_operational_contract");
+        const duplicate_context = try model_context.renderModelTurnContext(allocator, .{
+            .task = prompt,
+            .contracts = activeToolSchema(state),
+            .obligations = &.{
+                "The operational contract was already selected in this turn.",
+                "Use set_operational_contract only to switch to a different contract after evidence changes the operational strategy.",
+            },
+            .grounding = groundingRules(),
+            .next_action = "Continue inside the existing contract. Call an advertised evidence/session/tool if needed, otherwise answer the user now.",
+        });
+        defer allocator.free(duplicate_context);
+        try db.recordEvent(config.session, "model_context", duplicate_context);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink, state);
+    }
     const selected = contracts.activeContract(selected_name) orelse return error.MissingContract;
+    const switched_contract = state.contract_selected;
     state.selectContract(selected, request);
 
     const allowed = try renderAllowedTools(allocator, selected.allowed_tools);
@@ -2740,7 +2507,7 @@ fn runSetOperationalContractStep(
         },
     );
     defer allocator.free(audit_body);
-    try db.recordEvent(config.session, "contract_selected", audit_body);
+    try db.recordEvent(config.session, if (switched_contract) "contract_switched" else "contract_selected", audit_body);
     try events.emit(.{ .tool_start = .{ .name = "set_operational_contract", .detail = @tagName(selected.name) } });
     try events.emit(.{ .tool_result = .{ .name = "set_operational_contract", .output = audit_body } });
 
@@ -3126,7 +2893,7 @@ fn renderWebQueryOptimizationPrompt(allocator: std.mem.Allocator, prompt: []cons
         \\[WEB_QUERY_OPTIMIZATION]
         \\Return exactly one web search query. No prose, no XML, no markdown.
         \\Use USER_TASK and MODEL_DECLARED_QUERY to produce a narrow operational query.
-        \\If USER_TASK asks to verify/cite/source a fact and you know a likely candidate entity, include that candidate entity so the source can confirm or refute it.
+        \\Preserve MODEL_DECLARED_QUERY coverage. Do not enrich it with facts, entities, roles, categories, locations, nationality, platform, biography, or accusations absent from USER_TASK or MODEL_DECLARED_QUERY.
         \\Do not invent URLs. Maximum 12 words.
         \\
         \\[USER_TASK]
@@ -3251,7 +3018,7 @@ fn runWebSearchStep(
     defer allocator.free(target);
     const budget = collectWebEvidenceBudget(call.budget_bytes, state.remainingBudget());
     const strategy = contracts.StrategyName.document_summary;
-    if (state.hasExecutedArgs(target, declared_query, strategy, 1, 1)) {
+    if (state.hasExecutedWebTarget(target, strategy)) {
         try db.recordEvent(config.session, "tool_duplicate", "web_search");
         const duplicate_context = try renderCollectedEvidenceContext(
             allocator,
@@ -3319,7 +3086,7 @@ fn runWebSearchStep(
         null,
         null,
         if (state.shouldAllowMoreEvidence()) activeToolSchema(state) else context_profile.toolSchema(.code_evidence, .after_collect_evidence),
-        "Answer using cited WEB_EVIDENCE only if it directly and exactly supports the requested entity/fact. Similar names, adjacent topics, partial matches, or 'looks related' are insufficient. If WEB_EVIDENCE does not contain the named fact needed for the answer, do not answer from general knowledge; emit one refined web_search with a narrower model-selected query, including the exact candidate entity when you know one. Do not claim browser automation or full-page crawling.",
+        "Answer using cited WEB_EVIDENCE only if it directly and exactly supports the requested entity/fact. If WEB_EVIDENCE excerpt is empty, state that the search returned no direct supporting evidence. Similar names, adjacent topics, partial matches, or 'looks related' are insufficient. If WEB_EVIDENCE does not contain the named fact needed for the answer, do not answer from general knowledge; emit one refined web_search only if the query keeps the exact requested entity/fact and does not add guessed roles/categories/attributes. Do not ask permission for another search inside the active contract. Do not claim browser automation or full-page crawling.",
     );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
@@ -4133,44 +3900,6 @@ fn streamDeferredToolLoopTurnInternal(
                 required_tool_missing_visible,
             );
         }
-        if (outputDefersAvailableWorkspaceCollection(follow_sink.raw_visible.items, follow_context, active_contract.allowed_tools)) {
-            const deferred_output = try allocator.dupe(u8, follow_sink.raw_visible.items);
-            defer allocator.free(deferred_output);
-            follow_sink.discardDeferredVisible();
-            try db.recordEvent(config.session, "tool_repair", "answer deferred available workspace evidence collection");
-            const next = try streamSearchPlanTurn(
-                allocator,
-                config,
-                prompt,
-                client,
-                events,
-                db,
-                ui_ptr,
-                aggregate_sink,
-                active_contract,
-            );
-            switch (next) {
-                .final_answer => return .final_answer,
-                .stopped => {
-                    const repair_terms = try evidenceRepairTermsFromOutput(allocator, deferred_output, prompt, active_contract.allowed_tools);
-                    errdefer if (repair_terms) |terms| allocator.free(terms);
-                    return .{ .tool_call = .{
-                        .name = try allocator.dupe(u8, "collect_evidence"),
-                        .terms = repair_terms,
-                        .stage = try allocator.dupe(u8, "candidates"),
-                        .strategy = .symbol,
-                    } };
-                },
-                .tool_call => |next_call| return .{ .tool_call = next_call },
-            }
-        }
-        if (finalization_state) |state| {
-            if (state.finalizationBlocker() != null and outputNeedsRuntimeToolRepair(prompt, follow_sink.raw_visible.items, follow_context, active_contract.allowed_tools)) {
-                follow_sink.discardDeferredVisible();
-                try db.recordEvent(config.session, "tool_repair", "synthetic inspect_runtime from explicit runtime request");
-                return .{ .tool_call = try syntheticInspectRuntimeCall(allocator, prompt) };
-            }
-        }
         if (outputContradictsRuntimeInspection(follow_sink.raw_visible.items, follow_context)) {
             follow_sink.discardDeferredVisible();
             try db.recordEvent(config.session, "answer_repair", "runtime inspection contradiction");
@@ -4512,6 +4241,13 @@ const ToolLoopState = struct {
         });
     }
 
+    fn hasExecutedWebTarget(self: ToolLoopState, target: []const u8, strategy: contracts.StrategyName) bool {
+        for (self.context.entries.items) |entry| {
+            if (entry.strategy == strategy and entry.start_line == 1 and entry.max_lines == 1 and std.mem.eql(u8, entry.path, target)) return true;
+        }
+        return false;
+    }
+
     fn rememberExecutedArgs(self: *ToolLoopState, path: ?[]const u8, terms: ?[]const u8, strategy: contracts.StrategyName, start_line: usize, max_lines: usize, context_id: ?[]const u8, evidence_text: []const u8, model_bytes: usize, quality_score: i32) !void {
         self.context.remember(.{
             .path = path,
@@ -4534,6 +4270,7 @@ const ToolLoopState = struct {
         self.contract_selected = true;
         self.requirements = request;
         self.finalization_repairs = 0;
+        self.duplicate_contract_repairs = 0;
     }
 
     fn recordObservation(self: *ToolLoopState) void {
@@ -4941,7 +4678,7 @@ fn groundingRules() []const []const u8 {
         "S# entries are candidates; judge relevance and direct support before using them.",
         "Near/partial matches are not evidence for exact entity/fact claims; refine retrieval or state not evidenced.",
         "If E#/S# shows a tool already ran, do not claim the tool was unavailable; report the observed status/error/evidence instead.",
-        "Facts not grounded in current dialogue, MEMORY/SKILLS, SESSION_CONTEXT, E#, or stable knowledge need search_web/rag_web when available.",
+        "Named/obscure entities, handles, public-record/existence claims, or current facts absent from current dialogue, MEMORY/SKILLS, SESSION_CONTEXT, E#, or stable knowledge need search_web/rag_web before saying unknown, fictional, no-records, or similar.",
         "For vague workspace/code tasks, infer intent, split targets, and use collect_evidence terms as retrieval keys.",
         "If workspace/code context is required and collect_evidence is available, call it before saying context is unavailable.",
         "If web_search fails operationally, report status/error; do not invent a replacement URL.",
@@ -5509,8 +5246,8 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "apply_patch") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "grep_file") == null);
     const post_contract_schema = collectEvidenceToolSchema(false);
-    try std.testing.expect(std.mem.indexOf(u8, post_contract_schema, "set_operational_contract(") == null);
-    try std.testing.expect(std.mem.indexOf(u8, post_contract_schema, "Do not call set_operational_contract again") != null);
+    try std.testing.expect(std.mem.indexOf(u8, post_contract_schema, "set_operational_contract") != null);
+    try std.testing.expect(std.mem.indexOf(u8, post_contract_schema, "switch to a different contract") != null);
 
     var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
     defer db.close();
@@ -5530,7 +5267,7 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "assistant: resposta anterior") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "S1:") == null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[GROUNDING]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "Decide whether the current request needs tool-backed context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "First choose route") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "stage=overview") == null);
 
@@ -5694,7 +5431,7 @@ test "initial model context routes before prose without stale focus session sear
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SESSION_FOCUS]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "cloneEvidenceEntry") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Decide whether the current request needs tool-backed context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "First choose route") != null);
 }
 
 test "initial model context exposes session search without keyword-forced recall" {
@@ -5731,7 +5468,7 @@ test "initial model context exposes session search without keyword-forced recall
 
     try std.testing.expect(std.mem.indexOf(u8, recall, "[SESSION_FOCUS]") != null);
     try std.testing.expect(std.mem.indexOf(u8, recall, "search_session(intent?") != null);
-    try std.testing.expect(std.mem.indexOf(u8, recall, "Decide whether the current request needs tool-backed context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recall, "First choose route") != null);
 
     const register = (try buildInitialModelContext(
         std.testing.allocator,
@@ -5744,7 +5481,7 @@ test "initial model context exposes session search without keyword-forced recall
     )) orelse return error.MissingContext;
     defer std.testing.allocator.free(register);
 
-    try std.testing.expect(std.mem.indexOf(u8, register, "Decide whether the current request needs tool-backed context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, register, "First choose route") != null);
 }
 
 test "initial model context for one-shot prompt omits implicit session context" {
@@ -5776,7 +5513,7 @@ test "initial model context for one-shot prompt omits implicit session context" 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[SESSION_FOCUS]\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[RECENT_DIALOGUE]\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "cloneEvidenceEntry") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Decide whether the current request needs tool-backed context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "First choose route") != null);
 }
 
 test "initial model context includes long session summary without failed or current turns" {
@@ -5855,7 +5592,7 @@ test "initial model context combines stored focus with legacy turn topics" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "topic: projeto Zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "topic: qual a matematica perfeita de Matheus 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "source=sqlite_audit_fts") == null);
-    try std.testing.expect(rendered.len < 6000);
+    try std.testing.expect(rendered.len < 6200);
 }
 
 test "turn completion stores structured conversation memory in sqlite focus" {
@@ -6344,16 +6081,16 @@ test "missing evidence citation requires repair before visible answer" {
     try std.testing.expect(outputCitesMissingContextEvidence("Resposta cita S2 sem sessao.", "[TURN_CONTEXT v1]\n"));
     try std.testing.expect(!outputNeedsWorkspaceEvidenceRepair("A funcao e collect_evidence.", null, &.{"collect_evidence"}));
     try std.testing.expect(outputNeedsWorkspaceEvidenceRepair("EVIDENCE:\n- L4: chamada inventada", null, &.{"collect_evidence"}));
-    try std.testing.expect(outputNeedsWorkspaceEvidenceRepair("A funcao esta em src/clangd/SourceCode.cpp.", null, &.{"collect_evidence"}));
+    try std.testing.expect(!outputNeedsWorkspaceEvidenceRepair("A funcao esta em src/clangd/SourceCode.cpp.", null, &.{"collect_evidence"}));
     try std.testing.expect(!outputNeedsWorkspaceEvidenceRepair("O cmus nao grava historico em ~/.config/cmus/history.", null, &.{"set_operational_contract"}));
     try std.testing.expect(outputNeedsWorkspaceEvidenceRepair("Resposta cita E1 sem evidencia.", null, &.{"set_operational_contract"}));
-    try std.testing.expect(outputNeedsWorkspaceEvidenceRepair("Nao ha evidencia no contexto fornecido.", null, &.{"collect_evidence"}));
+    try std.testing.expect(!outputNeedsWorkspaceEvidenceRepair("Nao ha evidencia no contexto fornecido.", null, &.{"collect_evidence"}));
     try std.testing.expect(!outputNeedsWorkspaceEvidenceRepair(
         "Estimativa nao verificada: em 4-bit deve ficar acima de 16 GB de VRAM, dependendo do servidor.",
         "[TURN_CONTEXT v1]\n\n[CONTRACTS]\ncollect_evidence(intent, terms, strategy=auto|lexical|symbol)\n",
         &.{"collect_evidence"},
     ));
-    try std.testing.expect(outputNeedsWorkspaceEvidenceRepair(
+    try std.testing.expect(!outputNeedsWorkspaceEvidenceRepair(
         "Preciso que voce forneca os arquivos principais para analisar.",
         "[TURN_CONTEXT v1]\n\n[CONTRACTS]\ncollect_evidence(intent, terms, strategy=auto|lexical|symbol)\n",
         &.{"collect_evidence"},
@@ -6520,28 +6257,13 @@ test "missing initial router tool with empty visible output does not collect wor
     }
 }
 
-test "explicit runtime request repairs unavailable prose into runtime contract" {
-    const prompt = "Use set_operational_contract com requiresBrowserDiagnostics=true. Depois chame inspect_runtime com target http://127.0.0.1:11434/.";
+test "runtime contradiction repair is evidence based only" {
     const context =
         "[TURN_CONTEXT v1]\n\n" ++
         "[CONTRACTS]\nset_operational_contract(requiresInspection, requiresMutation, requiresRuntimeValidation, requiresBrowserDiagnostics)\ninspect_runtime(target)\n";
     const refusal = "inspect_runtime nao esta disponivel neste ambiente.";
 
-    try std.testing.expect(outputNeedsRuntimeContractRepair(prompt, refusal, context, &.{"set_operational_contract"}));
-    try std.testing.expect(outputNeedsRuntimeToolRepair(prompt, refusal, context, &.{"inspect_runtime"}));
-    try std.testing.expect(!outputNeedsRuntimeContractRepair("responda olá", refusal, context, &.{"set_operational_contract"}));
-    try std.testing.expect(!outputNeedsRuntimeToolRepair(prompt, "Resposta direta sem negativa.", context, &.{"inspect_runtime"}));
-
-    var contract_call = try syntheticRuntimeContractCall(std.testing.allocator);
-    defer contract_call.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("set_operational_contract", contract_call.name);
-    try std.testing.expect(contract_call.requires_browser_diagnostics.?);
-    try std.testing.expect(!contract_call.requires_mutation.?);
-
-    var runtime_call = try syntheticInspectRuntimeCall(std.testing.allocator, prompt);
-    defer runtime_call.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("inspect_runtime", runtime_call.name);
-    try std.testing.expectEqualStrings("http://127.0.0.1:11434/", runtime_call.target.?);
+    try std.testing.expect(!outputDefersAvailableWorkspaceCollection(refusal, context, &.{"inspect_runtime"}));
 
     const runtime_context =
         "[TURN_CONTEXT v1]\n\n" ++
@@ -6556,25 +6278,13 @@ test "explicit runtime request repairs unavailable prose into runtime contract" 
     ));
 }
 
-test "initial rejected executor can synthesize mutation contract only for edit requests" {
-    try std.testing.expect(promptRequestsMutation("Corrija src/math.zig usando apply_patch com contextId."));
-    try std.testing.expect(!promptRequestsMutation("implemente a validacao faltante"));
-    try std.testing.expect(promptRequestsMutation("Use set_operational_contract com requiresMutation=true."));
-    try std.testing.expect(!promptRequestsMutation("analise o projeto e pontue achados"));
-    try std.testing.expect(promptRequestsValidation("valide com validate_syntax antes de responder"));
-    try std.testing.expect(!promptRequestsValidation("valide antes de responder"));
-    try std.testing.expect(!promptRequestsValidation("explique o desenho atual"));
-    try std.testing.expect(initialRejectedToolCanStartMutation("collect_evidence"));
-    try std.testing.expect(initialRejectedToolCanStartMutation("apply_patch"));
-    try std.testing.expect(!initialRejectedToolCanStartMutation("search_session"));
-
-    var call = try syntheticMutationContractCall(std.testing.allocator);
-    defer call.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("set_operational_contract", call.name);
-    try std.testing.expect(call.requires_inspection.?);
-    try std.testing.expect(call.requires_mutation.?);
-    try std.testing.expect(!call.requires_runtime_validation.?);
-    try std.testing.expect(!call.requires_browser_diagnostics.?);
+test "initial rejected executor stays model-routed" {
+    const repair = try renderInitialRejectedToolContext(std.testing.allocator, "Corrija src/math.zig usando apply_patch.", "apply_patch");
+    defer std.testing.allocator.free(repair);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "Initial router") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "set_operational_contract") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "requiresMutation<-prompt") == null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "legacy synthetic") == null);
 }
 
 test "required tool protocol repair count is bounded by marker occurrences" {
@@ -6591,10 +6301,10 @@ test "required workspace refinement defers uncited prose while collection is ava
         "[NEXT_ACTION]\nkind=collect_context action=If evidence is weak or generic, emit a focused collect_evidence call before answering.\n";
 
     try std.testing.expect(!initialContextRequiresTool(context));
-    try std.testing.expect(outputDefersAvailableWorkspaceCollection("Nao ha contexto suficiente para concluir.", context, &.{"collect_evidence"}));
+    try std.testing.expect(!outputDefersAvailableWorkspaceCollection("Nao ha contexto suficiente para concluir.", context, &.{"collect_evidence"}));
     try std.testing.expect(!outputDefersAvailableWorkspaceCollection("E1 mostra o trecho pedido.", context, &.{"collect_evidence"}));
     try std.testing.expect(!outputDefersAvailableWorkspaceCollection("E1 mostra o commit removido 'collect_evidence web_distillation'.", context, &.{"collect_evidence"}));
-    try std.testing.expect(outputDefersAvailableWorkspaceCollection("E1 mostra um fragmento, mas sao necessarias evidencias adicionais.", context, &.{"collect_evidence"}));
+    try std.testing.expect(!outputDefersAvailableWorkspaceCollection("E1 mostra um fragmento, mas sao necessarias evidencias adicionais.", context, &.{"collect_evidence"}));
     try std.testing.expect(!outputDefersAvailableWorkspaceCollection("Nao ha contexto suficiente.", context, &.{"search_session"}));
     try std.testing.expect(!outputDefersAvailableWorkspaceCollection(
         "Nao ha contexto suficiente.",
@@ -6612,7 +6322,7 @@ test "optional workspace refinement rejects clarification-only answer" {
     const clarification =
         "Preciso saber sobre o que voce quer mais detalhes. Especifique qual topico, codigo ou assunto.";
 
-    try std.testing.expect(outputDefersAvailableWorkspaceCollection(clarification, context, &.{"collect_evidence"}));
+    try std.testing.expect(!outputDefersAvailableWorkspaceCollection(clarification, context, &.{"collect_evidence"}));
     try std.testing.expect(!outputDefersAvailableWorkspaceCollection("E1 mostra que o projeto implementa um agente local.", context, &.{"collect_evidence"}));
 }
 
@@ -7136,6 +6846,9 @@ test "tool loop state dedupe uses repaired effective path" {
     try state.rememberExecutedArgs(null, "render", .auto, 1, 12, "ctx_render", "[EVIDENCE]\n- src/render.zig L1-L12 hash=abc\n", 120, 40);
     try std.testing.expect(state.hasExecutedArgs(null, "render", .auto, 1, 12));
     try std.testing.expect(!state.hasExecutedArgs(null, "http", .auto, 1, 12));
+    try state.rememberExecutedArgs("https://html.duckduckgo.com/html/?q=a", "short", .document_summary, 1, 1, "ctx_web", "[WEB_EVIDENCE]\nquery=short\n", 80, 30);
+    try std.testing.expect(state.hasExecutedWebTarget("https://html.duckduckgo.com/html/?q=a", .document_summary));
+    try std.testing.expect(!state.hasExecutedWebTarget("https://html.duckduckgo.com/html/?q=b", .document_summary));
 }
 
 test "duplicate evidence context keeps evidence and tool schema" {
@@ -7303,8 +7016,12 @@ test "web query optimization output is one bounded query and rejects tool calls"
     defer std.testing.allocator.free(with_prose);
     try std.testing.expectEqualStrings("Linus Torvalds criou o kernel Linux em 1991", with_prose);
 
+    const optimize_prompt = try renderWebQueryOptimizationPrompt(std.testing.allocator, "quem e Pessoa X?", "Pessoa X");
+    defer std.testing.allocator.free(optimize_prompt);
+    try std.testing.expect(std.mem.indexOf(u8, optimize_prompt, "Do not enrich it with facts") != null);
+
     try std.testing.expect(!optimizedQueryKeepsDeclaredCoverage("quem criou o kernel Linux", "quem"));
-    try std.testing.expect(optimizedQueryKeepsDeclaredCoverage("quem criou o kernel Linux", "criador kernel Linux Linus Torvalds"));
+    try std.testing.expect(optimizedQueryKeepsDeclaredCoverage("quem criou o kernel Linux", "criador kernel Linux"));
     try std.testing.expect((try normalizeWebQueryOptimizationOutput(std.testing.allocator, "<tool_call><function=web_search></function></tool_call>")) == null);
 }
 
@@ -7402,30 +7119,15 @@ test "plain URL in model prose does not synthesize web search" {
     }
 }
 
-test "missing initial router fallback selects inspection and overview evidence" {
-    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
-    defer db.close();
-    var bus = ui_events.EventBus.init(std.testing.allocator);
-    defer bus.deinit();
+test "workflow starts without synthetic inspection fallback" {
     var state = ToolLoopState.init(std.testing.allocator);
     defer state.deinit();
 
-    try selectSyntheticInspectionContract(std.testing.allocator, "router-fallback", &bus, &db, &state);
-    try std.testing.expectEqual(contracts.ContractName.collect_evidence, state.active_contract.name);
-    try std.testing.expect(state.contract_selected);
-    try std.testing.expect(state.active_contract.allows("collect_evidence"));
-
-    var call = try syntheticWorkspaceOverviewCall(std.testing.allocator);
-    defer call.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("collect_evidence", call.name);
-    try std.testing.expectEqualStrings("overview", call.stage.?);
-    try std.testing.expectEqual(contracts.StrategyName.auto, call.strategy.?);
-
-    var events = try db.loadSessionEvents(std.testing.allocator, "router-fallback", 8);
-    defer audit.freeAuditEvents(std.testing.allocator, &events);
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expectEqualStrings("contract_selected", events.items[0].kind);
-    try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "contract=collect_evidence") != null);
+    try std.testing.expectEqual(contracts.ContractName.workflow, state.active_contract.name);
+    try std.testing.expect(!state.contract_selected);
+    try std.testing.expect(state.active_contract.allows("set_operational_contract"));
+    try std.testing.expect(!state.active_contract.allows("collect_evidence"));
+    try std.testing.expect(!state.active_contract.allows("web_search"));
 }
 
 test "turn progress blocks finalization until selected contract is satisfied" {
@@ -7503,7 +7205,7 @@ test "allowed tools render compact audit list" {
     const active = contracts.activeContract(.mutate_file) orelse return error.MissingContract;
     const rendered = try renderAllowedTools(std.testing.allocator, active.allowed_tools);
     defer std.testing.allocator.free(rendered);
-    try std.testing.expectEqualStrings("collect_evidence,search_session,apply_patch", rendered);
+    try std.testing.expectEqualStrings("set_operational_contract,collect_evidence,search_session,apply_patch", rendered);
 }
 
 test "active tool schema follows selected contract" {
@@ -7603,7 +7305,7 @@ test "grounding rules separate dialogue continuity from exact session evidence" 
     try std.testing.expect(hasGroundingRule(rules, "vague workspace/code tasks", "split targets"));
     try std.testing.expect(hasGroundingRule(rules, "history is unavailable", "search_session"));
     try std.testing.expect(hasGroundingRule(rules, "workspace/code context is required", "collect_evidence"));
-    try std.testing.expect(hasGroundingRule(rules, "not grounded in current dialogue", "search_web/rag_web"));
+    try std.testing.expect(hasGroundingRule(rules, "Named/obscure entities", "search_web/rag_web"));
     try std.testing.expect(hasGroundingRule(rules, "web_search fails operationally", "do not invent a replacement URL"));
     try std.testing.expect(hasGroundingRule(rules, "[CONTRACTS]", "not evidence"));
     try std.testing.expect(hasGroundingRule(rules, "S# entries", "candidates"));

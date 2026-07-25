@@ -46,11 +46,11 @@ run_turn() {
 }
 
 run_turn \
-  "Atualiza o clima agora para a cidade alvo Sao_Paulo e cite a evidencia usada." \
+  "Como esta o clima agora em Sao_Paulo? Cite a fonte usada." \
   turn1
 
 run_turn \
-  "Agora declarativamente use ragweb para conferir o clima atual da cidade alvo Brasilia. Use query=Brasilia se acionar web. Conecte com a resposta anterior." \
+  "E em Brasilia, como esta agora? Conecte com a resposta anterior." \
   turn2
 
 run_turn \

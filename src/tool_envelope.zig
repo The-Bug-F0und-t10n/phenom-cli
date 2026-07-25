@@ -208,6 +208,23 @@ test "set operational contract is accepted as model-visible controller tool" {
     try std.testing.expectEqual(true, envelope.call.?.requires_inspection.?);
 }
 
+test "active contract accepts explicit contract switch" {
+    const active = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
+    const output =
+        \\<tool_call>
+        \\<function=set_operational_contract>
+        \\<parameter=contract>search_web</parameter>
+        \\<parameter=query>entity fact to verify</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.accepted, envelope.state);
+    try std.testing.expectEqualStrings("set_operational_contract", envelope.raw_name);
+    try std.testing.expectEqual(contracts.ContractName.search_web, envelope.call.?.contract.?);
+}
+
 test "mutation executor is rejected before contract and accepted by mutation contract" {
     const initial = contracts.activeContract(.workflow) orelse return error.MissingContract;
     const output =

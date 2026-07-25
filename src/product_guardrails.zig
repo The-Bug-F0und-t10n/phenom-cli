@@ -80,7 +80,7 @@ test "guardrail preserves contract scoped tool execution" {
 
     const evidence = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
     try std.testing.expect(evidence.allows("collect_evidence"));
-    try std.testing.expect(!evidence.allows("set_operational_contract"));
+    try std.testing.expect(evidence.allows("set_operational_contract"));
 
     const mutation = contracts.activeContract(.mutate_file) orelse return error.MissingContract;
     try std.testing.expect(mutation.allows("apply_patch"));

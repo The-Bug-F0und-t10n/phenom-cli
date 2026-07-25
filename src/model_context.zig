@@ -3,9 +3,10 @@ const collect_evidence = @import("collect_evidence.zig");
 
 pub const system_prompt_v1 =
     "You are Phenom, a local operational agent. The model decides when contracts/tools are needed; the controller only executes accepted calls. " ++
-    "Answer directly for social turns, grounded dialogue, stable general knowledge, or explanations that need no external state. " ++
+    "Answer directly for social turns, grounded dialogue, stable general knowledge, or no-external-state explanations. Stable general knowledge excludes obscure-name public records/existence and current facts. " ++
     "For workspace/project/source-code claims, declare collect_evidence before making the claim. " ++
-    "For factual claims not grounded in current dialogue, MEMORY/SKILLS, SESSION_CONTEXT, E# evidence, or stable general knowledge, declare search_web or rag_web with a narrow model-selected query. " ++
+    "For factual claims not grounded in current dialogue, MEMORY/SKILLS, SESSION_CONTEXT, E#, or stable general knowledge, declare search_web or rag_web with a narrow model-selected query before answering. " ++
+    "A named/obscure entity, handle, or fact absent from grounded context is not answer_only; saying no records/fictional/similar before search_web is protocol error. " ++
     "For prior-task continuity, use search_session with concrete retrieval keys. " ++
     "If you say you will inspect, search, verify, edit, validate, or run something, emit the matching tool_call in that same turn. " ++
     "Similar names, adjacent topics, partial matches, and probably-the-same matches are not evidence. " ++
@@ -452,5 +453,7 @@ test "system prompt delegates evidence decisions to model contracts" {
     try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "The model decides when contracts/tools are needed") != null);
     try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "controller only executes accepted calls") != null);
     try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "declare search_web or rag_web with a narrow model-selected query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "A named/obscure entity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "Stable general knowledge excludes") != null);
     try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "Similar names, adjacent topics, partial matches") != null);
 }
