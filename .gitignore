@@ -13,6 +13,9 @@ bin/zig-cache/
 graph.html
 phenom-zig/zig-out/
 phenom-zig/.zig-cache/
+TASKS.md
+alinhamento.md
+Phenom.md
 
 # ChromaDB
 data/
