@@ -121,8 +121,6 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
         terminal_columns: ?*const fn () usize = null,
         assistant_started: bool = false,
         turn_started_ms: i64 = 0,
-        context_status: ?[]const u8 = null,
-        context_status_buf: [48]u8 = undefined,
 
         const Self = @This();
 
@@ -168,9 +166,7 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
                 .inference_cancel => |reason| try self.renderer.status(reason),
                 .progress_update => |message| try self.renderer.status(message),
                 .token_update => {},
-                .context_update => |usage| {
-                    self.context_status = formatContextUsage(&self.context_status_buf, usage.used_tokens, usage.limit_tokens);
-                },
+                .context_update => {},
                 .clear_streaming => {},
                 .think_end => {
                     try self.renderer.thinkingEnd();
@@ -191,22 +187,11 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
             var elapsed_buf: [32]u8 = undefined;
             const elapsed_ms = stored_elapsed_ms orelse elapsedMillisSince(self.turn_started_ms);
             const elapsed = formatElapsedMillis(&elapsed_buf, elapsed_ms);
-            try self.renderer.doneWithElapsedAndContext(elapsed, self.context_status);
+            try self.renderer.doneWithElapsed(elapsed);
             self.assistant_started = false;
             self.turn_started_ms = 0;
-            self.context_status = null;
         }
     };
-}
-
-pub fn formatContextUsage(buf: *[48]u8, used_tokens: usize, limit_tokens: usize) []const u8 {
-    var used_buf: [24]u8 = undefined;
-    var limit_buf: [24]u8 = undefined;
-    const used = formatTokenCount(&used_buf, used_tokens);
-    const limit = formatTokenCount(&limit_buf, limit_tokens);
-    const raw_pct = if (limit_tokens == 0) 100.0 else (@as(f64, @floatFromInt(used_tokens)) * 100.0) / @as(f64, @floatFromInt(limit_tokens));
-    const pct = @min(raw_pct, 100.0);
-    return std.fmt.bufPrint(buf, "ctx {d:.1}% {s}/{s} tok", .{ pct, used, limit }) catch "ctx ?% ?/? tok";
 }
 
 fn formatTokenCount(buf: *[24]u8, value: usize) []const u8 {
@@ -281,7 +266,7 @@ test "event bus dispatches events in registration order" {
     try std.testing.expectEqual(@as(usize, 12), state.value);
 }
 
-test "renderer sink carries context usage into final worked line" {
+test "renderer sink keeps context usage out of final worked line" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
 
@@ -296,7 +281,7 @@ test "renderer sink carries context usage into final worked line" {
 
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Worked for 5s") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "ctx 1.1% 737/65k tok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "ctx 1.1% 737/65k tok") == null);
 }
 
 test "renderer sink maps chat events to transcript" {

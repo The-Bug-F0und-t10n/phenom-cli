@@ -31,6 +31,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         markdown_in_code: bool = false,
         markdown_code_lang: [24]u8 = undefined,
         markdown_code_lang_len: usize = 0,
+        markdown_plain_fence_deferred: bool = false,
         markdown_diff_old_line: ?usize = null,
         markdown_diff_new_line: ?usize = null,
         markdown_diff_code_lang: [24]u8 = undefined,
@@ -239,13 +240,9 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         }
 
         pub fn doneWithElapsed(self: *Self, elapsed: []const u8) !void {
-            try self.doneWithElapsedAndContext(elapsed, null);
-        }
-
-        pub fn doneWithElapsedAndContext(self: *Self, elapsed: []const u8, context_status: ?[]const u8) !void {
             try self.closeOpenBlocks();
             try self.blockGap(.done);
-            try self.writeWorkedLine(elapsed, context_status);
+            try self.writeWorkedLine(elapsed);
             try self.writer.writeAll("\n");
             self.last_block = .done;
         }
@@ -393,6 +390,10 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 try self.appendMarkdownTableRow(line);
                 return;
             }
+            if (self.markdown_in_code and self.markdown_plain_fence_deferred) {
+                try self.writeMarkdownLine(line, newline);
+                return;
+            }
             try self.flushMarkdownTables();
             try self.writeMarkdownLine(line, newline);
         }
@@ -400,6 +401,11 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         fn flushMarkdown(self: *Self) !void {
             if (self.markdown_pending_len > 0) {
                 try self.renderMarkdownPending(false);
+            }
+            if (self.markdown_in_code and self.markdown_plain_fence_deferred and self.markdown_table_rows > 0) {
+                self.markdown_in_code = false;
+                self.markdown_plain_fence_deferred = false;
+                self.markdown_code_lang_len = 0;
             }
             try self.flushMarkdownTables();
         }
@@ -427,7 +433,15 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         }
 
         fn writeMarkdownLine(self: *Self, line: []const u8, newline: bool) !void {
+            if (self.markdown_in_code and self.markdown_plain_fence_deferred) {
+                try self.writeDeferredPlainFenceLine(line, newline);
+                return;
+            }
             if (isFenceLine(line)) {
+                if (!self.markdown_in_code and fenceLang(line).len == 0) {
+                    self.setMarkdownFence(line);
+                    return;
+                }
                 try self.writeFenceLine(line);
                 self.setMarkdownFence(line);
             } else if (self.markdown_in_code) {
@@ -443,6 +457,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             if (!self.markdown_in_code) {
                 self.markdown_in_code = true;
                 const lang = fenceLang(line);
+                if (lang.len == 0) self.markdown_plain_fence_deferred = true;
                 const len = @min(lang.len, self.markdown_code_lang.len);
                 if (len > 0) @memcpy(self.markdown_code_lang[0..len], lang[0..len]);
                 self.markdown_code_lang_len = len;
@@ -453,11 +468,55 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 }
             } else {
                 self.markdown_in_code = false;
+                self.markdown_plain_fence_deferred = false;
                 self.markdown_code_lang_len = 0;
                 self.markdown_diff_old_line = null;
                 self.markdown_diff_new_line = null;
                 self.markdown_diff_code_lang_len = 0;
             }
+        }
+
+        fn writeDeferredPlainFenceLine(self: *Self, line: []const u8, newline: bool) anyerror!void {
+            if (isFenceLine(line)) {
+                if (self.markdown_table_rows > 0) {
+                    self.markdown_in_code = false;
+                    self.markdown_plain_fence_deferred = false;
+                    self.markdown_code_lang_len = 0;
+                    try self.flushMarkdownTables();
+                    if (newline) try self.writer.writeAll("\n");
+                    self.stream_needs_gutter = true;
+                    return;
+                }
+                try self.writeFenceLine("```");
+                try self.writer.writeAll("\n");
+                self.markdown_plain_fence_deferred = false;
+                try self.writeFenceLine(line);
+                self.setMarkdownFence(line);
+                if (newline) try self.writer.writeAll("\n");
+                self.stream_needs_gutter = true;
+                return;
+            }
+            if (isMarkdownTableRow(line)) {
+                try self.appendMarkdownTableRow(line);
+                return;
+            }
+            try self.writeFenceLine("```");
+            try self.writer.writeAll("\n");
+            try self.writeDeferredPlainFenceRowsAsCode();
+            self.markdown_plain_fence_deferred = false;
+            try self.writeCodeLine(line);
+            if (newline) try self.writer.writeAll("\n");
+            self.stream_needs_gutter = true;
+        }
+
+        fn writeDeferredPlainFenceRowsAsCode(self: *Self) anyerror!void {
+            var start: usize = 0;
+            while (nextLine(self.markdown_table[0..self.markdown_table_len], &start)) |line| {
+                try self.writeCodeLine(line);
+                try self.writer.writeAll("\n");
+            }
+            self.markdown_table_len = 0;
+            self.markdown_table_rows = 0;
         }
 
         fn writeCodeLine(self: *Self, line: []const u8) !void {
@@ -624,7 +683,10 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 col_count = @max(col_count, col);
             }
             if (col_count == 0) return;
-            self.capTableWidths(widths[0..col_count]);
+            if (!self.capTableWidths(widths[0..col_count])) {
+                try self.writeCompactMarkdownTable(table, col_count);
+                return;
+            }
             try self.writeTableBorder("┌", "┬", "┐", widths[0..col_count]);
             start = 0;
             var row_index: usize = 0;
@@ -657,13 +719,67 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             try self.writeTableBorder("└", "┴", "┘", widths[0..col_count]);
         }
 
-        fn capTableWidths(self: *Self, widths: []usize) void {
-            if (widths.len == 0) return;
+        fn capTableWidths(self: *Self, widths: []usize) bool {
+            if (widths.len == 0) return false;
             const usable = self.contentWrapWidth();
             const borders = widths.len + 1 + widths.len * 2;
-            const available = if (usable > borders) usable - borders else widths.len;
-            const per_col = @max(@as(usize, 8), available / widths.len);
+            if (usable <= borders) return false;
+            const available = usable - borders;
+            if (available < widths.len) return false;
+            if (available < widths.len * 3) return false;
+            const per_col = @max(@as(usize, 1), available / widths.len);
             for (widths) |*width| width.* = @min(width.*, per_col);
+            return true;
+        }
+
+        fn writeCompactMarkdownTable(self: *Self, table: []const u8, col_count: usize) anyerror!void {
+            var headers = [_][]const u8{""} ** 8;
+            var start: usize = 0;
+            var row_index: usize = 0;
+            while (nextLine(table, &start)) |line| {
+                if (isTableSeparator(line)) continue;
+                var it = CellIterator.init(line);
+                var cells = [_][]const u8{""} ** 8;
+                var col: usize = 0;
+                while (col < col_count) : (col += 1) cells[col] = if (it.next()) |value| value else "";
+                if (row_index == 0) {
+                    for (cells[0..col_count], 0..) |cell, i| headers[i] = cell;
+                    row_index += 1;
+                    continue;
+                }
+                if (row_index > 1) try self.writer.writeAll("\n");
+                col = 0;
+                while (col < col_count) : (col += 1) {
+                    if (cells[col].len == 0) continue;
+                    var label_buf: [16]u8 = undefined;
+                    const label = if (headers[col].len > 0) headers[col] else try std.fmt.bufPrint(&label_buf, "Col {d}", .{col + 1});
+                    try self.writeCompactTableCell(if (col == 0) "• " else "  ", label, cells[col]);
+                }
+                row_index += 1;
+            }
+        }
+
+        fn writeCompactTableCell(self: *Self, prefix: []const u8, label: []const u8, value: []const u8) anyerror!void {
+            const head_cols = utf8Columns(prefix) + visibleMarkdownWidth(label) + 2;
+            const value_width = @max(@as(usize, 1), self.contentWrapWidth() -| head_cols);
+            var cursor: usize = 0;
+            var first = true;
+            var wrote = false;
+            while (cursor < value.len or !wrote) {
+                const part = tableCellNextSlice(value, value_width, &cursor);
+                try self.writeContentGutter();
+                if (first) {
+                    try self.writeCyan(prefix);
+                    try self.writeBoldInlineMarkdown(label);
+                    try self.writeDim(": ");
+                } else {
+                    try self.writeSpaces(head_cols);
+                }
+                try self.writeInlineMarkdown(part.text);
+                try self.writer.writeAll("\n");
+                first = false;
+                wrote = true;
+            }
         }
 
         fn writeTableBorder(self: *Self, left: []const u8, mid: []const u8, right: []const u8, widths: []const usize) !void {
@@ -924,21 +1040,11 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             }
         }
 
-        fn writeWorkedLine(self: *Self, elapsed: []const u8, context_status: ?[]const u8) !void {
+        fn writeWorkedLine(self: *Self, elapsed: []const u8) !void {
             const paint_cols = self.paintCols();
             var prefix_buf: [96]u8 = undefined;
             const prefix = try std.fmt.bufPrint(&prefix_buf, "  ─ Worked for {s} ", .{elapsed});
             const shown_cols = try self.writeDimColumns(prefix, paint_cols);
-            const right = context_status orelse "";
-            const right_cols = utf8Columns(right);
-            const right_gap: usize = 2;
-            if (right_cols > 0 and paint_cols > shown_cols + right_gap + right_cols) {
-                var i: usize = shown_cols;
-                while (i < paint_cols - right_gap - right_cols) : (i += 1) try self.writeDim("─");
-                try self.writeDim("  ");
-                try self.writeDim(right);
-                return;
-            }
             var i: usize = shown_cols;
             while (i < paint_cols) : (i += 1) try self.writeDim("─");
         }
@@ -1824,7 +1930,7 @@ test "assistant markdown renders code agent structure" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "─ Worked for 1s") != null);
 }
 
-test "done line can carry model context usage on the right" {
+test "done line renders only elapsed separator" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
 
@@ -1832,10 +1938,10 @@ test "done line can carry model context usage on the right" {
     var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 42 });
     try renderer.assistantStart();
     try renderer.assistantDelta("ok");
-    try renderer.doneWithElapsedAndContext("2s", "ctx 1.1% 737/65k tok");
+    try renderer.doneWithElapsed("2s");
 
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "─ Worked for 2s ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "  ctx 1.1% 737/65k tok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "ctx ") == null);
 
     var start: usize = 0;
     while (nextLine(buffer.items, &start)) |line| {
@@ -1914,6 +2020,104 @@ test "assistant markdown table wraps long cells inside borders" {
         if (line.len == 0) continue;
         try std.testing.expect(visibleTextWidth(line) <= 43);
     }
+}
+
+test "assistant markdown wide table fits narrow terminal without terminal wrapping" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 80 });
+    try renderer.assistantStart();
+    try renderer.assistantDelta(
+        \\| Um | Dois | Tres | Quatro | Cinco | Seis | Sete | Oito |
+        \\| --- | --- | --- | --- | --- | --- | --- | --- |
+        \\| acessivel | semantica | formularios | imagens | headings | tabelas | layout | navegacao |
+    );
+    try renderer.done();
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, " ┌") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "acess") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "naveg") != null);
+    var start: usize = 0;
+    while (nextLine(buffer.items, &start)) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(visibleTextWidth(line) <= 79);
+    }
+}
+
+test "assistant markdown impossible table falls back to compact cells" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 24 });
+    try renderer.assistantStart();
+    try renderer.assistantDelta(
+        \\| Nome | Descricao | Estado | Observacao |
+        \\| --- | --- | --- | --- |
+        \\| HTML | estrutura semantica longa | ok | sem tabela quebrada |
+    );
+    try renderer.done();
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, " ┌") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, " • Nome: HTML") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Descricao: estrutura") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "tabela") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "quebrada") != null);
+    var start: usize = 0;
+    while (nextLine(buffer.items, &start)) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(visibleTextWidth(line) <= 23);
+    }
+}
+
+test "assistant markdown table inside plain fence renders as table not code" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 72 });
+    try renderer.assistantStart();
+    try renderer.assistantDelta(
+        \\```
+        \\ID | Nome | Cargo | Departamento | Salario | Data Admissao | Status | Nivel | Regiao
+        \\---|------|-------|-------------|---------|---------------|--------|-------|-------
+        \\1 | Joao Silva | Analista Senior | TI | R$ 15000 | 2018-03-15 | Ativo | L4 | Sul
+        \\2 | Maria Santos | Gerente de Projetos | Marketing | R$ 18500 | 2017-06-22 | Ativo | L5 | Sudeste
+        \\```
+    );
+    try renderer.done();
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, " │ ```") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, " ┌") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Joao") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Maria") != null);
+    var start: usize = 0;
+    while (nextLine(buffer.items, &start)) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(visibleTextWidth(line) <= 71);
+    }
+}
+
+test "assistant markdown plain non-table fence remains code" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 60 });
+    try renderer.assistantStart();
+    try renderer.assistantDelta(
+        \\```
+        \\ID: 1
+        \\Nome: Joao
+        \\```
+    );
+    try renderer.done();
+
+    try std.testing.expect(countNeedle(buffer.items, " │ ```") == 2);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, " │ ID: 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, " ┌") == null);
 }
 
 test "assistant markdown split stream keeps incomplete markdown until flush" {

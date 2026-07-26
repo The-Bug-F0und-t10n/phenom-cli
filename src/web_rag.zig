@@ -2,6 +2,7 @@ const std = @import("std");
 
 const evidence = @import("evidence.zig");
 const http = @import("http.zig");
+const temporal = @import("temporal.zig");
 
 const c = @cImport({
     @cInclude("stdlib.h");
@@ -42,11 +43,15 @@ pub fn fetch(allocator: std.mem.Allocator, io: std.Io, target: []const u8, query
     defer allocator.free(title);
     const plain_text = try distillText(allocator, inspected.body_snippet, inspected.body_snippet.len);
     defer allocator.free(plain_text);
-    const searchable_text = try structuredTextForDistillation(allocator, inspected.body_snippet, plain_text);
+    const searchable_text = try structuredTextForDistillation(allocator, inspected.target, inspected.body_snippet, plain_text);
     defer allocator.free(searchable_text);
     const distilled = try distillTextForQuery(allocator, searchable_text, query, budget_bytes);
     defer allocator.free(distilled);
-    const web_block = try renderWebEvidenceBlock(allocator, inspected, title, distilled, query, budget_bytes);
+    const excerpt = if (distilled.len == 0 and isDirectStructuredSummary(searchable_text))
+        searchable_text[0..@min(searchable_text.len, budget_bytes)]
+    else
+        distilled;
+    const web_block = try renderWebEvidenceBlock(allocator, inspected, title, excerpt, query, budget_bytes);
     defer allocator.free(web_block);
     const status_text = try renderStatusText(allocator, inspected.status);
     defer allocator.free(status_text);
@@ -214,11 +219,14 @@ fn renderWebEvidenceBlock(
 ) ![]u8 {
     const status_text = try renderStatusText(allocator, inspected.status);
     defer allocator.free(status_text);
+    var retrieved_buf: [16]u8 = undefined;
+    const retrieved_at = temporal.currentUtcDateText(&retrieved_buf);
     return std.fmt.allocPrint(
         allocator,
-        "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=query_chunks target={s}\nstatus={s}\nserver={s}\nerror={s}\nquery={s}\ntitle={s}\nexcerpt_budget_bytes={}\nexcerpt={s}\n",
+        "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=query_chunks target={s}\nretrieved_at={s}\ntimezone=UTC\nstatus={s}\nserver={s}\nerror={s}\nquery={s}\ntitle={s}\nexcerpt_budget_bytes={}\nexcerpt={s}\n",
         .{
             inspected.target,
+            retrieved_at,
             status_text,
             inspected.server orelse "",
             inspected.error_name orelse "",
@@ -289,13 +297,172 @@ pub fn distillTextForQuery(allocator: std.mem.Allocator, text: []const u8, query
     return out.toOwnedSlice(allocator);
 }
 
-fn structuredTextForDistillation(allocator: std.mem.Allocator, raw: []const u8, plain_fallback: []const u8) ![]u8 {
+fn structuredTextForDistillation(allocator: std.mem.Allocator, target: []const u8, raw: []const u8, plain_fallback: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0 or (trimmed[0] != '{' and trimmed[0] != '[')) return allocator.dupe(u8, plain_fallback);
-    const json_text = try jsonStringValuesToText(allocator, trimmed, trimmed.len);
-    defer allocator.free(json_text);
-    if (std.mem.trim(u8, json_text, " \t\r\n").len == 0) return allocator.dupe(u8, plain_fallback);
-    return distillText(allocator, json_text, @max(json_text.len, plain_fallback.len));
+    if (trimmed.len == 0) return allocator.dupe(u8, plain_fallback);
+    if (trimmed[0] == '{' or trimmed[0] == '[') {
+        const json_text = try jsonStringValuesToText(allocator, trimmed, trimmed.len);
+        defer allocator.free(json_text);
+        if (std.mem.trim(u8, json_text, " \t\r\n").len == 0) return allocator.dupe(u8, plain_fallback);
+        return distillText(allocator, json_text, @max(json_text.len, plain_fallback.len));
+    }
+    if (isDuckDuckGoSearchTarget(target)) {
+        const results = try duckDuckGoResultsText(allocator, trimmed);
+        if (std.mem.trim(u8, results, " \t\r\n").len > 0) return results;
+        allocator.free(results);
+        return allocator.dupe(u8, "");
+    }
+    const releases = try htmlReleaseEntriesText(allocator, trimmed);
+    if (std.mem.trim(u8, releases, " \t\r\n").len > 0) return releases;
+    allocator.free(releases);
+    return allocator.dupe(u8, plain_fallback);
+}
+
+fn isDirectStructuredSummary(text: []const u8) bool {
+    return std.mem.startsWith(u8, std.mem.trim(u8, text, " \t\r\n"), "release=");
+}
+
+fn isDuckDuckGoSearchTarget(target: []const u8) bool {
+    return containsIgnoreCase(target, "://html.duckduckgo.com/html/");
+}
+
+fn duckDuckGoResultsText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    var cursor: usize = 0;
+    var result_index: usize = 0;
+    while (result_index < 8) {
+        const rel = indexOfIgnoreCase(raw[cursor..], "result__a") orelse break;
+        const class_pos = cursor + rel;
+        const tag_start = tagStartBefore(raw, class_pos) orelse break;
+        const tag_end = std.mem.indexOfScalar(u8, raw[class_pos..], '>') orelse break;
+        const content_start = class_pos + tag_end + 1;
+        const title_end_rel = indexOfIgnoreCase(raw[content_start..], "</a>") orelse break;
+        const title_html = raw[content_start .. content_start + title_end_rel];
+        const title = try distillText(allocator, title_html, 240);
+        defer allocator.free(title);
+        const trimmed_title = std.mem.trim(u8, title, " \t\r\n");
+        if (trimmed_title.len == 0) {
+            cursor = content_start + title_end_rel + "</a>".len;
+            continue;
+        }
+
+        const result_start = content_start + title_end_rel + "</a>".len;
+        const next_result = if (indexOfIgnoreCase(raw[result_start..], "result__a")) |next| result_start + next else @min(raw.len, result_start + 4096);
+        const href = try extractHtmlAttribute(allocator, raw[tag_start..content_start], "href");
+        defer allocator.free(href);
+        const snippet = try extractTagBodyAfterClass(allocator, raw[result_start..next_result], "result__snippet");
+        defer allocator.free(snippet);
+
+        result_index += 1;
+        try appendResultField(allocator, &out, result_index, "title", trimmed_title);
+        if (std.mem.trim(u8, href, " \t\r\n").len > 0) try appendResultField(allocator, &out, result_index, "url", href);
+        const trimmed_snippet = std.mem.trim(u8, snippet, " \t\r\n");
+        if (trimmed_snippet.len > 0) try appendResultField(allocator, &out, result_index, "snippet", trimmed_snippet);
+        cursor = result_start;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn tagStartBefore(raw: []const u8, pos: usize) ?usize {
+    var i = pos;
+    while (i > 0) {
+        i -= 1;
+        if (raw[i] == '<') return i;
+        if (raw[i] == '>') return null;
+    }
+    return null;
+}
+
+fn extractHtmlAttribute(allocator: std.mem.Allocator, tag: []const u8, name: []const u8) ![]u8 {
+    var cursor: usize = 0;
+    while (cursor < tag.len) {
+        const rel = indexOfIgnoreCase(tag[cursor..], name) orelse return allocator.dupe(u8, "");
+        const key_pos = cursor + rel;
+        var i = key_pos + name.len;
+        while (i < tag.len and std.ascii.isWhitespace(tag[i])) : (i += 1) {}
+        if (i >= tag.len or tag[i] != '=') {
+            cursor = i;
+            continue;
+        }
+        i += 1;
+        while (i < tag.len and std.ascii.isWhitespace(tag[i])) : (i += 1) {}
+        if (i >= tag.len) return allocator.dupe(u8, "");
+        const quote = tag[i];
+        if (quote != '"' and quote != '\'') return allocator.dupe(u8, "");
+        i += 1;
+        const start = i;
+        while (i < tag.len and tag[i] != quote) : (i += 1) {}
+        return distillText(allocator, tag[start..i], 512);
+    }
+    return allocator.dupe(u8, "");
+}
+
+fn extractTagBodyAfterClass(allocator: std.mem.Allocator, html: []const u8, class_marker: []const u8) ![]u8 {
+    const rel = indexOfIgnoreCase(html, class_marker) orelse return allocator.dupe(u8, "");
+    const class_pos = rel;
+    const tag_end_rel = std.mem.indexOfScalar(u8, html[class_pos..], '>') orelse return allocator.dupe(u8, "");
+    const content_start = class_pos + tag_end_rel + 1;
+    const close = nearestHtmlClose(html[content_start..]) orelse return allocator.dupe(u8, "");
+    return distillText(allocator, html[content_start .. content_start + close], 512);
+}
+
+fn nearestHtmlClose(html: []const u8) ?usize {
+    var best: ?usize = null;
+    const closers = [_][]const u8{ "</a>", "</div>", "</td>", "</span>" };
+    for (closers) |closer| {
+        if (indexOfIgnoreCase(html, closer)) |idx| {
+            if (best == null or idx < best.?) best = idx;
+        }
+    }
+    return best;
+}
+
+fn appendResultField(allocator: std.mem.Allocator, out: *std.ArrayList(u8), idx: usize, name: []const u8, value: []const u8) !void {
+    const line = try std.fmt.allocPrint(allocator, "result={d} {s}={s}\n", .{ idx, name, value });
+    defer allocator.free(line);
+    try out.appendSlice(allocator, line);
+}
+
+fn htmlReleaseEntriesText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var cursor: usize = 0;
+    var count: usize = 0;
+    while (count < 12) {
+        const rel = indexOfIgnoreCase(raw[cursor..], "<h2 id=\"release-") orelse break;
+        const id_start = cursor + rel + "<h2 id=\"release-".len;
+        const id_end_rel = std.mem.indexOfScalar(u8, raw[id_start..], '"') orelse break;
+        const release_id = raw[id_start .. id_start + id_end_rel];
+        const tag_end_rel = std.mem.indexOfScalar(u8, raw[id_start + id_end_rel ..], '>') orelse break;
+        const label_start = id_start + id_end_rel + tag_end_rel + 1;
+        const label_end_rel = indexOfIgnoreCase(raw[label_start..], "</h2>") orelse break;
+        const label = try distillText(allocator, raw[label_start .. label_start + label_end_rel], 120);
+        defer allocator.free(label);
+        const section_start = label_start + label_end_rel + "</h2>".len;
+        const section_end = if (indexOfIgnoreCase(raw[section_start..], "<h2 id=\"release-")) |next| section_start + next else @min(raw.len, section_start + 4096);
+        const date = try firstHtmlListItemText(allocator, raw[section_start..section_end]);
+        defer allocator.free(date);
+
+        count += 1;
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "release={s} label={s} date={s}\n",
+            .{ release_id, std.mem.trim(u8, label, " \t\r\n"), std.mem.trim(u8, date, " \t\r\n") },
+        );
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+        cursor = section_start;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn firstHtmlListItemText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
+    const start_rel = indexOfIgnoreCase(html, "<li>") orelse return allocator.dupe(u8, "");
+    const content_start = start_rel + "<li>".len;
+    const end_rel = indexOfIgnoreCase(html[content_start..], "</li>") orelse return allocator.dupe(u8, "");
+    return distillText(allocator, html[content_start .. content_start + end_rel], 80);
 }
 
 fn jsonStringValuesToText(allocator: std.mem.Allocator, json: []const u8, budget_bytes: usize) ![]u8 {
@@ -550,7 +717,7 @@ test "json search payload is converted to readable evidence before query ranking
     ;
     const fallback = try distillText(std.testing.allocator, raw, raw.len);
     defer std.testing.allocator.free(fallback);
-    const text = try structuredTextForDistillation(std.testing.allocator, raw, fallback);
+    const text = try structuredTextForDistillation(std.testing.allocator, "https://example.test/search", raw, fallback);
     defer std.testing.allocator.free(text);
     const out = try distillTextForQuery(std.testing.allocator, text, "criador kernel Linux Linus Torvalds", 512);
     defer std.testing.allocator.free(out);
@@ -559,6 +726,51 @@ test "json search payload is converted to readable evidence before query ranking
     try std.testing.expect(std.mem.indexOf(u8, out, "searchmatch") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Linus") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Torvalds") != null);
+}
+
+test "duckduckgo html search results become structured snippets" {
+    const raw =
+        \\<html><body>
+        \\<a rel="nofollow" class="result__a" href="https://ziglang.org/download/">Download - Zig Programming Language</a>
+        \\<a class="result__snippet">Download the latest release of Zig from the official project page.</a>
+        \\<a rel="nofollow" class="result__a" href="https://example.test/other">Other result</a>
+        \\<a class="result__snippet">Adjacent topic without the requested fact.</a>
+        \\</body></html>
+    ;
+    const text = try structuredTextForDistillation(std.testing.allocator, "https://html.duckduckgo.com/html/?q=zig", raw, "");
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "result=1 title=Download - Zig Programming Language") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "result=1 url=https://ziglang.org/download/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "result=1 snippet=Download the latest release") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "<a") == null);
+}
+
+test "duckduckgo challenge page does not become query echo evidence" {
+    const raw =
+        \\<html><title>DuckDuckGo</title><body>
+        \\<form id="challenge-form" action="//duckduckgo.com/anomaly.js?q=versao mais recente zig">
+        \\<div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div>
+        \\</form></body></html>
+    ;
+    const text = try structuredTextForDistillation(std.testing.allocator, "https://html.duckduckgo.com/html/?q=zig", raw, "DuckDuckGo versao mais recente zig");
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expectEqualStrings("", text);
+}
+
+test "release html becomes compact structured evidence" {
+    const raw =
+        \\<h2 id="release-master">master</h2><ul><li>2026-07-25</li></ul>
+        \\<h2 id="release-0.15.1">0.15.1</h2><ul><li>2026-04-10</li></ul>
+        \\<table><a href="https://ziglang.org/download/0.15.1/zig-0.15.1.tar.xz">zig-0.15.1.tar.xz</a></table>
+    ;
+    const text = try structuredTextForDistillation(std.testing.allocator, "https://ziglang.org/download/", raw, "");
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "release=master label=master date=2026-07-25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "release=0.15.1 label=0.15.1 date=2026-04-10") != null);
+    try std.testing.expect(isDirectStructuredSummary(text));
 }
 
 test "rejects non http targets" {

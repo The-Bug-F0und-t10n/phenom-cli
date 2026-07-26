@@ -1093,6 +1093,54 @@ fn outputDefersAvailableWorkspaceCollection(output: []const u8, context: ?[]cons
     return false;
 }
 
+fn webEvidenceHasOnlyEmptyExcerpts(context: []const u8) bool {
+    if (std.mem.indexOf(u8, context, "[WEB_EVIDENCE]") == null) return false;
+    var saw_excerpt = false;
+    var saw_nonempty_excerpt = false;
+    var lines = std.mem.splitScalar(u8, context, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (!std.mem.startsWith(u8, trimmed, "excerpt=")) continue;
+        saw_excerpt = true;
+        if (std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n").len > 0) {
+            saw_nonempty_excerpt = true;
+        }
+    }
+    return saw_excerpt and !saw_nonempty_excerpt;
+}
+
+fn unsupportedWebAnswerLiteral(output: []const u8, context: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, context, "[WEB_EVIDENCE]") == null) return null;
+    var it = std.mem.tokenizeAny(u8, output, " \t\r\n");
+    while (it.next()) |raw| {
+        const token = std.mem.trim(u8, raw, ".,;:!?()[]{}<>\"'`*");
+        if (!isEvidenceLiteral(token)) continue;
+        if (containsAsciiIgnoreCase(context, token)) continue;
+        if (token.len > 1 and (token[0] == 'v' or token[0] == 'V') and containsAsciiIgnoreCase(context, token[1..])) continue;
+        return token;
+    }
+    return null;
+}
+
+fn isEvidenceLiteral(token: []const u8) bool {
+    if (token.len < 4) return false;
+    var digits: usize = 0;
+    var all_digits = true;
+    var has_structural_separator = false;
+    for (token) |ch| {
+        if (std.ascii.isDigit(ch)) {
+            digits += 1;
+            continue;
+        }
+        all_digits = false;
+        if (ch == '.' or ch == '-' or ch == '/' or ch == ':' or ch == '_') has_structural_separator = true;
+    }
+    if (digits == 0) return false;
+    if (all_digits and token.len == 4) return true;
+    // ponytail: this enforces numeric/version/date literal support; upgrade to semantic entailment when a verifier model exists.
+    return has_structural_separator;
+}
+
 fn outputClaimsEvidenceWithoutBlock(output: []const u8) bool {
     return std.mem.indexOf(u8, output, "[EVIDENCE]") != null or
         std.mem.indexOf(u8, output, "EVIDENCE:") != null or
@@ -2999,10 +3047,17 @@ fn runWebSearchStep(
     tool_iterations.* += 1;
     if (!webEvidenceHasModelIntent(call)) return try repairWebEvidenceIntentCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "web_search requires model-selected query matching the user's external-evidence intent");
     const declared_query = declaredWebQuery(call);
-    const optimized_query = try optimizeWebSearchQueryForFetch(allocator, config, prompt, declared_query, client, db);
+    const explicit_target = explicitHttpTargetFromCall(call) orelse if (declared_query) |query_text| explicitHttpTargetFromText(query_text) else null;
+    const stripped_query = if (explicit_target != null and explicitHttpTargetFromCall(call) == null and declared_query != null)
+        try stripFirstHttpUrlFromText(allocator, declared_query.?)
+    else
+        null;
+    defer if (stripped_query) |value| allocator.free(value);
+    const fetch_query_input = if (stripped_query) |value| if (std.mem.trim(u8, value, " \t\r\n").len > 0) value else declared_query else declared_query;
+    const optimized_query = try optimizeWebSearchQueryForFetch(allocator, config, prompt, fetch_query_input, client, db);
     defer if (optimized_query) |value| allocator.free(value);
-    const query = optimized_query orelse declared_query;
-    const target = web_rag.resolveSearchTargetWithTemplate(allocator, call.target orelse call.path, query, config.web_search_url) catch |err| {
+    const query = optimized_query orelse fetch_query_input;
+    const target = web_rag.resolveSearchTargetWithTemplate(allocator, explicit_target, query, config.web_search_url) catch |err| {
         const message = switch (err) {
             error.MissingWebSearchTarget => "web_search target is missing and web_search_url/PHENOM_WEB_SEARCH_URL is not configured",
             error.InvalidWebSearchTemplate => "web_search_url/PHENOM_WEB_SEARCH_URL must include {query}",
@@ -3134,6 +3189,37 @@ fn explicitHttpTargetFromCall(call: *const tool_call.ToolCall) ?[]const u8 {
     if (call.target) |target| if (web_rag.isHttpTarget(target)) return target;
     if (call.path) |path| if (web_rag.isHttpTarget(path)) return path;
     return null;
+}
+
+fn explicitHttpTargetFromText(text: []const u8) ?[]const u8 {
+    var cursor: usize = 0;
+    while (cursor < text.len) {
+        const http_idx = std.mem.indexOf(u8, text[cursor..], "http://");
+        const https_idx = std.mem.indexOf(u8, text[cursor..], "https://");
+        const rel = if (http_idx) |h|
+            if (https_idx) |s| @min(h, s) else h
+        else
+            https_idx orelse return null;
+        const start = cursor + rel;
+        var end = start;
+        while (end < text.len and !std.ascii.isWhitespace(text[end])) : (end += 1) {}
+        const target = std.mem.trim(u8, text[start..end], ".,;:!?()[]{}<>\"'");
+        if (web_rag.isHttpTarget(target)) return target;
+        cursor = end;
+    }
+    return null;
+}
+
+fn stripFirstHttpUrlFromText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const target = explicitHttpTargetFromText(text) orelse return allocator.dupe(u8, text);
+    const start = @intFromPtr(target.ptr) - @intFromPtr(text.ptr);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, std.mem.trim(u8, text[0..start], " \t\r\n"));
+    if (out.items.len > 0) try out.append(allocator, ' ');
+    const after_start = start + target.len;
+    if (after_start < text.len) try out.appendSlice(allocator, std.mem.trim(u8, text[after_start..], " \t\r\n"));
+    return out.toOwnedSlice(allocator);
 }
 
 fn collectWebEvidenceBudget(requested: ?usize, remaining_budget: usize) usize {
@@ -3469,7 +3555,7 @@ fn recordModelContextBudget(
         "unavailable";
     const body = try std.fmt.allocPrint(
         allocator,
-        "pre_send=true tokenizer={s} token_estimate=false context_source={s} context_used_tokens={s} context_limit_tokens={s} context_used_percent={s} system_bytes={} header_bytes={} contracts_bytes={} skills_bytes={} memory_bytes={} candidates_bytes={} evidence_bytes={} focus_bytes={} dialogue_bytes={} session_bytes={} obligations_bytes={} grounding_bytes={} next_action_bytes={} total_context_bytes={} fallback_context_limit_bytes={}",
+        "pre_send=true tokenizer={s} token_estimate=false context_source={s} context_used_tokens={s} context_limit_tokens={s} context_used_percent={s} system_bytes={} header_bytes={} temporal_bytes={} contracts_bytes={} skills_bytes={} memory_bytes={} candidates_bytes={} evidence_bytes={} focus_bytes={} dialogue_bytes={} session_bytes={} obligations_bytes={} grounding_bytes={} next_action_bytes={} total_context_bytes={} fallback_context_limit_bytes={}",
         .{
             if (client.tokenizer_available) "backend" else "unavailable",
             budget_source,
@@ -3478,6 +3564,7 @@ fn recordModelContextBudget(
             percent_text,
             buckets.system,
             buckets.header,
+            buckets.temporal,
             buckets.contracts,
             buckets.skills,
             buckets.memory,
@@ -3927,6 +4014,54 @@ fn streamDeferredToolLoopTurnInternal(
             );
         }
         if (follow_sink.raw_visible.items.len > 0) {
+            if (active_contract.name == .search_web and webEvidenceHasOnlyEmptyExcerpts(follow_context)) {
+                follow_sink.discardDeferredVisible();
+                try db.recordEvent(config.session, "answer_repair", "empty web evidence final answer blocked");
+                try aggregate_sink.emitVisibleText("[WEB_EVIDENCE_EMPTY] web_search returned no direct supporting excerpt; no current factual answer is evidenced by collected WEB_EVIDENCE.");
+                return .final_answer;
+            }
+            if (active_contract.name == .search_web) {
+                if (unsupportedWebAnswerLiteral(follow_sink.raw_visible.items, follow_context)) |literal| {
+                    follow_sink.discardDeferredVisible();
+                    if (finalization_state) |state| {
+                        if (state.finalization_repairs < max_tool_repairs) {
+                            state.finalization_repairs += 1;
+                            const repair_context = try std.fmt.allocPrint(
+                                allocator,
+                                "{s}\n[ANSWER_REPAIR]\nThe previous visible answer introduced `{s}`, but that literal is not present in WEB_EVIDENCE. Under search_web, numeric, date, and version facts must be copied from collected evidence. Emit one refined web_search with the exact user fact intent if more evidence is needed; otherwise state that collected WEB_EVIDENCE does not directly support the answer. No unsupported factual literals.\n",
+                                .{ follow_context, literal },
+                            );
+                            defer allocator.free(repair_context);
+                            try db.recordEvent(config.session, "answer_repair", "unsupported web literal");
+                            try db.recordEvent(config.session, "model_context", repair_context);
+                            return streamDeferredToolLoopTurnInternal(
+                                allocator,
+                                config,
+                                prompt,
+                                repair_context,
+                                null,
+                                client,
+                                events,
+                                db,
+                                ui_ptr,
+                                aggregate_sink,
+                                active_contract,
+                                finalization_state,
+                                required_tool_missing_visible,
+                            );
+                        }
+                    }
+                    const visible = try std.fmt.allocPrint(
+                        allocator,
+                        "[WEB_EVIDENCE_UNSUPPORTED] final answer contained `{s}`, but collected WEB_EVIDENCE does not contain that literal.",
+                        .{literal},
+                    );
+                    defer allocator.free(visible);
+                    try db.recordEvent(config.session, "answer_repair", "unsupported web literal final answer blocked");
+                    try aggregate_sink.emitVisibleText(visible);
+                    return .final_answer;
+                }
+            }
             if (finalization_state) |state| {
                 if (state.finalizationBlocker()) |blocker| {
                     follow_sink.discardDeferredVisible();
@@ -4566,7 +4701,7 @@ fn renderWebDistillationPrompt(
         \\[WEB_DISTILLATION_TASK]
         \\Compress fetched web evidence before permanent context insertion.
         \\Return exactly one [WEB_EVIDENCE] block. No prose, no tool calls, no markdown fences.
-        \\Use only WEB_EVIDENCE_INPUT. Preserve target, status, query, and title if present.
+        \\Use only WEB_EVIDENCE_INPUT. Preserve target, retrieved_at, timezone, status, query, and title if present.
         \\Keep only facts that directly and exactly match USER_TASK and MODEL_WEB_QUERY. Similar names, adjacent topics, partial matches, and "probably the same" are not evidence.
         \\If the input has only similar/unrelated results, return [WEB_EVIDENCE] with the original metadata and an empty excerpt. Exclude raw HTML, logs, and long explanations.
         \\Maximum output: 1600 bytes.
@@ -4622,7 +4757,7 @@ fn normalizeWebDistillationOutput(
     const clipped = trimmed[0..@min(trimmed.len, max_web_distillation_output_bytes)];
     return std.fmt.allocPrint(
         allocator,
-        "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target={s}\nquery={s}\nexcerpt={s}\n",
+        "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target={s}\nretrieved_at=unknown\ntimezone=UTC\nquery={s}\nexcerpt={s}\n",
         .{ target, query orelse "", clipped },
     );
 }
@@ -7003,6 +7138,14 @@ test "search web contract next action uses declared query from parser field" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "budget_bytes=2048") != null);
 }
 
+test "web search can derive explicit http target from declared query text" {
+    const text = "https://ziglang.org/download/ stable version today";
+    try std.testing.expectEqualStrings("https://ziglang.org/download/", explicitHttpTargetFromText(text).?);
+    const stripped = try stripFirstHttpUrlFromText(std.testing.allocator, text);
+    defer std.testing.allocator.free(stripped);
+    try std.testing.expectEqualStrings("stable version today", stripped);
+}
+
 test "web query optimization output is one bounded query and rejects tool calls" {
     const query = (try normalizeWebQueryOptimizationOutput(std.testing.allocator, "criador kernel Linux Linus Torvalds fonte\nprosa extra")) orelse return error.MissingQuery;
     defer std.testing.allocator.free(query);
@@ -7066,6 +7209,41 @@ test "web evidence budget is capped before model context insertion" {
     };
     defer strategy_call.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 12000), collectEvidenceBudgetForCall(&strategy_call, null, 64 * 1024));
+}
+
+test "empty web evidence excerpt is detected structurally" {
+    const empty =
+        \\[EVIDENCE]
+        \\E1:
+        \\  [WEB_EVIDENCE]
+        \\  status=200
+        \\  query=latest zig
+        \\  excerpt=
+    ;
+    const nonempty =
+        \\[EVIDENCE]
+        \\E1:
+        \\  [WEB_EVIDENCE]
+        \\  status=200
+        \\  query=latest zig
+        \\  excerpt=Zig 0.16.0
+    ;
+    try std.testing.expect(webEvidenceHasOnlyEmptyExcerpts(empty));
+    try std.testing.expect(!webEvidenceHasOnlyEmptyExcerpts(nonempty));
+    try std.testing.expect(!webEvidenceHasOnlyEmptyExcerpts("[EVIDENCE]\nexcerpt=\n"));
+}
+
+test "web final answer numeric literal must be present in web evidence" {
+    const context =
+        \\[EVIDENCE]
+        \\E1:
+        \\  [WEB_EVIDENCE]
+        \\  query=latest zig
+        \\  excerpt=Download the latest release of Zig from the official project page.
+    ;
+    try std.testing.expectEqualStrings("0.13.0", unsupportedWebAnswerLiteral("A versao mais recente e 0.13.0.", context).?);
+    try std.testing.expect(unsupportedWebAnswerLiteral("Nao encontrei evidencia direta.", context) == null);
+    try std.testing.expect(unsupportedWebAnswerLiteral("A versao evidenciada e 0.15.1.", "[WEB_EVIDENCE]\nexcerpt=Zig 0.15.1\n") == null);
 }
 
 test "plain URL in model prose does not synthesize web search" {
