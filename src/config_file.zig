@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const cli = @import("cli.zig");
+const system_prompt = @import("system_prompt.zig");
 
 const c = @cImport({
     @cInclude("stdio.h");
@@ -152,6 +153,8 @@ fn applyKey(
         cfg.fail_on_model_error = try parseBool(value);
     } else if (std.mem.eql(u8, key, "web_search_url")) {
         cfg.web_search_url = value;
+    } else if (std.mem.eql(u8, key, "system_prompt_profile")) {
+        cfg.system_prompt_profile = system_prompt.parseProfile(value) orelse return error.UnknownSystemPromptProfile;
     } else if (std.mem.eql(u8, key, "expect_contains")) {
         cfg.expect_contains = value;
     } else if (std.mem.eql(u8, key, "show_expect_status")) {
@@ -269,6 +272,7 @@ test "config file applies host port and flags override" {
         \\model = "phenom:latest"
         \\thinking = "on"
         \\max_tokens = 256
+        \\system_prompt_profile = "strict"
         \\web_search_url = "http://127.0.0.1:8080/search?q={query}"
         \\no_color = true
     .*;
@@ -282,6 +286,7 @@ test "config file applies host port and flags override" {
     try std.testing.expectEqualStrings("192.168.1.122:11434", cfg.host);
     try std.testing.expectEqualStrings("phenom:latest", cfg.model);
     try std.testing.expectEqual(cli.ThinkingMode.off, cfg.thinking);
+    try std.testing.expectEqual(system_prompt.Profile.strict, cfg.system_prompt_profile);
     try std.testing.expectEqual(@as(u16, 256), cfg.max_tokens);
     try std.testing.expectEqualStrings("http://127.0.0.1:8080/search?q={query}", cfg.web_search_url.?);
     try std.testing.expect(cfg.no_color);

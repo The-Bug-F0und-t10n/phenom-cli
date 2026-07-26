@@ -15,6 +15,7 @@ O projeto e voltado a uso local-first com backends como Ollama e llama.cpp. A pr
 - Recuperacao de sessao por eventos recentes, `SESSION_FOCUS`, FTS5/BM25 e resumo operacional de sessoes longas.
 - Tool loop com allowlist por contrato operacional.
 - `collect_evidence`, `search_session`, `apply_patch`, `validate_syntax`, `promote_context` e perfis de contexto.
+- Perfis de system prompt stock (`stock` e `strict`) com override local por `Phenom.md`.
 - Orcamento pre-send de contexto do modelo, com limite atual de 24 KiB e rejeicao de marcadores brutos.
 
 ## Requisitos

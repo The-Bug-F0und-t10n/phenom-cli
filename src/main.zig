@@ -118,6 +118,10 @@ fn backendName(backend: cli.Backend) []const u8 {
     };
 }
 
+fn effectiveSystemPrompt(config: cli.Config) []const u8 {
+    return config.system_prompt orelse system_prompt.profileText(config.system_prompt_profile);
+}
+
 fn recordBackendConfig(allocator: std.mem.Allocator, db: *audit.AuditDb, config: cli.Config, client: *http.LocalModelClient) !void {
     const endpoint = blk: {
         break :blk client.endpointSummary(allocator) catch |err| {
@@ -129,7 +133,7 @@ fn recordBackendConfig(allocator: std.mem.Allocator, db: *audit.AuditDb, config:
     defer allocator.free(body);
     try db.recordEvent(config.session, "model_backend", body);
 
-    const metadata = client.probeMetadata(allocator, config.system_prompt orelse system_prompt.default_system_prompt);
+    const metadata = client.probeMetadata(allocator, effectiveSystemPrompt(config));
     defer metadata.deinit(allocator);
     client.rememberMetadata(metadata);
     const schema_tokens = try optionalUsizeText(allocator, metadata.schema_baseline_tokens);
@@ -314,6 +318,7 @@ const interactive_help_text =
     \\  --host HOST:PORT           endereco do backend
     \\  --model MODEL              modelo enviado ao backend
     \\  --thinking auto/on/off     controle de reasoning/template
+    \\  --system-prompt-profile stock/strict  perfil stock quando Phenom.md nao existir
     \\  --max-tokens N             limite de geracao enviado ao backend
     \\  --no-color                 desativa ANSI
     \\  --fail-on-model-error      falha com exit code nao-zero em erro de modelo/backend
@@ -325,7 +330,7 @@ const interactive_help_text =
     \\  ordem: ./config.toml, depois ~/.config/phenom/config.toml, depois flags
     \\  chaves: backend, host, port, server, model, thinking, max_tokens, no_color,
     \\         offline, fail_on_model_error, web_search_url, expect_contains,
-    \\         show_expect_status, demo_read_file, session
+    \\         show_expect_status, demo_read_file, session, system_prompt_profile
     \\
     \\Build e validacao:
     \\  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast
@@ -414,7 +419,7 @@ fn runCreateCustomPromptCommand(
     defer sink.deinit();
     client.streamInference(.{
         .user_prompt = generator_prompt,
-        .system_prompt = system_prompt.default_system_prompt,
+        .system_prompt = effectiveSystemPrompt(config),
         .max_tokens = @min(config.max_tokens, 1800),
     }, &sink) catch |err| {
         try db.recordTurnError(config.session, .infrastructure, "create_custom_prompt", @errorName(err));
@@ -521,6 +526,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
     if (turn_project_prompt) |value| {
         if (std.mem.trim(u8, value, " \t\r\n").len > 0) effective_config.system_prompt = value;
     }
+    if (effective_config.system_prompt == null) effective_config.system_prompt = system_prompt.profileText(effective_config.system_prompt_profile);
 
     const size = tui.terminalSize();
     const ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter) = ui;
@@ -5965,8 +5971,17 @@ test "interactive help slash command is local only" {
     try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "/create_custom_prompt") != null);
     try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "phenom graph") != null);
     try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "--expect-contains") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "--system-prompt-profile stock/strict") != null);
     try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "real-session-smoke") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, interactive_help_text, '|') == null);
+}
+
+test "effective system prompt uses selected stock profile without override" {
+    const strict = effectiveSystemPrompt(.{ .system_prompt_profile = .strict });
+    try std.testing.expectEqualStrings(system_prompt.strict_system_prompt, strict);
+
+    const custom = effectiveSystemPrompt(.{ .system_prompt_profile = .strict, .system_prompt = "CUSTOM" });
+    try std.testing.expectEqualStrings("CUSTOM", custom);
 }
 
 test "custom prompt path reports cwd target" {

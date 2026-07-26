@@ -36,6 +36,7 @@ Flags:
 - `--model MODEL`: nome do modelo enviado ao backend.
 - `--max-tokens N`: compatibilidade legado; nao limita geracao no cliente. Configure limites no servidor do modelo.
 - `--thinking auto|on|off`: controla template/filtro de reasoning.
+- `--system-prompt-profile stock|strict`: seleciona prompt stock quando `Phenom.md` nao existe. `strict` e mais conservador para reduzir alucinacao em modelos pequenos/medios.
 - `--no-color`: desativa ANSI colorido.
 - `--fail-on-model-error`: retorna erro se o modelo/backend falhar.
 - `--expect-contains TEXT`: exige que a resposta visivel contenha o texto.
@@ -139,6 +140,7 @@ Chaves aceitas:
 - `server = "http://127.0.0.1:8080"`
 - `model = "llama3.2"`
 - `thinking = "auto"` ou `"on"` ou `"off"`
+- `system_prompt_profile = "stock"` ou `"strict"`
 - `max_tokens = 4096` (legado/no-op no cliente)
 - `no_color = true|false`
 - `offline = true|false`
@@ -156,6 +158,7 @@ host = "127.0.0.1"
 port = 8080
 model = "local"
 thinking = "auto"
+system_prompt_profile = "strict"
 max_tokens = 4096 # legado/no-op no cliente; limite real fica no servidor
 session = "dev"
 no_color = false

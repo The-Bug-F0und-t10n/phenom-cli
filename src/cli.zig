@@ -1,4 +1,5 @@
 const std = @import("std");
+const system_prompt = @import("system_prompt.zig");
 
 pub const Backend = enum {
     ollama,
@@ -36,6 +37,7 @@ pub const Config = struct {
     fail_on_model_error: bool = false,
     web_search_url: ?[]const u8 = null,
     system_prompt: ?[]const u8 = null,
+    system_prompt_profile: system_prompt.Profile = .stock,
     expect_contains: ?[]const u8 = null,
     expect_contains_all: [8]?[]const u8 = [_]?[]const u8{null} ** 8,
     expect_contains_count: usize = 0,
@@ -114,6 +116,10 @@ pub fn parseArgsWithBase(base: Config, args: []const []const u8) !Config {
             cfg.offline = true;
         } else if (std.mem.eql(u8, arg, "--fail-on-model-error")) {
             cfg.fail_on_model_error = true;
+        } else if (std.mem.eql(u8, arg, "--system-prompt-profile")) {
+            i += 1;
+            if (i >= args.len) return error.MissingSystemPromptProfile;
+            cfg.system_prompt_profile = system_prompt.parseProfile(args[i]) orelse return error.UnknownSystemPromptProfile;
         } else if (std.mem.eql(u8, arg, "--expect-contains")) {
             i += 1;
             if (i >= args.len) return error.MissingExpectedText;
@@ -152,6 +158,7 @@ pub fn printUsage(writer: anytype) !void {
         \\  --no-color
         \\  --max-tokens N (generation token limit sent to supported backends)
         \\  --thinking auto|on|off
+        \\  --system-prompt-profile stock|strict
         \\  --fail-on-model-error
         \\  --expect-contains TEXT
         \\  --show-expect-status
@@ -162,7 +169,7 @@ pub fn printUsage(writer: anytype) !void {
         \\  flags override config values
         \\  keys: backend, host, port, server, model, thinking, max_tokens, no_color,
         \\        offline, fail_on_model_error, web_search_url, expect_contains,
-        \\        show_expect_status, demo_read_file, session
+        \\        show_expect_status, demo_read_file, session, system_prompt_profile
         \\
     );
 }
@@ -183,6 +190,7 @@ test "parse args preserves config defaults and lets flags override" {
     try std.testing.expectEqual(Backend.llamacpp, cfg.backend);
     try std.testing.expectEqual(ThinkingMode.off, cfg.thinking);
     try std.testing.expectEqual(@as(u16, 128), cfg.max_tokens);
+    try std.testing.expectEqual(system_prompt.Profile.stock, cfg.system_prompt_profile);
 }
 
 test "parse probe args" {
@@ -200,7 +208,7 @@ test "parse graph args" {
 }
 
 test "parse chat args" {
-    const args = &.{ "phenom", "chat", "--session", "s1", "--prompt", "ola", "--backend", "llamacpp", "--host", "127.0.0.1:8080", "--model", "local", "--max-tokens", "32", "--thinking", "on", "--no-color" };
+    const args = &.{ "phenom", "chat", "--session", "s1", "--prompt", "ola", "--backend", "llamacpp", "--host", "127.0.0.1:8080", "--model", "local", "--max-tokens", "32", "--thinking", "on", "--system-prompt-profile", "strict", "--no-color" };
     const cfg = try parseArgs(args);
     try std.testing.expectEqual(Command.chat, cfg.command);
     try std.testing.expect(std.mem.eql(u8, cfg.session, "s1"));
@@ -210,6 +218,7 @@ test "parse chat args" {
     try std.testing.expectEqual(Backend.llamacpp, cfg.backend);
     try std.testing.expectEqual(@as(u16, 32), cfg.max_tokens);
     try std.testing.expectEqual(ThinkingMode.on, cfg.thinking);
+    try std.testing.expectEqual(system_prompt.Profile.strict, cfg.system_prompt_profile);
     try std.testing.expect(cfg.no_color);
 }
 

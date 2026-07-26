@@ -1,7 +1,34 @@
+const std = @import("std");
+
 pub const default_system_prompt: []const u8 = @embedFile("system_prompt.md");
+pub const strict_system_prompt: []const u8 = @embedFile("system_prompt_strict.md");
+
+pub const Profile = enum {
+    stock,
+    strict,
+};
+
+pub fn parseProfile(value: []const u8) ?Profile {
+    if (std.mem.eql(u8, value, "stock") or std.mem.eql(u8, value, "default")) return .stock;
+    if (std.mem.eql(u8, value, "strict")) return .strict;
+    return null;
+}
+
+pub fn profileName(profile: Profile) []const u8 {
+    return switch (profile) {
+        .stock => "stock",
+        .strict => "strict",
+    };
+}
+
+pub fn profileText(profile: Profile) []const u8 {
+    return switch (profile) {
+        .stock => default_system_prompt,
+        .strict => strict_system_prompt,
+    };
+}
 
 test "default system prompt is loaded from template file" {
-    const std = @import("std");
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "You are Phenom") == null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Model decides when contracts/tools are needed") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Do not roleplay identity") != null);
@@ -11,4 +38,14 @@ test "default system prompt is loaded from template file" {
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "promote a concise interpreted SKILLS rule") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "separate known, inferred, and unknown") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Do not fill gaps") != null);
+}
+
+test "system prompt profiles are named and selectable" {
+    try std.testing.expectEqual(Profile.stock, parseProfile("stock").?);
+    try std.testing.expectEqual(Profile.stock, parseProfile("default").?);
+    try std.testing.expectEqual(Profile.strict, parseProfile("strict").?);
+    try std.testing.expect(parseProfile("unknown") == null);
+    try std.testing.expectEqualStrings("strict", profileName(.strict));
+    try std.testing.expect(profileText(.stock).ptr == default_system_prompt.ptr);
+    try std.testing.expect(std.mem.indexOf(u8, profileText(.strict), "Do not infer identity") != null);
 }
