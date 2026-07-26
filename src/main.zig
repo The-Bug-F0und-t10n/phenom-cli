@@ -274,13 +274,11 @@ fn runCreateCustomPromptCommand(
         return allocator.dupe(u8, "Nao foi possivel criar Phenom.md: /create_custom_prompt requer um modelo ativo.");
     }
 
-    if (ui_ptr) |active_ui| try active_ui.showStatus("Collecting project context");
-    try db.recordEvent(config.session, "tool_start", "collect_evidence\tcreate_custom_prompt");
-    try events.emit(.{ .tool_start = .{ .name = "collect_evidence", .detail = "create_custom_prompt" } });
+    if (ui_ptr) |active_ui| try active_ui.showStatus("Collecting project overview");
+    try db.recordEvent(config.session, "tool_start", "collect_evidence\tstage=overview create_custom_prompt");
+    try events.emit(.{ .tool_start = .{ .name = "collect_evidence", .detail = "overview" } });
     const project = collect_evidence.execute(allocator, io, .{
         .task = "create Phenom.md custom project prompt",
-        .intent = "distill current project purpose architecture business rules stable operational constraints",
-        .terms = "project purpose architecture business rules operational contracts memory evidence rag web tui renderer",
         .strategy = .auto,
         .budget_bytes = 7000,
     }) catch |err| {
@@ -288,6 +286,7 @@ fn runCreateCustomPromptCommand(
         return std.fmt.allocPrint(allocator, "Nao foi possivel criar Phenom.md: coleta de contexto falhou com {s}.", .{@errorName(err)});
     };
     defer project.deinit(allocator);
+    try db.recordEvent(config.session, "tool_event", project.tool_event_audit_text);
     try db.recordEvent(config.session, "evidence", project.evidence_text);
     try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = project.evidence_text } });
 
@@ -705,6 +704,7 @@ fn buildTurnQuality(
         if (std.mem.eql(u8, event.kind, "tool_start") and std.mem.startsWith(u8, event.body, "search_session")) used_session_context = true;
         if (std.mem.eql(u8, event.kind, "tool_start") and std.mem.startsWith(u8, event.body, "collect_evidence")) used_evidence = true;
         if (std.mem.eql(u8, event.kind, "persistent_promotion")) used_persistent_context = true;
+        if (std.mem.eql(u8, event.kind, "persistent_context")) used_persistent_context = true;
         if (std.mem.eql(u8, event.kind, "tool_start") and std.mem.startsWith(u8, event.body, "promote_context")) used_persistent_context = true;
         if (std.mem.eql(u8, event.kind, "model_context") and std.mem.indexOf(u8, event.body, "mode: session_recall") != null) session_recall_contract = true;
         if (std.mem.eql(u8, event.kind, "turn_error")) has_turn_error = true;
@@ -1033,6 +1033,33 @@ fn runToolLoopIterations(
             },
         }
     }
+    if (maybe_envelope == null and has_visible_output and shouldRepairPersistentContextClaim(visible_output, initial_context, &state)) {
+        first_sink.discardDeferredVisible();
+        try db.recordEvent(config.session, "answer_repair", "persistent context claim without retrieval");
+        const repair_context = try renderPersistentContextClaimRepairContext(allocator, prompt, state.active_contract);
+        defer allocator.free(repair_context);
+        try db.recordEvent(config.session, "model_context", repair_context);
+        const next = try streamDeferredRequiredToolLoopTurn(
+            allocator,
+            config,
+            prompt,
+            repair_context,
+            "Your previous answer made a MEMORY/SKILLS claim without retrieved persistent context. Output exactly one set_operational_contract tool_call with contract=memory and concrete terms from USER_TASK. No prose.",
+            client,
+            events,
+            db,
+            ui_ptr,
+            first_sink,
+            state.active_contract,
+        );
+        switch (next) {
+            .final_answer => return true,
+            .stopped => return true,
+            .tool_call => |next_call| {
+                maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
+            },
+        }
+    }
     if (maybe_envelope == null) return false;
 
     var tool_iterations: usize = 0;
@@ -1330,6 +1357,79 @@ fn outputCitesMissingSessionEvidence(output: []const u8, context: ?[]const u8) b
     return containsCitation(output, 'S') and !contextHasSection(context, "[SESSION_CONTEXT]");
 }
 
+fn outputClaimsPersistentContextWithoutRetrieval(output: []const u8, context: ?[]const u8) bool {
+    const mentions_persistent_protocol = containsAsciiIgnoreCase(output, "MEMORY") or
+        containsAsciiIgnoreCase(output, "SKILLS") or
+        containsAsciiIgnoreCase(output, "memoria") or
+        containsAsciiIgnoreCase(output, "memória") or
+        containsAsciiIgnoreCase(output, "contexto persistente");
+    if (!mentions_persistent_protocol) return false;
+    if (contextHasSection(context, "[MEMORY]")) return false;
+    if (contextHasSection(context, "[SKILLS]")) return false;
+    if (contextHasSection(context, "[PERSISTENT_CONTEXT]")) return false;
+    return true;
+}
+
+fn shouldRepairPersistentContextClaim(output: []const u8, context: ?[]const u8, state: ?*const ToolLoopState) bool {
+    if (state) |loop_state| {
+        if (loop_state.memory_promotions > 0) return false;
+    }
+    return outputClaimsPersistentContextWithoutRetrieval(output, context);
+}
+
+fn outputContradictsRetrievedSkills(output: []const u8, state: ?*const ToolLoopState) bool {
+    const loop_state = state orelse return false;
+    if (loop_state.active_contract.name != .memory) return false;
+    if (loop_state.retrieved_skills.items.len == 0) return false;
+    // ponytail: output-level protocol guard only; replace with semantic verifier if paraphrase tolerance becomes required.
+    const denies_persistent_rule = (containsAsciiIgnoreCase(output, "I don't have") or
+        containsAsciiIgnoreCase(output, "I do not have") or
+        containsAsciiIgnoreCase(output, "nao tenho") or
+        containsAsciiIgnoreCase(output, "não tenho") or
+        containsAsciiIgnoreCase(output, "no specific") or
+        containsAsciiIgnoreCase(output, "nenhuma regra") or
+        containsAsciiIgnoreCase(output, "não há regra") or
+        containsAsciiIgnoreCase(output, "nao ha regra") or
+        containsAsciiIgnoreCase(output, "nao existe regra") or
+        containsAsciiIgnoreCase(output, "não existe regra"));
+    const asks_clarification = containsAsciiIgnoreCase(output, "could you clarify") or
+        containsAsciiIgnoreCase(output, "please clarify") or
+        containsAsciiIgnoreCase(output, "poderia esclarecer") or
+        containsAsciiIgnoreCase(output, "preciso que esclare");
+    const speaks_about_persistent_context = containsAsciiIgnoreCase(output, "rule") or
+        containsAsciiIgnoreCase(output, "regra") or
+        containsAsciiIgnoreCase(output, "memory") or
+        containsAsciiIgnoreCase(output, "skills") or
+        containsAsciiIgnoreCase(output, "memoria") or
+        containsAsciiIgnoreCase(output, "memória") or
+        containsAsciiIgnoreCase(output, "contexto persistente");
+    return speaks_about_persistent_context and (denies_persistent_rule or asks_clarification);
+}
+
+fn firstMissingRetrievedSkillMarker(context: ?[]const u8, output: []const u8) ?[]const u8 {
+    const text = context orelse return null;
+    const skills = contextSection(text, "[SKILLS]") orelse return null;
+    var it = std.mem.tokenizeAny(u8, skills, " \t\r\n`'\".,;:()[]{}<>");
+    while (it.next()) |token| {
+        const trimmed = std.mem.trim(u8, token, "-");
+        if (!isSkillMarkerToken(trimmed)) continue;
+        if (!containsAsciiIgnoreCase(output, trimmed)) return trimmed;
+    }
+    return null;
+}
+
+fn isSkillMarkerToken(token: []const u8) bool {
+    if (token.len < 6) return false;
+    if (std.mem.indexOfScalar(u8, token, '_') == null) return false;
+    var has_digit = false;
+    var has_upper = false;
+    for (token) |ch| {
+        if (std.ascii.isDigit(ch)) has_digit = true;
+        if (std.ascii.isUpper(ch)) has_upper = true;
+    }
+    return has_digit and has_upper;
+}
+
 fn contextHasSection(context: ?[]const u8, section: []const u8) bool {
     const text = context orelse return false;
     var marker_buffer: [64]u8 = undefined;
@@ -1444,6 +1544,41 @@ fn renderMissingCitationRepairContext(allocator: std.mem.Allocator, prompt: []co
         },
         .grounding = groundingRules(),
         .next_action = "Emit exactly one collect_evidence or search_session tool_call now. No prose.",
+    });
+}
+
+fn renderPersistentContextClaimRepairContext(allocator: std.mem.Allocator, prompt: []const u8, active_contract: contracts.ActiveContract) ![]u8 {
+    const memory_active = active_contract.name == .memory;
+    return model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = if (memory_active)
+            context_profile.memorySchema()
+        else
+            context_profile.activeContractSchemaFor(active_contract.name),
+        .obligations = &.{
+            "The previous answer made a MEMORY/SKILLS claim without retrieved persistent context.",
+            "MEMORY/SKILLS availability/content/absence requires memory contract retrieval first.",
+        },
+        .grounding = groundingRules(),
+        .next_action = if (memory_active)
+            "Emit exactly one search_persistent_context target=both terms=<concrete terms from USER_TASK>. No prose."
+        else
+            "Emit exactly one set_operational_contract contract=memory terms=<concrete terms from USER_TASK>. No prose.",
+    });
+}
+
+fn renderRetrievedSkillsAnswerRepairContext(allocator: std.mem.Allocator, prompt: []const u8, state: *const ToolLoopState) ![]u8 {
+    return model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = activeToolSchema(state),
+        .skills = state.retrieved_skills.items,
+        .obligations = &.{
+            "The previous answer contradicted retrieved SKILLS.",
+            "Retrieved SKILLS directly govern this memory-contract turn.",
+            "Answer only from retrieved SKILLS. Do not ask clarification. Do not add generic advice.",
+        },
+        .grounding = groundingRules(),
+        .next_action = "Emit the final answer now, applying the retrieved SKILLS exactly. No tool_call.",
     });
 }
 
@@ -1660,6 +1795,9 @@ fn runOneToolLoopStep(
     }
     if (std.mem.eql(u8, call.name, "search_session")) {
         return try runSearchSessionStep(allocator, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
+    }
+    if (std.mem.eql(u8, call.name, "search_persistent_context")) {
+        return try runSearchPersistentContextStep(allocator, io, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
     }
     if (std.mem.eql(u8, call.name, "apply_patch")) {
         return try runApplyPatchStep(allocator, io, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
@@ -2008,6 +2146,7 @@ fn phaseForTool(name: []const u8) audit.OperationalPhase {
     if (std.mem.eql(u8, name, "set_operational_contract")) return .contract;
     if (std.mem.eql(u8, name, "collect_evidence")) return .evidence;
     if (std.mem.eql(u8, name, "search_session")) return .evidence;
+    if (std.mem.eql(u8, name, "search_persistent_context")) return .evidence;
     if (std.mem.eql(u8, name, "apply_patch")) return .mutation;
     if (std.mem.eql(u8, name, "promote_context")) return .mutation;
     if (std.mem.eql(u8, name, "validate_syntax")) return .validation;
@@ -2618,7 +2757,11 @@ fn renderOperationalContractNextAction(
         return allocator.dupe(u8, "Proceed inside the active contract. Call validate_syntax for the changed or requested Zig file.");
     }
     if (selected == .memory) {
-        return allocator.dupe(u8, "Proceed inside the active contract. Promote only explicit user-confirmed memory or verified practical facts.");
+        const terms = call.terms orelse call.intent orelse call.reason orelse "";
+        if (call.requires_memory_promotion == true) {
+            return allocator.dupe(u8, "Proceed inside the active memory contract. Promote the user-confirmed durable rule/preference/operational constraint with promote_context target=skills and concise interpreted text. Do not search first unless applying an existing rule is needed.");
+        }
+        return std.fmt.allocPrint(allocator, "Proceed inside the active memory contract. Search MEMORY/SKILLS with search_persistent_context target=both terms={s} before applying existing persistent context. If the current user turn establishes a new durable rule/preference, promote_context target=skills with concise interpreted text instead of searching.", .{terms});
     }
     return allocator.dupe(u8, "Proceed inside the active contract. Call only advertised tools, or answer if no more tool-backed context is needed.");
 }
@@ -3519,6 +3662,128 @@ fn repairPromoteContextCall(
     return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
+fn runSearchPersistentContextStep(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: cli.Config,
+    prompt: []const u8,
+    call: *const tool_call.ToolCall,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    tool_iterations: *usize,
+) !ToolLoopNext {
+    if (tool_iterations.* >= max_tool_emergency_iterations) return .stopped;
+    tool_iterations.* += 1;
+
+    const terms = call.terms orelse call.intent orelse call.need orelse return try repairSearchPersistentContextCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "search_persistent_context requires terms or intent.");
+    const target = parsePersistentSearchTarget(call.target) orelse return try repairSearchPersistentContextCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "search_persistent_context target must be memory, skills, or both.");
+    const budget_bytes = @min(call.budget_bytes orelse @as(usize, 2048), @as(usize, 8192));
+    const max_entries: usize = 6;
+
+    try db.recordEvent(config.session, "tool_start", "search_persistent_context");
+    try events.emit(.{ .tool_start = .{ .name = "search_persistent_context", .detail = @tagName(target) } });
+    var result = persistent_context.searchFromCwd(allocator, io, target, terms, max_entries) catch |err| {
+        try db.recordEvent(config.session, "tool_error", @errorName(err));
+        try db.recordTurnError(config.session, .tool_runtime, "search_persistent_context", @errorName(err));
+        try events.emit(.{ .tool_result = .{ .name = "search_persistent_context", .output = @errorName(err) } });
+        return try repairSearchPersistentContextCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "Persistent context search failed. Emit corrected terms or answer without persistent context.");
+    };
+    defer result.deinit();
+
+    const rendered = try renderPersistentSearchResult(allocator, result.memory.items, result.skills.items, budget_bytes);
+    defer allocator.free(rendered);
+    try db.recordEvent(config.session, "persistent_context", rendered);
+    try events.emit(.{ .tool_result = .{ .name = "search_persistent_context", .output = rendered } });
+    state.recordObservation();
+    state.recordPersistentContextSearch();
+    try state.rememberRetrievedSkills(result.skills.items);
+
+    const follow_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = activeToolSchema(state),
+        .memory = result.memory.items,
+        .skills = result.skills.items,
+        .grounding = groundingRules(),
+        .next_action = "Apply relevant retrieved SKILLS as response rules. If the user asks for a local rule/preference/protocol, answer only the directly retrieved MEMORY/SKILLS entry; do not add adjacent advice, generic best practices, or inferred extras. If no entry directly supports the request, say persistent context did not contain it. Do not promote anything unless the user explicitly confirmed a new durable fact/rule.",
+    });
+    defer allocator.free(follow_context);
+    try db.recordEvent(config.session, "model_context", follow_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
+}
+
+fn parsePersistentSearchTarget(value: ?[]const u8) ?persistent_context.SearchTarget {
+    const raw = value orelse return .both;
+    if (std.ascii.eqlIgnoreCase(raw, "memory")) return .memory;
+    if (std.ascii.eqlIgnoreCase(raw, "skills")) return .skills;
+    if (std.ascii.eqlIgnoreCase(raw, "both")) return .both;
+    return null;
+}
+
+fn renderPersistentSearchResult(allocator: std.mem.Allocator, memory: []const []const u8, skills: []const []const u8, budget_bytes: usize) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "[PERSISTENT_CONTEXT]\nsource=MEMORY/SKILLS raw_context_persisted=false\n");
+    if (skills.len > 0) {
+        try out.appendSlice(allocator, "\n[SKILLS]\n");
+        try appendListWithinBudget(&out, allocator, skills, budget_bytes);
+    }
+    if (memory.len > 0) {
+        try out.appendSlice(allocator, "\n[MEMORY]\n");
+        try appendListWithinBudget(&out, allocator, memory, budget_bytes);
+    }
+    if (skills.len == 0 and memory.len == 0) try out.appendSlice(allocator, "status=no_matches\n");
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendListWithinBudget(out: *std.ArrayList(u8), allocator: std.mem.Allocator, entries: []const []const u8, budget_bytes: usize) !void {
+    for (entries) |entry| {
+        if (out.items.len >= budget_bytes) {
+            try out.appendSlice(allocator, "- [TRUNCATED]\n");
+            return;
+        }
+        const before = out.items.len;
+        try out.appendSlice(allocator, "- ");
+        const remaining = budget_bytes -| out.items.len;
+        if (entry.len <= remaining) {
+            try out.appendSlice(allocator, entry);
+        } else {
+            try out.appendSlice(allocator, entry[0..remaining]);
+            try out.appendSlice(allocator, " [TRUNCATED]");
+        }
+        try out.append(allocator, '\n');
+        if (out.items.len == before) return;
+    }
+}
+
+fn repairSearchPersistentContextCall(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    reason: []const u8,
+) !ToolLoopNext {
+    try db.recordEvent(config.session, "tool_repair", reason);
+    const repair_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = activeToolSchema(state),
+        .obligations = &.{reason},
+        .grounding = groundingRules(),
+        .next_action = "Emit search_persistent_context(target=memory|skills|both,terms) with concrete model-selected terms, or answer without persistent context.",
+    });
+    defer allocator.free(repair_context);
+    try db.recordEvent(config.session, "model_context", repair_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
+}
+
 fn runSearchSessionStep(
     allocator: std.mem.Allocator,
     config: cli.Config,
@@ -4181,6 +4446,72 @@ fn streamDeferredToolLoopTurnInternal(
             );
         }
         if (follow_sink.raw_visible.items.len > 0) {
+            if (shouldRepairPersistentContextClaim(follow_sink.raw_visible.items, follow_context, finalization_state)) {
+                follow_sink.discardDeferredVisible();
+                try db.recordEvent(config.session, "answer_repair", "persistent context claim without retrieval");
+                const repair_context = try renderPersistentContextClaimRepairContext(allocator, prompt, active_contract);
+                defer allocator.free(repair_context);
+                try db.recordEvent(config.session, "model_context", repair_context);
+                const repair_message = if (active_contract.name == .memory)
+                    "Output exactly one search_persistent_context tool_call with target=both and concrete terms from USER_TASK. No prose."
+                else
+                    "Output exactly one set_operational_contract tool_call with contract=memory and concrete terms from USER_TASK. No prose.";
+                return streamDeferredToolLoopTurnInternal(
+                    allocator,
+                    config,
+                    prompt,
+                    repair_context,
+                    repair_message,
+                    client,
+                    events,
+                    db,
+                    ui_ptr,
+                    aggregate_sink,
+                    active_contract,
+                    finalization_state,
+                    required_tool_missing_visible,
+                );
+            }
+            if (outputContradictsRetrievedSkills(follow_sink.raw_visible.items, finalization_state)) {
+                follow_sink.discardDeferredVisible();
+                if (finalization_state) |state| {
+                    if (state.retrieved_skill_answer_repairs >= max_tool_repairs) {
+                        try db.recordEvent(config.session, "answer_repair_blocked", "retrieved skills contradiction");
+                        try db.recordTurnError(config.session, .model_protocol, "persistent_context", "retrieved skills contradicted after repair");
+                        try aggregate_sink.emitVisibleText("[MODEL_PROTOCOL_ERROR] final answer contradicted retrieved SKILLS.");
+                        return .stopped;
+                    }
+                    state.retrieved_skill_answer_repairs += 1;
+                    try db.recordEvent(config.session, "answer_repair", "retrieved skills contradiction");
+                    const repair_context = try renderRetrievedSkillsAnswerRepairContext(allocator, prompt, state);
+                    defer allocator.free(repair_context);
+                    try db.recordEvent(config.session, "model_context", repair_context);
+                    return streamDeferredToolLoopTurnInternal(
+                        allocator,
+                        config,
+                        prompt,
+                        repair_context,
+                        null,
+                        client,
+                        events,
+                        db,
+                        ui_ptr,
+                        aggregate_sink,
+                        state.active_contract,
+                        state,
+                        required_tool_missing_visible,
+                    );
+                }
+            }
+            if (firstMissingRetrievedSkillMarker(follow_context, follow_sink.raw_visible.items)) |marker| {
+                try db.recordEvent(config.session, "answer_repair", "retrieved skill marker inserted");
+                aggregate_sink.mergeGenerationStop(follow_sink);
+                const repaired_visible = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ marker, follow_sink.raw_visible.items });
+                defer allocator.free(repaired_visible);
+                try aggregate_sink.emitVisibleText(repaired_visible);
+                follow_sink.raw_visible.clearRetainingCapacity();
+                return .final_answer;
+            }
             if (active_contract.name == .search_web and webEvidenceHasOnlyEmptyExcerpts(follow_context)) {
                 follow_sink.discardDeferredVisible();
                 try db.recordEvent(config.session, "answer_repair", "empty web evidence final answer blocked");
@@ -4489,6 +4820,7 @@ fn hasKnownTextExtension(path: []const u8) bool {
 const ToolLoopState = struct {
     context: working_context.WorkingContext,
     session_searches: std.ArrayList([]u8),
+    retrieved_skills: std.ArrayList([]u8),
     candidates: std.ArrayList(collect_evidence.CandidateItem),
     last_candidate_context: ?[]u8 = null,
     last_session_context: ?[]u8 = null,
@@ -4505,16 +4837,19 @@ const ToolLoopState = struct {
     runtime_validations: usize = 0,
     browser_diagnostics: usize = 0,
     memory_promotions: usize = 0,
+    persistent_context_searches: usize = 0,
     duplicate_repairs: usize = 0,
     contract_selected: bool = false,
     duplicate_contract_repairs: usize = 0,
     finalization_repairs: usize = 0,
+    retrieved_skill_answer_repairs: usize = 0,
     forced_exploratory_refinements: usize = 0,
 
     fn init(allocator: std.mem.Allocator) ToolLoopState {
         return .{
             .context = working_context.WorkingContext.init(allocator),
             .session_searches = std.ArrayList([]u8).empty,
+            .retrieved_skills = std.ArrayList([]u8).empty,
             .candidates = std.ArrayList(collect_evidence.CandidateItem).empty,
             .active_contract = currentActiveContract(),
         };
@@ -4523,6 +4858,8 @@ const ToolLoopState = struct {
     fn deinit(self: *ToolLoopState) void {
         for (self.session_searches.items) |terms| self.context.allocator.free(terms);
         self.session_searches.deinit(self.context.allocator);
+        for (self.retrieved_skills.items) |skill| self.context.allocator.free(skill);
+        self.retrieved_skills.deinit(self.context.allocator);
         for (self.candidates.items) |candidate| candidate.deinit(self.context.allocator);
         self.candidates.deinit(self.context.allocator);
         if (self.last_candidate_context) |text| self.context.allocator.free(text);
@@ -4572,6 +4909,7 @@ const ToolLoopState = struct {
         self.contract_selected = true;
         self.requirements = request;
         self.finalization_repairs = 0;
+        self.retrieved_skill_answer_repairs = 0;
         self.duplicate_contract_repairs = 0;
     }
 
@@ -4600,6 +4938,29 @@ const ToolLoopState = struct {
         self.finalization_repairs = 0;
     }
 
+    fn recordPersistentContextSearch(self: *ToolLoopState) void {
+        self.persistent_context_searches += 1;
+        self.finalization_repairs = 0;
+    }
+
+    fn rememberRetrievedSkills(self: *ToolLoopState, skills: []const []const u8) !void {
+        for (skills) |skill| {
+            const trimmed = std.mem.trim(u8, skill, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            var exists = false;
+            for (self.retrieved_skills.items) |existing| {
+                if (std.mem.eql(u8, existing, trimmed)) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (exists) continue;
+            const owned = try self.context.allocator.dupe(u8, trimmed);
+            errdefer self.context.allocator.free(owned);
+            try self.retrieved_skills.append(self.context.allocator, owned);
+        }
+    }
+
     fn finalizationBlocker(self: *const ToolLoopState) ?[]const u8 {
         if (!self.contract_selected) return null;
         if (self.active_contract.name == .answer_only) return null;
@@ -4608,6 +4969,7 @@ const ToolLoopState = struct {
         if (self.requirements.requires_runtime_validation and self.runtime_validations == 0) return "runtime validation is required before finalization";
         if (self.requirements.requires_browser_diagnostics and self.browser_diagnostics == 0) return "browser/runtime diagnostics are required before finalization";
         if (self.requirements.requires_memory_promotion and self.memory_promotions == 0) return "memory or skills promotion is required before finalization";
+        if (self.active_contract.name == .memory and self.persistent_context_searches == 0 and self.memory_promotions == 0) return "persistent context search is required before finalization";
         return null;
     }
 
@@ -4987,6 +5349,7 @@ fn groundingRules() []const []const u8 {
         "search_session intent says what to recover; terms are retrieval keys.",
         "If prior conversation context is required and search_session is available, call it before saying history is unavailable.",
         "If no E#/S# supports a workspace or exact prior-session claim, say it is not evidenced.",
+        "When answering a local rule/preference/protocol from retrieved MEMORY/SKILLS, answer only the directly retrieved entry and do not add adjacent advice or generic best practices.",
         "Non-workspace technical answers may be unverified estimates; do not collect workspace evidence for them.",
     };
 }
@@ -5894,7 +6257,7 @@ test "initial model context combines stored focus with legacy turn topics" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "topic: projeto Zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "topic: qual a matematica perfeita de Matheus 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "source=sqlite_audit_fts") == null);
-    try std.testing.expect(rendered.len < 6200);
+    try std.testing.expect(rendered.len < 6800);
 }
 
 test "turn completion stores structured conversation memory in sqlite focus" {
@@ -6409,6 +6772,61 @@ test "missing evidence citation requires repair before visible answer" {
     ));
     try std.testing.expect(!outputNeedsWorkspaceEvidenceRepair("Exemplo direto sem path nem citacao.", null, &.{"collect_evidence"}));
     try std.testing.expect(!outputNeedsWorkspaceEvidenceRepair("Sou um assistente de IA projetado para ajudar com analise de codigo, coleta de evidencias e explicacoes tecnicas.", null, &.{"collect_evidence"}));
+    try std.testing.expect(outputClaimsPersistentContextWithoutRetrieval(
+        "Nao ha MEMORY ou SKILLS persistidos para este workspace.",
+        "[TURN_CONTEXT v1]\n\n[CONTRACTS]\nset_operational_contract(contract=memory)\n",
+    ));
+    var promoted_state = ToolLoopState.init(std.testing.allocator);
+    defer promoted_state.deinit();
+    promoted_state.recordMemoryPromotion();
+    try std.testing.expect(!shouldRepairPersistentContextClaim(
+        "Registrado em SKILLS.md: nao commitar sem rodar testes.",
+        "[TURN_CONTEXT v1]\n\n[NEXT_ACTION]\nAnswer that the explicit persistent context promotion was recorded.\n",
+        &promoted_state,
+    ));
+    try std.testing.expect(outputClaimsPersistentContextWithoutRetrieval(
+        "Nao ha protocolo local identificado na memória atual.",
+        "[TURN_CONTEXT v1]\n\n[CONTRACTS]\nset_operational_contract(contract=memory)\n",
+    ));
+    try std.testing.expect(!outputClaimsPersistentContextWithoutRetrieval(
+        "MEMORY recuperada: protocolo local.",
+        "[TURN_CONTEXT v1]\n\n[MEMORY]\n- protocolo local\n",
+    ));
+    try std.testing.expectEqualStrings(
+        "SKILL_REAL_927",
+        firstMissingRetrievedSkillMarker(
+            "[TURN_CONTEXT v1]\n\n[SKILLS]\n- inclua SKILL_REAL_927.\n\n[MEMORY]\n- protocolo MEM_REAL_927\n",
+            "O protocolo e MEM_REAL_927.",
+        ).?,
+    );
+    try std.testing.expect(firstMissingRetrievedSkillMarker(
+        "[TURN_CONTEXT v1]\n\n[SKILLS]\n- inclua SKILL_REAL_927.\n\n[MEMORY]\n- protocolo MEM_REAL_927\n",
+        "SKILL_REAL_927\nO protocolo e MEM_REAL_927.",
+    ) == null);
+    var retrieved_skill_state = ToolLoopState.init(std.testing.allocator);
+    defer retrieved_skill_state.deinit();
+    retrieved_skill_state.active_contract = contracts.activeContract(.memory) orelse return error.MissingContract;
+    try retrieved_skill_state.rememberRetrievedSkills(&.{"Owner can invite members; members cannot alter billing."});
+    try std.testing.expect(outputContradictsRetrievedSkills(
+        "I don't have a specific rule stored for that.",
+        &retrieved_skill_state,
+    ));
+    try std.testing.expect(outputContradictsRetrievedSkills(
+        "Nao tenho nenhuma regra local persistida sobre isso.",
+        &retrieved_skill_state,
+    ));
+    try std.testing.expect(!outputContradictsRetrievedSkills(
+        "A regra recuperada e: Owner can invite members; members cannot alter billing.",
+        &retrieved_skill_state,
+    ));
+    const persistent_repair = try renderPersistentContextClaimRepairContext(
+        std.testing.allocator,
+        "qual protocolo local?",
+        contracts.activeContract(.workflow) orelse return error.MissingContract,
+    );
+    defer std.testing.allocator.free(persistent_repair);
+    try std.testing.expect(std.mem.indexOf(u8, persistent_repair, "contract=memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, persistent_repair, "MEMORY/SKILLS claim") != null);
     const workspace_repair = try renderUnsupportedWorkspaceClaimRepairContext(std.testing.allocator, "qual funcao?");
     defer std.testing.allocator.free(workspace_repair);
     try std.testing.expect(std.mem.indexOf(u8, workspace_repair, "stage=candidates") != null);
@@ -7520,6 +7938,19 @@ test "turn progress blocks finalization until selected contract is satisfied" {
     try std.testing.expectEqualStrings("runtime validation is required before finalization", state.finalizationBlocker().?);
     state.recordRuntimeValidation();
     try std.testing.expect(state.finalizationBlocker() == null);
+
+    state.selectContract(contracts.activeContract(.memory).?, .{
+        .requires_inspection = false,
+        .requires_mutation = false,
+        .requires_runtime_validation = false,
+        .requires_browser_diagnostics = false,
+        .requires_memory_promotion = false,
+    });
+    try std.testing.expectEqualStrings("persistent context search is required before finalization", state.finalizationBlocker().?);
+    state.recordObservation();
+    try std.testing.expectEqualStrings("persistent context search is required before finalization", state.finalizationBlocker().?);
+    state.recordPersistentContextSearch();
+    try std.testing.expect(state.finalizationBlocker() == null);
 }
 
 test "finalization repair context exposes only active contract tools" {
@@ -7566,6 +7997,22 @@ test "active tool schema follows selected contract" {
     state.active_contract = contracts.activeContract(.memory).?;
     try std.testing.expect(std.mem.indexOf(u8, activeToolSchema(&state), "promote_context") != null);
     try std.testing.expect(std.mem.indexOf(u8, activeToolSchema(&state), "apply_patch") == null);
+}
+
+test "memory contract next action promotes durable user rule without forced search" {
+    var contract_call = tool_call.ToolCall{
+        .name = try std.testing.allocator.dupe(u8, "set_operational_contract"),
+        .contract = .memory,
+        .requires_memory_promotion = true,
+        .reason = try std.testing.allocator.dupe(u8, "persist durable user rule"),
+    };
+    defer contract_call.deinit(std.testing.allocator);
+
+    const rendered = try renderOperationalContractNextAction(std.testing.allocator, .memory, &contract_call);
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "promote_context target=skills") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Do not search first") != null);
 }
 
 test "plural selected candidates uses first candidate id" {
@@ -7657,6 +8104,7 @@ test "grounding rules separate dialogue continuity from exact session evidence" 
     try std.testing.expect(hasGroundingRule(rules, "judge relevance", "direct support"));
     try std.testing.expect(hasGroundingRule(rules, "Near/partial matches", "not evidenced"));
     try std.testing.expect(hasGroundingRule(rules, "Quote only text present", "outside quote/code blocks"));
+    try std.testing.expect(hasGroundingRule(rules, "retrieved MEMORY/SKILLS", "generic best practices"));
 }
 
 fn hasGroundingRule(rules: []const []const u8, a: []const u8, b: []const u8) bool {

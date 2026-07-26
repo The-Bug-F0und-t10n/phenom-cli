@@ -111,6 +111,7 @@ pub const all_tools = [_]ToolSpec{
     .{ .name = "list_session_files", .visibility = .internal_context },
     .{ .name = "set_operational_contract", .visibility = .model_visible },
     .{ .name = "promote_context", .visibility = .model_visible },
+    .{ .name = "search_persistent_context", .visibility = .model_visible },
     .{ .name = "build_task_context", .visibility = .internal_context },
     .{ .name = "get_context", .visibility = .internal_context },
     .{ .name = "get_minimal_context", .visibility = .internal_context },
@@ -186,7 +187,7 @@ pub const contract_specs = [_]ContractSpec{
     .{
         .name = .memory,
         .endpoint = "set_operational_contract",
-        .allowed_tools = &.{ "set_operational_contract", "collect_evidence", "search_session", "promote_context" },
+        .allowed_tools = &.{ "set_operational_contract", "search_persistent_context", "promote_context" },
     },
 };
 
@@ -395,7 +396,7 @@ test "operational contract selection opens only selected executor family" {
     try std.testing.expect(strategyAllowed(selected, .path));
 }
 
-test "memory contract opens only explicit persistent promotion" {
+test "memory contract opens persistent lookup and promotion only" {
     const selected = selectOperationalContract(.{
         .requires_inspection = false,
         .requires_mutation = false,
@@ -405,9 +406,11 @@ test "memory contract opens only explicit persistent promotion" {
     });
     try std.testing.expectEqual(ContractName.memory, selected);
     const active = activeContract(selected) orelse return error.MissingContract;
+    try std.testing.expect(active.allows("search_persistent_context"));
     try std.testing.expect(active.allows("promote_context"));
-    try std.testing.expect(active.allows("collect_evidence"));
-    try std.testing.expect(active.allows("search_session"));
+    try std.testing.expect(active.allows("set_operational_contract"));
+    try std.testing.expect(!active.allows("collect_evidence"));
+    try std.testing.expect(!active.allows("search_session"));
     try std.testing.expect(!active.allows("apply_patch"));
     try std.testing.expect(!active.allows("validate_syntax"));
 }

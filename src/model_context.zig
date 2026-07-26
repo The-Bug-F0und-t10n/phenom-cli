@@ -462,11 +462,15 @@ test "model context accepts collect evidence output without raw tail" {
 test "system prompt delegates evidence decisions to model contracts" {
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "The model decides when contracts/tools are needed") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "controller only executes accepted calls") != null);
-    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Use TEMPORAL_CONTEXT only for freshness") != null);
-    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Ungrounded factual claims require search_web or rag_web") != null);
-    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "A named/obscure entity") != null);
-    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Stable knowledge excludes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Similar names, adjacent topics, partial matches") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "TEMPORAL_CONTEXT signals freshness") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Ungrounded facts require search_web/rag_web") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Named/obscure entities") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "stable excludes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Similar/adjacent/partial matches") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "MEMORY=verified project/workdir facts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "SKILLS=user-confirmed durable rules/preferences/operational constraints") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "before a relevant memory lookup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "promote a concise interpreted SKILLS rule") != null);
 }
 
 test "system prompt can be rendered from override template text" {

@@ -95,13 +95,16 @@ pub fn initialRouterSchema() []const u8 {
     \\set_operational_contract(contract=answer_only|collect_evidence|mutate_file|validate_work|inspect_runtime|search_web|rag_web|memory, strategyId?, query?, intent?, terms?, target?, budget_bytes?, requiresInspection?, requiresMutation?, requiresRuntimeValidation?, requiresBrowserDiagnostics?, requiresMemoryPromotion?, reason?)
     \\search_session(intent?, terms, scope=current|all, session?)
     \\Initial router. The model chooses either a direct final answer or one contract declaration. The controller does not infer missing external/workspace intent for you.
-    \\Decision: answer_only when enough. collect_evidence for workspace/project/source-code claims. search_web/rag_web for external grounding, current facts, requested sources/citations, named real-world entities/facts, obscure names/handles/entities, public-record/existence claims, or facts not grounded in current dialogue/MEMORY/SKILLS/SESSION_CONTEXT/E#/stable general knowledge. Other contracts: search_session prior recovery; mutate_file edits; validate_work validation; inspect_runtime diagnostics; memory durable.
+    \\Decision: answer_only when enough. collect_evidence for workspace/project/source-code claims. memory for durable local lookup/promotion, including user-confirmed future-turn rules/preferences/operational constraints. search_web/rag_web for external grounding, current facts, requested sources/citations, named real-world entities/facts, obscure names/handles/entities, public-record/existence claims, or facts not grounded in dialogue, persistent context, session context, E#, or stable knowledge. Other contracts: search_session prior recovery; mutate_file edits; validate_work validation; inspect_runtime diagnostics.
+    \\Local persisted claims need memory before unknown/absent.
     \\search_web/rag_web query must be narrow and match the user's external evidence intent; the controller activates the contract and executes web_search from that declared query. Omitted target uses the built-in search provider or configured web_search_url/PHENOM_WEB_SEARCH_URL. Only include target for user-supplied HTTP/HTTPS URL or URL already in E#.
     \\For named entity/fact lookup, query must include the exact requested entity/fact. Refined queries must not add guessed roles, categories, locations, nationality, platform, biography, or accusations unless present in USER_TASK or E#. Similar names, adjacent topics, partial matches, and probably-the-same matches are not evidence.
-    \\Do not call collect_evidence/web_search in this initial router state; declare the contract first. Short social turns should answer directly, not declare a contract.
+    \\Router state: declare contracts before executors. Short social turns answer directly.
     \\search_session: terms=concrete keys from SESSION_FOCUS/reasoning. Prior-session claims require directly supporting S#. Retrieved S# is not confirmed truth; judge direct support before citing. Do not pass generic user words unless remembered content.
     \\If you cannot identify the requested name/entity from grounded context, do not answer no-records/fictitious/similar; emit search_web:
     \\<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>exact requested name or entity</parameter></function></tool_call>
+    \\<tool_call><function=set_operational_contract><parameter=contract>memory</parameter><parameter=requiresMemoryPromotion>true</parameter><parameter=reason>persist user-confirmed durable rule or preference</parameter></function></tool_call>
+    \\<tool_call><function=set_operational_contract><parameter=contract>memory</parameter><parameter=query>local project rule preference protocol or durable fact</parameter></function></tool_call>
     \\<tool_call><function=set_operational_contract><parameter=contract>collect_evidence</parameter><parameter=reason>inspect workspace</parameter></function></tool_call>
     \\<tool_call><function=search_session><parameter=intent>recover prior decision</parameter><parameter=terms>TopicName EntityName DecisionKey</parameter><parameter=scope>current</parameter></function></tool_call>
     ;
@@ -190,11 +193,11 @@ pub fn searchWebSchema() []const u8 {
 pub fn memorySchema() []const u8 {
     return
     \\[TOOLS v1]
-    \\collect_evidence(strategyId?, source=auto|file|code|git|diagnostic?, intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol|diagnostic|diff|history|show|reflog|unreachable, start_line=1, max_lines=12)
-    \\search_session(intent?, terms, scope=current|all, session?)
+    \\search_persistent_context(target=memory|skills|both, terms, intent?, budget_bytes?)
     \\promote_context(target=memory|skills, text)
     \\set_operational_contract(contract=answer_only|collect_evidence|mutate_file|validate_work|inspect_runtime|search_web, query?, reason?)
-    \\Memory contract active. Promote only explicit user-confirmed preferences, rules, or verified practical facts. Never promote raw tool output, E#/S# blocks, logs, patches, or unverified model guesses. Use set_operational_contract only for an explicit switch to a different contract.
+    \\Memory contract active. Search MEMORY/SKILLS by model-selected terms before applying existing local durable facts/rules. Retrieved SKILLS are active response rules when relevant. If the user asks for a local rule/preference/protocol, answer only from directly retrieved MEMORY/SKILLS entries; do not add adjacent advice, generic best practices, or inferred extras. Promote explicit user-confirmed future-turn rules/preferences/operational constraints to skills as one concise interpreted imperative. Promote verified reusable project/workdir facts to memory. Never promote raw tool output, E#/S# blocks, logs, patches, unverified model guesses, or one-off task instructions. If the user wording is not durable enough to persist, ask/answer without promotion. Use set_operational_contract only for an explicit switch to a different contract.
+    \\<tool_call><function=search_persistent_context><parameter=target>both</parameter><parameter=terms>specific local rule preference protocol fact</parameter></function></tool_call>
     \\<tool_call><function=promote_context><parameter=target>skills</parameter><parameter=text>Prefer concise final answers.</parameter></function></tool_call>
     ;
 }
@@ -254,9 +257,11 @@ test "schemas are state scoped" {
     try std.testing.expect(std.mem.indexOf(u8, evidence, "set_operational_contract") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "Initial router") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "collect_evidence for workspace/project/source-code claims") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "not grounded in current dialogue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "not grounded in dialogue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "persistent context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "Local persisted claims need memory") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "named real-world entities/facts") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "stable general knowledge") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "stable knowledge") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "The model chooses either a direct final answer or one contract declaration") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "The controller does not infer missing external/workspace intent for you") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "controller activates the contract and executes web_search from that declared query") != null);
@@ -281,6 +286,14 @@ test "schemas are state scoped" {
     try std.testing.expect(std.mem.indexOf(u8, expand, "selectedCandidate>C1") == null);
     try std.testing.expect(std.mem.indexOf(u8, expand, "search_session") == null);
     try std.testing.expect(std.mem.indexOf(u8, expand, "strategy=auto") == null);
+
+    const memory = memorySchema();
+    try std.testing.expect(std.mem.indexOf(u8, memory, "Retrieved SKILLS are active response rules") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "answer only from directly retrieved MEMORY/SKILLS entries") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "generic best practices") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "future-turn rules/preferences/operational constraints") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "one concise interpreted imperative") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "one-off task instructions") != null);
 }
 
 test "contract schemas expose executor families only after contract selection" {
@@ -305,6 +318,9 @@ test "contract schemas expose executor families only after contract selection" {
     const memory = activeContractSchemaFor(.memory);
     try std.testing.expect(std.mem.indexOf(u8, memory, "promote_context") != null);
     try std.testing.expect(std.mem.indexOf(u8, memory, "Never promote raw tool output") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "<parameter=target>skills</parameter>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "interpreted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "inferred extras") != null);
     try std.testing.expect(std.mem.indexOf(u8, memory, "apply_patch") == null);
 
     const web = activeContractSchemaFor(.search_web);

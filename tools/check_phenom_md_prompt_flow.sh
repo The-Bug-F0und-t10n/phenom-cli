@@ -173,6 +173,8 @@ sql_count() {
 }
 
 test "$(sql_count "kind = 'custom_prompt_created' and body like '%path=Phenom.md%'")" -ge 1 || { printf 'phenom-md-prompt-flow: missing custom_prompt_created audit\n' >&2; exit 1; }
+test "$(sql_count "kind = 'tool_start' and body like 'collect_evidence%stage=overview%create_custom_prompt%'")" -ge 1 || { printf 'phenom-md-prompt-flow: create_custom_prompt did not collect project overview\n' >&2; exit 1; }
+test "$(sql_count "kind = 'tool_event' and body like '%workspace_overview%'")" -ge 1 || { printf 'phenom-md-prompt-flow: overview collection did not use workspace_overview\n' >&2; exit 1; }
 test "$(sql_count "kind = 'turn_done' and body like 'status=ok%quality=confirmed%'")" -ge 1 || { printf 'phenom-md-prompt-flow: final turn was not confirmed\n' >&2; exit 1; }
 
 printf 'phenom-md-prompt-flow: ok work=%s db=%s\n' "$WORK" "$DB"

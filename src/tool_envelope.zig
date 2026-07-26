@@ -316,6 +316,29 @@ test "persistent promotion only runs under memory contract" {
     try std.testing.expectEqualStrings("skills", accepted.call.?.target.?);
 }
 
+test "persistent search only runs under memory contract" {
+    const initial = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
+    const output =
+        \\<tool_call>
+        \\<function=search_persistent_context>
+        \\<parameter=target>both</parameter>
+        \\<parameter=terms>local protocol preference</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    var rejected = (try parseFirst(std.testing.allocator, output, initial)) orelse return error.NoToolCall;
+    defer rejected.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.rejected, rejected.state);
+    try std.testing.expectEqual(RejectionReason.tool_not_advertised, rejected.rejection_reason.?);
+
+    const memory = contracts.activeContract(.memory) orelse return error.MissingContract;
+    var accepted = (try parseFirst(std.testing.allocator, output, memory)) orelse return error.NoToolCall;
+    defer accepted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.accepted, accepted.state);
+    try std.testing.expectEqualStrings("search_persistent_context", accepted.raw_name);
+    try std.testing.expectEqualStrings("local protocol preference", accepted.call.?.terms.?);
+}
+
 test "envelope audit records contract source parser name and state" {
     const active = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
     const output =

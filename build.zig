@@ -299,6 +299,16 @@ pub fn build(b: *std.Build) void {
     const memory_persistence_step = b.step("memory-persistence-smoke", "Offline e2e SQLite smoke for completed and interrupted conversation memory.");
     memory_persistence_step.dependOn(&memory_persistence_cmd.step);
 
+    const user_rule_promotion_cmd = b.addSystemCommand(&.{
+        "sh",
+        "tools/check_user_rule_promotion_flow.sh",
+    });
+    user_rule_promotion_cmd.step.dependOn(&install_artifact.step);
+    user_rule_promotion_cmd.addFileArg(exe.getEmittedBin());
+
+    const user_rule_promotion_step = b.step("user-rule-promotion-flow-smoke", "Scripted-backend e2e smoke for model-driven SKILLS.md rule promotion and retrieval.");
+    user_rule_promotion_step.dependOn(&user_rule_promotion_cmd.step);
+
     const agent_patch_flow_cmd = b.addSystemCommand(&.{
         "sh",
         "tools/check_agent_patch_flow.sh",
