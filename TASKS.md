@@ -11753,3 +11753,59 @@ Invariantes afetadas:
 Risco residual:
 
 - Mais perfis so devem ser adicionados quando houver comportamento stock real diferente, com teste e criterio de selecao claro.
+
+## T326 - Tolerar headings equivalentes em `/create_custom_prompt`
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: `/create_custom_prompt` podia terminar com `error: InvalidGeneratedPrompt` depois da coleta de evidencia. A causa raiz era o normalizador exigir o heading literal `# Phenom Behavioral System Prompt`, enquanto modelos locais pequenos/medios frequentemente retornam headings equivalentes como `# Phenom`, `# Phenom.md` ou `# Prompt Comportamental do Phenom` mesmo quando o corpo e um system prompt comportamental valido.
+
+Regra de negocio preservada:
+
+- `Phenom.md` continua sendo system prompt comportamental, nao MEMORY/SKILLS.
+- Outputs com `<tool_call>`, `[MEMORY]`, `[SKILLS]`, `[EVIDENCE]`, `memory model`, `project summary` ou `evidence cache` continuam rejeitados.
+- O heading salvo e sempre canonicalizado para `# Phenom Behavioral System Prompt`.
+- Erro invalido agora vira mensagem controlada e audit `model_protocol`, nao stack/error cru para o usuario.
+
+Passos de implementacao:
+
+1. Adicionar teste com output realista `# Phenom` vindo do backend fake.
+2. Adicionar teste com fence markdown e heading em portugues.
+3. Canonicalizar apenas aliases conhecidos de heading.
+4. Manter rejeicao de formatos que parecem memoria, summary ou cache de evidencia.
+5. Atualizar smoke `check_phenom_md_prompt_flow.sh` para o prompt stock atual e path absoluto auditado.
+6. Rodar unitario, smoke de `Phenom.md`, suite completa e install local.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: `normalizeGeneratedPhenomPrompt` agora canonicaliza headings equivalentes e usa helpers `generatedPromptHasForbiddenShape`, `normalizeGeneratedPromptHeading` e `isGeneratedPromptHeadingAlias`.
+- `phenom-zig/src/main.zig`: `runCreateCustomPromptCommand` captura `InvalidGeneratedPrompt` e retorna mensagem visivel controlada.
+- `phenom-zig/tools/check_phenom_md_prompt_flow.sh`: smoke atualizado para verificar heading canonicamente salvo, string atual do prompt stock e evento audit com path absoluto.
+
+Criterio de aceite:
+
+- Backend que retorna `# Phenom` gera `Phenom.md` valido com heading canonico.
+- Backend que retorna heading em portugues dentro de fence markdown tambem e aceito.
+- Output que parece MEMORY continua rejeitado.
+- O smoke de `Phenom.md` prova que o prompt gerado e carregado no turno seguinte.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; 415 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test sh tools/check_phenom_md_prompt_flow.sh ./zig-out/bin/phenom` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test --summary all` -> passou; 415/415 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
+- `sha256sum zig-out/bin/phenom /home/ashirak/.local/bin/phenom` -> hashes iguais.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; formatos raw/evidence continuam bloqueados.
+- 3. MEMORY/SKILLS nao competem com storage operacional: preservada; formatos memory/skills continuam rejeitados.
+- 6. Falha de modelo nao parece falha de infraestrutura: ampliada; formato invalido vira erro protocolar controlado.
+- 7. Cada turno consegue ser auditado e reproduzido: ampliada; smoke cobre criacao e reuso de `Phenom.md`.
+
+Risco residual:
+
+- Se o modelo gerar corpo sem regras comportamentais, mas com heading aceitavel e sem marcadores proibidos, o controller nao faz avaliacao semantica profunda; isso exigiria um segundo reparo/criticador ou template deterministico.

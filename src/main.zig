@@ -427,7 +427,10 @@ fn runCreateCustomPromptCommand(
     };
     try sink.flush();
 
-    const custom_prompt = try normalizeGeneratedPhenomPrompt(allocator, sink.visible.items);
+    const custom_prompt = normalizeGeneratedPhenomPrompt(allocator, sink.visible.items) catch |err| {
+        try db.recordTurnError(config.session, .model_protocol, "create_custom_prompt", @errorName(err));
+        return std.fmt.allocPrint(allocator, "Nao foi possivel criar Phenom.md: modelo retornou prompt invalido ({s}).", .{@errorName(err)});
+    };
     defer allocator.free(custom_prompt);
     try model_context.assertNoRawContextLeak(custom_prompt);
     try writeFileAtomic(io, "Phenom.md", "Phenom.md.tmp", custom_prompt);
@@ -503,8 +506,41 @@ fn normalizeGeneratedPhenomPrompt(allocator: std.mem.Allocator, raw: []const u8)
         if (std.mem.endsWith(u8, trimmed, "```")) trimmed = std.mem.trim(u8, trimmed[0 .. trimmed.len - 3], " \t\r\n");
     }
     if (trimmed.len == 0) return error.InvalidGeneratedPrompt;
-    if (std.mem.indexOf(u8, trimmed, "# Phenom Behavioral System Prompt") == null) return error.InvalidGeneratedPrompt;
+    if (generatedPromptHasForbiddenShape(trimmed)) return error.InvalidGeneratedPrompt;
+    if (std.mem.indexOf(u8, trimmed, "# Phenom Behavioral System Prompt") == null) {
+        return normalizeGeneratedPromptHeading(allocator, trimmed);
+    }
     return allocator.dupe(u8, trimmed[0..@min(trimmed.len, 12 * 1024)]);
+}
+
+fn generatedPromptHasForbiddenShape(text: []const u8) bool {
+    return containsAsciiIgnoreCase(text, "[MEMORY]") or
+        containsAsciiIgnoreCase(text, "[SKILLS]") or
+        containsAsciiIgnoreCase(text, "[EVIDENCE]") or
+        containsAsciiIgnoreCase(text, "memory model") or
+        containsAsciiIgnoreCase(text, "project summary") or
+        containsAsciiIgnoreCase(text, "evidence cache");
+}
+
+fn normalizeGeneratedPromptHeading(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    if (!std.mem.startsWith(u8, text, "# ")) return error.InvalidGeneratedPrompt;
+    const first_newline = std.mem.indexOfScalar(u8, text, '\n') orelse return error.InvalidGeneratedPrompt;
+    const heading = std.mem.trim(u8, text[0..first_newline], " \t\r");
+    if (!isGeneratedPromptHeadingAlias(heading)) return error.InvalidGeneratedPrompt;
+    const body = std.mem.trim(u8, text[first_newline + 1 ..], " \t\r\n");
+    if (body.len == 0) return error.InvalidGeneratedPrompt;
+    const capped = body[0..@min(body.len, 12 * 1024)];
+    return std.fmt.allocPrint(allocator, "# Phenom Behavioral System Prompt\n{s}", .{capped});
+}
+
+fn isGeneratedPromptHeadingAlias(heading: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(heading, "# Phenom") or
+        std.ascii.eqlIgnoreCase(heading, "# Phenom.md") or
+        std.ascii.eqlIgnoreCase(heading, "# Phenom System Prompt") or
+        std.ascii.eqlIgnoreCase(heading, "# Phenom Behavioral Prompt") or
+        std.ascii.eqlIgnoreCase(heading, "# System Prompt") or
+        std.ascii.eqlIgnoreCase(heading, "# Behavioral System Prompt") or
+        std.ascii.eqlIgnoreCase(heading, "# Prompt Comportamental do Phenom");
 }
 
 fn writeFileAtomic(io: std.Io, path: []const u8, tmp_path: []const u8, data: []const u8) !void {
@@ -6017,6 +6053,23 @@ test "generated Phenom.md must be behavioral system prompt" {
     defer std.testing.allocator.free(good);
 
     try std.testing.expectEqualStrings("# Phenom Behavioral System Prompt\nUse evidence before workspace claims.", good);
+    const heading_alias = try normalizeGeneratedPhenomPrompt(std.testing.allocator,
+        \\# Phenom
+        \\
+        \\CUSTOM_PROJECT_RULE: keep durable project rules from Phenom.md.
+    );
+    defer std.testing.allocator.free(heading_alias);
+    try std.testing.expectEqualStrings("# Phenom Behavioral System Prompt\nCUSTOM_PROJECT_RULE: keep durable project rules from Phenom.md.", heading_alias);
+
+    const fenced_alias = try normalizeGeneratedPhenomPrompt(std.testing.allocator,
+        \\```markdown
+        \\# Prompt Comportamental do Phenom
+        \\Use collect_evidence before workspace claims.
+        \\```
+    );
+    defer std.testing.allocator.free(fenced_alias);
+    try std.testing.expectEqualStrings("# Phenom Behavioral System Prompt\nUse collect_evidence before workspace claims.", fenced_alias);
+
     try std.testing.expectError(error.InvalidGeneratedPrompt, normalizeGeneratedPhenomPrompt(std.testing.allocator,
         \\# Phenom.md
         \\## Memory Model

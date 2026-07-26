@@ -143,6 +143,7 @@ EOF
 wait "$SERVER_PID" 2>/dev/null || true
 trap - EXIT
 
+grep -q '# Phenom Behavioral System Prompt' "$WORK/Phenom.md" || { printf 'phenom-md-prompt-flow: Phenom.md heading was not canonicalized\n' >&2; exit 1; }
 grep -q 'CUSTOM_PROJECT_RULE' "$WORK/Phenom.md" || { printf 'phenom-md-prompt-flow: Phenom.md was not generated from model output\n' >&2; exit 1; }
 grep -q "$EXPECT" "$WORK/out.txt" || { printf 'phenom-md-prompt-flow: custom prompt chat did not finish\n' >&2; exit 1; }
 
@@ -160,11 +161,11 @@ first = requests.get(1, "")
 second = requests.get(2, "")
 if "[CREATE_PHENOM_MD]" not in first:
     raise SystemExit("phenom-md-prompt-flow: generator request did not receive create prompt")
-if "The model decides when contracts/tools are needed" not in first:
+if "Model decides when contracts/tools are needed" not in first:
     raise SystemExit("phenom-md-prompt-flow: generator request did not use stock prompt fallback")
 if "CUSTOM_PROJECT_RULE" not in second:
     raise SystemExit("phenom-md-prompt-flow: second request did not load Phenom.md")
-if "The model decides when contracts/tools are needed" in second:
+if "Model decides when contracts/tools are needed" in second:
     raise SystemExit("phenom-md-prompt-flow: custom Phenom.md request still used stock prompt")
 PY
 
@@ -172,7 +173,7 @@ sql_count() {
   sqlite3 "$DB" "select count(*) from events where session = '$SESSION' and $1;"
 }
 
-test "$(sql_count "kind = 'custom_prompt_created' and body like '%path=Phenom.md%'")" -ge 1 || { printf 'phenom-md-prompt-flow: missing custom_prompt_created audit\n' >&2; exit 1; }
+test "$(sql_count "kind = 'custom_prompt_created' and body like '%Phenom.md%'")" -ge 1 || { printf 'phenom-md-prompt-flow: missing custom_prompt_created audit\n' >&2; exit 1; }
 test "$(sql_count "kind = 'tool_start' and body like 'collect_evidence%stage=overview%create_custom_prompt%'")" -ge 1 || { printf 'phenom-md-prompt-flow: create_custom_prompt did not collect project overview\n' >&2; exit 1; }
 test "$(sql_count "kind = 'tool_event' and body like '%workspace_overview%'")" -ge 1 || { printf 'phenom-md-prompt-flow: overview collection did not use workspace_overview\n' >&2; exit 1; }
 test "$(sql_count "kind = 'turn_done' and body like 'status=ok%quality=confirmed%'")" -ge 1 || { printf 'phenom-md-prompt-flow: final turn was not confirmed\n' >&2; exit 1; }
