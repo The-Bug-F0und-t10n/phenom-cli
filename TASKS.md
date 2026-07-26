@@ -11809,3 +11809,57 @@ Invariantes afetadas:
 Risco residual:
 
 - Se o modelo gerar corpo sem regras comportamentais, mas com heading aceitavel e sem marcadores proibidos, o controller nao faz avaliacao semantica profunda; isso exigiria um segundo reparo/criticador ou template deterministico.
+
+## T327 - Garantir fallback deterministico em `/create_custom_prompt`
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: mesmo depois de aceitar aliases de heading, o comando ainda podia falhar quando o modelo retornava prosa livre como `I cannot create that file...`. A causa raiz operacional e depender de uma unica geracao perfeita para uma acao que pode ser concluida com template seguro. `/create_custom_prompt` deve preferir a geracao do modelo, mas nao pode terminar sem `Phenom.md` quando ja coletou evidencia e tem comportamento fallback seguro.
+
+Regra de negocio preservada:
+
+- Saida valida do modelo continua sendo usada.
+- `Phenom.md` existente e valido e preservado como fallback preferencial.
+- Fallback novo e system prompt comportamental curto, nao memoria, nao evidencia e nao resumo.
+- O fallback e auditado como `custom_prompt_fallback`.
+
+Passos de implementacao:
+
+1. Criar fallback deterministico com heading canonico.
+2. Usar fallback quando `normalizeGeneratedPhenomPrompt` falhar.
+3. Auditar o erro protocolar e o uso do fallback.
+4. Ajustar smoke para backend fake retornar output invalido.
+5. Rodar unitario, smoke especifico, guardrail isolado, suite completa e install local.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: `fallbackGeneratedPhenomPrompt` cria prompt comportamental seguro e reutiliza prompt existente valido quando disponivel.
+- `phenom-zig/src/main.zig`: `/create_custom_prompt` deixa de retornar `InvalidGeneratedPrompt` ao usuario quando fallback seguro existe.
+- `phenom-zig/tools/check_phenom_md_prompt_flow.sh`: backend fake agora retorna prosa invalida na primeira chamada e valida que o fallback foi salvo/carregado.
+
+Criterio de aceite:
+
+- Modelo que retorna prosa invalida ainda resulta em `Phenom.md` criado.
+- O arquivo salvo contem `# Phenom Behavioral System Prompt` e regras comportamentais.
+- O turno seguinte carrega o `Phenom.md` salvo como system prompt.
+- Audit contem `custom_prompt_fallback`.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; 416 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test sh tools/check_phenom_md_prompt_flow.sh ./zig-out/bin/phenom` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/product_guardrails.zig -lc -lsqlite3 --cache-dir /tmp/phenom-product-guardrails-test` -> passou; 185 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test --summary all` -> passou; 416/416 testes.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; fallback nao injeta evidencia bruta.
+- 3. MEMORY/SKILLS nao competem com storage operacional: preservada; fallback nao cria memoria/preferencia persistente.
+- 6. Falha de modelo nao parece falha de infraestrutura: ampliada; formato ruim vira fallback auditado.
+- 7. Cada turno consegue ser auditado e reproduzido: ampliada; smoke cobre evento `custom_prompt_fallback`.
+
+Risco residual:
+
+- Fallback e deliberadamente generico. Prompt comportamental altamente customizado ainda depende de uma geracao valida do modelo ou edicao manual posterior de `Phenom.md`.

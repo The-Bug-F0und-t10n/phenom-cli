@@ -427,9 +427,11 @@ fn runCreateCustomPromptCommand(
     };
     try sink.flush();
 
-    const custom_prompt = normalizeGeneratedPhenomPrompt(allocator, sink.visible.items) catch |err| {
+    const custom_prompt = normalizeGeneratedPhenomPrompt(allocator, sink.visible.items) catch |err| blk: {
         try db.recordTurnError(config.session, .model_protocol, "create_custom_prompt", @errorName(err));
-        return std.fmt.allocPrint(allocator, "Nao foi possivel criar Phenom.md: modelo retornou prompt invalido ({s}).", .{@errorName(err)});
+        const fallback_prompt = try fallbackGeneratedPhenomPrompt(allocator, config.system_prompt);
+        try db.recordEvent(config.session, "custom_prompt_fallback", @errorName(err));
+        break :blk fallback_prompt;
     };
     defer allocator.free(custom_prompt);
     try model_context.assertNoRawContextLeak(custom_prompt);
@@ -541,6 +543,23 @@ fn isGeneratedPromptHeadingAlias(heading: []const u8) bool {
         std.ascii.eqlIgnoreCase(heading, "# System Prompt") or
         std.ascii.eqlIgnoreCase(heading, "# Behavioral System Prompt") or
         std.ascii.eqlIgnoreCase(heading, "# Prompt Comportamental do Phenom");
+}
+
+fn fallbackGeneratedPhenomPrompt(allocator: std.mem.Allocator, existing_prompt: ?[]const u8) ![]u8 {
+    if (existing_prompt) |prompt| {
+        if (normalizeGeneratedPhenomPrompt(allocator, prompt)) |normalized| return normalized else |_| {}
+    }
+    return allocator.dupe(u8,
+        \\# Phenom Behavioral System Prompt
+        \\Treat this file as the project's system prompt behavior override, not long-term facts, collected context, or task notes.
+        \\Use concise Portuguese when the user writes Portuguese; preserve code identifiers, file paths, commands, and error strings exactly.
+        \\For workspace/source claims, request or use collected E# evidence before final answers.
+        \\Do not invent MEMORY, SKILLS, files, commands, paths, versions, test results, commits, or missing evidence.
+        \\Separate known, inferred, and unknown facts when evidence is incomplete.
+        \\If a required fact is unsupported, say insufficient evidence or call the appropriate tool.
+        \\Use only announced contracts/tools; if you say inspect, search, verify, edit, validate, or run, emit the matching tool call.
+        \\Keep edits minimal, validate changed behavior, and report tests or commands actually run.
+    );
 }
 
 fn writeFileAtomic(io: std.Io, path: []const u8, tmp_path: []const u8, data: []const u8) !void {
@@ -6075,6 +6094,20 @@ test "generated Phenom.md must be behavioral system prompt" {
         \\## Memory Model
         \\- Persistent: SQLite audit store.
     ));
+}
+
+test "invalid generated Phenom.md can fall back to safe behavioral prompt" {
+    const fallback = try fallbackGeneratedPhenomPrompt(std.testing.allocator, null);
+    defer std.testing.allocator.free(fallback);
+
+    try std.testing.expect(std.mem.startsWith(u8, fallback, "# Phenom Behavioral System Prompt"));
+    try std.testing.expect(std.mem.indexOf(u8, fallback, "system prompt behavior override") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fallback, "[MEMORY]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fallback, "[EVIDENCE]") == null);
+
+    const normalized = try normalizeGeneratedPhenomPrompt(std.testing.allocator, fallback);
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectEqualStrings(fallback, normalized);
 }
 
 test "visible output trims only leading whitespace after thinking" {
