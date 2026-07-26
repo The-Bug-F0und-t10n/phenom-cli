@@ -249,6 +249,12 @@ fn runInteractiveChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Conf
             try ui.showPrompt();
             continue;
         }
+        if (isInteractiveHelpCommand(input)) {
+            try ui.positionContent();
+            try renderInteractiveHelp(stdout, config, &ui, input);
+            try ui.showPrompt();
+            continue;
+        }
 
         try ui.showStatus("Thinking");
         try ui.positionContent();
@@ -263,6 +269,93 @@ fn runChatTurn(allocator: std.mem.Allocator, io: std.Io, config: cli.Config, std
 
 fn isCreateCustomPromptCommand(input: []const u8) bool {
     return std.mem.eql(u8, std.mem.trim(u8, input, " \t\r\n"), "/create_custom_prompt");
+}
+
+fn isInteractiveHelpCommand(input: []const u8) bool {
+    return std.mem.eql(u8, std.mem.trim(u8, input, " \t\r\n"), "/help");
+}
+
+const interactive_help_text =
+    \\Phenom Zig - ajuda local
+    \\
+    \\Comandos interativos:
+    \\  /help                  mostra esta ajuda, sem chamar o modelo
+    \\  /reset                 limpa o prompt atual
+    \\  /exit                  salva a sessao e sai
+    \\  /create_custom_prompt  cria/atualiza Phenom.md usando contexto do projeto; requer modelo ativo
+    \\
+    \\Uso diario:
+    \\  phenom chat --session trabalho
+    \\  phenom chat --prompt "texto"
+    \\  phenom chat --session trabalho --prompt "continue"
+    \\  phenom chat --offline --session dev --prompt "teste"
+    \\
+    \\Backends:
+    \\  phenom chat --backend ollama --host 127.0.0.1:11434 --model llama3.2 --prompt "ola"
+    \\  phenom chat --backend llamacpp --host 127.0.0.1:8080 --model local --prompt "ola"
+    \\  phenom probe --backend ollama --host 127.0.0.1:11434
+    \\  phenom probe --backend llamacpp --host 127.0.0.1:8080
+    \\
+    \\Comandos CLI:
+    \\  phenom chat [opcoes]       conversa interativa ou turno unico
+    \\  phenom probe [opcoes]      testa backend sem inferencia
+    \\  phenom graph               gera graph.html do codigo
+    \\  phenom snapshot            executa snapshot local
+    \\  phenom version             mostra versao do binario
+    \\  phenom help                mostra uso resumido
+    \\
+    \\Flags de chat:
+    \\  --prompt TEXT              turno nao interativo
+    \\  --session ID               namespace SQLite da conversa; default: default
+    \\  --offline                  valida CLI/audit sem modelo
+    \\  --backend ollama/llamacpp  backend HTTP
+    \\  --host HOST:PORT           endereco do backend
+    \\  --model MODEL              modelo enviado ao backend
+    \\  --thinking auto/on/off     controle de reasoning/template
+    \\  --max-tokens N             limite de geracao enviado ao backend
+    \\  --no-color                 desativa ANSI
+    \\  --fail-on-model-error      falha com exit code nao-zero em erro de modelo/backend
+    \\  --expect-contains TEXT     exige texto na resposta visivel
+    \\  --show-expect-status       mostra status da expectativa
+    \\  --demo-read-file PATH      demonstra leitura de arquivo por tool controlada
+    \\
+    \\Configuracao:
+    \\  ordem: ./config.toml, depois ~/.config/phenom/config.toml, depois flags
+    \\  chaves: backend, host, port, server, model, thinking, max_tokens, no_color,
+    \\         offline, fail_on_model_error, web_search_url, expect_contains,
+    \\         show_expect_status, demo_read_file, session
+    \\
+    \\Build e validacao:
+    \\  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast
+    \\  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test
+    \\  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build run -- chat --offline --session dev --prompt "ola"
+    \\
+    \\Smokes reais:
+    \\  zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
+    \\  zig build real-session-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
+    \\  zig build real-dialogue-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
+    \\  zig build real-long-session-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
+    \\
+;
+
+fn renderInteractiveHelp(
+    stdout: fd_writer.FdWriter,
+    config: cli.Config,
+    ui: *tui.TerminalUi(fd_writer.FdWriter),
+    input: []const u8,
+) !void {
+    var transcript_writer = fd_writer.NewlineWriter(fd_writer.FdWriter){ .inner = stdout, .crlf = true };
+    var renderer = render.AppendOnlyRenderer(@TypeOf(&transcript_writer)).init(&transcript_writer, .{
+        .color = !config.no_color,
+        .terminal_columns = tui.terminalSize().cols,
+        .user_label = userLabel(),
+    });
+    tui.lockTerminal(ui.mutex());
+    defer ui.mutex().unlock();
+    try renderer.user(input);
+    try renderer.assistantStart();
+    try renderer.assistantDelta(interactive_help_text);
+    try renderer.doneWithElapsed("0s");
 }
 
 fn runCreateCustomPromptCommand(
@@ -5847,6 +5940,19 @@ test "offline stub is explicit and not ok" {
     try std.testing.expect(!std.mem.eql(u8, response, "ok"));
     try std.testing.expect(std.mem.indexOf(u8, response, "offline") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "model not called") != null);
+}
+
+test "interactive help slash command is local only" {
+    try std.testing.expect(isInteractiveHelpCommand("/help"));
+    try std.testing.expect(isInteractiveHelpCommand("  /help\n"));
+    try std.testing.expect(!isInteractiveHelpCommand("help"));
+    try std.testing.expect(!isInteractiveHelpCommand("/help me"));
+    try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "/exit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "/create_custom_prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "phenom graph") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "--expect-contains") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "real-session-smoke") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, interactive_help_text, '|') == null);
 }
 
 test "visible output trims only leading whitespace after thinking" {
