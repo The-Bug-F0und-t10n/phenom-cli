@@ -26,6 +26,7 @@ pub const BottomBarState = struct {
     cols: usize = 80,
     status: ?[]const u8 = null,
     status_right: ?[]const u8 = null,
+    footer: ?[]const u8 = null,
     visualizer: ?[]const u8 = null,
     visualizer_mode: ?VisualizerMode = null,
     visualizer_tick: usize = 0,
@@ -225,13 +226,17 @@ pub fn modeFromLabel(label: []const u8) VisualizerMode {
 }
 
 pub fn bottomBarRows(prompt_rows: usize) usize {
-    return 1 + 1 + @max(@as(usize, 1), @min(max_prompt_rows, prompt_rows)) + 1;
+    return 1 + 1 + 1 + @max(@as(usize, 1), @min(max_prompt_rows, prompt_rows)) + 1 + 1;
 }
 
 pub fn renderBottomBar(writer: anytype, state: BottomBarState) !usize {
     const paint_cols = @max(@as(usize, 1), state.cols -| 1);
     var rows_written: usize = 0;
 
+    try writeSpaces(writer, paint_cols);
+    rows_written += 1;
+
+    try writer.writeAll("\r\n");
     if (state.status) |status| {
         if (state.visualizer_mode) |mode| {
             try writeStatusDynamic(writer, state.color, status, state.status_right, mode, state.visualizer_tick, paint_cols);
@@ -266,6 +271,14 @@ pub fn renderBottomBar(writer: anytype, state: BottomBarState) !usize {
 
     try writer.writeAll("\r\n");
     try paintInputBlank(writer, state.color, paint_cols);
+    rows_written += 1;
+
+    try writer.writeAll("\r\n");
+    if (state.footer) |footer| {
+        try writeFooter(writer, state.color, footer, paint_cols);
+    } else {
+        try paintInputBlank(writer, state.color, paint_cols);
+    }
     rows_written += 1;
     return rows_written;
 }
@@ -603,6 +616,9 @@ pub fn TerminalUi(comptime Writer: type) type {
         context_used_tokens: usize = 0,
         context_limit_tokens: usize = 0,
         has_context_usage: bool = false,
+        footer_model: []const u8 = "",
+        cwd_buf: [4096]u8 = undefined,
+        footer_cwd: []const u8 = "",
         visualizer_mode: VisualizerMode = .idle,
         visualizer_tick: usize = 0,
         visualizer: MiniVisualizer,
@@ -633,6 +649,18 @@ pub fn TerminalUi(comptime Writer: type) type {
 
         pub fn mutex(self: *Self) *std.atomic.Mutex {
             return &self.write_mutex;
+        }
+
+        pub fn setFooterModel(self: *Self, model: []const u8) void {
+            self.footer_model = model;
+        }
+
+        pub fn refreshFooterCwd(self: *Self) void {
+            if (c.getcwd(&self.cwd_buf, self.cwd_buf.len)) |ptr| {
+                self.footer_cwd = std.mem.span(ptr);
+            } else {
+                self.footer_cwd = "";
+            }
         }
 
         pub fn attach(self: *Self) !void {
@@ -836,7 +864,7 @@ pub fn TerminalUi(comptime Writer: type) type {
             const paint_cols = @max(@as(usize, 1), size.cols -| 1);
             const view = computePromptView(self.editor.buffer.items, self.editor.cursor, paint_cols);
             const max_footer_rows = @max(@as(usize, 1), size.rows -| 1);
-            const max_prompt_lines = @max(@as(usize, 1), max_footer_rows -| 3);
+            const max_prompt_lines = @max(@as(usize, 1), max_footer_rows -| 5);
             const active_prompt_lines = if (opts.show_prompt) @min(view.line_count, max_prompt_lines) else 1;
             const rows = @min(bottomBarRows(active_prompt_lines), max_footer_rows);
             const size_changed = size.rows != self.terminal_rows or size.cols != self.terminal_cols;
@@ -853,13 +881,13 @@ pub fn TerminalUi(comptime Writer: type) type {
             defer out.deinit(self.allocator);
             const bw = fd_writer.BufferWriter{ .allocator = self.allocator, .list = &out };
             var status_buf: [192]u8 = undefined;
-            var status_right_buf: [48]u8 = undefined;
+            var footer_buf: [512]u8 = undefined;
             const status_text = if (opts.status) |status| self.formatStatus(status, &status_buf) else null;
-            const status_right = self.formatStatusRight(&status_right_buf);
+            const footer = self.formatFooter(&footer_buf);
             var visualizer_buf: [max_visualizer_cols * 4]u8 = undefined;
             var visualizer_text: ?[]const u8 = null;
             if (status_text) |text| {
-                if (opts.status != null and self.visualizer_mode != .idle and status_right == null) {
+                if (opts.status != null and self.visualizer_mode != .idle) {
                     const visual_cols = visualizerWidth(text, paint_cols);
                     if (visual_cols > 0) {
                         self.visualizer.setWidth(visual_cols);
@@ -873,7 +901,8 @@ pub fn TerminalUi(comptime Writer: type) type {
                 .color = self.color,
                 .cols = size.cols,
                 .status = status_text,
-                .status_right = status_right,
+                .status_right = null,
+                .footer = footer,
                 .visualizer = visualizer_text,
                 .visualizer_mode = null,
                 .visualizer_tick = self.visualizer_tick,
@@ -885,7 +914,7 @@ pub fn TerminalUi(comptime Writer: type) type {
             if (opts.preserve_cursor) {
                 try bw.writeAll("\x1b8");
             } else if (opts.show_prompt) {
-                const prompt_first_row = status_row + 2;
+                const prompt_first_row = status_row + 3;
                 const screen_col = @min(size.cols, @as(usize, 3) + view.cursor_col);
                 const screen_row = @min(size.rows, prompt_first_row + view.cursor_row);
                 try bw.print("\x1b[{};{}H", .{ screen_row, screen_col });
@@ -931,6 +960,14 @@ pub fn TerminalUi(comptime Writer: type) type {
             const raw_pct = (@as(f64, @floatFromInt(self.context_used_tokens)) * 100.0) / @as(f64, @floatFromInt(self.context_limit_tokens));
             const pct = @min(raw_pct, 100.0);
             return std.fmt.bufPrint(buf, "ctx {d:.1}% {s}/{s} tok", .{ pct, used, limit }) catch null;
+        }
+
+        fn formatFooter(self: *Self, buf: *[512]u8) []const u8 {
+            var ctx_buf: [48]u8 = undefined;
+            const context_text = self.formatStatusRight(&ctx_buf) orelse "ctx --";
+            const model = if (self.footer_model.len > 0) self.footer_model else "model?";
+            const cwd = if (self.footer_cwd.len > 0) self.footer_cwd else "cwd?";
+            return std.fmt.bufPrint(buf, "{s} · cwd {s} · {s}", .{ model, cwd, context_text }) catch context_text;
         }
 
         fn formatOutputTokenCount(self: *Self, buf: *[24]u8) []const u8 {
@@ -981,13 +1018,17 @@ pub fn terminalSize() TerminalSize {
 
 fn writeStatus(writer: anytype, color: bool, status: []const u8, right: ?[]const u8, visualizer: ?[]const u8, width: usize) !void {
     if (width == 0) return;
+    const pad = @min(@as(usize, 2), width);
+    if (pad > 0) try writeSpaces(writer, pad);
+    const inner_width = width - pad;
+    if (inner_width == 0) return;
     const visual = visualizer orelse "";
     const right_text = right orelse "";
     const right_cols = utf8Columns(right_text);
-    if (right_cols > 0 and right_cols + 1 >= width) {
-        const clipped_right = right_text[0..utf8PrefixBytes(right_text, width)];
+    if (right_cols > 0 and right_cols + 1 >= inner_width) {
+        const clipped_right = right_text[0..utf8PrefixBytes(right_text, inner_width)];
         const clipped_right_cols = utf8Columns(clipped_right);
-        if (clipped_right_cols < width) try writeSpaces(writer, width - clipped_right_cols);
+        if (clipped_right_cols < inner_width) try writeSpaces(writer, inner_width - clipped_right_cols);
         if (color) try writer.writeAll(dim);
         try writer.writeAll(clipped_right);
         if (color) try writer.writeAll(reset);
@@ -997,7 +1038,7 @@ fn writeStatus(writer: anytype, color: bool, status: []const u8, right: ?[]const
     const visual_cols = utf8Columns(visual);
     const right_gap: usize = if (right_cols > 0) 1 else 0;
     const reserved_cols = visual_cols + visual_gap + right_cols + right_gap;
-    const status_width = if (width > reserved_cols) width - reserved_cols else width;
+    const status_width = if (inner_width > reserved_cols) inner_width - reserved_cols else inner_width;
     const clipped = status[0..utf8PrefixBytes(status, status_width)];
     const clipped_cols = utf8Columns(clipped);
     if (color) {
@@ -1005,18 +1046,18 @@ fn writeStatus(writer: anytype, color: bool, status: []const u8, right: ?[]const
     }
     try writer.writeAll(clipped);
     if (color) try writer.writeAll(reset);
-    if (visual.len > 0 and width > clipped_cols + visual_cols + right_cols + right_gap) {
-        try writeSpaces(writer, width - clipped_cols - visual_cols - right_cols - right_gap);
+    if (visual.len > 0 and inner_width > clipped_cols + visual_cols + right_cols + right_gap) {
+        try writeSpaces(writer, inner_width - clipped_cols - visual_cols - right_cols - right_gap);
         if (color) try writer.writeAll(cyan);
         try writer.writeAll(visual);
         if (color) try writer.writeAll(reset);
         if (right_cols > 0) try writeSpaces(writer, right_gap);
-    } else if (right_cols > 0 and width >= clipped_cols + right_cols) {
-        try writeSpaces(writer, width - clipped_cols - right_cols);
-    } else if (right_cols == 0 and clipped_cols < width) {
-        try writeSpaces(writer, width - clipped_cols);
+    } else if (right_cols > 0 and inner_width >= clipped_cols + right_cols) {
+        try writeSpaces(writer, inner_width - clipped_cols - right_cols);
+    } else if (right_cols == 0 and clipped_cols < inner_width) {
+        try writeSpaces(writer, inner_width - clipped_cols);
     }
-    if (right_cols > 0 and width >= right_cols) {
+    if (right_cols > 0 and inner_width >= right_cols) {
         if (color) try writer.writeAll(dim);
         try writer.writeAll(right_text);
         if (color) try writer.writeAll(reset);
@@ -1025,22 +1066,36 @@ fn writeStatus(writer: anytype, color: bool, status: []const u8, right: ?[]const
 
 fn writeStatusDynamic(writer: anytype, color: bool, status: []const u8, right: ?[]const u8, mode: VisualizerMode, tick: usize, width: usize) !void {
     if (right != null) return writeStatus(writer, color, status, right, null, width);
+    const pad = @min(@as(usize, 2), width);
+    if (pad > 0) try writeSpaces(writer, pad);
+    const inner_width = width - pad;
+    if (inner_width == 0) return;
     const min_visual_cols: usize = 4;
-    const status_cols = @min(utf8Columns(status), width);
-    const visual_cols = if (width > status_cols + 1 + min_visual_cols) width - status_cols - 1 else 0;
-    const clipped = status[0..utf8PrefixBytes(status, width -| (visual_cols + if (visual_cols > 0) @as(usize, 1) else 0))];
+    const status_cols = @min(utf8Columns(status), inner_width);
+    const visual_cols = if (inner_width > status_cols + 1 + min_visual_cols) inner_width - status_cols - 1 else 0;
+    const clipped = status[0..utf8PrefixBytes(status, inner_width -| (visual_cols + if (visual_cols > 0) @as(usize, 1) else 0))];
     const clipped_cols = utf8Columns(clipped);
     if (color) try writer.writeAll(dim);
     try writer.writeAll(clipped);
     if (color) try writer.writeAll(reset);
     if (visual_cols > 0) {
-        try writeSpaces(writer, width - clipped_cols - visual_cols);
+        try writeSpaces(writer, inner_width - clipped_cols - visual_cols);
         if (color) try writer.writeAll(cyan);
         try writeVisualizerFrame(writer, mode, tick, visual_cols);
         if (color) try writer.writeAll(reset);
-    } else if (clipped_cols < width) {
-        try writeSpaces(writer, width - clipped_cols);
+    } else if (clipped_cols < inner_width) {
+        try writeSpaces(writer, inner_width - clipped_cols);
     }
+}
+
+fn writeFooter(writer: anytype, color: bool, footer: []const u8, width: usize) !void {
+    if (width == 0) return;
+    const clipped = footer[0..utf8PrefixBytes(footer, width)];
+    const clipped_cols = utf8Columns(clipped);
+    if (color) try writer.writeAll(dim);
+    try writer.writeAll(clipped);
+    if (clipped_cols < width) try writeSpaces(writer, width - clipped_cols);
+    if (color) try writer.writeAll(reset);
 }
 
 fn visualizerWidth(status: []const u8, width: usize) usize {
@@ -1227,9 +1282,11 @@ test "bottom bar snapshot matches prompt and status surface" {
     });
 
     const expected =
-        "Thinking (3s  ▁▂▃\r\n" ++
+        "                 \r\n" ++
+        "  Thinking (3 ▁▂▃\r\n" ++
         "                 \r\n" ++
         "> ola            \r\n" ++
+        "                 \r\n" ++
         "                 ";
     try std.testing.expectEqualStrings(expected, buffer.items);
 }
@@ -1273,17 +1330,19 @@ test "status bar does not fabricate output token limit" {
     try std.testing.expect(std.mem.indexOf(u8, status, "max?") == null);
 }
 
-test "status bar shows model context usage on the right" {
+test "footer shows model cwd and context usage" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
     const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
     var ui = TerminalUi(@TypeOf(writer)).init(std.testing.allocator, writer, false);
     defer ui.deinit();
+    ui.setFooterModel("llama3.2");
+    ui.footer_cwd = "/tmp/project";
     try ui.showContextUsage(8192, 24 * 1024);
 
-    var right_buf: [48]u8 = undefined;
-    const right = ui.formatStatusRight(&right_buf) orelse return error.ExpectedContextUsage;
-    try std.testing.expectEqualStrings("ctx 33.3% 8.1k/24k tok", right);
+    var footer_buf: [512]u8 = undefined;
+    const footer = ui.formatFooter(&footer_buf);
+    try std.testing.expectEqualStrings("llama3.2 · cwd /tmp/project · ctx 33.3% 8.1k/24k tok", footer);
 }
 
 test "context usage starts thinking status when shown before model tokens" {
@@ -1296,12 +1355,12 @@ test "context usage starts thinking status when shown before model tokens" {
     try ui.showContextUsage(737, 65_536);
 
     try std.testing.expectEqualStrings("Thinking", ui.last_status orelse return error.ExpectedStatus);
-    var right_buf: [48]u8 = undefined;
-    const right = ui.formatStatusRight(&right_buf) orelse return error.ExpectedContextUsage;
-    try std.testing.expectEqualStrings("ctx 1.1% 737/65k tok", right);
+    var footer_buf: [512]u8 = undefined;
+    const footer = ui.formatFooter(&footer_buf);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "ctx 1.1% 737/65k tok") != null);
 }
 
-test "bottom bar keeps right status inside terminal width" {
+test "bottom bar keeps context out of top status" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
     const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
@@ -1310,17 +1369,23 @@ test "bottom bar keeps right status inside terminal width" {
         .color = false,
         .cols = 40,
         .status = "Thinking",
-        .status_right = "ctx 33.3% 8.1k/24k tok",
+        .footer = "llama3.2 · cwd /tmp/project · ctx 33.3% 8.1k/24k tok",
         .prompt = "",
         .cursor = 0,
         .show_prompt = false,
     });
 
-    const first_line_end = std.mem.indexOf(u8, buffer.items, "\r\n") orelse return error.ExpectedStatusLine;
-    try std.testing.expectEqualStrings("Thinking         ctx 33.3% 8.1k/24k tok", buffer.items[0..first_line_end]);
+    const first_line_end = std.mem.indexOf(u8, buffer.items, "\r\n") orelse return error.ExpectedTopPad;
+    try std.testing.expectEqualStrings("                                       ", buffer.items[0..first_line_end]);
+    const status_start = first_line_end + "\r\n".len;
+    const status_rel_end = std.mem.indexOf(u8, buffer.items[status_start..], "\r\n") orelse return error.ExpectedStatusLine;
+    const status_line = buffer.items[status_start..][0..status_rel_end];
+    try std.testing.expectEqualStrings("  Thinking                             ", status_line);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "llama3.2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_line, "ctx") == null);
 }
 
-test "bottom bar shows context usage while prompt is idle" {
+test "bottom bar shows footer below prompt while idle" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
     const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
@@ -1329,14 +1394,22 @@ test "bottom bar shows context usage while prompt is idle" {
         .color = false,
         .cols = 40,
         .status = null,
-        .status_right = "ctx 1.1% 737/65k tok",
+        .footer = "local · cwd /tmp/project · ctx 1.1% 737/65k tok",
         .prompt = "proxima query",
         .cursor = 12,
         .show_prompt = true,
     });
 
-    const first_line_end = std.mem.indexOf(u8, buffer.items, "\r\n") orelse return error.ExpectedStatusLine;
-    try std.testing.expectEqualStrings("                   ctx 1.1% 737/65k tok", buffer.items[0..first_line_end]);
+    var it = std.mem.splitSequence(u8, buffer.items, "\r\n");
+    _ = it.next() orelse return error.ExpectedTopPad;
+    _ = it.next() orelse return error.ExpectedStatusLine;
+    _ = it.next() orelse return error.ExpectedPromptPad;
+    const prompt = it.next() orelse return error.ExpectedPrompt;
+    const lower_pad = it.next() orelse return error.ExpectedLowerPad;
+    const footer = it.next() orelse return error.ExpectedFooter;
+    try std.testing.expectEqualStrings("> proxima query                        ", prompt);
+    try std.testing.expectEqualStrings("                                       ", lower_pad);
+    try std.testing.expect(std.mem.startsWith(u8, footer, "local · cwd /tmp/project · ctx 1.1%"));
 }
 
 test "prompt view wraps and keeps cursor in visible window" {

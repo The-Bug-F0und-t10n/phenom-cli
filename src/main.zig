@@ -201,6 +201,8 @@ fn runChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Config) !void {
 
 fn runInteractiveChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Config, stdout: fd_writer.FdWriter) !void {
     var ui = tui.TerminalUi(@TypeOf(stdout)).init(allocator, stdout, !config.no_color);
+    ui.setFooterModel(config.model);
+    ui.refreshFooterCwd();
     var attached = false;
     defer if (attached) ui.deinit();
 
