@@ -1807,7 +1807,7 @@ test "ollama body includes model context in system message" {
     });
     defer std.testing.allocator.free(body);
 
-    try std.testing.expect(std.mem.indexOf(u8, body, "The model decides when contracts/tools are needed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Model decides when contracts/tools are needed") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "[TURN_CONTEXT v1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "task: corrigir") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "corrija") != null);
@@ -1832,7 +1832,7 @@ test "backend request can use custom system prompt template" {
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "CUSTOM_SYSTEM_TEMPLATE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "The model decides when contracts/tools are needed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Model decides when contracts/tools are needed") == null);
 }
 
 test "ollama body includes recent dialogue as real chat roles" {
