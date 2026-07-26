@@ -1,5 +1,6 @@
 const std = @import("std");
 const cli = @import("cli.zig");
+const system_prompt = @import("system_prompt.zig");
 
 const c = @cImport({
     @cInclude("arpa/inet.h");
@@ -193,6 +194,9 @@ pub const LocalModelClient = struct {
     fn buildBodyForInput(self: *LocalModelClient, input: InferenceInput) ![]u8 {
         const escaped_prompt = try jsonEscape(self.allocator, input.user_prompt);
         defer self.allocator.free(escaped_prompt);
+        const selected_system_prompt = input.system_prompt orelse system_prompt.default_system_prompt;
+        const escaped_system_prompt = try jsonEscape(self.allocator, selected_system_prompt);
+        defer self.allocator.free(escaped_system_prompt);
         const stable_context = if (input.model_context) |context| try stripVolatileTurnContextForPrompt(self.allocator, context) else null;
         defer if (stable_context) |context| self.allocator.free(context);
         var stable_input = input;
@@ -203,7 +207,7 @@ pub const LocalModelClient = struct {
         defer self.allocator.free(escaped_model);
 
         return switch (self.backend) {
-            .ollama => try self.buildOllamaBody(escaped_model, escaped_context, escaped_prompt, input.dialogue, input.max_tokens),
+            .ollama => try self.buildOllamaBody(escaped_model, escaped_system_prompt, escaped_context, escaped_prompt, input.dialogue, input.max_tokens),
             .llamacpp => blk: {
                 const resolved_thinking = resolveThinking(self.thinking, input.user_prompt);
                 const generation_prefix = if (resolved_thinking == .on)
@@ -223,10 +227,11 @@ pub const LocalModelClient = struct {
         };
     }
 
-    fn buildOllamaBody(self: *LocalModelClient, escaped_model: []const u8, escaped_context: ?[]const u8, escaped_prompt: []const u8, dialogue: []const ChatMessage, max_tokens: u16) ![]u8 {
+    fn buildOllamaBody(self: *LocalModelClient, escaped_model: []const u8, escaped_system_prompt: []const u8, escaped_context: ?[]const u8, escaped_prompt: []const u8, dialogue: []const ChatMessage, max_tokens: u16) ![]u8 {
         var messages = std.ArrayList(u8).empty;
         defer messages.deinit(self.allocator);
-        try messages.appendSlice(self.allocator, "{\"role\":\"system\",\"content\":\"Responda de forma direta, curta e no idioma do usuario. Nao mostre raciocinio.");
+        try messages.appendSlice(self.allocator, "{\"role\":\"system\",\"content\":\"");
+        try messages.appendSlice(self.allocator, escaped_system_prompt);
         if (escaped_context) |context| {
             try messages.appendSlice(self.allocator, "\\n\\n");
             try messages.appendSlice(self.allocator, context);
@@ -254,7 +259,8 @@ pub const LocalModelClient = struct {
     fn buildLlamaCppPrompt(self: *LocalModelClient, input: InferenceInput, generation_prefix: []const u8) ![]u8 {
         var out = std.ArrayList(u8).empty;
         errdefer out.deinit(self.allocator);
-        try out.appendSlice(self.allocator, "<|im_start|>system\nResponda de forma direta, curta e no idioma do usuario. Quando thinking estiver habilitado, use o bloco <think> somente para raciocinio interno e finalize com resposta visivel fora dele.");
+        try out.appendSlice(self.allocator, "<|im_start|>system\n");
+        try out.appendSlice(self.allocator, input.system_prompt orelse system_prompt.default_system_prompt);
         if (input.model_context) |context| {
             try out.appendSlice(self.allocator, "\n\n");
             try out.appendSlice(self.allocator, context);
@@ -401,6 +407,7 @@ pub const ChatMessage = struct {
 
 pub const InferenceInput = struct {
     user_prompt: []const u8,
+    system_prompt: ?[]const u8 = null,
     model_context: ?[]const u8 = null,
     dialogue: []const ChatMessage = &.{},
     max_tokens: u16 = 4096,
@@ -1800,7 +1807,7 @@ test "ollama body includes model context in system message" {
     });
     defer std.testing.allocator.free(body);
 
-    try std.testing.expect(std.mem.indexOf(u8, body, "Responda de forma direta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "The model decides when contracts/tools are needed") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "[TURN_CONTEXT v1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "task: corrigir") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "corrija") != null);
@@ -1808,6 +1815,24 @@ test "ollama body includes model context in system message" {
     const context_idx = std.mem.indexOf(u8, body, "[TURN_CONTEXT v1]") orelse return error.MissingContext;
     const user_idx = std.mem.indexOf(u8, body, "corrija") orelse return error.MissingPrompt;
     try std.testing.expect(context_idx < user_idx);
+}
+
+test "backend request can use custom system prompt template" {
+    var client = LocalModelClient{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1:11434",
+        .backend = .llamacpp,
+        .model = "phenom:latest",
+        .thinking = .off,
+    };
+    const body = try client.buildBodyForInput(.{
+        .user_prompt = "ola",
+        .system_prompt = "CUSTOM_SYSTEM_TEMPLATE",
+    });
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "CUSTOM_SYSTEM_TEMPLATE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "The model decides when contracts/tools are needed") == null);
 }
 
 test "ollama body includes recent dialogue as real chat roles" {

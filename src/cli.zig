@@ -35,6 +35,7 @@ pub const Config = struct {
     offline: bool = false,
     fail_on_model_error: bool = false,
     web_search_url: ?[]const u8 = null,
+    system_prompt: ?[]const u8 = null,
     expect_contains: ?[]const u8 = null,
     expect_contains_all: [8]?[]const u8 = [_]?[]const u8{null} ** 8,
     expect_contains_count: usize = 0,

@@ -1,17 +1,9 @@
 const std = @import("std");
 const collect_evidence = @import("collect_evidence.zig");
+const system_prompt = @import("system_prompt.zig");
 const temporal = @import("temporal.zig");
 
-pub const system_prompt_v1 =
-    "You are Phenom, a local operational agent. The model decides when contracts/tools are needed; the controller only executes accepted calls. " ++
-    "Answer directly for social turns, grounded dialogue, stable general knowledge, or no-external-state explanations. Stable knowledge excludes obscure public-record existence and current facts. " ++
-    "Use TEMPORAL_CONTEXT only for freshness; time-sensitive facts need grounded evidence. " ++
-    "Workspace/project/source-code claims require collect_evidence. Ungrounded factual claims require search_web or rag_web with a narrow model-selected query. " ++
-    "A named/obscure entity, handle, or fact absent from grounded context is not answer_only; no-records/fictional/similar before search_web is protocol error. " ++
-    "For prior-task continuity use search_session with concrete keys. " ++
-    "If you say inspect, search, verify, edit, validate, or run, emit the matching tool_call in that turn. " ++
-    "Similar names, adjacent topics, partial matches, and probably-the-same matches are not evidence. " ++
-    "Do not invent MEMORY/SKILLS or cite evidence that is not present.";
+pub const default_system_prompt = system_prompt.default_system_prompt;
 
 pub const EvidenceBlock = struct {
     text: []const u8,
@@ -46,7 +38,7 @@ pub const NextAction = struct {
 };
 
 pub const ContextByteBuckets = struct {
-    system: usize = system_prompt_v1.len,
+    system: usize = default_system_prompt.len,
     header: usize = 0,
     temporal: usize = 0,
     contracts: usize = 0,
@@ -81,8 +73,8 @@ pub const ModelTurnContext = struct {
     next_action: []const u8 = "",
 };
 
-pub fn renderSystemPrompt(allocator: std.mem.Allocator) ![]u8 {
-    return allocator.dupe(u8, system_prompt_v1);
+pub fn renderSystemPrompt(allocator: std.mem.Allocator, override: ?[]const u8) ![]u8 {
+    return allocator.dupe(u8, override orelse default_system_prompt);
 }
 
 pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContext) ![]u8 {
@@ -294,7 +286,7 @@ fn appendEvidenceText(out: *std.ArrayList(u8), allocator: std.mem.Allocator, tex
 }
 
 test "system prompt stays compact and stable" {
-    const prompt = try renderSystemPrompt(std.testing.allocator);
+    const prompt = try renderSystemPrompt(std.testing.allocator, null);
     defer std.testing.allocator.free(prompt);
 
     try std.testing.expect(prompt.len < 1200);
@@ -357,7 +349,7 @@ test "model context renders typed next action and byte buckets" {
 
     const buckets = measureRenderedContextBytes(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "kind=collect_context action=emit collect_evidence if more context is needed") != null);
-    try std.testing.expect(buckets.system == system_prompt_v1.len);
+    try std.testing.expect(buckets.system == default_system_prompt.len);
     try std.testing.expect(buckets.temporal > 0);
     try std.testing.expect(buckets.contracts > 0);
     try std.testing.expect(buckets.evidence > 0);
@@ -468,11 +460,17 @@ test "model context accepts collect evidence output without raw tail" {
 }
 
 test "system prompt delegates evidence decisions to model contracts" {
-    try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "The model decides when contracts/tools are needed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "controller only executes accepted calls") != null);
-    try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "Use TEMPORAL_CONTEXT only for freshness") != null);
-    try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "Ungrounded factual claims require search_web or rag_web") != null);
-    try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "A named/obscure entity") != null);
-    try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "Stable knowledge excludes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, system_prompt_v1, "Similar names, adjacent topics, partial matches") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "The model decides when contracts/tools are needed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "controller only executes accepted calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Use TEMPORAL_CONTEXT only for freshness") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Ungrounded factual claims require search_web or rag_web") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "A named/obscure entity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Stable knowledge excludes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Similar names, adjacent topics, partial matches") != null);
+}
+
+test "system prompt can be rendered from override template text" {
+    const prompt = try renderSystemPrompt(std.testing.allocator, "custom system prompt");
+    defer std.testing.allocator.free(prompt);
+    try std.testing.expectEqualStrings("custom system prompt", prompt);
 }

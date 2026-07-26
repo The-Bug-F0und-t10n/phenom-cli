@@ -21,6 +21,7 @@ const reasoning_filter = @import("reasoning_filter.zig");
 const render = @import("render.zig");
 const session_context = @import("session_context.zig");
 const strategy_registry = @import("strategy_registry.zig");
+const system_prompt = @import("system_prompt.zig");
 const tool_call = @import("tool_call.zig");
 const tool_envelope = @import("tool_envelope.zig");
 const tool_event = @import("tool_event.zig");
@@ -125,7 +126,7 @@ fn recordBackendConfig(allocator: std.mem.Allocator, db: *audit.AuditDb, config:
     defer allocator.free(body);
     try db.recordEvent(config.session, "model_backend", body);
 
-    const metadata = client.probeMetadata(allocator, model_context.system_prompt_v1);
+    const metadata = client.probeMetadata(allocator, config.system_prompt orelse system_prompt.default_system_prompt);
     defer metadata.deinit(allocator);
     client.rememberMetadata(metadata);
     const schema_tokens = try optionalUsizeText(allocator, metadata.schema_baseline_tokens);
@@ -256,7 +257,161 @@ fn runChatTurn(allocator: std.mem.Allocator, io: std.Io, config: cli.Config, std
     try runChatTurnWithUi(allocator, io, config, stdout, prompt, null);
 }
 
+fn isCreateCustomPromptCommand(input: []const u8) bool {
+    return std.mem.eql(u8, std.mem.trim(u8, input, " \t\r\n"), "/create_custom_prompt");
+}
+
+fn runCreateCustomPromptCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: cli.Config,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+) ![]u8 {
+    if (config.offline) {
+        try db.recordTurnError(config.session, .infrastructure, "create_custom_prompt", "live model required");
+        return allocator.dupe(u8, "Nao foi possivel criar Phenom.md: /create_custom_prompt requer um modelo ativo.");
+    }
+
+    if (ui_ptr) |active_ui| try active_ui.showStatus("Collecting project context");
+    try db.recordEvent(config.session, "tool_start", "collect_evidence\tcreate_custom_prompt");
+    try events.emit(.{ .tool_start = .{ .name = "collect_evidence", .detail = "create_custom_prompt" } });
+    const project = collect_evidence.execute(allocator, io, .{
+        .task = "create Phenom.md custom project prompt",
+        .intent = "distill current project purpose architecture business rules stable operational constraints",
+        .terms = "project purpose architecture business rules operational contracts memory evidence rag web tui renderer",
+        .strategy = .auto,
+        .budget_bytes = 7000,
+    }) catch |err| {
+        try db.recordTurnError(config.session, .tool_runtime, "collect_evidence", @errorName(err));
+        return std.fmt.allocPrint(allocator, "Nao foi possivel criar Phenom.md: coleta de contexto falhou com {s}.", .{@errorName(err)});
+    };
+    defer project.deinit(allocator);
+    try db.recordEvent(config.session, "evidence", project.evidence_text);
+    try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = project.evidence_text } });
+
+    var persistent = persistent_context.Loaded.init(allocator);
+    defer persistent.deinit();
+    persistent = persistent_context.loadFromCwd(allocator, io) catch persistent_context.Loaded.init(allocator);
+
+    const generator_prompt = try renderCreateCustomPromptPrompt(allocator, project.evidence_text, persistent.memory.items, persistent.skills.items, config.system_prompt);
+    defer allocator.free(generator_prompt);
+
+    if (ui_ptr) |active_ui| try active_ui.showStatus("Generating Phenom.md");
+    var client = http.LocalModelClient{
+        .allocator = allocator,
+        .host = config.host,
+        .backend = config.backend,
+        .model = config.model,
+        .thinking = .off,
+    };
+    defer client.deinit();
+    var sink = InternalCaptureSink{
+        .allocator = allocator,
+        .filter = reasoning_filter.ReasoningFilter.init(allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .thinking = std.ArrayList(u8).empty,
+    };
+    defer sink.deinit();
+    client.streamInference(.{
+        .user_prompt = generator_prompt,
+        .system_prompt = system_prompt.default_system_prompt,
+        .max_tokens = @min(config.max_tokens, 1800),
+    }, &sink) catch |err| {
+        try db.recordTurnError(config.session, .infrastructure, "create_custom_prompt", @errorName(err));
+        return std.fmt.allocPrint(allocator, "Nao foi possivel criar Phenom.md: modelo falhou com {s}.", .{@errorName(err)});
+    };
+    try sink.flush();
+
+    const custom_prompt = try normalizeGeneratedPhenomPrompt(allocator, sink.visible.items);
+    defer allocator.free(custom_prompt);
+    try model_context.assertNoRawContextLeak(custom_prompt);
+    try writeFileAtomic(io, "Phenom.md", "Phenom.md.tmp", custom_prompt);
+    const audit_body = try std.fmt.allocPrint(allocator, "path=Phenom.md bytes={} evidence_bytes={}", .{ custom_prompt.len, project.evidence_text.len });
+    defer allocator.free(audit_body);
+    try db.recordEvent(config.session, "custom_prompt_created", audit_body);
+    return std.fmt.allocPrint(allocator, "Phenom.md criado/atualizado com prompt customizado do projeto ({} bytes).", .{custom_prompt.len});
+}
+
+fn renderCreateCustomPromptPrompt(
+    allocator: std.mem.Allocator,
+    project_evidence: []const u8,
+    memory: []const []const u8,
+    skills: []const []const u8,
+    existing_prompt: ?[]const u8,
+) ![]u8 {
+    var memory_text = std.ArrayList(u8).empty;
+    defer memory_text.deinit(allocator);
+    try appendList(&memory_text, allocator, memory);
+    var skills_text = std.ArrayList(u8).empty;
+    defer skills_text.deinit(allocator);
+    try appendList(&skills_text, allocator, skills);
+    return std.fmt.allocPrint(allocator,
+        \\[CREATE_PHENOM_MD]
+        \\Create or refresh the project's Phenom.md custom prompt.
+        \\Return only Markdown content for Phenom.md. No XML, no tool calls, no fenced wrapper.
+        \\Keep durable project facts: purpose, architecture, contracts, absolute business rules, safety rules, persistent model behavior rules.
+        \\Exclude transient task status, raw logs, long code dumps, secrets, volatile implementation guesses, and anything not grounded below.
+        \\Use concise sections and imperative rules. Maximum 2400 bytes.
+        \\
+        \\[EXISTING_PHENOM_MD]
+        \\{s}
+        \\
+        \\[PROJECT_EVIDENCE]
+        \\{s}
+        \\
+        \\[MEMORY_MD]
+        \\{s}
+        \\
+        \\[SKILLS_MD]
+        \\{s}
+        \\
+    , .{
+        existing_prompt orelse "",
+        project_evidence[0..@min(project_evidence.len, 7000)],
+        memory_text.items,
+        skills_text.items,
+    });
+}
+
+fn appendList(out: *std.ArrayList(u8), allocator: std.mem.Allocator, items: []const []const u8) !void {
+    if (items.len == 0) {
+        try out.appendSlice(allocator, "none");
+        return;
+    }
+    for (items) |item| {
+        try out.appendSlice(allocator, item);
+        if (!std.mem.endsWith(u8, item, "\n")) try out.append(allocator, '\n');
+    }
+}
+
+fn normalizeGeneratedPhenomPrompt(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.indexOf(u8, trimmed, "<tool_call>") != null) return error.InvalidGeneratedPrompt;
+    if (std.mem.startsWith(u8, trimmed, "```")) {
+        const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return error.InvalidGeneratedPrompt;
+        trimmed = std.mem.trim(u8, trimmed[first_newline + 1 ..], " \t\r\n");
+        if (std.mem.endsWith(u8, trimmed, "```")) trimmed = std.mem.trim(u8, trimmed[0 .. trimmed.len - 3], " \t\r\n");
+    }
+    if (trimmed.len == 0) return error.InvalidGeneratedPrompt;
+    return allocator.dupe(u8, trimmed[0..@min(trimmed.len, 12 * 1024)]);
+}
+
+fn writeFileAtomic(io: std.Io, path: []const u8, tmp_path: []const u8, data: []const u8) !void {
+    const dir = std.Io.Dir.cwd();
+    try dir.writeFile(io, .{ .sub_path = tmp_path, .data = data });
+    try dir.rename(tmp_path, dir, path, io);
+}
+
 fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Config, stdout: fd_writer.FdWriter, prompt: []const u8, ui: anytype) !void {
+    var effective_config = config;
+    const turn_project_prompt = if (config.system_prompt == null) try config_file.loadProjectPromptIfPresent(allocator) else null;
+    defer if (turn_project_prompt) |value| allocator.free(value);
+    if (turn_project_prompt) |value| {
+        if (std.mem.trim(u8, value, " \t\r\n").len > 0) effective_config.system_prompt = value;
+    }
+
     const size = tui.terminalSize();
     const ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter) = ui;
     var transcript_writer = fd_writer.NewlineWriter(fd_writer.FdWriter){ .inner = stdout, .crlf = ui_ptr != null };
@@ -282,6 +437,15 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
     try recordSessionCheckpointForTurn(allocator, &db, config.session, prompt);
     try db.recordTurnPhase(config.session, .intent, "turn_start");
     try events.emit(.{ .user_message = prompt });
+
+    if (isCreateCustomPromptCommand(prompt)) {
+        const visible = try runCreateCustomPromptCommand(allocator, io, effective_config, &events, &db, ui_ptr);
+        defer allocator.free(visible);
+        try events.emit(.{ .message_chunk = visible });
+        try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
+        return;
+    }
+
     try events.emit(.{ .think_start = "Thinking" });
 
     if (config.demo_read_file) |path| {
@@ -320,7 +484,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             .thinking = config.thinking,
         };
         defer client.deinit();
-        try recordBackendConfig(allocator, &db, config, &client);
+        try recordBackendConfig(allocator, &db, effective_config, &client);
         const enable_tool_loop = true;
         var sink = StreamSink{
             .allocator = allocator,
@@ -357,6 +521,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
 
         const inference_input = http.InferenceInput{
             .user_prompt = prompt,
+            .system_prompt = effective_config.system_prompt,
             .model_context = model_context_text,
             .dialogue = dialogue_messages.items,
             .max_tokens = config.max_tokens,
@@ -414,10 +579,10 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         var repaired_think_only_before_tool_loop = false;
         if (enable_tool_loop and sink.hasNoVisibleText() and sink.thinking_bytes > 0) {
             sink.raw_visible.clearRetainingCapacity();
-            repaired_think_only_before_tool_loop = try repairThinkOnlyFinalAnswer(allocator, config, prompt, &client, &events, &db, ui_ptr, &sink);
+            repaired_think_only_before_tool_loop = try repairThinkOnlyFinalAnswer(allocator, effective_config, prompt, &client, &events, &db, ui_ptr, &sink);
         }
         if (enable_tool_loop and !repaired_think_only_before_tool_loop) {
-            const handled_by_tool_loop = runToolLoopIterations(allocator, io, config, prompt, sink.raw_model.items, sink.raw_visible.items, model_context_text, &client, &events, &db, ui_ptr, &sink) catch |err| blk: {
+            const handled_by_tool_loop = runToolLoopIterations(allocator, io, effective_config, prompt, sink.raw_model.items, sink.raw_visible.items, model_context_text, &client, &events, &db, ui_ptr, &sink) catch |err| blk: {
                 if (err == error.Cancelled) {
                     try events.emit(.{ .inference_cancel = "cancelled by user" });
                     try db.recordEvent(config.session, "inference_cancel", "cancelled by user");
@@ -437,7 +602,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         }
         if (sink.hasNoVisibleText() and sink.thinking_bytes > 0) {
             sink.raw_visible.clearRetainingCapacity();
-            if (try repairThinkOnlyFinalAnswer(allocator, config, prompt, &client, &events, &db, ui_ptr, &sink)) {
+            if (try repairThinkOnlyFinalAnswer(allocator, effective_config, prompt, &client, &events, &db, ui_ptr, &sink)) {
                 try sink.flushDeferredVisible();
             }
         }
@@ -3531,7 +3696,8 @@ fn recordModelContextBudget(
     input: http.InferenceInput,
 ) !ModelContextUsage {
     try model_context.assertNoRawContextLeak(rendered);
-    const buckets = model_context.measureRenderedContextBytes(rendered);
+    var buckets = model_context.measureRenderedContextBytes(rendered);
+    buckets.system = (input.system_prompt orelse system_prompt.default_system_prompt).len;
     const used_tokens = client.countInputTokens(input);
     const limit_tokens = client.context_window;
     if (used_tokens) |used| {
@@ -3715,7 +3881,7 @@ fn streamSearchPlanTurn(
     };
     defer plan_sink.deinit();
 
-    const plan_input = http.InferenceInput{ .user_prompt = prompt, .model_context = plan_context, .max_tokens = config.max_tokens };
+    const plan_input = http.InferenceInput{ .user_prompt = prompt, .system_prompt = config.system_prompt, .model_context = plan_context, .max_tokens = config.max_tokens };
     const context_usage = recordModelContextBudget(allocator, db, config.session, plan_context, client, plan_input) catch |err| {
         try db.recordEvent(config.session, "model_error", @errorName(err));
         return .stopped;
@@ -3839,6 +4005,7 @@ fn repairThinkOnlyFinalAnswer(
 
     const repair_input = http.InferenceInput{
         .user_prompt = prompt,
+        .system_prompt = config.system_prompt,
         .model_context = repair_context,
         .max_tokens = config.max_tokens,
     };
@@ -3921,7 +4088,7 @@ fn streamDeferredToolLoopTurnInternal(
         .trim_visible_leading_whitespace = false,
     };
     defer follow_sink.deinit();
-    const follow_input = http.InferenceInput{ .user_prompt = prompt, .model_context = follow_context, .max_tokens = config.max_tokens };
+    const follow_input = http.InferenceInput{ .user_prompt = prompt, .system_prompt = config.system_prompt, .model_context = follow_context, .max_tokens = config.max_tokens };
     const context_usage = recordModelContextBudget(allocator, db, config.session, follow_context, client, follow_input) catch |err| {
         const message = if (err == error.ModelContextBudgetExceeded)
             "context limit exceeded before model call"
