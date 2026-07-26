@@ -426,10 +426,12 @@ fn runCreateCustomPromptCommand(
     defer allocator.free(custom_prompt);
     try model_context.assertNoRawContextLeak(custom_prompt);
     try writeFileAtomic(io, "Phenom.md", "Phenom.md.tmp", custom_prompt);
-    const audit_body = try std.fmt.allocPrint(allocator, "path=Phenom.md bytes={} evidence_bytes={}", .{ custom_prompt.len, project.evidence_text.len });
+    const prompt_path = try cwdJoinAlloc(allocator, "Phenom.md");
+    defer allocator.free(prompt_path);
+    const audit_body = try std.fmt.allocPrint(allocator, "path={s} bytes={} evidence_bytes={}", .{ prompt_path, custom_prompt.len, project.evidence_text.len });
     defer allocator.free(audit_body);
     try db.recordEvent(config.session, "custom_prompt_created", audit_body);
-    return std.fmt.allocPrint(allocator, "Phenom.md criado/atualizado com prompt customizado do projeto ({} bytes).", .{custom_prompt.len});
+    return std.fmt.allocPrint(allocator, "Phenom.md criado/atualizado em {s} ({} bytes).", .{ prompt_path, custom_prompt.len });
 }
 
 fn renderCreateCustomPromptPrompt(
@@ -500,6 +502,12 @@ fn writeFileAtomic(io: std.Io, path: []const u8, tmp_path: []const u8, data: []c
     const dir = std.Io.Dir.cwd();
     try dir.writeFile(io, .{ .sub_path = tmp_path, .data = data });
     try dir.rename(tmp_path, dir, path, io);
+}
+
+fn cwdJoinAlloc(allocator: std.mem.Allocator, file_name: []const u8) ![]u8 {
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd = if (c.getcwd(&cwd_buf, cwd_buf.len)) |ptr| std.mem.span(ptr) else ".";
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, file_name });
 }
 
 fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Config, stdout: fd_writer.FdWriter, prompt: []const u8, ui: anytype) !void {
@@ -5955,6 +5963,14 @@ test "interactive help slash command is local only" {
     try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "--expect-contains") != null);
     try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "real-session-smoke") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, interactive_help_text, '|') == null);
+}
+
+test "custom prompt path reports cwd target" {
+    const path = try cwdJoinAlloc(std.testing.allocator, "Phenom.md");
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expect(std.mem.endsWith(u8, path, "/Phenom.md"));
+    try std.testing.expect(std.mem.indexOfScalar(u8, path, '/') != null);
 }
 
 test "visible output trims only leading whitespace after thinking" {

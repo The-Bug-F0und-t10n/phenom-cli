@@ -39,6 +39,8 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         markdown_table: [8192]u8 = undefined,
         markdown_table_len: usize = 0,
         markdown_table_rows: usize = 0,
+        assistant_escape_state: EscapeState = .plain,
+        thinking_escape_state: EscapeState = .plain,
         last_block: BlockKind = .none,
         tool_seq: usize = 0,
 
@@ -53,6 +55,14 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             diff,
             status,
             done,
+        };
+
+        const EscapeState = enum {
+            plain,
+            esc,
+            csi,
+            osc,
+            osc_esc,
         };
 
         const user_bg = "\x1b[48;5;236m";
@@ -101,16 +111,31 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             try self.blockGap(.assistant);
             self.assistant_open = true;
             self.assistant_wrote_content = false;
+            self.assistant_escape_state = .plain;
             self.stream_needs_gutter = true;
             self.last_block = .assistant;
         }
 
         pub fn assistantDelta(self: *Self, text: []const u8) !void {
-            if (text.len > 0) self.assistant_wrote_content = true;
-            try self.writeMarkdownStream(text);
+            try self.writeSanitizedAssistantDelta(text);
         }
 
         pub fn thinkingDelta(self: *Self, text: []const u8) !void {
+            var buf: [1024]u8 = undefined;
+            var len: usize = 0;
+            for (text) |byte| {
+                if (!stripModelEscapeByte(&self.thinking_escape_state, byte)) continue;
+                buf[len] = byte;
+                len += 1;
+                if (len == buf.len) {
+                    try self.writeThinkingDeltaPlain(buf[0..len]);
+                    len = 0;
+                }
+            }
+            if (len > 0) try self.writeThinkingDeltaPlain(buf[0..len]);
+        }
+
+        fn writeThinkingDeltaPlain(self: *Self, text: []const u8) !void {
             if (!self.thinking_open) {
                 var wrote_gap = false;
                 if (self.assistant_open) {
@@ -153,6 +178,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             self.thinking_open = false;
             self.thinking_needs_gutter = true;
             self.thinking_col = 0;
+            self.thinking_escape_state = .plain;
             try self.writer.writeAll("\n");
             self.assistant_open = true;
             self.assistant_wrote_content = false;
@@ -266,6 +292,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 if (self.assistant_wrote_content) try self.writer.writeAll("\n");
                 self.assistant_open = false;
                 self.assistant_wrote_content = false;
+                self.assistant_escape_state = .plain;
             }
         }
 
@@ -419,6 +446,61 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             self.markdown_table[self.markdown_table_len] = '\n';
             self.markdown_table_len += 1;
             self.markdown_table_rows += 1;
+        }
+
+        fn writeSanitizedAssistantDelta(self: *Self, text: []const u8) !void {
+            var buf: [1024]u8 = undefined;
+            var len: usize = 0;
+            for (text) |byte| {
+                if (!stripModelEscapeByte(&self.assistant_escape_state, byte)) continue;
+                buf[len] = byte;
+                len += 1;
+                if (len == buf.len) {
+                    try self.writeMarkdownStream(buf[0..len]);
+                    self.assistant_wrote_content = true;
+                    len = 0;
+                }
+            }
+            if (len > 0) {
+                try self.writeMarkdownStream(buf[0..len]);
+                self.assistant_wrote_content = true;
+            }
+        }
+
+        fn stripModelEscapeByte(state: *EscapeState, byte: u8) bool {
+            switch (state.*) {
+                .plain => {
+                    if (byte == 0x1b) {
+                        state.* = .esc;
+                        return false;
+                    }
+                    if (byte == 0x9b) {
+                        state.* = .csi;
+                        return false;
+                    }
+                    return true;
+                },
+                .esc => {
+                    state.* = switch (byte) {
+                        '[' => .csi,
+                        ']' => .osc,
+                        else => .plain,
+                    };
+                    return false;
+                },
+                .csi => {
+                    if (byte >= 0x40 and byte <= 0x7e) state.* = .plain;
+                    return false;
+                },
+                .osc => {
+                    if (byte == 0x07) state.* = .plain else if (byte == 0x1b) state.* = .osc_esc;
+                    return false;
+                },
+                .osc_esc => {
+                    state.* = if (byte == '\\') .plain else .osc;
+                    return false;
+                },
+            }
         }
 
         fn flushMarkdownTables(self: *Self) !void {
@@ -1606,6 +1688,36 @@ test "thinking stream preserves utf8 text inside styled chunks" {
     try renderer.thinkingDelta("usuário em português");
 
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "usuário em português") != null);
+}
+
+test "assistant plain prose does not get syntax color" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = true });
+    try renderer.assistantStart();
+    try renderer.assistantDelta("Ola! Tudo bem? Em que posso ajudar hoje?");
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Ola! Tudo bem? Em que posso ajudar hoje?") != null);
+}
+
+test "assistant strips model ansi escapes across stream chunks" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = true });
+    try renderer.assistantStart();
+    try renderer.assistantDelta("\x1b[3");
+    try renderer.assistantDelta("1mOla\x1b[0");
+    try renderer.assistantDelta("m! Tudo \x1b]8;;https://x");
+    try renderer.assistantDelta("\x1b\\Em");
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Ola! Tudo Em") != null);
 }
 
 test "thinking wraps inside narrow terminal with gutter on continuation" {
