@@ -11360,3 +11360,396 @@ Invariantes afetadas:
 Risco residual:
 
 - Overview pode responder perguntas amplas; perguntas de identidade simbolica ainda dependem do modelo obedecer `stage=candidates` ou do reparo posterior detectar resposta sem suporte.
+
+## T318 - Compilar ajuda local, versao centralizada e menu sem duplicacao de identidade
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: o menu inicial, `phenom help` e `/help` estavam divergindo do uso real do projeto. A versao aparecia duplicada com nome de produto no banner, havia texto redundante no menu e comandos importantes nao estavam reunidos em uma documentacao operacional curta.
+
+Regra de negocio preservada:
+
+- `/help` continua local e nao chama modelo.
+- A versao fica em uma unica fonte de build, sem strings espalhadas.
+- O menu mostra Phenom como marca uma vez; a linha de versao nao repete a identidade.
+
+Passos de implementacao:
+
+1. Centralizar a versao no build e consumir dinamicamente no binario.
+2. Remover texto duplicado do menu e manter somente a versao.
+3. Expandir `/help` com comandos interativos, CLI, flags, configuracao, build e smokes.
+4. Garantir que o help renderize como texto simples, sem tabelas acidentais.
+5. Rodar testes de parser/help/render e build local.
+
+Implementacao:
+
+- `phenom-zig/build.zig`: versao centralizada para o binario.
+- `phenom-zig/src/main.zig`: `/help` local compilado e menu alinhado ao uso atual.
+- `phenom-zig/src/welcome.zig`: banner ajustado para nao repetir nome antes da versao.
+- `phenom-zig/src/render.zig`: renderizacao do help preserva linhas de comando como texto, sem converter flags em tabela.
+
+Criterio de aceite:
+
+- `phenom version` mostra `phenom-zig 0.1.2-dev`.
+- `/help` mostra os comandos de uso sem chamar modelo.
+- Flags como `--backend ollama/llamacpp` e `--thinking auto/on/off` nao viram tabelas.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; 415 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test --summary all` -> passou; 415/415 testes.
+- `/home/ashirak/.local/bin/phenom version` -> `phenom-zig 0.1.2-dev`.
+
+Invariantes afetadas:
+
+- 6. Falha de modelo nao parece falha de infraestrutura: preservada; help local nao toca backend.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; comandos documentados refletem o fluxo real.
+
+Risco residual:
+
+- A documentacao de `/help` deve ser atualizada sempre que nova flag ou comando entrar.
+
+## T319 - Reposicionar status de contexto para footer abaixo da user query
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: a contagem de contexto no topo poluia a statusbar principal e a user query ficava colada ao footer. Tambem havia bug visual em que o cursor permanecia na primeira linha enquanto o texto digitado aparecia na segunda linha.
+
+Regra de negocio preservada:
+
+- A mudanca e somente TUI/render; nao altera prompt, contexto model-visible, audit ou tool loop.
+- O contador continua sendo pre-send/context budget local, nao token neural fabricado.
+
+Passos de implementacao:
+
+1. Remover contagem de contexto da statusbar superior.
+2. Criar footer abaixo da user query com modelo, cwd e uso de contexto.
+3. Adicionar padding vertical/horizontal para separar statusbars do output e do prompt.
+4. Corrigir janela/cursor do editor para texto e cursor ficarem na mesma linha visual.
+5. Cobrir layout com snapshots/testes de TUI.
+
+Implementacao:
+
+- `phenom-zig/src/tui.zig`: footer com modelo/cwd/contexto, top statusbar simplificada, espacamentos e prompt view corrigidos.
+- `phenom-zig/src/main.zig`: alimenta o footer com modelo/cwd/contexto do turno.
+
+Criterio de aceite:
+
+- Contexto aparece somente abaixo da user query.
+- Statusbar superior nao fica colada ao output.
+- User query e cursor renderizam na mesma linha visual.
+- Layout pequeno continua funcional.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; inclui `footer shows model cwd and context usage`, `bottom bar keeps context out of top status`, `bottom bar shows footer below prompt while idle`, `prompt view wraps and keeps cursor in visible window`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test --summary all` -> passou; 415/415 testes.
+
+Invariantes afetadas:
+
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; mudanca visual nao altera eventos.
+
+Risco residual:
+
+- Terminais muito estreitos podem exigir mais abreviacao do cwd/modelo.
+
+## T320 - Melhorar navegacao do `graph.html` com zoom e filtros auditaveis
+
+Status: implemented-verified.
+
+Prioridade: media.
+
+Motivacao: o `graph.html` gerado existia, mas era dificil distinguir fluxo, navegar entre nos e inspecionar areas densas do grafo. O usuario precisava de zoom para analisar nos simples e complexos sem perder auditabilidade.
+
+Regra de negocio preservada:
+
+- `phenom graph` continua comando local standalone.
+- `graph.html` continua artefato gerado, sem entrar no contexto do modelo.
+- Nenhuma dependencia JS/CSS externa foi adicionada.
+
+Passos de implementacao:
+
+1. Adicionar controles locais de zoom.
+2. Manter busca, filtros e detalhes de no.
+3. Melhorar pan/viewport para navegar em grafos maiores.
+4. Garantir que JSON embutido permanece escapado e standalone.
+5. Rodar testes do grafo e suite principal.
+
+Implementacao:
+
+- `phenom-zig/src/code_graph.zig`: HTML exportado ganhou navegacao visual melhor, controles de zoom e interacao local no SVG.
+
+Criterio de aceite:
+
+- `phenom graph` gera HTML abrivel sem servidor.
+- O usuario consegue aproximar/afastar e inspecionar detalhes dos nodes.
+- Os dados continuam embutidos e auditaveis no arquivo.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; inclui `code_graph.test.caveman graph writes standalone local html`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test --summary all` -> passou; 415/415 testes.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; export HTML nao e prompt.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; comando graph nao altera audit de chat.
+
+Risco residual:
+
+- O layout ainda e caveman graph, nao Tree-sitter/LSP; precisao estrutural maior exige parser por linguagem.
+
+## T321 - Manter nodes do `graph.html` separados e legiveis
+
+Status: implemented-verified.
+
+Prioridade: media.
+
+Motivacao: mesmo com organizacao boa, nodes densos podiam se sobrepor visualmente, tornando o HTML pouco nitido para auditoria manual.
+
+Regra de negocio preservada:
+
+- Layout continua deterministico e local.
+- A melhoria e visual; ranking interno do grafo nao muda de semantica.
+
+Passos de implementacao:
+
+1. Aumentar separacao visual proporcional ao volume de nodes.
+2. Ajustar raio/spacing para reduzir sobreposicao.
+3. Preservar filtros, zoom e detalhes.
+4. Rodar testes do grafo e suite principal.
+
+Implementacao:
+
+- `phenom-zig/src/code_graph.zig`: ajuste de espacamento e legibilidade do SVG exportado.
+
+Criterio de aceite:
+
+- Nodes permanecem distinguiveis em grafo denso.
+- O HTML continua standalone e gerado por `phenom graph`.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; 415 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test --summary all` -> passou; 415/415 testes.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada.
+
+Risco residual:
+
+- Grafos muito grandes ainda podem exigir agrupamento por arquivo/modulo ou layout hierarquico futuro.
+
+## T322 - Sanitizar texto do modelo sem coloracao acidental de conversa comum
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: respostas comuns como `Ola! Tudo bem? Em que posso te ajudar hoje?` tinham palavras coloridas como se fossem linguagem/codigo. A causa raiz era o renderer aplicar realce onde deveria renderizar prosa normal, nao falta de heuristica de palavras especificas.
+
+Regra de negocio preservada:
+
+- Code blocks, diff e markdown continuam recebendo realce apropriado.
+- Prosa normal de assistant nao recebe syntax highlight.
+- ANSI vindo do modelo e removido antes de renderizar.
+
+Passos de implementacao:
+
+1. Criar regressao para assistant plain prose sem coloracao sintatica.
+2. Sanitizar escapes ANSI vindos do modelo.
+3. Restringir realce a contextos estruturados de markdown/code/diff.
+4. Garantir que o output visivel usado pelo tool loop continua parseavel.
+5. Rodar testes de render e suite principal.
+
+Implementacao:
+
+- `phenom-zig/src/render.zig`: renderer separa prosa comum de blocos estruturados e remove escapes do modelo.
+- `phenom-zig/src/main.zig`: caminho de texto visivel usa a sanitizacao antes do transcript.
+
+Criterio de aceite:
+
+- Conversa normal nao colore palavras soltas.
+- ANSI malicioso ou acidental do modelo nao controla o terminal.
+- Markdown/code/diff continuam legiveis.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; inclui `render.test.assistant plain prose does not get syntax color` e `render.test.assistant strips model ansi escapes across stream chunks`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test --summary all` -> passou; 415/415 testes.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada.
+- 6. Falha de modelo nao parece falha de infraestrutura: preservada; problema visual nao vira erro de backend.
+- 7. Cada turno consegue ser auditado e reproduzido: ampliada; transcript fica limpo.
+
+Risco residual:
+
+- Linguagens em code fence sem parser dedicado ainda usam realce simples do renderer.
+
+## T323 - Tratar `Phenom.md` como system prompt comportamental do projeto
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: `/create_custom_prompt` criava/atualizava `Phenom.md`, mas o fluxo precisava garantir que ele fosse system prompt comportamental do cwd, nao memoria curta, resumo operacional ou cache de evidencia.
+
+Regra de negocio preservada:
+
+- `Phenom.md` e override de system prompt quando presente no cwd.
+- `MEMORY.md` e `SKILLS.md` continuam sendo as unicas fontes persistentes textuais de memoria/preferencias.
+- `Phenom.md` nao deve virar evidencia nem ser promovido como memory.
+
+Passos de implementacao:
+
+1. Ajustar o prompt gerador de `/create_custom_prompt` para exigir system prompt comportamental.
+2. Gravar `Phenom.md` no cwd operacional e reportar path absoluto.
+3. Carregar `Phenom.md` como `config.system_prompt` quando presente.
+4. Garantir que override do projeto substitui prompt stock no backend.
+5. Rodar teste de fluxo `Phenom.md` e suite principal.
+
+Implementacao:
+
+- `phenom-zig/src/config_file.zig`: loader de `Phenom.md` como `system_prompt`.
+- `phenom-zig/src/main.zig`: `/create_custom_prompt` gera prompt comportamental, valida forma e grava no cwd.
+
+Criterio de aceite:
+
+- `Phenom.md` gerado contem `# Phenom Behavioral System Prompt`.
+- Turnos seguintes usam `Phenom.md` como system prompt.
+- O stock prompt nao e usado quando existe override customizado valido.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; inclui testes de `create custom prompt`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test --summary all` -> passou; 415/415 testes.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; prompt gerado e validado.
+- 3. MEMORY/SKILLS nao competem com storage operacional: ampliada; `Phenom.md` fica separado de memory/skills.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; criacao registra evento `custom_prompt_created`.
+
+Risco residual:
+
+- Qualidade semantica do `Phenom.md` depende do modelo gerador; o controller valida forma e vazamento, nao perfeicao editorial.
+
+## T324 - Endurecer system prompt stock sem identidade fixa
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: o prompt stock ainda continha identidade e podia induzir modelos pequenos/medios a preencher lacunas, assumir estado atual, confiar em matches fracos ou responder com certeza sem evidencia suficiente.
+
+Regra de negocio preservada:
+
+- Prompt stock continua compacto.
+- O modelo continua decidindo quando contratos/tools sao necessarios.
+- Controller continua executando apenas chamadas aceitas.
+
+Passos de implementacao:
+
+1. Remover identidade `You are Phenom` do stock prompt.
+2. Adicionar regras diretas de incerteza, evidencia e anti-alucinacao.
+3. Manter o prompt abaixo do limite compacto existente.
+4. Atualizar testes que ancoram o texto do prompt.
+5. Rodar testes focados, suite completa e install local.
+
+Implementacao:
+
+- `phenom-zig/src/system_prompt.md`: stock prompt sem identidade e com regras `known/inferred/unknown`, `unsupported`, `weak matches` e `Do not fill gaps`.
+- `phenom-zig/src/system_prompt.zig`, `phenom-zig/src/model_context.zig`, `phenom-zig/src/http.zig`: testes atualizados para os novos anchors.
+
+Criterio de aceite:
+
+- Stock prompt nao contem `You are Phenom`.
+- Prompt instrui separacao entre conhecido, inferido e desconhecido.
+- Prompt orienta ferramenta/evidencia quando falta suporte.
+
+Validacao executada:
+
+- `zig test src/system_prompt.zig` -> passou.
+- `zig test src/http.zig -lc` -> passou.
+- `zig test src/model_context.zig -lc -lsqlite3` -> passou; 160/160 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test --summary all` -> passou; 415/415 testes.
+- `/home/ashirak/.local/bin/phenom version` -> `phenom-zig 0.1.2-dev`.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada.
+- 3. MEMORY/SKILLS nao competem com storage operacional: preservada.
+- 6. Falha de modelo nao parece falha de infraestrutura: ampliada; prompt pede incerteza em vez de fabricacao.
+
+Risco residual:
+
+- Prompt nao e garantia absoluta contra alucinacao; contratos, evidencia e reparos continuam sendo a barreira principal.
+
+## T325 - Adicionar sistema de perfis de system prompt por configuracao
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: apos endurecer o stock prompt, passou a existir necessidade real de alternar entre um prompt stock normal e um prompt mais conservador para modelos pequenos/medios. Fazer isso por strings espalhadas recriaria erro de versionamento/configuracao.
+
+Regra de negocio preservada:
+
+- `stock` continua comportamento default.
+- `strict` e opt-in por CLI/config.
+- `Phenom.md` continua tendo precedencia como override do projeto.
+- Nomes desconhecidos falham cedo.
+
+Passos de implementacao:
+
+1. Criar registry pequeno de perfis em `system_prompt.zig`.
+2. Adicionar `system_prompt_strict.md` como segundo perfil real.
+3. Expor `--system-prompt-profile stock|strict`.
+4. Expor `system_prompt_profile = "stock"|"strict"` no `config.toml`.
+5. Resolver prompt efetivo antes da chamada ao backend, preservando override por `Phenom.md`.
+6. Atualizar docs e testes.
+
+Implementacao:
+
+- `phenom-zig/src/system_prompt.zig`: `Profile`, `parseProfile`, `profileName` e `profileText`.
+- `phenom-zig/src/system_prompt_strict.md`: prompt conservador para reduzir alucinacao e vies de modelos menores.
+- `phenom-zig/src/cli.zig`: flag `--system-prompt-profile`.
+- `phenom-zig/src/config_file.zig`: chave `system_prompt_profile`.
+- `phenom-zig/src/main.zig`: `effectiveSystemPrompt` aplica perfil quando nao ha override customizado.
+- `phenom-zig/README.md` e `phenom-zig/doc/FLAGS.md`: documentacao atualizada.
+
+Criterio de aceite:
+
+- `stock` e `strict` sao perfis selecionaveis.
+- `default` funciona como alias de `stock`.
+- `Phenom.md` prevalece sobre o perfil.
+- O binario instalado usa a feature validada.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/system_prompt.zig --cache-dir /tmp/phenom-system-prompt-test` -> passou; 2 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/cli.zig --cache-dir /tmp/phenom-cli-test` -> passou; 10 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/config_file.zig -lc --cache-dir /tmp/phenom-config-test` -> passou; 13 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-test ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; 415 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test --summary all` -> passou; 415/415 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build install-local -Doptimize=ReleaseFast` -> passou.
+- `sha256sum zig-out/bin/phenom /home/ashirak/.local/bin/phenom` -> hashes iguais.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; perfis sao prompts stock, nao dumps.
+- 3. MEMORY/SKILLS nao competem com storage operacional: preservada; `Phenom.md` e system prompt, memory/skills continuam separados.
+- 6. Falha de modelo nao parece falha de infraestrutura: ampliada; perfil `strict` orienta incerteza e evidencia.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; configuracao fica explicita no fluxo.
+
+Risco residual:
+
+- Mais perfis so devem ser adicionados quando houver comportamento stock real diferente, com teste e criterio de selecao claro.
