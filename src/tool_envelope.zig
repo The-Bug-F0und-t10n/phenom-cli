@@ -128,7 +128,7 @@ fn rejectedParse(
     reason: RejectionReason,
 ) !?ToolCallEnvelope {
     return .{
-        .raw_name = try allocator.dupe(u8, "<parse_error>"),
+        .raw_name = try allocator.dupe(u8, "tool_call"),
         .source = .text_protocol,
         .parse_strategy = .qwopus_xml,
         .state = .rejected,
@@ -208,6 +208,23 @@ test "set operational contract is accepted as model-visible controller tool" {
     try std.testing.expectEqual(true, envelope.call.?.requires_inspection.?);
 }
 
+test "active contract accepts explicit contract switch" {
+    const active = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
+    const output =
+        \\<tool_call>
+        \\<function=set_operational_contract>
+        \\<parameter=contract>search_web</parameter>
+        \\<parameter=query>entity fact to verify</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.accepted, envelope.state);
+    try std.testing.expectEqualStrings("set_operational_contract", envelope.raw_name);
+    try std.testing.expectEqual(contracts.ContractName.search_web, envelope.call.?.contract.?);
+}
+
 test "mutation executor is rejected before contract and accepted by mutation contract" {
     const initial = contracts.activeContract(.workflow) orelse return error.MissingContract;
     const output =
@@ -242,6 +259,23 @@ test "invalid strategy is a rejected envelope" {
     defer envelope.deinit(std.testing.allocator);
     try std.testing.expectEqual(State.rejected, envelope.state);
     try std.testing.expectEqual(RejectionReason.invalid_strategy, envelope.rejection_reason.?);
+}
+
+test "invalid contract parameter is a format rejection not a pseudo tool" {
+    const active = contracts.activeContract(.workflow) orelse return error.MissingContract;
+    const output =
+        \\<tool_call>
+        \\<function=set_operational_contract>
+        \\<parameter=contract>made_up</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.rejected, envelope.state);
+    try std.testing.expectEqual(RejectionReason.parse_error, envelope.rejection_reason.?);
+    try std.testing.expect(envelope.call == null);
+    try std.testing.expectEqualStrings("tool_call", envelope.raw_name);
 }
 
 test "inactive collect evidence strategy is rejected by active contract" {
@@ -280,6 +314,29 @@ test "persistent promotion only runs under memory contract" {
     try std.testing.expectEqual(State.accepted, accepted.state);
     try std.testing.expectEqualStrings("promote_context", accepted.raw_name);
     try std.testing.expectEqualStrings("skills", accepted.call.?.target.?);
+}
+
+test "persistent search only runs under memory contract" {
+    const initial = contracts.activeContract(.collect_evidence) orelse return error.MissingContract;
+    const output =
+        \\<tool_call>
+        \\<function=search_persistent_context>
+        \\<parameter=target>both</parameter>
+        \\<parameter=terms>local protocol preference</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    var rejected = (try parseFirst(std.testing.allocator, output, initial)) orelse return error.NoToolCall;
+    defer rejected.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.rejected, rejected.state);
+    try std.testing.expectEqual(RejectionReason.tool_not_advertised, rejected.rejection_reason.?);
+
+    const memory = contracts.activeContract(.memory) orelse return error.MissingContract;
+    var accepted = (try parseFirst(std.testing.allocator, output, memory)) orelse return error.NoToolCall;
+    defer accepted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.accepted, accepted.state);
+    try std.testing.expectEqualStrings("search_persistent_context", accepted.raw_name);
+    try std.testing.expectEqualStrings("local protocol preference", accepted.call.?.terms.?);
 }
 
 test "envelope audit records contract source parser name and state" {

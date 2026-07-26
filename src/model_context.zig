@@ -1,10 +1,9 @@
 const std = @import("std");
 const collect_evidence = @import("collect_evidence.zig");
+const system_prompt = @import("system_prompt.zig");
+const temporal = @import("temporal.zig");
 
-pub const system_prompt_v1 =
-    "You are Phenom, a code agent. Use only provided contracts/evidence. " ++
-    "Vague source-code task: infer intent, gather/compare evidence, refine gaps, answer with limits. " ++
-    "Do not invent MEMORY or SKILLS.";
+pub const default_system_prompt = system_prompt.default_system_prompt;
 
 pub const EvidenceBlock = struct {
     text: []const u8,
@@ -36,12 +35,12 @@ pub const NextActionKind = enum {
 pub const NextAction = struct {
     kind: NextActionKind,
     text: []const u8,
-    required_tool_calls: u8 = 0,
 };
 
 pub const ContextByteBuckets = struct {
-    system: usize = system_prompt_v1.len,
+    system: usize = default_system_prompt.len,
     header: usize = 0,
+    temporal: usize = 0,
     contracts: usize = 0,
     skills: usize = 0,
     memory: usize = 0,
@@ -74,8 +73,8 @@ pub const ModelTurnContext = struct {
     next_action: []const u8 = "",
 };
 
-pub fn renderSystemPrompt(allocator: std.mem.Allocator) ![]u8 {
-    return allocator.dupe(u8, system_prompt_v1);
+pub fn renderSystemPrompt(allocator: std.mem.Allocator, override: ?[]const u8) ![]u8 {
+    return allocator.dupe(u8, override orelse default_system_prompt);
 }
 
 pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContext) ![]u8 {
@@ -86,6 +85,7 @@ pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContex
     try appendLine(&out, allocator, "task", ctx.task);
     try appendLine(&out, allocator, "mode", ctx.mode);
     try appendLine(&out, allocator, "budget", ctx.budget);
+    try appendTemporalContext(&out, allocator);
 
     if (ctx.contracts.len > 0) {
         try out.appendSlice(allocator, "\n[CONTRACTS]\n");
@@ -170,7 +170,7 @@ pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContex
 
     if (ctx.next_action_v1) |action| {
         try out.appendSlice(allocator, "\n[NEXT_ACTION]\n");
-        const line = try std.fmt.allocPrint(allocator, "kind={s} required_tool_calls={} action={s}\n", .{ @tagName(action.kind), action.required_tool_calls, action.text });
+        const line = try std.fmt.allocPrint(allocator, "kind={s} action={s}\n", .{ @tagName(action.kind), action.text });
         defer allocator.free(line);
         try out.appendSlice(allocator, line);
     } else if (ctx.next_action.len > 0) {
@@ -187,6 +187,7 @@ pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContex
 
 pub fn measureRenderedContextBytes(rendered: []const u8) ContextByteBuckets {
     const markers = [_][]const u8{
+        "\n[TEMPORAL_CONTEXT]\n",
         "\n[CONTRACTS]\n",
         "\n[SKILLS]\n",
         "\n[MEMORY]\n",
@@ -201,6 +202,7 @@ pub fn measureRenderedContextBytes(rendered: []const u8) ContextByteBuckets {
     };
     var buckets = ContextByteBuckets{ .total_context = rendered.len };
     buckets.header = firstBlockStart(rendered, markers[0..]);
+    buckets.temporal = sectionLen(rendered, "\n[TEMPORAL_CONTEXT]\n", markers[0..]);
     buckets.contracts = sectionLen(rendered, "\n[CONTRACTS]\n", markers[0..]);
     buckets.skills = sectionLen(rendered, "\n[SKILLS]\n", markers[0..]);
     buckets.memory = sectionLen(rendered, "\n[MEMORY]\n", markers[0..]);
@@ -213,6 +215,15 @@ pub fn measureRenderedContextBytes(rendered: []const u8) ContextByteBuckets {
     buckets.grounding = sectionLen(rendered, "\n[GROUNDING]\n", markers[0..]);
     buckets.next_action = sectionLen(rendered, "\n[NEXT_ACTION]\n", markers[0..]);
     return buckets;
+}
+
+fn appendTemporalContext(out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    var date_buf: [16]u8 = undefined;
+    const current_date = temporal.currentUtcDateText(&date_buf);
+    try out.appendSlice(allocator, "\n[TEMPORAL_CONTEXT]\n");
+    try out.appendSlice(allocator, "current_date=");
+    try out.appendSlice(allocator, current_date);
+    try out.appendSlice(allocator, "\ntimezone=UTC\nknowledge_cutoff=unknown\nfreshness_rule=model_decides\n");
 }
 
 pub fn assertNoRawContextLeak(rendered: []const u8) !void {
@@ -275,13 +286,13 @@ fn appendEvidenceText(out: *std.ArrayList(u8), allocator: std.mem.Allocator, tex
 }
 
 test "system prompt stays compact and stable" {
-    const prompt = try renderSystemPrompt(std.testing.allocator);
+    const prompt = try renderSystemPrompt(std.testing.allocator, null);
     defer std.testing.allocator.free(prompt);
 
-    try std.testing.expect(prompt.len < 240);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "infer intent") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "refine gaps") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not invent MEMORY or SKILLS") != null);
+    try std.testing.expect(prompt.len < 1200);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "The model decides when contracts/tools are needed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Answer directly for social turns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not invent MEMORY/SKILLS") != null);
 }
 
 test "model context omits absent memory skills and evidence blocks" {
@@ -292,6 +303,9 @@ test "model context omits absent memory skills and evidence blocks" {
     defer std.testing.allocator.free(rendered);
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[TURN_CONTEXT v1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[TEMPORAL_CONTEXT]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "knowledge_cutoff=unknown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "freshness_rule=model_decides") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[CONTRACTS]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
@@ -328,19 +342,19 @@ test "model context renders typed next action and byte buckets" {
         .evidence = &evidence_blocks,
         .next_action_v1 = .{
             .kind = .collect_context,
-            .required_tool_calls = 1,
-            .text = "emit one collect_evidence call before prose",
+            .text = "emit collect_evidence if more context is needed",
         },
     });
     defer std.testing.allocator.free(rendered);
 
     const buckets = measureRenderedContextBytes(rendered);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "kind=collect_context required_tool_calls=1") != null);
-    try std.testing.expect(buckets.system == system_prompt_v1.len);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "kind=collect_context action=emit collect_evidence if more context is needed") != null);
+    try std.testing.expect(buckets.system == default_system_prompt.len);
+    try std.testing.expect(buckets.temporal > 0);
     try std.testing.expect(buckets.contracts > 0);
     try std.testing.expect(buckets.evidence > 0);
     try std.testing.expect(buckets.next_action > 0);
-    try std.testing.expectEqual(rendered.len, buckets.header + buckets.contracts + buckets.evidence + buckets.next_action);
+    try std.testing.expectEqual(rendered.len, buckets.header + buckets.temporal + buckets.contracts + buckets.evidence + buckets.next_action);
 }
 
 test "model context renders candidates outside evidence" {
@@ -443,4 +457,24 @@ test "model context accepts collect evidence output without raw tail" {
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "alpha") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "SECRET_RAW_TAIL") == null);
+}
+
+test "system prompt delegates evidence decisions to model contracts" {
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "The model decides when contracts/tools are needed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "controller only executes accepted calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "TEMPORAL_CONTEXT signals freshness") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Ungrounded facts require search_web/rag_web") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Named/obscure entities") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "stable excludes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Similar/adjacent/partial matches") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "MEMORY=verified project/workdir facts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "SKILLS=user-confirmed durable rules/preferences/operational constraints") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "before a relevant memory lookup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "promote a concise interpreted SKILLS rule") != null);
+}
+
+test "system prompt can be rendered from override template text" {
+    const prompt = try renderSystemPrompt(std.testing.allocator, "custom system prompt");
+    defer std.testing.allocator.free(prompt);
+    try std.testing.expectEqualStrings("custom system prompt", prompt);
 }

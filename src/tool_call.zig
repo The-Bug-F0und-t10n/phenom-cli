@@ -11,6 +11,7 @@ pub const ToolCall = struct {
     terms: ?[]const u8 = null,
     target_files: ?[]const u8 = null,
     scope_root: ?[]const u8 = null,
+    source: ?contracts.SourceName = null,
     stage: ?[]const u8 = null,
     selected_candidate: ?[]const u8 = null,
     selected_candidates: ?[]const u8 = null,
@@ -25,6 +26,10 @@ pub const ToolCall = struct {
     content: ?[]const u8 = null,
     target: ?[]const u8 = null,
     text: ?[]const u8 = null,
+    contract: ?contracts.ContractName = null,
+    budget_bytes: ?usize = null,
+    http_search: ?bool = null,
+    strategy_id: ?[]const u8 = null,
     strategy: ?contracts.StrategyName = null,
     start_line: usize = 1,
     max_lines: usize = 12,
@@ -60,6 +65,7 @@ pub const ToolCall = struct {
         if (self.content) |content| allocator.free(content);
         if (self.target) |target| allocator.free(target);
         if (self.text) |text| allocator.free(text);
+        if (self.strategy_id) |strategy_id| allocator.free(strategy_id);
         if (self.reason) |reason| allocator.free(reason);
     }
 };
@@ -79,9 +85,10 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
     const scope = normalizeOptionalText(parseParameter(body, "scope"));
     const intent = normalizeOptionalText(parseParameter(body, "intent"));
     const need = normalizeOptionalText(parseParameter(body, "need"));
-    const terms = normalizeOptionalText(parseParameter(body, "terms"));
+    const terms = normalizeOptionalText(parseParameter(body, "terms") orelse parseParameter(body, "query"));
     const target_files = normalizeOptionalText(parseParameter(body, "targetFiles") orelse parseParameter(body, "target_files"));
     const scope_root = normalizeOptionalText(parseParameter(body, "scopeRoot") orelse parseParameter(body, "scope_root"));
+    const source = try parseSourceParameter(body);
     const stage = normalizeOptionalText(parseParameter(body, "stage"));
     const selected_candidate = normalizeOptionalText(parseParameter(body, "selectedCandidate") orelse parseParameter(body, "selected_candidate"));
     const selected_candidates = normalizeOptionalText(parseParameter(body, "selectedCandidates") orelse parseParameter(body, "selected_candidates"));
@@ -97,9 +104,11 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
     errdefer freeParamList(allocator, replaces);
     const destination_path = normalizeOptionalPath(parseParameter(body, "destinationPath") orelse parseParameter(body, "destination_path") orelse parseParameter(body, "destPath") orelse parseParameter(body, "dest"));
     const content = normalizeOptionalContent(parseParameter(body, "content"));
-    const target = normalizeOptionalText(parseParameter(body, "target"));
+    const target = normalizeOptionalText(parseParameter(body, "target") orelse parseParameter(body, "url"));
     const text = normalizeOptionalText(parseParameter(body, "text"));
+    const contract = try parseContractParameter(body);
     const reason = normalizeOptionalText(parseParameter(body, "reason"));
+    const strategy_id = normalizeOptionalText(parseParameter(body, "strategyId") orelse parseParameter(body, "strategy_id"));
     const strategy = try parseStrategyParameter(body);
 
     return .{
@@ -112,6 +121,7 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
         .terms = if (terms) |value| try allocator.dupe(u8, value) else null,
         .target_files = if (target_files) |value| try allocator.dupe(u8, value) else null,
         .scope_root = if (scope_root) |value| try allocator.dupe(u8, value) else null,
+        .source = source,
         .stage = if (stage) |value| try allocator.dupe(u8, value) else null,
         .selected_candidate = if (selected_candidate) |value| try allocator.dupe(u8, value) else null,
         .selected_candidates = if (selected_candidates) |value| try allocator.dupe(u8, value) else null,
@@ -126,6 +136,10 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
         .content = if (content) |value| try allocator.dupe(u8, value) else null,
         .target = if (target) |value| try allocator.dupe(u8, value) else null,
         .text = if (text) |value| try allocator.dupe(u8, value) else null,
+        .contract = contract,
+        .budget_bytes = parseIntParameter(body, "budget_bytes") orelse parseIntParameter(body, "max_bytes"),
+        .http_search = parseBoolParameter(body, "httpSearch") orelse parseBoolParameter(body, "http_search"),
+        .strategy_id = if (strategy_id) |value| try allocator.dupe(u8, value) else null,
         .strategy = strategy,
         .start_line = parseIntParameter(body, "start_line") orelse 1,
         .max_lines = parseIntParameter(body, "max_lines") orelse 12,
@@ -233,10 +247,40 @@ fn parseStrategyParameter(body: []const u8) !?contracts.StrategyName {
     if (std.mem.eql(u8, value, "diagnostic")) return .diagnostic;
     if (std.mem.eql(u8, value, "runtime")) return .runtime;
     if (std.mem.eql(u8, value, "diff")) return .diff;
+    if (std.mem.eql(u8, value, "history")) return .history;
+    if (std.mem.eql(u8, value, "show")) return .show;
+    if (std.mem.eql(u8, value, "reflog")) return .reflog;
+    if (std.mem.eql(u8, value, "unreachable")) return .@"unreachable";
     if (std.mem.eql(u8, value, "semantic")) return .semantic;
     if (std.mem.eql(u8, value, "news_table")) return .news_table;
     if (std.mem.eql(u8, value, "document_summary")) return .document_summary;
     return error.InvalidStrategy;
+}
+
+fn parseContractParameter(body: []const u8) !?contracts.ContractName {
+    const value = parseParameter(body, "contract") orelse return null;
+    if (std.ascii.eqlIgnoreCase(value, "answer_only")) return .answer_only;
+    if (std.ascii.eqlIgnoreCase(value, "collect_evidence")) return .collect_evidence;
+    if (std.ascii.eqlIgnoreCase(value, "mutate_file")) return .mutate_file;
+    if (std.ascii.eqlIgnoreCase(value, "validate_work")) return .validate_work;
+    if (std.ascii.eqlIgnoreCase(value, "inspect_runtime")) return .inspect_runtime;
+    if (std.ascii.eqlIgnoreCase(value, "search_web")) return .search_web;
+    if (std.ascii.eqlIgnoreCase(value, "rag_web")) return .search_web;
+    if (std.ascii.eqlIgnoreCase(value, "ragweb")) return .search_web;
+    if (std.ascii.eqlIgnoreCase(value, "memory")) return .memory;
+    return error.InvalidContract;
+}
+
+fn parseSourceParameter(body: []const u8) !?contracts.SourceName {
+    const value = parseParameter(body, "source") orelse return null;
+    if (std.mem.eql(u8, value, "auto")) return .auto;
+    if (std.mem.eql(u8, value, "file")) return .file;
+    if (std.mem.eql(u8, value, "code")) return .code;
+    if (std.mem.eql(u8, value, "git")) return .git;
+    if (std.mem.eql(u8, value, "web")) return .web;
+    if (std.mem.eql(u8, value, "diagnostic")) return .diagnostic;
+    if (std.mem.eql(u8, value, "rag")) return .rag;
+    return error.InvalidSource;
 }
 
 test "parses qwopus xml tool call" {
@@ -432,6 +476,45 @@ test "collect evidence parses v2 search fields and plural selected candidates" {
     try std.testing.expectEqualStrings("C2,C3", call.selected_candidates.?);
 }
 
+test "collect evidence parses model-selected source and git strategy" {
+    const output =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=source>git</parameter>
+        \\<parameter=strategy>reflog</parameter>
+        \\<parameter=intent>recover deleted commit touching collect_evidence</parameter>
+        \\<parameter=terms>collect_evidence web_distillation</parameter>
+        \\<parameter=budget_bytes>12000</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("collect_evidence", call.name);
+    try std.testing.expectEqual(contracts.SourceName.git, call.source.?);
+    try std.testing.expectEqual(contracts.StrategyName.reflog, call.strategy.?);
+    try std.testing.expectEqualStrings("recover deleted commit touching collect_evidence", call.intent.?);
+    try std.testing.expectEqualStrings("collect_evidence web_distillation", call.terms.?);
+    try std.testing.expectEqual(@as(usize, 12000), call.budget_bytes.?);
+}
+
+test "collect evidence parses descriptive strategy id" {
+    const output =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=strategyId>collect_micro_context_for_simple_analysis</parameter>
+        \\<parameter=intent>simple analysis</parameter>
+        \\<parameter=terms>strategy registry</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("collect_evidence", call.name);
+    try std.testing.expectEqualStrings("collect_micro_context_for_simple_analysis", call.strategy_id.?);
+    try std.testing.expect(call.strategy == null);
+}
+
 test "apply patch parses context id search and replace" {
     const output =
         \\<tool_call>
@@ -491,6 +574,9 @@ test "parses set operational contract fields and owns reason" {
         \\<parameter=requiresRuntimeValidation>false</parameter>
         \\<parameter=requiresBrowserDiagnostics>false</parameter>
         \\<parameter=requiresMemoryPromotion>true</parameter>
+        \\<parameter=contract>rag_web</parameter>
+        \\<parameter=strategyId>search_web_distilled</parameter>
+        \\<parameter=query>horario de brasilia agora</parameter>
         \\<parameter=reason>Need focused evidence before a patch.</parameter>
         \\</function>
         \\</tool_call>
@@ -505,6 +591,9 @@ test "parses set operational contract fields and owns reason" {
     try std.testing.expectEqual(false, call.requires_runtime_validation.?);
     try std.testing.expectEqual(false, call.requires_browser_diagnostics.?);
     try std.testing.expectEqual(true, call.requires_memory_promotion.?);
+    try std.testing.expectEqual(contracts.ContractName.search_web, call.contract.?);
+    try std.testing.expectEqualStrings("search_web_distilled", call.strategy_id.?);
+    try std.testing.expectEqualStrings("horario de brasilia agora", call.terms.?);
     try std.testing.expectEqualStrings("Need focused evidence before a patch.", call.reason.?);
 }
 
@@ -522,4 +611,42 @@ test "promote context parses target and text" {
     try std.testing.expectEqualStrings("promote_context", call.name);
     try std.testing.expectEqualStrings("skills", call.target.?);
     try std.testing.expectEqualStrings("Prefer concise final answers.", call.text.?);
+}
+
+test "web search parses url alias and byte budget" {
+    const output =
+        \\<tool_call>
+        \\<function=web_search>
+        \\<parameter=url>http://127.0.0.1:8080/page.html</parameter>
+        \\<parameter=query>phenom rag web</parameter>
+        \\<parameter=max_bytes>4096</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("web_search", call.name);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/page.html", call.target.?);
+    try std.testing.expectEqualStrings("phenom rag web", call.terms.?);
+    try std.testing.expectEqual(@as(?usize, 4096), call.budget_bytes);
+}
+
+test "collect evidence parses explicit http search toggle" {
+    const output =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=httpSearch>true</parameter>
+        \\<parameter=target>http://127.0.0.1:8080/page.html</parameter>
+        \\<parameter=query>horario de brasilia</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("collect_evidence", call.name);
+    try std.testing.expectEqual(true, call.http_search.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/page.html", call.target.?);
+    try std.testing.expectEqualStrings("horario de brasilia", call.terms.?);
 }

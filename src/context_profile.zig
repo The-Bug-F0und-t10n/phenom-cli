@@ -92,13 +92,20 @@ pub fn codeEvidenceSchema() []const u8 {
 pub fn initialRouterSchema() []const u8 {
     return
     \\[TOOLS v1]
-    \\set_operational_contract(requiresInspection, requiresMutation, requiresRuntimeValidation, requiresBrowserDiagnostics, requiresMemoryPromotion?, reason?)
+    \\set_operational_contract(contract=answer_only|collect_evidence|mutate_file|validate_work|inspect_runtime|search_web|rag_web|memory, strategyId?, query?, intent?, terms?, target?, budget_bytes?, requiresInspection?, requiresMutation?, requiresRuntimeValidation?, requiresBrowserDiagnostics?, requiresMemoryPromotion?, reason?)
     \\search_session(intent?, terms, scope=current|all, session?)
-    \\Initial router. Direct final answer is valid when the request does not need local workspace state, prior-session facts, mutation, validation, runtime diagnostics, or memory promotion.
-    \\For local workspace/source-code claims, call set_operational_contract with requiresInspection=true before answering. For edits use requiresMutation=true. For validation use requiresRuntimeValidation=true. For runtime/browser diagnostics use requiresBrowserDiagnostics=true. For persistent memory/skill promotion use requiresMemoryPromotion=true.
-    \\Do not call collect_evidence in this initial router state; the controller exposes it only after an inspection/mutation/validation contract is selected.
-    \\search_session: first decide intent, then terms=concrete keys from SESSION_FOCUS/reasoning. Prior-session claims require directly supporting S#. Retrieved S# is not confirmed truth; judge whether it directly answers, contradicts, or is irrelevant before citing it. Do not pass generic user words unless they are the remembered content.
-    \\<tool_call><function=set_operational_contract><parameter=requiresInspection>true</parameter><parameter=requiresMutation>false</parameter><parameter=requiresRuntimeValidation>false</parameter><parameter=requiresBrowserDiagnostics>false</parameter><parameter=requiresMemoryPromotion>false</parameter><parameter=reason>short reason</parameter></function></tool_call>
+    \\Initial router. The model chooses either a direct final answer or one contract declaration. The controller does not infer missing external/workspace intent for you.
+    \\Decision: answer_only when enough. collect_evidence for workspace/project/source-code claims. memory for durable local lookup/promotion, including user-confirmed future-turn rules/preferences/operational constraints. search_web/rag_web for external grounding, current facts, requested sources/citations, named real-world entities/facts, obscure names/handles/entities, public-record/existence claims, or facts not grounded in dialogue, persistent context, session context, E#, or stable knowledge. Other contracts: search_session prior recovery; mutate_file edits; validate_work validation; inspect_runtime diagnostics.
+    \\Local persisted claims need memory before unknown/absent.
+    \\search_web/rag_web query must be narrow and match the user's external evidence intent; the controller activates the contract and executes web_search from that declared query. Omitted target uses the built-in search provider or configured web_search_url/PHENOM_WEB_SEARCH_URL. Only include target for user-supplied HTTP/HTTPS URL or URL already in E#.
+    \\For named entity/fact lookup, query must include the exact requested entity/fact. Refined queries must not add guessed roles, categories, locations, nationality, platform, biography, or accusations unless present in USER_TASK or E#. Similar names, adjacent topics, partial matches, and probably-the-same matches are not evidence.
+    \\Router state: declare contracts before executors. Short social turns answer directly.
+    \\search_session: terms=concrete keys from SESSION_FOCUS/reasoning. Prior-session claims require directly supporting S#. Retrieved S# is not confirmed truth; judge direct support before citing. Do not pass generic user words unless remembered content.
+    \\If you cannot identify the requested name/entity from grounded context, do not answer no-records/fictitious/similar; emit search_web:
+    \\<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>exact requested name or entity</parameter></function></tool_call>
+    \\<tool_call><function=set_operational_contract><parameter=contract>memory</parameter><parameter=requiresMemoryPromotion>true</parameter><parameter=reason>persist user-confirmed durable rule or preference</parameter></function></tool_call>
+    \\<tool_call><function=set_operational_contract><parameter=contract>memory</parameter><parameter=query>local project rule preference protocol or durable fact</parameter></function></tool_call>
+    \\<tool_call><function=set_operational_contract><parameter=contract>collect_evidence</parameter><parameter=reason>inspect workspace</parameter></function></tool_call>
     \\<tool_call><function=search_session><parameter=intent>recover prior decision</parameter><parameter=terms>TopicName EntityName DecisionKey</parameter><parameter=scope>current</parameter></function></tool_call>
     ;
 }
@@ -106,10 +113,13 @@ pub fn initialRouterSchema() []const u8 {
 pub fn activeContractSchema() []const u8 {
     return
     \\[TOOLS v1]
-    \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol|diagnostic, stage=overview|minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
+    \\collect_evidence(strategyId?, source=auto|file|code|git|web|diagnostic|rag?, intent?, need?, path?, target?, httpSearch=true|false?, query?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol|diagnostic|diff|history|show|reflog|unreachable, stage=overview|minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
+    \\web_search(target?=http://host/path, query, budget_bytes?)
     \\search_session(intent?, terms, scope=current|all, session?)
-    \\Contract active. Do not call set_operational_contract again. Pathless collect_evidence needs intent+terms unless stage=overview. Broad map -> stage=overview strategy=auto no terms. Symbol identity -> stage=candidates then stage=expand selectedCandidate. Do not use auto overview for identity questions.
+    \\Contract active. set_operational_contract is allowed only for an explicit model-selected switch to a different contract after tool evidence changes the strategy; do not repeat the same contract. strategyId names a registered strategy descriptor; examples: collect_micro_context_for_simple_analysis, collect_symbol_candidates, collect_git_reflog, collect_web_evidence_distilled. Web retrieval runs only from a model-declared contract/query or a model web_search call. web_search accepts target=http://... plus query; if target is omitted, the controller uses the built-in search provider, or configured web_search_url/PHENOM_WEB_SEARCH_URL override, with the model-selected query. query must express the user's external evidence intent, not generic prompt text. collect_evidence uses web only with strategyId=collect_web_evidence_distilled or httpSearch=true and target=http://... plus query/intent/terms; missing or false httpSearch means no rag_web. Web results are distilled to small WEB_EVIDENCE before context insertion. source selects the internal collector family without exposing internal tools. Use strategyId=collect_git_reflog or source=git strategy=reflog for repository history evidence. Pathless workspace collect_evidence needs intent+terms unless source=git or stage=overview. Broad map -> stage=overview strategy=auto no terms. Symbol identity -> stage=candidates then stage=expand selectedCandidate. Do not use auto overview for identity questions.
+    \\<tool_call><function=collect_evidence><parameter=strategyId>collect_micro_context_for_simple_analysis</parameter><parameter=intent>compare source definitions</parameter><parameter=terms>SymbolName FileName ErrorCode</parameter></function></tool_call>
     \\<tool_call><function=collect_evidence><parameter=intent>compare source definitions</parameter><parameter=strategy>symbol</parameter><parameter=stage>candidates</parameter><parameter=terms>SymbolName FileName ErrorCode</parameter></function></tool_call>
+    \\<tool_call><function=collect_evidence><parameter=strategyId>collect_git_reflog</parameter><parameter=intent>recover deleted commit touching component</parameter><parameter=terms>SymbolName FileName</parameter></function></tool_call>
     \\<tool_call><function=collect_evidence><parameter=stage>expand</parameter><parameter=selectedCandidate>C#</parameter><parameter=max_lines>32</parameter></function></tool_call>
     \\<tool_call><function=search_session><parameter=intent>recover prior decision</parameter><parameter=terms>TopicName EntityName DecisionKey</parameter><parameter=scope>current</parameter></function></tool_call>
     ;
@@ -122,6 +132,7 @@ pub fn activeContractSchemaFor(contract: contracts.ContractName) []const u8 {
         .mutate_file => mutateFileSchema(),
         .validate_work => validateWorkSchema(),
         .inspect_runtime => inspectRuntimeSchema(),
+        .search_web => searchWebSchema(),
         .memory => memorySchema(),
         else => activeContractSchema(),
     };
@@ -137,10 +148,11 @@ pub fn answerOnlySchema() []const u8 {
 pub fn mutateFileSchema() []const u8 {
     return
     \\[TOOLS v1]
-    \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol|diagnostic, stage=minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
+    \\collect_evidence(strategyId?, source=auto|file|code|git|diagnostic|rag?, intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol|diagnostic|diff|history|show|reflog|unreachable, stage=minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
     \\search_session(intent?, terms, scope=current|all, session?)
     \\apply_patch(operation=edit|create|delete|rename, path, destinationPath?, content?, contextId?, repeated search/replace?)
-    \\Mutation contract active. Use collect_evidence first when editing/deleting/renaming. edit accepts repeated contextId/search/replace hunks; every search must be exact and unique in the original file. create requires content and refuses overwrite. delete/rename require fresh contextId. The controller rejects missing or stale patch context.
+    \\set_operational_contract(contract=answer_only|collect_evidence|validate_work|inspect_runtime|search_web|memory, query?, reason?)
+    \\Mutation contract active. Use collect_evidence first when editing/deleting/renaming. Use strategy=diff to inspect existing Git changes. edit accepts repeated contextId/search/replace hunks; every search must be exact and unique in the original file. create requires content and refuses overwrite. delete/rename require fresh contextId. The controller rejects missing or stale patch context. Use set_operational_contract only for an explicit switch to a different contract.
     \\<tool_call><function=apply_patch><parameter=operation>edit</parameter><parameter=path>relative/path</parameter><parameter=contextId>ctx_...</parameter><parameter=search>exact old text</parameter><parameter=replace>exact new text</parameter></function></tool_call>
     ;
 }
@@ -148,9 +160,10 @@ pub fn mutateFileSchema() []const u8 {
 pub fn validateWorkSchema() []const u8 {
     return
     \\[TOOLS v1]
-    \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=diagnostic|path, start_line=1, max_lines=12)
+    \\collect_evidence(strategyId?, source=diagnostic|file?, intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=diagnostic|path, start_line=1, max_lines=12)
     \\validate_syntax(path)
-    \\Validation contract active. Only syntax validation is available in this Zig controller pass.
+    \\set_operational_contract(contract=answer_only|collect_evidence|mutate_file|inspect_runtime|search_web|memory, query?, reason?)
+    \\Validation contract active. Only syntax validation is available in this Zig controller pass. Use set_operational_contract only for an explicit switch to a different contract.
     \\<tool_call><function=validate_syntax><parameter=path>relative/path.zig</parameter></function></tool_call>
     ;
 }
@@ -158,20 +171,33 @@ pub fn validateWorkSchema() []const u8 {
 pub fn inspectRuntimeSchema() []const u8 {
     return
     \\[TOOLS v1]
-    \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=diagnostic|path, start_line=1, max_lines=12)
-    \\inspect_runtime(path?)
-    \\Runtime inspection contract active. This pass returns controller capability evidence only; browser/runtime execution is not opened unless implemented by the controller.
-    \\<tool_call><function=inspect_runtime><parameter=path>relative/path</parameter></function></tool_call>
+    \\collect_evidence(strategyId?, source=diagnostic|file|web?, intent?, need?, path?, target?, httpSearch=true|false?, query?, targetFiles?, scopeRoot?, terms?, strategy=diagnostic|path, start_line=1, max_lines=12)
+    \\web_search(target?=http://host/path, query, budget_bytes?)
+    \\inspect_runtime(target? http://host:port/path or path?)
+    \\set_operational_contract(contract=answer_only|collect_evidence|mutate_file|validate_work|search_web|memory, query?, reason?)
+    \\Runtime inspection contract active. inspect_runtime performs bounded HTTP GET for runtime status/body. web_search is model-called only, needs a query matching the user's external-evidence intent, and returns distilled WEB_EVIDENCE for answer grounding. If target is omitted, the built-in search provider is used; configured web_search_url/PHENOM_WEB_SEARCH_URL overrides it. collect_evidence URL fetch requires httpSearch=true. HTTPS/DOM/browser automation is not available in this pass. Use set_operational_contract only for an explicit switch to a different contract.
+    \\<tool_call><function=inspect_runtime><parameter=target>http://127.0.0.1:3000/health</parameter></function></tool_call>
+    ;
+}
+
+pub fn searchWebSchema() []const u8 {
+    return
+    \\[TOOLS v1]
+    \\web_search(strategyId=search_web_distilled?, target?=http://host/path, query, budget_bytes?)
+    \\set_operational_contract(contract=answer_only|collect_evidence|mutate_file|validate_work|inspect_runtime|memory, reason?)
+    \\search_web contract active. Web retrieval is model-called or contract-declared only. query must express the user's external evidence intent as a narrow search phrase. If the contract was declared with query, the controller may already execute this web_search before asking again. When verifying or identifying a named entity/fact, include the exact requested entity/fact in query so the source can confirm or refute it. Refined queries must not add guessed roles, categories, locations, nationality, platform, biography, or accusations unless those details are in USER_TASK or current E# evidence. Similar names, adjacent topics, partial matches, and "probably the same" are not evidence. If target is omitted, the built-in search provider is used; configured web_search_url/PHENOM_WEB_SEARCH_URL overrides it. Only include target when the user supplied an explicit HTTP/HTTPS URL or the current E# evidence already contains one. Return distilled WEB_EVIDENCE, not raw page text. Do not ask permission for another search while search_web is active; emit a non-duplicated grounded web_search or answer that evidence is insufficient. Use set_operational_contract only to switch to a different contract after web evidence changes the operational strategy.
+    \\<tool_call><function=web_search><parameter=strategyId>search_web_distilled</parameter><parameter=query>specific user intent</parameter></function></tool_call>
     ;
 }
 
 pub fn memorySchema() []const u8 {
     return
     \\[TOOLS v1]
-    \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol|diagnostic, start_line=1, max_lines=12)
-    \\search_session(intent?, terms, scope=current|all, session?)
+    \\search_persistent_context(target=memory|skills|both, terms, intent?, budget_bytes?)
     \\promote_context(target=memory|skills, text)
-    \\Memory contract active. Promote only explicit user-confirmed preferences, rules, or verified practical facts. Never promote raw tool output, E#/S# blocks, logs, patches, or unverified model guesses.
+    \\set_operational_contract(contract=answer_only|collect_evidence|mutate_file|validate_work|inspect_runtime|search_web, query?, reason?)
+    \\Memory contract active. Search MEMORY/SKILLS by model-selected terms before applying existing local durable facts/rules. Retrieved SKILLS are active response rules when relevant. If the user asks for a local rule/preference/protocol, answer only from directly retrieved MEMORY/SKILLS entries; do not add adjacent advice, generic best practices, or inferred extras. Promote explicit user-confirmed future-turn rules/preferences/operational constraints to skills as one concise interpreted imperative. Promote verified reusable project/workdir facts to memory. Never promote raw tool output, E#/S# blocks, logs, patches, unverified model guesses, or one-off task instructions. If the user wording is not durable enough to persist, ask/answer without promotion. Use set_operational_contract only for an explicit switch to a different contract.
+    \\<tool_call><function=search_persistent_context><parameter=target>both</parameter><parameter=terms>specific local rule preference protocol fact</parameter></function></tool_call>
     \\<tool_call><function=promote_context><parameter=target>skills</parameter><parameter=text>Prefer concise final answers.</parameter></function></tool_call>
     ;
 }
@@ -230,7 +256,15 @@ test "schemas are state scoped" {
     try std.testing.expect(std.mem.indexOf(u8, evidence, "collect_evidence(") == null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "set_operational_contract") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "Initial router") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "requiresInspection=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "collect_evidence for workspace/project/source-code claims") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "not grounded in dialogue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "persistent context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "Local persisted claims need memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "named real-world entities/facts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "stable knowledge") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "The model chooses either a direct final answer or one contract declaration") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "The controller does not infer missing external/workspace intent for you") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "controller activates the contract and executes web_search from that declared query") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "generic user words") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "directly supporting S#") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "Retrieved S# is not confirmed truth") != null);
@@ -252,6 +286,14 @@ test "schemas are state scoped" {
     try std.testing.expect(std.mem.indexOf(u8, expand, "selectedCandidate>C1") == null);
     try std.testing.expect(std.mem.indexOf(u8, expand, "search_session") == null);
     try std.testing.expect(std.mem.indexOf(u8, expand, "strategy=auto") == null);
+
+    const memory = memorySchema();
+    try std.testing.expect(std.mem.indexOf(u8, memory, "Retrieved SKILLS are active response rules") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "answer only from directly retrieved MEMORY/SKILLS entries") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "generic best practices") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "future-turn rules/preferences/operational constraints") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "one concise interpreted imperative") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "one-off task instructions") != null);
 }
 
 test "contract schemas expose executor families only after contract selection" {
@@ -276,5 +318,21 @@ test "contract schemas expose executor families only after contract selection" {
     const memory = activeContractSchemaFor(.memory);
     try std.testing.expect(std.mem.indexOf(u8, memory, "promote_context") != null);
     try std.testing.expect(std.mem.indexOf(u8, memory, "Never promote raw tool output") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "<parameter=target>skills</parameter>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "interpreted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "inferred extras") != null);
     try std.testing.expect(std.mem.indexOf(u8, memory, "apply_patch") == null);
+
+    const web = activeContractSchemaFor(.search_web);
+    try std.testing.expect(std.mem.indexOf(u8, web, "web_search") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web, "PHENOM_WEB_SEARCH_URL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web, "Only include target when the user supplied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web, "contract was declared with query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web, "exact requested entity/fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web, "must not add guessed roles") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web, "Do not ask permission for another search") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web, "Similar names") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web, "not evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web, "127.0.0.1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, web, "<parameter=query>specific user intent</parameter>") != null);
 }

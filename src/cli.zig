@@ -34,6 +34,8 @@ pub const Config = struct {
     no_color: bool = false,
     offline: bool = false,
     fail_on_model_error: bool = false,
+    web_search_url: ?[]const u8 = null,
+    system_prompt: ?[]const u8 = null,
     expect_contains: ?[]const u8 = null,
     expect_contains_all: [8]?[]const u8 = [_]?[]const u8{null} ** 8,
     expect_contains_count: usize = 0,
@@ -148,7 +150,7 @@ pub fn printUsage(writer: anytype) !void {
         \\
         \\options:
         \\  --no-color
-        \\  --max-tokens N (compat no-op; generation limits belong to the model server)
+        \\  --max-tokens N (generation token limit sent to supported backends)
         \\  --thinking auto|on|off
         \\  --fail-on-model-error
         \\  --expect-contains TEXT
@@ -159,8 +161,8 @@ pub fn printUsage(writer: anytype) !void {
         \\  reads ./config.toml, then ~/.config/phenom/config.toml when local config is absent
         \\  flags override config values
         \\  keys: backend, host, port, server, model, thinking, max_tokens, no_color,
-        \\        offline, fail_on_model_error, expect_contains, show_expect_status,
-        \\        demo_read_file, session
+        \\        offline, fail_on_model_error, web_search_url, expect_contains,
+        \\        show_expect_status, demo_read_file, session
         \\
     );
 }

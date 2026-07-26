@@ -102,10 +102,11 @@ Smokes reais exigem backend ativo:
 
 ```sh
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build real-alignment-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
 ```
 
 ## Estado do projeto
 
 Phenom Zig e produto em desenvolvimento ativo. O nucleo de CLI/TUI, renderizacao, streaming, auditoria, recuperacao de sessao, contexto operacional, contratos e ferramentas principais ja existe. Familias adicionais de tools, integracoes externas e politicas mais amplas devem seguir as tasks e guardrails do repositorio antes de serem consideradas completas.
 
-Ao alterar codigo, use os documentos de `doc/`, `../TASKS.md`, `../alinhamento.md` e os testes como fonte de verdade operacional.
+Ao alterar codigo, use os documentos de `doc/`, `TASKS.md`, `alinhamento.md` e os testes como fonte de verdade operacional.

@@ -4,18 +4,25 @@ const contracts = @import("contracts.zig");
 const diagnostic_runner = @import("diagnostic_runner.zig");
 const evidence = @import("evidence.zig");
 const evidence_ranker = @import("evidence_ranker.zig");
+const git_evidence = @import("git_evidence.zig");
 const micro_context = @import("micro_context.zig");
+const strategy_registry = @import("strategy_registry.zig");
 const tool_event = @import("tool_event.zig");
 const tools = @import("tools.zig");
+const web_rag = @import("web_rag.zig");
 
 pub const Args = struct {
     path: ?[]const u8 = null,
+    target: ?[]const u8 = null,
+    http_search: bool = false,
     intent: ?[]const u8 = null,
     need: ?[]const u8 = null,
     terms: ?[]const u8 = null,
     target_files: ?[]const u8 = null,
     scope_root: ?[]const u8 = null,
     task: []const u8 = "",
+    source: contracts.SourceName = .auto,
+    strategy_id: ?[]const u8 = null,
     strategy: contracts.StrategyName = .auto,
     start_line: usize = 1,
     max_lines: usize = 12,
@@ -76,18 +83,96 @@ pub const CandidateResult = struct {
 
 pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: Args) !Result {
     if (args.budget_bytes == 0) return error.InvalidEvidenceBudget;
-    const strategy = contracts.resolveCollectEvidenceStrategy(args.strategy) orelse return error.InvalidStrategy;
-    if (strategy == .diagnostic) return executeDiagnostic(allocator, args);
-    if (args.path) |path| {
-        if (isWorkspaceRootPath(path)) {
-            var ranked_args = args;
-            ranked_args.path = null;
-            ranked_args.strategy = if (strategy == .path) .auto else strategy;
-            return executeRanked(allocator, io, ranked_args, ranked_args.strategy);
-        }
-    }
-    if (strategy == .path or args.path != null) return executePath(allocator, args, strategy);
-    return executeRanked(allocator, io, args, strategy);
+    const requested_strategy = contracts.resolveCollectEvidenceStrategy(args.strategy) orelse return error.InvalidStrategy;
+    const descriptor = try strategy_registry.resolveCollectEvidence(.{
+        .strategy_id = args.strategy_id,
+        .source = args.source,
+        .strategy = requested_strategy,
+        .path = args.path,
+        .target = args.target,
+        .http_search = args.http_search,
+    });
+    const strategy = if (args.strategy_id != null) descriptor.strategy else requested_strategy;
+    var resolved_args = args;
+    resolved_args.strategy = strategy;
+    return switch (descriptor.collector) {
+        .web => blk: {
+            const target = args.target orelse args.path orelse return error.InvalidWebTarget;
+            if (!web_rag.isHttpTarget(target)) return error.InvalidWebTarget;
+            if (!args.http_search) return error.HttpSearchNotRequested;
+            break :blk try executeWeb(allocator, io, target, args.terms orelse args.intent, args.budget_bytes);
+        },
+        .diagnostic => try executeDiagnostic(allocator, resolved_args),
+        .git => try executeGit(allocator, io, resolved_args),
+        .path => blk: {
+            if (args.path) |path| {
+                if (isWorkspaceRootPath(path)) {
+                    var ranked_args = resolved_args;
+                    ranked_args.path = null;
+                    ranked_args.strategy = if (strategy == .path) .auto else strategy;
+                    break :blk try executeRanked(allocator, io, ranked_args, ranked_args.strategy);
+                }
+            }
+            break :blk try executePath(allocator, resolved_args, strategy);
+        },
+        .ranked => try executeRanked(allocator, io, resolved_args, strategy),
+    };
+}
+
+fn executeWeb(allocator: std.mem.Allocator, io: std.Io, target: []const u8, query: ?[]const u8, budget_bytes: usize) !Result {
+    const result = try web_rag.fetch(allocator, io, target, query, budget_bytes);
+    defer result.deinit(allocator);
+    const context_id = try allocator.dupe(u8, result.context_id);
+    errdefer allocator.free(context_id);
+    const evidence_text = try allocator.dupe(u8, result.evidence_text);
+    errdefer allocator.free(evidence_text);
+    const micro_context_text = try allocator.dupe(u8, "");
+    errdefer allocator.free(micro_context_text);
+    const tool_event_audit_text = try allocator.dupe(u8, result.audit_text);
+    errdefer allocator.free(tool_event_audit_text);
+    return .{
+        .strategy = .document_summary,
+        .context_id = context_id,
+        .evidence_text = evidence_text,
+        .micro_context_text = micro_context_text,
+        .tool_event_audit_text = tool_event_audit_text,
+        .raw_bytes_read = result.raw_bytes_read,
+        .model_bytes = result.model_bytes,
+        .quality_score = result.quality_score,
+        .range_count = 1,
+    };
+}
+
+fn executeGit(allocator: std.mem.Allocator, io: std.Io, args: Args) !Result {
+    const result = try git_evidence.execute(allocator, io, .{
+        .path = args.path,
+        .intent = args.intent,
+        .terms = args.terms,
+        .target_files = args.target_files,
+        .scope_root = args.scope_root,
+        .strategy = args.strategy,
+        .budget_bytes = args.budget_bytes,
+    });
+    defer result.deinit(allocator);
+    const context_id = try allocator.dupe(u8, result.context_id);
+    errdefer allocator.free(context_id);
+    const evidence_text = try allocator.dupe(u8, result.evidence_text);
+    errdefer allocator.free(evidence_text);
+    const micro_context_text = try allocator.dupe(u8, "");
+    errdefer allocator.free(micro_context_text);
+    const tool_event_audit_text = try allocator.dupe(u8, result.tool_event_audit_text);
+    errdefer allocator.free(tool_event_audit_text);
+    return .{
+        .strategy = args.strategy,
+        .context_id = context_id,
+        .evidence_text = evidence_text,
+        .micro_context_text = micro_context_text,
+        .tool_event_audit_text = tool_event_audit_text,
+        .raw_bytes_read = result.raw_bytes_read,
+        .model_bytes = result.model_bytes,
+        .quality_score = result.quality_score,
+        .range_count = 1,
+    };
 }
 
 pub fn executeCandidates(allocator: std.mem.Allocator, io: std.Io, args: Args) !CandidateResult {
@@ -644,7 +729,7 @@ test "candidate line selection can use candidate path stem without language list
 }
 
 test "collect evidence rejects inactive strategies instead of falling back" {
-    const strategies = [_]contracts.StrategyName{ .semantic, .runtime, .diff };
+    const strategies = [_]contracts.StrategyName{ .semantic, .runtime };
     for (strategies) |strategy| {
         try std.testing.expectError(error.InvalidStrategy, execute(std.testing.allocator, std.testing.io, .{
             .task = "collect_evidence tool_event diff error",
@@ -652,6 +737,32 @@ test "collect evidence rejects inactive strategies instead of falling back" {
             .budget_bytes = 6000,
         }));
     }
+}
+
+test "collect evidence diff strategy returns git evidence without exposing git tool surface" {
+    const result = try execute(std.testing.allocator, std.testing.io, .{
+        .strategy = .diff,
+        .budget_bytes = 4096,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(contracts.StrategyName.diff, result.strategy);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "[GIT_STATUS]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "[GIT_DIFF]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "strategy=diff") != null);
+    try std.testing.expect(!contracts.isModelVisible("git_diff"));
+}
+
+test "collect evidence accepts descriptive strategy id" {
+    const result = try execute(std.testing.allocator, std.testing.io, .{
+        .strategy_id = "collect_git_history",
+        .budget_bytes = 4096,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(contracts.StrategyName.history, result.strategy);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "[GIT_HISTORY]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "source=git") != null);
 }
 
 test "collect evidence diagnostic strategy returns syntax evidence" {
@@ -755,5 +866,29 @@ test "collect evidence rejects zero budget" {
     try std.testing.expectError(error.InvalidEvidenceBudget, execute(std.testing.allocator, std.testing.io, .{
         .path = "README.md",
         .budget_bytes = 0,
+    }));
+}
+
+test "collect evidence target http uses web evidence executor before file lookup" {
+    const result = try execute(std.testing.allocator, std.testing.io, .{
+        .target = "http://",
+        .http_search = true,
+        .terms = "external evidence",
+        .budget_bytes = 2048,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(contracts.StrategyName.document_summary, result.strategy);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "[WEB_EVIDENCE]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_text, "target=http://") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "tool=web_search") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_event_audit_text, "InvalidRuntimeTarget") != null);
+}
+
+test "collect evidence target http requires explicit http search opt in" {
+    try std.testing.expectError(error.HttpSearchNotRequested, execute(std.testing.allocator, std.testing.io, .{
+        .target = "https://example.invalid/page",
+        .terms = "external evidence",
+        .budget_bytes = 2048,
     }));
 }

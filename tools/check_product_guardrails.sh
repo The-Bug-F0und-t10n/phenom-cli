@@ -24,6 +24,10 @@ run "$ZIG" test "$ROOT/src/model_context.zig" -lc -lsqlite3
 run "$ZIG" test "$ROOT/src/persistent_context.zig" -lc -lsqlite3
 run "$ZIG" test "$ROOT/src/apply_patch_tool.zig" -lc -lsqlite3
 run "$ZIG" test "$ROOT/src/collect_evidence.zig" -lc -lsqlite3
+run "$ZIG" test "$ROOT/src/audit.zig" -lc -lsqlite3
+run "$ZIG" test "$ROOT/src/http.zig" -lc
+run "$ZIG" test "$ROOT/src/render.zig"
+run "$ZIG" test "$ROOT/src/main.zig" -lc -lsqlite3
 run "$ZIG" test "$ROOT/src/product_guardrails.zig" -lc -lsqlite3
 
 printf 'guardrail: ok\n'

@@ -1,4 +1,6 @@
 const std = @import("std");
+const fd_writer = @import("fd_writer.zig");
+const render = @import("render.zig");
 
 const c = @cImport({
     @cInclude("time.h");
@@ -15,6 +17,7 @@ pub const EventType = enum {
     think_start,
     think_end,
     turn_done,
+    context_update,
     token_update,
     file_diff,
     inference_cancel,
@@ -56,6 +59,11 @@ pub const TurnDone = struct {
     elapsed_ms: ?u64 = null,
 };
 
+pub const ContextUpdate = struct {
+    used_tokens: usize,
+    limit_tokens: usize,
+};
+
 pub const Event = union(EventType) {
     user_message: []const u8,
     agent_message: []const u8,
@@ -67,6 +75,7 @@ pub const Event = union(EventType) {
     think_start: []const u8,
     think_end: void,
     turn_done: TurnDone,
+    context_update: ContextUpdate,
     token_update: TokenUpdate,
     file_diff: FileDiff,
     inference_cancel: []const u8,
@@ -157,9 +166,10 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
                 .inference_cancel => |reason| try self.renderer.status(reason),
                 .progress_update => |message| try self.renderer.status(message),
                 .token_update => {},
+                .context_update => {},
                 .clear_streaming => {},
                 .think_end => {
-                    try self.finish(null);
+                    try self.renderer.thinkingEnd();
                 },
                 .turn_done => |done| {
                     try self.finish(done.elapsed_ms);
@@ -182,6 +192,23 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
             self.turn_started_ms = 0;
         }
     };
+}
+
+fn formatTokenCount(buf: *[24]u8, value: usize) []const u8 {
+    if (value >= 1_000_000) {
+        const whole = value / 1_000_000;
+        const tenth = (value % 1_000_000) / 100_000;
+        if (tenth == 0) return std.fmt.bufPrint(buf, "{}m", .{whole}) catch "?";
+        return std.fmt.bufPrint(buf, "{}.{}m", .{ whole, tenth }) catch "?";
+    }
+    if (value >= 10_000) return std.fmt.bufPrint(buf, "{}k", .{value / 1000}) catch "?";
+    if (value >= 1000) {
+        const whole = value / 1000;
+        const tenth = (value % 1000) / 100;
+        if (tenth == 0) return std.fmt.bufPrint(buf, "{}k", .{whole}) catch "?";
+        return std.fmt.bufPrint(buf, "{}.{}k", .{ whole, tenth }) catch "?";
+    }
+    return std.fmt.bufPrint(buf, "{}", .{value}) catch "?";
 }
 
 pub fn elapsedMillisSince(start_ms: i64) u64 {
@@ -239,10 +266,25 @@ test "event bus dispatches events in registration order" {
     try std.testing.expectEqual(@as(usize, 12), state.value);
 }
 
-test "renderer sink maps chat events to transcript" {
-    const fd_writer = @import("fd_writer.zig");
-    const render = @import("render.zig");
+test "renderer sink keeps context usage out of final worked line" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
 
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = render.AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 80 });
+    var sink = RendererEventSink(@TypeOf(&renderer)){ .renderer = &renderer };
+
+    try sink.handle(.{ .user_message = "ola" });
+    try sink.handle(.{ .context_update = .{ .used_tokens = 737, .limit_tokens = 65_536 } });
+    try sink.handle(.{ .message_chunk = "ok" });
+    try sink.handle(.{ .turn_done = .{ .elapsed_ms = 5000 } });
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Worked for 5s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "ctx 1.1% 737/65k tok") == null);
+}
+
+test "renderer sink maps chat events to transcript" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
     const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
@@ -253,6 +295,7 @@ test "renderer sink maps chat events to transcript" {
     try sink.handle(.{ .think_start = "Thinking" });
     try sink.handle(.{ .message_chunk = "resposta" });
     try sink.handle(.{ .think_end = {} });
+    try sink.handle(.{ .turn_done = .{ .elapsed_ms = 0 } });
 
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "> [user] ola") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "resposta") != null);

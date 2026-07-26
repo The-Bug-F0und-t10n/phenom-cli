@@ -5,6 +5,24 @@ const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
+pub const ErrorClass = enum {
+    model_protocol,
+    tool_contract,
+    tool_runtime,
+    infrastructure,
+    insufficient_evidence,
+    validation_failed,
+};
+
+pub const OperationalPhase = enum {
+    intent,
+    contract,
+    evidence,
+    mutation,
+    validation,
+    final,
+};
+
 pub const AuditEvent = struct {
     kind: []u8,
     body: []u8,
@@ -144,6 +162,18 @@ pub const AuditDb = struct {
         if (c.sqlite3_bind_text(stmt, 3, z_body.ptr, @as(c_int, @intCast(body.len)), null) != c.SQLITE_OK) return error.SqliteBindFailed;
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteStepFailed;
+    }
+
+    pub fn recordTurnPhase(self: *AuditDb, session: []const u8, phase: OperationalPhase, reason: []const u8) !void {
+        const body = try std.fmt.allocPrint(self.allocator, "phase={s} reason={s}", .{ @tagName(phase), reason });
+        defer self.allocator.free(body);
+        try self.recordEvent(session, "turn_phase", body);
+    }
+
+    pub fn recordTurnError(self: *AuditDb, session: []const u8, class: ErrorClass, source: []const u8, detail: []const u8) !void {
+        const body = try std.fmt.allocPrint(self.allocator, "class={s} source={s} detail={s}", .{ @tagName(class), source, detail });
+        defer self.allocator.free(body);
+        try self.recordEvent(session, "turn_error", body);
     }
 
     fn ensureSessionFts(self: *AuditDb) !void {
@@ -430,7 +460,7 @@ pub const AuditDb = struct {
             \\  select id, kind, body, created_at
             \\  from events
             \\  where session = ?1
-            \\    and kind in ('turn_start', 'assistant_delta', 'tool_start', 'working_context_add', 'tool_duplicate', 'turn_done')
+            \\    and kind in ('turn_start', 'turn_checkpoint', 'assistant_delta', 'tool_start', 'working_context_add', 'tool_duplicate', 'turn_done')
             \\    and not (kind = 'tool_start' and body like 'search_session%')
             \\  order by id desc
             \\  limit ?2
@@ -620,7 +650,7 @@ pub const AuditDb = struct {
             \\where events_fts match ?1
             \\  and (?2 is null or e.session = ?2)
             \\  and e.body <> ?3
-            \\  and e.kind in ('turn_start', 'assistant_delta', 'tool_start', 'working_context_add', 'tool_duplicate', 'turn_done')
+            \\  and e.kind in ('turn_start', 'turn_checkpoint', 'assistant_delta', 'tool_start', 'working_context_add', 'tool_duplicate', 'turn_done')
             \\  and not (e.kind = 'tool_start' and e.body like 'search_session%')
             \\order by rank_score desc, e.id desc
             \\limit ?4
@@ -705,7 +735,7 @@ pub const AuditDb = struct {
             \\  and id >= start_id
             \\  and id < end_id
             \\  and body <> ?3
-            \\  and kind in ('turn_start', 'assistant_delta', 'tool_start', 'working_context_add', 'tool_duplicate', 'turn_done')
+            \\  and kind in ('turn_start', 'turn_checkpoint', 'assistant_delta', 'tool_start', 'working_context_add', 'tool_duplicate', 'turn_done')
             \\  and not (kind = 'tool_start' and body like 'search_session%')
             \\order by id asc
             \\limit ?4
@@ -763,6 +793,64 @@ pub fn freeSessionSearchHits(allocator: std.mem.Allocator, hits: *std.ArrayList(
 pub fn freeSessionFocus(allocator: std.mem.Allocator, rows: *std.ArrayList(SessionFocus)) void {
     for (rows.items) |*row| row.deinit(allocator);
     rows.deinit(allocator);
+}
+
+pub fn validPhaseTransition(from: ?OperationalPhase, to: OperationalPhase) bool {
+    const prev = from orelse return to == .intent or to == .contract or to == .evidence;
+    if (prev == to) return true;
+    return switch (prev) {
+        .intent => to == .contract or to == .evidence or to == .final,
+        .contract => to == .evidence or to == .mutation or to == .validation or to == .final,
+        .evidence => to == .evidence or to == .mutation or to == .validation or to == .final,
+        .mutation => to == .evidence or to == .validation or to == .final,
+        .validation => to == .evidence or to == .mutation or to == .final,
+        .final => false,
+    };
+}
+
+pub fn renderTurnReplay(allocator: std.mem.Allocator, events: []const AuditEvent) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "[TURN_REPLAY v1]\n");
+    for (events) |event| {
+        if (!isReplayEvent(event.kind)) continue;
+        const body = firstReplayLine(event.body);
+        const line = try std.fmt.allocPrint(allocator, "{s}\t{s}\n", .{ event.kind, body });
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn isReplayEvent(kind: []const u8) bool {
+    const replay_kinds = [_][]const u8{
+        "turn_start",
+        "turn_phase",
+        "model_backend",
+        "contract_selected",
+        "tool_envelope",
+        "tool_start",
+        "tool_event",
+        "tool_rejected",
+        "tool_error",
+        "turn_error",
+        "evidence",
+        "patch_result",
+        "validation",
+        "model_error",
+        "empty_visible_answer",
+        "assistant_delta",
+        "turn_done",
+    };
+    for (replay_kinds) |replay_kind| {
+        if (std.mem.eql(u8, kind, replay_kind)) return true;
+    }
+    return false;
+}
+
+fn firstReplayLine(text: []const u8) []const u8 {
+    const first = if (std.mem.indexOfScalar(u8, text, '\n')) |idx| text[0..idx] else text;
+    return first[0..@min(first.len, 512)];
 }
 
 fn bindText(stmt: ?*c.sqlite3_stmt, index: c_int, text: []const u8) !void {
@@ -865,6 +953,48 @@ test "session events load in insertion order" {
     try std.testing.expectEqualStrings("assistant_delta", recent.items[0].kind);
     try std.testing.expectEqualStrings("ok", recent.items[0].body);
     try std.testing.expectEqualStrings("turn_done", recent.items[1].kind);
+}
+
+test "turn phase transition validator permits operational loop and rejects final rewind" {
+    try std.testing.expect(validPhaseTransition(null, .intent));
+    try std.testing.expect(validPhaseTransition(.intent, .contract));
+    try std.testing.expect(validPhaseTransition(.contract, .evidence));
+    try std.testing.expect(validPhaseTransition(.evidence, .mutation));
+    try std.testing.expect(validPhaseTransition(.mutation, .validation));
+    try std.testing.expect(validPhaseTransition(.validation, .final));
+    try std.testing.expect(!validPhaseTransition(.final, .evidence));
+    try std.testing.expect(!validPhaseTransition(null, .mutation));
+}
+
+test "turn replay includes phases typed errors accepted rejected and final events" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordEvent("s1", "turn_start", "corrija src/main.zig");
+    try db.recordTurnPhase("s1", .intent, "turn_start");
+    try db.recordEvent("s1", "contract_selected", "contract=mutate_file allowed_tools=collect_evidence,apply_patch");
+    try db.recordTurnPhase("s1", .evidence, "collect_evidence");
+    try db.recordEvent("s1", "tool_start", "collect_evidence\tpath=src/main.zig");
+    try db.recordEvent("s1", "evidence", "[EVIDENCE_PACKET v1]\nE1 src/main.zig");
+    try db.recordEvent("s1", "tool_rejected", "write_file\ttool_not_advertised");
+    try db.recordTurnError("s1", .tool_contract, "tool_gate", "write_file rejected");
+    try db.recordEvent("s1", "tool_error", "PatchContextStale");
+    try db.recordTurnError("s1", .tool_runtime, "apply_patch", "PatchContextStale");
+    try db.recordTurnPhase("s1", .final, "turn_done");
+    try db.recordEvent("s1", "turn_done", "status=ok elapsed_ms=10");
+
+    var events = try db.loadSessionEvents(std.testing.allocator, "s1", 50);
+    defer freeAuditEvents(std.testing.allocator, &events);
+    const replay = try renderTurnReplay(std.testing.allocator, events.items);
+    defer std.testing.allocator.free(replay);
+
+    try std.testing.expect(std.mem.indexOf(u8, replay, "[TURN_REPLAY v1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "turn_phase\tphase=intent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "contract_selected\tcontract=mutate_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "tool_rejected\twrite_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "class=tool_contract") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "class=tool_runtime") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "turn_done\tstatus=ok") != null);
 }
 
 test "session focus stores compact operational turn summaries" {

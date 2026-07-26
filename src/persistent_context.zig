@@ -16,6 +16,17 @@ pub const Promotion = struct {
     text: []const u8,
 };
 
+pub const SearchTarget = enum {
+    memory,
+    skills,
+    both,
+};
+
+const SearchMatch = struct {
+    index: usize,
+    score: usize,
+};
+
 pub const Loaded = struct {
     allocator: std.mem.Allocator,
     memory: std.ArrayList([]u8),
@@ -146,6 +157,75 @@ fn containsRawMarker(content: []const u8) bool {
 
 pub fn promoteFromCwd(allocator: std.mem.Allocator, io: std.Io, promotion: Promotion) ![]u8 {
     return promoteFromDir(allocator, io, std.Io.Dir.cwd(), promotion);
+}
+
+pub fn searchFromCwd(allocator: std.mem.Allocator, io: std.Io, target: SearchTarget, terms: []const u8, max_entries: usize) !Loaded {
+    return searchFromDir(allocator, io, std.Io.Dir.cwd(), target, terms, max_entries);
+}
+
+pub fn searchFromDir(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, target: SearchTarget, terms: []const u8, max_entries: usize) !Loaded {
+    if (std.mem.trim(u8, terms, " \t\r\n").len == 0) return error.MissingTerms;
+    var loaded = try loadFromDir(allocator, io, dir);
+    defer loaded.deinit();
+
+    var result = Loaded.init(allocator);
+    errdefer result.deinit();
+    if (target == .memory or target == .both) {
+        try appendRankedMatches(allocator, loaded.memory.items, terms, &result.memory, max_entries);
+        if (loaded.memory_path) |path| result.memory_path = try allocator.dupe(u8, path);
+    }
+    if (target == .skills or target == .both) {
+        try appendRankedMatches(allocator, loaded.skills.items, terms, &result.skills, max_entries);
+        if (loaded.skills_path) |path| result.skills_path = try allocator.dupe(u8, path);
+    }
+    return result;
+}
+
+fn appendRankedMatches(
+    allocator: std.mem.Allocator,
+    entries: []const []u8,
+    terms: []const u8,
+    out: *std.ArrayList([]u8),
+    max_entries: usize,
+) !void {
+    var ranked = std.ArrayList(SearchMatch).empty;
+    defer ranked.deinit(allocator);
+    for (entries, 0..) |entry, index| {
+        const score = matchScore(entry, terms);
+        if (score == 0) continue;
+        try ranked.append(allocator, .{ .index = index, .score = score });
+    }
+    std.mem.sort(SearchMatch, ranked.items, {}, struct {
+        fn lessThan(_: void, a: SearchMatch, b: SearchMatch) bool {
+            if (a.score == b.score) return a.index < b.index;
+            return a.score > b.score;
+        }
+    }.lessThan);
+
+    for (ranked.items) |item| {
+        if (out.items.len >= max_entries) break;
+        try out.append(allocator, try allocator.dupe(u8, entries[item.index]));
+    }
+}
+
+fn matchScore(entry: []const u8, terms: []const u8) usize {
+    var score: usize = 0;
+    var it = std.mem.tokenizeAny(u8, terms, " \t\r\n.,;:()[]{}<>/\\|\"'");
+    while (it.next()) |token| {
+        const normalized = std.mem.trim(u8, token, "_-");
+        if (normalized.len < 2) continue;
+        if (indexOfIgnoreCase(entry, normalized) != null) score += normalized.len;
+    }
+    return score;
+}
+
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
 }
 
 pub fn promoteFromDir(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, promotion: Promotion) ![]u8 {
@@ -313,4 +393,44 @@ test "promotion separates skills and rejects raw tool output" {
     defer loaded.deinit();
     try std.testing.expectEqual(@as(usize, 0), loaded.memory.items.len);
     try std.testing.expectEqualStrings("Nunca use any", loaded.skills.items[0]);
+}
+
+test "promotion stores interpreted durable user rule in skills" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const audit_body = try promoteFromDir(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .target = .skills,
+        .text = "Nao commitar sem rodar testes",
+    });
+    defer std.testing.allocator.free(audit_body);
+    try std.testing.expect(std.mem.indexOf(u8, audit_body, "status=promoted") != null);
+
+    const duplicate = try promoteFromDir(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .target = .skills,
+        .text = "- Nao commitar sem rodar testes",
+    });
+    defer std.testing.allocator.free(duplicate);
+    try std.testing.expect(std.mem.indexOf(u8, duplicate, "status=duplicate") != null);
+
+    var loaded = try loadFromDir(std.testing.allocator, std.testing.io, tmp.dir);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), loaded.memory.items.len);
+    try std.testing.expectEqual(@as(usize, 1), loaded.skills.items.len);
+    try std.testing.expectEqualStrings("Nao commitar sem rodar testes", loaded.skills.items[0]);
+}
+
+test "persistent context search returns only relevant memory and skills" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "MEMORY.md", .data = "- protocolo local usa MEM_REAL_826\n- tema distante\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "SKILLS.md", .data = "- responder protocolo com SKILL_REAL_826\n- preferencia distante\n" });
+
+    var result = try searchFromDir(std.testing.allocator, std.testing.io, tmp.dir, .both, "protocolo local continuar", 4);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.memory.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.skills.items.len);
+    try std.testing.expectEqualStrings("protocolo local usa MEM_REAL_826", result.memory.items[0]);
+    try std.testing.expectEqualStrings("responder protocolo com SKILL_REAL_826", result.skills.items[0]);
 }

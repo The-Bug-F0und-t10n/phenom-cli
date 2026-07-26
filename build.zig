@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) void {
     const install_local_cmd = b.addSystemCommand(&.{
         "sh",
         "-c",
-        "test -n \"$HOME\" && install -Dm755 \"$1\" \"$HOME/.local/bin/phenom\" && sh tools/merge_config.sh ../config.toml \"$HOME/.config/phenom/config.toml\"",
+        "test -n \"$HOME\" && install -Dm755 \"$1\" \"$HOME/.local/bin/phenom\" && { test ! -f config.toml || sh tools/merge_config.sh config.toml \"$HOME/.config/phenom/config.toml\"; }",
         "sh",
     });
     install_local_cmd.addFileArg(exe.getEmittedBin());
@@ -47,6 +47,7 @@ pub fn build(b: *std.Build) void {
     const real_session = b.option([]const u8, "real-session", "Session id for multi-turn real smoke test") orelse "real-session-smoke-294";
     const real_dialogue_session = b.option([]const u8, "real-dialogue-session", "Session id for dialogue continuity real smoke test") orelse "real-dialogue-smoke-301";
     const real_long_session = b.option([]const u8, "real-long-session", "Session id for long-session real smoke test") orelse "real-long-session-smoke-294";
+    const real_patch_session = b.option([]const u8, "real-patch-session", "Session id for autonomous real patch smoke test") orelse "real-patch-smoke";
 
     const real_smoke_cmd = b.addRunArtifact(exe);
     real_smoke_cmd.step.dependOn(b.getInstallStep());
@@ -62,8 +63,6 @@ pub fn build(b: *std.Build) void {
         real_prompt,
         "--max-tokens",
         "96",
-        "--thinking",
-        "off",
         "--expect-contains",
         real_expect,
         "--show-expect-status",
@@ -89,8 +88,6 @@ pub fn build(b: *std.Build) void {
         "Nesta sessao, registre este acordo operacional: a palavra-codigo de validacao do contexto de sessao e AZUL-FTS-294. Responda exatamente: PHENOM_SESSION_SEED_294",
         "--max-tokens",
         "260",
-        "--thinking",
-        "off",
         "--expect-contains",
         "PHENOM_SESSION_SEED_294",
         "--show-expect-status",
@@ -114,8 +111,6 @@ pub fn build(b: *std.Build) void {
         "Qual foi a palavra-codigo de validacao do contexto de sessao que combinamos? Responda exatamente no formato: CODIGO=<valor> PHENOM_SESSION_RECALL_294",
         "--max-tokens",
         "420",
-        "--thinking",
-        "off",
         "--expect-contains",
         "CODIGO=AZUL-FTS-294 PHENOM_SESSION_RECALL_294",
         "--show-expect-status",
@@ -142,8 +137,6 @@ pub fn build(b: *std.Build) void {
         "Me de um exemplo simples de uma funcao Python chamada calcular_media que calcula media de notas. Termine exatamente com PHENOM_DIALOGUE_SEED_302",
         "--max-tokens",
         "260",
-        "--thinking",
-        "off",
         "--expect-contains",
         "PHENOM_DIALOGUE_SEED_302",
         "--show-expect-status",
@@ -167,8 +160,6 @@ pub fn build(b: *std.Build) void {
         "me de um exemplo mais robusto.",
         "--max-tokens",
         "700",
-        "--thinking",
-        "off",
         "--expect-contains",
         "calcular_media",
         "--show-expect-status",
@@ -226,8 +217,6 @@ pub fn build(b: *std.Build) void {
             turn.prompt,
             "--max-tokens",
             "320",
-            "--thinking",
-            "off",
             "--expect-contains",
             turn.expect,
             "--show-expect-status",
@@ -253,8 +242,6 @@ pub fn build(b: *std.Build) void {
         "Na sessao longa, qual foi a palavra-codigo antiga que combinamos? Responda exatamente no formato: CODIGO=<valor> PHENOM_LONG_RECALL_294",
         "--max-tokens",
         "900",
-        "--thinking",
-        "off",
         "--expect-contains",
         "LONG-SESSION-294",
         "--show-expect-status",
@@ -264,6 +251,93 @@ pub fn build(b: *std.Build) void {
 
     const real_long_session_smoke_step = b.step("real-long-session-smoke", "Opt-in long-session continuity smoke test. Requires active HOST:PORT.");
     real_long_session_smoke_step.dependOn(&real_long_recall_cmd.step);
+
+    const real_alignment_session = b.option([]const u8, "real-alignment-session", "Session id for real alignment smoke") orelse "real-alignment-smoke-290";
+    const real_alignment_prompt = b.option([]const u8, "real-alignment-prompt", "Prompt for real alignment smoke") orelse "Complete: PHENOM_REAL_ALIGNMENT_290";
+    const real_alignment_expect = b.option([]const u8, "real-alignment-expect", "Expected visible text for real alignment smoke") orelse "PHENOM_REAL_ALIGNMENT_290";
+    const real_alignment_cmd = b.addSystemCommand(&.{
+        "sh",
+        "tools/check_real_alignment.sh",
+    });
+    real_alignment_cmd.step.dependOn(&install_artifact.step);
+    real_alignment_cmd.addFileArg(exe.getEmittedBin());
+    real_alignment_cmd.addArgs(&.{
+        real_backend,
+        real_host,
+        real_model,
+        real_alignment_session,
+        real_alignment_prompt,
+        real_alignment_expect,
+    });
+
+    const real_alignment_smoke_step = b.step("real-alignment-smoke", "Opt-in real backend smoke with SQLite audit validation.");
+    real_alignment_smoke_step.dependOn(&real_alignment_cmd.step);
+
+    const real_patch_cmd = b.addSystemCommand(&.{
+        "sh",
+        "tools/check_real_patch.sh",
+    });
+    real_patch_cmd.step.dependOn(&install_artifact.step);
+    real_patch_cmd.addFileArg(exe.getEmittedBin());
+    real_patch_cmd.addArgs(&.{
+        real_backend,
+        real_host,
+        real_model,
+        real_patch_session,
+    });
+
+    const real_patch_smoke_step = b.step("real-patch-smoke", "Opt-in autonomous real model patch/validation smoke test. Requires active HOST:PORT.");
+    real_patch_smoke_step.dependOn(&real_patch_cmd.step);
+
+    const memory_persistence_cmd = b.addSystemCommand(&.{
+        "sh",
+        "tools/check_memory_persistence.sh",
+    });
+    memory_persistence_cmd.step.dependOn(&install_artifact.step);
+    memory_persistence_cmd.addFileArg(exe.getEmittedBin());
+
+    const memory_persistence_step = b.step("memory-persistence-smoke", "Offline e2e SQLite smoke for completed and interrupted conversation memory.");
+    memory_persistence_step.dependOn(&memory_persistence_cmd.step);
+
+    const user_rule_promotion_cmd = b.addSystemCommand(&.{
+        "sh",
+        "tools/check_user_rule_promotion_flow.sh",
+    });
+    user_rule_promotion_cmd.step.dependOn(&install_artifact.step);
+    user_rule_promotion_cmd.addFileArg(exe.getEmittedBin());
+
+    const user_rule_promotion_step = b.step("user-rule-promotion-flow-smoke", "Scripted-backend e2e smoke for model-driven SKILLS.md rule promotion and retrieval.");
+    user_rule_promotion_step.dependOn(&user_rule_promotion_cmd.step);
+
+    const agent_patch_flow_cmd = b.addSystemCommand(&.{
+        "sh",
+        "tools/check_agent_patch_flow.sh",
+    });
+    agent_patch_flow_cmd.step.dependOn(&install_artifact.step);
+    agent_patch_flow_cmd.addFileArg(exe.getEmittedBin());
+
+    const agent_patch_flow_step = b.step("agent-patch-flow-smoke", "Offline e2e scripted-backend agent smoke for collect evidence and apply_patch.");
+    agent_patch_flow_step.dependOn(&agent_patch_flow_cmd.step);
+
+    const required_tool_repair_cmd = b.addSystemCommand(&.{
+        "sh",
+        "tools/check_required_tool_repair_flow.sh",
+    });
+    required_tool_repair_cmd.step.dependOn(&install_artifact.step);
+    required_tool_repair_cmd.addFileArg(exe.getEmittedBin());
+
+    const required_tool_repair_step = b.step("required-tool-repair-smoke", "Offline e2e scripted-backend smoke for required tool repair finalization.");
+    required_tool_repair_step.dependOn(&required_tool_repair_cmd.step);
+
+    const think_only_finalization_cmd = b.addSystemCommand(&.{
+        "sh",
+        "tools/check_think_only_finalization.sh",
+    });
+    think_only_finalization_cmd.step.dependOn(&install_artifact.step);
+    think_only_finalization_cmd.addFileArg(exe.getEmittedBin());
+
+    const think_only_finalization_step = b.step("think-only-finalization-smoke", "Offline e2e scripted-backend smoke for visible finalization after think-only output.");
+    think_only_finalization_step.dependOn(&think_only_finalization_cmd.step);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

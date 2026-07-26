@@ -9,13 +9,16 @@ const c = @cImport({
 });
 
 const max_config_bytes = 64 * 1024;
+const max_project_prompt_bytes = 64 * 1024;
 
 pub const LoadedConfig = struct {
     config: cli.Config = .{},
     text: ?[]u8 = null,
     owned_host: ?[]u8 = null,
+    owned_system_prompt: ?[]u8 = null,
 
     pub fn deinit(self: *LoadedConfig, allocator: std.mem.Allocator) void {
+        if (self.owned_system_prompt) |prompt| allocator.free(prompt);
         if (self.owned_host) |host| allocator.free(host);
         if (self.text) |text| allocator.free(text);
         self.* = .{};
@@ -34,10 +37,14 @@ fn loadFileDefaults(allocator: std.mem.Allocator) !LoadedConfig {
     if (try readIfExists(allocator, "config.toml")) |text| {
         loaded.text = text;
         try parseTomlSubset(allocator, &loaded, text);
+        try loadProjectPrompt(allocator, &loaded);
         return loaded;
     }
     const path = configHomePath(allocator) catch |err| switch (err) {
-        error.HomeNotSet => return loaded,
+        error.HomeNotSet => {
+            try loadProjectPrompt(allocator, &loaded);
+            return loaded;
+        },
         else => return err,
     };
     defer allocator.free(path);
@@ -45,6 +52,7 @@ fn loadFileDefaults(allocator: std.mem.Allocator) !LoadedConfig {
         loaded.text = text;
         try parseTomlSubset(allocator, &loaded, text);
     }
+    try loadProjectPrompt(allocator, &loaded);
     return loaded;
 }
 
@@ -142,6 +150,8 @@ fn applyKey(
         cfg.offline = try parseBool(value);
     } else if (std.mem.eql(u8, key, "fail_on_model_error")) {
         cfg.fail_on_model_error = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "web_search_url")) {
+        cfg.web_search_url = value;
     } else if (std.mem.eql(u8, key, "expect_contains")) {
         cfg.expect_contains = value;
     } else if (std.mem.eql(u8, key, "show_expect_status")) {
@@ -151,6 +161,49 @@ fn applyKey(
     } else {
         return error.UnknownConfigKey;
     }
+}
+
+fn loadProjectPrompt(allocator: std.mem.Allocator, loaded: *LoadedConfig) !void {
+    const prompt = (try loadProjectPromptIfPresent(allocator)) orelse return;
+    errdefer allocator.free(prompt);
+    if (std.mem.trim(u8, prompt, " \t\r\n").len == 0) {
+        allocator.free(prompt);
+        return;
+    }
+    loaded.owned_system_prompt = prompt;
+    loaded.config.system_prompt = prompt;
+}
+
+pub fn loadProjectPromptIfPresent(allocator: std.mem.Allocator) !?[]u8 {
+    return readIfExistsLimited(allocator, "Phenom.md", max_project_prompt_bytes);
+}
+
+pub fn loadProjectPromptFromDirIfPresent(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !?[]u8 {
+    return dir.readFileAlloc(io, "Phenom.md", allocator, .limited(max_project_prompt_bytes)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+}
+
+fn readIfExistsLimited(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) !?[]u8 {
+    const z_path = try allocator.dupeZ(u8, path);
+    defer allocator.free(z_path);
+    if (c.access(z_path.ptr, c.F_OK) != 0) return null;
+    const file = c.fopen(z_path.ptr, "rb") orelse return error.ConfigReadFailed;
+    defer _ = c.fclose(file);
+
+    if (c.fseek(file, 0, c.SEEK_END) != 0) return error.ConfigReadFailed;
+    const size_raw = c.ftell(file);
+    if (size_raw < 0) return error.ConfigReadFailed;
+    const size: usize = @intCast(size_raw);
+    if (size > max_bytes) return error.StreamTooLong;
+    if (c.fseek(file, 0, c.SEEK_SET) != 0) return error.ConfigReadFailed;
+
+    const out = try allocator.alloc(u8, size);
+    errdefer allocator.free(out);
+    const read = c.fread(out.ptr, 1, size, file);
+    if (read != size) return error.ConfigReadFailed;
+    return out;
 }
 
 fn stripInlineComment(value: []const u8) []const u8 {
@@ -216,6 +269,7 @@ test "config file applies host port and flags override" {
         \\model = "phenom:latest"
         \\thinking = "on"
         \\max_tokens = 256
+        \\web_search_url = "http://127.0.0.1:8080/search?q={query}"
         \\no_color = true
     .*;
     var loaded = LoadedConfig{};
@@ -229,6 +283,7 @@ test "config file applies host port and flags override" {
     try std.testing.expectEqualStrings("phenom:latest", cfg.model);
     try std.testing.expectEqual(cli.ThinkingMode.off, cfg.thinking);
     try std.testing.expectEqual(@as(u16, 256), cfg.max_tokens);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/search?q={query}", cfg.web_search_url.?);
     try std.testing.expect(cfg.no_color);
 }
 
@@ -242,4 +297,19 @@ test "config file accepts server alias" {
     try parseTomlSubset(std.testing.allocator, &loaded, &text);
     try std.testing.expectEqualStrings("http://127.0.0.1:8080", loaded.config.host);
     try std.testing.expectEqual(cli.Backend.llamacpp, loaded.config.backend);
+}
+
+test "config file loads Phenom.md project prompt when present" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "Phenom.md", .data = "custom prompt\n" });
+
+    var loaded = LoadedConfig{};
+    defer loaded.deinit(std.testing.allocator);
+    const prompt = (try loadProjectPromptFromDirIfPresent(std.testing.allocator, std.testing.io, tmp.dir)).?;
+    loaded.owned_system_prompt = prompt;
+    loaded.config.system_prompt = prompt;
+
+    try std.testing.expectEqualStrings("custom prompt\n", loaded.config.system_prompt.?);
+    try std.testing.expectEqualStrings(loaded.config.system_prompt.?, loaded.owned_system_prompt.?);
 }
