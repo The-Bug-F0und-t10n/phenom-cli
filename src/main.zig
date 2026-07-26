@@ -2,6 +2,7 @@ const std = @import("std");
 
 const audit = @import("audit.zig");
 const apply_patch_tool = @import("apply_patch_tool.zig");
+const build_options = @import("build_options");
 const cli = @import("cli.zig");
 const code_graph = @import("code_graph.zig");
 const collect_evidence = @import("collect_evidence.zig");
@@ -61,7 +62,7 @@ pub fn main(init: std.process.Init) !void {
 
     switch (config.command) {
         .help => try cli.printUsage(fd_writer.FdWriter{ .fd = 1 }),
-        .version => try (fd_writer.FdWriter{ .fd = 1 }).print("phenom-zig 0.2.0-dev\n", .{}),
+        .version => try (fd_writer.FdWriter{ .fd = 1 }).print("phenom-zig {s}\n", .{phenom_version}),
         .chat => try runChat(allocator, init.io, config),
         .probe => try runProbe(allocator, config),
         .graph => try runGraph(allocator, init.io),
@@ -5496,7 +5497,7 @@ fn userLabel() []const u8 {
     return "user";
 }
 
-const phenom_version = "0.2.0-dev";
+const phenom_version = build_options.version;
 
 // Best-effort welcome banner at the top of an interactive session. Failures
 // (no cwd, write error) are swallowed: a missing banner must never block chat.

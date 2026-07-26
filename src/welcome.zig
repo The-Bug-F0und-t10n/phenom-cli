@@ -14,7 +14,6 @@ const logo = [3][]const u8{
     "╹  ╹ ╹┗━╸╹ ╹┗━┛╹ ╹",
 };
 
-const tagline = "agente local · tool loop auditável";
 const logo_gap = "   ";
 
 const reset = "\x1b[0m";
@@ -88,15 +87,11 @@ pub fn render(writer: anytype, info: Info) !void {
     try writeIndent(writer);
     try writeStyled(writer, info.color, .accent, logo[1]);
     try writer.writeAll(logo_gap);
-    try writeStyled(writer, info.color, .accent_bold, "phenom");
-    try writer.writeAll("  ");
     try writeStyled(writer, info.color, .dim, version_line);
     try writer.writeAll("\n");
 
     try writeIndent(writer);
     try writeStyled(writer, info.color, .accent, logo[2]);
-    try writer.writeAll(logo_gap);
-    try writeStyled(writer, info.color, .dim, tagline);
     try writer.writeAll("\n\n");
 
     // --- info + command box ---
@@ -184,7 +179,7 @@ fn collectPlain(allocator: std.mem.Allocator, info: Info) !std.ArrayList(u8) {
 test "welcome banner monochrome has no escape codes and shows key fields" {
     const alloc = std.testing.allocator;
     var out = try collectPlain(alloc, .{
-        .version = "0.2.0-dev",
+        .version = "0.1.2-dev",
         .session = "dev",
         .model = "llama3.2",
         .backend = "ollama",
@@ -196,8 +191,9 @@ test "welcome banner monochrome has no escape codes and shows key fields" {
     defer out.deinit(alloc);
 
     try std.testing.expect(std.mem.indexOfScalar(u8, out.items, 0x1b) == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "phenom") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "v0.2.0-dev") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "v0.1.2-dev") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "phenom  v") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "agente local") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "sessão") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "dev") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "ollama@127.0.0.1:11434") != null);
@@ -209,7 +205,7 @@ test "welcome banner monochrome has no escape codes and shows key fields" {
 test "welcome banner emits truecolor accent when color enabled" {
     const alloc = std.testing.allocator;
     var out = try collectPlain(alloc, .{
-        .version = "0.2.0-dev",
+        .version = "0.1.2-dev",
         .session = "dev",
         .model = "llama3.2",
         .backend = "ollama",
@@ -227,7 +223,7 @@ test "welcome banner emits truecolor accent when color enabled" {
 test "welcome banner box borders align to a single width" {
     const alloc = std.testing.allocator;
     var out = try collectPlain(alloc, .{
-        .version = "0.2.0-dev",
+        .version = "0.1.2-dev",
         .session = "trabalho",
         .model = "local",
         .backend = "llamacpp",
@@ -263,7 +259,7 @@ test "welcome banner box borders align to a single width" {
 test "welcome banner offline shows stub label" {
     const alloc = std.testing.allocator;
     var out = try collectPlain(alloc, .{
-        .version = "0.2.0-dev",
+        .version = "0.1.2-dev",
         .session = "dev",
         .offline = true,
         .color = false,

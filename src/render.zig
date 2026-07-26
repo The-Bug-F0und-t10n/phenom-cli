@@ -119,10 +119,6 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                     wrote_gap = true;
                 }
                 if (!wrote_gap and self.last_block != .user) try self.writer.writeAll("\n");
-                try self.writeContentGutter();
-                try self.writeCyan("│ ");
-                try self.writeCyanBold("thinking");
-                try self.writer.writeAll("\n");
                 self.thinking_open = true;
                 self.thinking_needs_gutter = true;
                 self.thinking_col = 0;
@@ -1548,7 +1544,6 @@ test "thinking renders cyan gutter and separates final output" {
 
     const expected =
         \\
-        \\ │ thinking
         \\ │ interno
         \\
         \\ final
@@ -1571,7 +1566,6 @@ test "thinking streamed by token keeps one gutter per logical line" {
 
     const expected =
         \\
-        \\ │ thinking
         \\ │ O usuario esta
         \\ │ ok
         \\
@@ -1592,7 +1586,6 @@ test "thinking blank lines stay inside guttered component" {
 
     const expected =
         \\
-        \\ │ thinking
         \\ │ primeiro
         \\ │
         \\ │ segundo
@@ -1627,7 +1620,6 @@ test "thinking wraps inside narrow terminal with gutter on continuation" {
 
     const expected =
         \\
-        \\ │ thinking
         \\ │ abcdefgh
         \\ │ i
         \\
@@ -1845,7 +1837,6 @@ test "codex style append only turn snapshot covers core blocks" {
         " > [user] corrija o bug                  \n" ++
         "                                         \n" ++
         "\n" ++
-        " │ thinking\n" ++
         " │ vou inspecionar\n" ++
         " │\n" ++
         " │ aplicar patch\n" ++
@@ -2312,7 +2303,8 @@ test "broad visual transcript fixture fits small and wide terminals" {
         try renderer.doneWithElapsed("2s");
 
         try std.testing.expect(std.mem.indexOf(u8, buffer.items, "> [user] analise") != null);
-        try std.testing.expect(std.mem.indexOf(u8, buffer.items, "thinking") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buffer.items, "thinking") == null);
+        try std.testing.expect(std.mem.indexOf(u8, buffer.items, "planejar fases") != null);
         try std.testing.expect(std.mem.indexOf(u8, buffer.items, " # Resultado") != null);
         try std.testing.expect(std.mem.indexOf(u8, buffer.items, "collect_evidence: src/main.zig") != null);
         try std.testing.expect(std.mem.indexOf(u8, buffer.items, "more line truncated") != null);

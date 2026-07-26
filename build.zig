@@ -1,14 +1,19 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    const app_version = "0.1.2-dev";
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", app_version);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    exe_mod.addOptions("build_options", build_options);
     exe_mod.link_libc = true;
     exe_mod.linkSystemLibrary("sqlite3", .{});
 
@@ -344,6 +349,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    test_mod.addOptions("build_options", build_options);
     test_mod.link_libc = true;
     test_mod.linkSystemLibrary("sqlite3", .{});
 
