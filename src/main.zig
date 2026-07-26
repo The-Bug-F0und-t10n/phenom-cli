@@ -284,7 +284,7 @@ const interactive_help_text =
     \\  /help                  mostra esta ajuda, sem chamar o modelo
     \\  /reset                 limpa o prompt atual
     \\  /exit                  salva a sessao e sai
-    \\  /create_custom_prompt  cria/atualiza Phenom.md usando contexto do projeto; requer modelo ativo
+    \\  /create_custom_prompt  cria/atualiza Phenom.md como system prompt comportamental; requer modelo ativo
     \\
     \\Uso diario:
     \\  phenom chat --session trabalho
@@ -377,7 +377,7 @@ fn runCreateCustomPromptCommand(
     try db.recordEvent(config.session, "tool_start", "collect_evidence\tstage=overview create_custom_prompt");
     try events.emit(.{ .tool_start = .{ .name = "collect_evidence", .detail = "overview" } });
     const project = collect_evidence.execute(allocator, io, .{
-        .task = "create Phenom.md custom project prompt",
+        .task = "create Phenom.md behavioral system prompt",
         .strategy = .auto,
         .budget_bytes = 7000,
     }) catch |err| {
@@ -396,7 +396,7 @@ fn runCreateCustomPromptCommand(
     const generator_prompt = try renderCreateCustomPromptPrompt(allocator, project.evidence_text, persistent.memory.items, persistent.skills.items, config.system_prompt);
     defer allocator.free(generator_prompt);
 
-    if (ui_ptr) |active_ui| try active_ui.showStatus("Generating Phenom.md");
+    if (ui_ptr) |active_ui| try active_ui.showStatus("Generating behavioral system prompt");
     var client = http.LocalModelClient{
         .allocator = allocator,
         .host = config.host,
@@ -449,11 +449,14 @@ fn renderCreateCustomPromptPrompt(
     try appendList(&skills_text, allocator, skills);
     return std.fmt.allocPrint(allocator,
         \\[CREATE_PHENOM_MD]
-        \\Create or refresh the project's Phenom.md custom prompt.
+        \\Create or refresh Phenom.md as the project's behavioral system prompt.
         \\Return only Markdown content for Phenom.md. No XML, no tool calls, no fenced wrapper.
-        \\Keep durable project facts: purpose, architecture, contracts, absolute business rules, safety rules, persistent model behavior rules.
-        \\Exclude transient task status, raw logs, long code dumps, secrets, volatile implementation guesses, and anything not grounded below.
-        \\Use concise sections and imperative rules. Maximum 2400 bytes.
+        \\Required first heading: # Phenom Behavioral System Prompt
+        \\Phenom.md is loaded as system_prompt/model behavior override. It is not MEMORY.md, not SKILLS.md, not a project summary, not an evidence cache.
+        \\Write imperative behavioral rules for this repo: role boundaries, evidence use, contract/tool protocol, coding standards, validation, safety, output style.
+        \\Use project evidence only to derive behavior constraints. Do not store observations as memory. Do not include [MEMORY] or [SKILLS] blocks.
+        \\Exclude transient task status, raw logs, long code dumps, secrets, volatile guesses, and architecture prose that is not a behavior rule.
+        \\Maximum 6000 bytes.
         \\
         \\[EXISTING_PHENOM_MD]
         \\{s}
@@ -495,6 +498,7 @@ fn normalizeGeneratedPhenomPrompt(allocator: std.mem.Allocator, raw: []const u8)
         if (std.mem.endsWith(u8, trimmed, "```")) trimmed = std.mem.trim(u8, trimmed[0 .. trimmed.len - 3], " \t\r\n");
     }
     if (trimmed.len == 0) return error.InvalidGeneratedPrompt;
+    if (std.mem.indexOf(u8, trimmed, "# Phenom Behavioral System Prompt") == null) return error.InvalidGeneratedPrompt;
     return allocator.dupe(u8, trimmed[0..@min(trimmed.len, 12 * 1024)]);
 }
 
@@ -5971,6 +5975,38 @@ test "custom prompt path reports cwd target" {
 
     try std.testing.expect(std.mem.endsWith(u8, path, "/Phenom.md"));
     try std.testing.expect(std.mem.indexOfScalar(u8, path, '/') != null);
+}
+
+test "create custom prompt request defines Phenom.md as behavioral system prompt" {
+    const request = try renderCreateCustomPromptPrompt(
+        std.testing.allocator,
+        "[EVIDENCE]\n- E1 projeto usa contratos\n",
+        &.{},
+        &.{},
+        null,
+    );
+    defer std.testing.allocator.free(request);
+
+    try std.testing.expect(std.mem.indexOf(u8, request, "behavioral system prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "loaded as system_prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "not MEMORY.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "not a project summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "Do not include [MEMORY] or [SKILLS] blocks") != null);
+}
+
+test "generated Phenom.md must be behavioral system prompt" {
+    const good = try normalizeGeneratedPhenomPrompt(std.testing.allocator,
+        \\# Phenom Behavioral System Prompt
+        \\Use evidence before workspace claims.
+    );
+    defer std.testing.allocator.free(good);
+
+    try std.testing.expectEqualStrings("# Phenom Behavioral System Prompt\nUse evidence before workspace claims.", good);
+    try std.testing.expectError(error.InvalidGeneratedPrompt, normalizeGeneratedPhenomPrompt(std.testing.allocator,
+        \\# Phenom.md
+        \\## Memory Model
+        \\- Persistent: SQLite audit store.
+    ));
 }
 
 test "visible output trims only leading whitespace after thinking" {

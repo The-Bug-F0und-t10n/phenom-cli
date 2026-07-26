@@ -299,10 +299,10 @@ test "config file accepts server alias" {
     try std.testing.expectEqual(cli.Backend.llamacpp, loaded.config.backend);
 }
 
-test "config file loads Phenom.md project prompt when present" {
+test "config file loads Phenom.md as system prompt when present" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "Phenom.md", .data = "custom prompt\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "Phenom.md", .data = "# Phenom Behavioral System Prompt\nResponder com evidencia.\n" });
 
     var loaded = LoadedConfig{};
     defer loaded.deinit(std.testing.allocator);
@@ -310,6 +310,6 @@ test "config file loads Phenom.md project prompt when present" {
     loaded.owned_system_prompt = prompt;
     loaded.config.system_prompt = prompt;
 
-    try std.testing.expectEqualStrings("custom prompt\n", loaded.config.system_prompt.?);
+    try std.testing.expectEqualStrings("# Phenom Behavioral System Prompt\nResponder com evidencia.\n", loaded.config.system_prompt.?);
     try std.testing.expectEqualStrings(loaded.config.system_prompt.?, loaded.owned_system_prompt.?);
 }
