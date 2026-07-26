@@ -27,12 +27,14 @@ const tool_loop = @import("tool_loop.zig");
 const tools = @import("tools.zig");
 const tui = @import("tui.zig");
 const ui_events = @import("ui_events.zig");
+const welcome = @import("welcome.zig");
 const working_context = @import("working_context.zig");
 
 const c = @cImport({
     @cInclude("sys/stat.h");
     @cInclude("errno.h");
     @cInclude("stdlib.h");
+    @cInclude("unistd.h");
 });
 
 pub fn main(init: std.process.Init) !void {
@@ -140,6 +142,7 @@ fn runInteractiveChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Conf
     defer db.close();
     try loadHistoryFromDb(allocator, &db, &ui);
     try ui.positionContent();
+    renderWelcome(config, stdout, &ui);
     const restored = try renderRestoredSession(allocator, &db, config.session, stdout, !config.no_color, tui.terminalSize().cols, true, ui.mutex());
     if (restored > 0) try ui.showPrompt();
 
@@ -3534,6 +3537,48 @@ fn userLabel() []const u8 {
     return "user";
 }
 
+const phenom_version = "0.2.0-dev";
+
+// Best-effort welcome banner at the top of an interactive session. Failures
+// (no cwd, write error) are swallowed: a missing banner must never block chat.
+fn renderWelcome(config: cli.Config, stdout: fd_writer.FdWriter, ui: anytype) void {
+    var cwd_raw_buf: [4096]u8 = undefined;
+    const cwd_raw: []const u8 = if (c.getcwd(&cwd_raw_buf, cwd_raw_buf.len)) |ptr|
+        std.mem.span(ptr)
+    else
+        "";
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd = prettifyHome(&cwd_buf, cwd_raw);
+    const backend_name = switch (config.backend) {
+        .ollama => "ollama",
+        .llamacpp => "llamacpp",
+    };
+    var nl = fd_writer.NewlineWriter(fd_writer.FdWriter){ .inner = stdout, .crlf = true };
+    tui.lockTerminal(ui.mutex());
+    defer ui.mutex().unlock();
+    welcome.render(&nl, .{
+        .version = phenom_version,
+        .session = config.session,
+        .model = config.model,
+        .backend = backend_name,
+        .host = config.host,
+        .cwd = cwd,
+        .offline = config.offline,
+        .color = !config.no_color,
+        .columns = tui.terminalSize().cols,
+    }) catch {};
+}
+
+fn prettifyHome(buf: []u8, path: []const u8) []const u8 {
+    if (c.getenv("HOME")) |home_ptr| {
+        const home = std.mem.span(home_ptr);
+        if (home.len > 0 and std.mem.startsWith(u8, path, home)) {
+            return std.fmt.bufPrint(buf, "~{s}", .{path[home.len..]}) catch path;
+        }
+    }
+    return path;
+}
+
 fn loadHistoryFromDb(allocator: std.mem.Allocator, db: *audit.AuditDb, ui: anytype) !void {
     var lines = try db.loadInputHistoryNewestFirst(allocator, 200);
     defer audit.freeHistoryLines(allocator, &lines);
@@ -3786,6 +3831,7 @@ test {
     _ = tools;
     _ = tui;
     _ = ui_events;
+    _ = welcome;
     _ = working_context;
 }
 
