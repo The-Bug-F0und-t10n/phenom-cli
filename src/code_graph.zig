@@ -159,38 +159,62 @@ fn renderHtml(allocator: std.mem.Allocator, out: *std.ArrayList(u8), graph: Grap
         \\<meta name="viewport" content="width=device-width, initial-scale=1">
         \\<title>Phenom Code Graph</title>
         \\<style>
-        \\:root{color-scheme:dark;--bg:#101214;--panel:#171b1f;--text:#e6edf3;--muted:#8b949e;--line:#30363d;--accent:#3fb950;--warn:#d29922;--blue:#58a6ff}
+        \\:root{color-scheme:dark;--bg:#0b0d10;--panel:#15191e;--panel2:#101419;--text:#e6edf3;--muted:#8b949e;--line:#30363d;--soft:#202831;--green:#3fb950;--yellow:#d29922;--blue:#58a6ff;--violet:#bc8cff;--red:#ff7b72}
         \\*{box-sizing:border-box}
-        \\body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-        \\header{display:flex;gap:12px;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
-        \\h1{font-size:16px;margin:0;font-weight:650}
-        \\main{display:grid;grid-template-columns:minmax(0,1fr) 320px;min-height:calc(100vh - 57px)}
-        \\#graph{width:100%;height:calc(100vh - 57px);display:block;background:#0d1117}
-        \\aside{border-left:1px solid var(--line);background:var(--panel);padding:12px;overflow:auto}
-        \\label{display:block;color:var(--muted);font-size:12px;margin:12px 0 6px}
+        \\body{margin:0;background:var(--bg);color:var(--text);font:13px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+        \\header{display:flex;gap:16px;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+        \\h1{font-size:15px;margin:0;font-weight:650;letter-spacing:0}
+        \\#summary{color:var(--muted);white-space:nowrap}
+        \\main{display:grid;grid-template-columns:minmax(0,1fr) 360px;min-height:calc(100vh - 50px)}
+        \\#stage{min-width:0;position:relative;background:linear-gradient(#0d1117,#0b0d10)}
+        \\#graph{width:100%;height:calc(100vh - 50px);display:block}
+        \\aside{border-left:1px solid var(--line);background:var(--panel);padding:14px;overflow:auto}
+        \\label{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;margin:12px 0 6px}
         \\input,select{width:100%;border:1px solid var(--line);background:#0d1117;color:var(--text);border-radius:6px;padding:8px}
         \\button{border:1px solid var(--line);background:#21262d;color:var(--text);border-radius:6px;padding:8px 10px;cursor:pointer}
         \\button:hover{border-color:var(--blue)}
+        \\.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+        \\.legend{display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin:10px 0}
+        \\.key{display:inline-flex;gap:6px;align-items:center}
+        \\.swatch{width:14px;height:3px;border-radius:2px;display:inline-block;background:var(--line)}
+        \\.swatch.calls{background:var(--blue)}
+        \\.swatch.imports{background:var(--yellow)}
         \\dl{display:grid;grid-template-columns:1fr auto;gap:4px 10px;margin:12px 0}
         \\dt{color:var(--muted)}
         \\dd{margin:0}
-        \\pre{white-space:pre-wrap;word-break:break-word;background:#0d1117;border:1px solid var(--line);border-radius:6px;padding:10px;min-height:88px}
-        \\.edge{stroke:#38404a;stroke-width:1;opacity:.55}
-        \\.edge.imports{stroke:var(--warn)}
-        \\.node{stroke:#0d1117;stroke-width:1.5;cursor:pointer}
-        \\.node.hit{stroke:#fff;stroke-width:3}
-        \\.label{fill:#c9d1d9;font-size:11px;paint-order:stroke;stroke:#0d1117;stroke-width:3;pointer-events:none}
-        \\@media(max-width:860px){main{grid-template-columns:1fr}aside{border-left:0;border-top:1px solid var(--line)}#graph{height:65vh}}
+        \\pre{white-space:pre-wrap;word-break:break-word;background:#0d1117;border:1px solid var(--line);border-radius:6px;padding:10px;min-height:160px}
+        \\.lane{fill:#0f141a;stroke:#212a33;stroke-width:1}
+        \\.lane:nth-child(odd){fill:#10171f}
+        \\.lane-label{fill:#8b949e;font-size:12px;font-weight:650}
+        \\.lane-sub{fill:#6e7681;font-size:10px}
+        \\.axis{stroke:#252d37;stroke-width:1}
+        \\.edge{fill:none;stroke:#38404a;stroke-width:1.4;opacity:.44}
+        \\.edge.calls{stroke:var(--blue)}
+        \\.edge.imports{stroke:var(--yellow);stroke-dasharray:5 4}
+        \\.edge.dim{opacity:.08}
+        \\.edge.focus{opacity:1;stroke-width:2.8}
+        \\.node{stroke:#0d1117;stroke-width:1.6;cursor:pointer}
+        \\.node.dim{opacity:.22}
+        \\.node.focus{stroke:#fff;stroke-width:3.2}
+        \\.node.hit{stroke:var(--red);stroke-width:3}
+        \\.label{fill:#d0d7de;font-size:11px;paint-order:stroke;stroke:#0d1117;stroke-width:3;pointer-events:none}
+        \\.label.dim{opacity:.24}
+        \\.hint{position:absolute;left:14px;bottom:12px;color:#8b949e;background:rgba(13,17,23,.78);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
+        \\.zoom{position:absolute;left:14px;top:14px;display:flex;gap:6px;background:rgba(13,17,23,.78);border:1px solid var(--line);border-radius:6px;padding:6px}
+        \\.zoom button{padding:4px 8px}
+        \\.zoom span{color:var(--muted);min-width:44px;text-align:center;align-self:center}
+        \\@media(max-width:900px){main{grid-template-columns:1fr}aside{border-left:0;border-top:1px solid var(--line)}#graph{height:68vh}}
         \\</style>
         \\</head>
         \\<body>
         \\<header><h1>Phenom Code Graph</h1><div id="summary"></div></header>
-        \\<main><svg id="graph" role="img" aria-label="Code graph"></svg><aside>
+        \\<main><section id="stage"><svg id="graph" role="img" aria-label="Code graph"></svg><div class="zoom"><button id="zoomOut">-</button><button id="zoomIn">+</button><button id="zoomFit">fit</button><span id="zoomPct">100%</span></div><div class="hint">Wheel zooms. Drag pans. Lane = file. X axis = source line. Solid = calls. Dashed = imports.</div></section><aside>
         \\<label for="q">Search</label><input id="q" autocomplete="off" placeholder="symbol or path">
-        \\<label for="edgeKind">Edges</label><select id="edgeKind"><option value="all">all</option><option value="calls">calls</option><option value="imports">imports</option></select>
-        \\<label for="minDegree">Minimum degree</label><input id="minDegree" type="number" min="0" value="0">
-        \\<p><button id="fit">Fit graph</button></p>
-        \\<dl><dt>Nodes</dt><dd id="nodesCount"></dd><dt>Edges</dt><dd id="edgesCount"></dd><dt>Indexed files</dt><dd id="filesCount"></dd></dl>
+        \\<div class="row"><div><label for="edgeKind">Edges</label><select id="edgeKind"><option value="all">all</option><option value="calls">calls</option><option value="imports">imports</option></select></div><div><label for="limit">Nodes</label><select id="limit"><option value="120">top 120</option><option value="240">top 240</option><option value="0">all</option></select></div></div>
+        \\<label for="minDegree">Minimum degree</label><input id="minDegree" type="number" min="0" value="1">
+        \\<p><button id="fit">Fit graph</button> <button id="clear">Clear focus</button></p>
+        \\<div class="legend"><span class="key"><span class="swatch calls"></span>calls</span><span class="key"><span class="swatch imports"></span>imports</span></div>
+        \\<dl><dt>Visible nodes</dt><dd id="nodesCount"></dd><dt>Visible edges</dt><dd id="edgesCount"></dd><dt>Files</dt><dd id="filesCount"></dd><dt>Focused</dt><dd id="focusCount"></dd></dl>
         \\<pre id="details">Click a node.</pre>
         \\</aside></main>
         \\<script>
@@ -203,16 +227,37 @@ fn renderHtml(allocator: std.mem.Allocator, out: *std.ArrayList(u8), graph: Grap
         \\const summary=document.getElementById("summary");
         \\const q=document.getElementById("q");
         \\const edgeKind=document.getElementById("edgeKind");
+        \\const limit=document.getElementById("limit");
         \\const minDegree=document.getElementById("minDegree");
         \\const details=document.getElementById("details");
+        \\const zoomPct=document.getElementById("zoomPct");
+        \\let selected=null;
+        \\let baseBox={x:0,y:0,w:1000,h:600},viewBox=null,isPanning=false,panStart=null;
         \\const nodesById=new Map(graphData.nodes.map(n=>[n.id,n]));
-        \\function hash(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return h>>>0}
-        \\function prepare(){const groups=new Map();for(const n of graphData.nodes){const key=n.path.split("/").slice(0,-1).join("/")||".";if(!groups.has(key))groups.set(key,[]);groups.get(key).push(n)}let gi=0;for(const group of groups.values()){const base=2*Math.PI*gi/Math.max(1,groups.size);const ring=220+80*(gi%5);group.sort((a,b)=>b.degree-a.degree||a.name.localeCompare(b.name));group.forEach((n,i)=>{const spread=(i/group.length-.5)*0.9;const jitter=(hash(n.path+n.name)%100)/600;n.x=Math.cos(base+spread+jitter)*ring;n.y=Math.sin(base+spread+jitter)*ring});gi++}}
-        \\function filtered(){const term=q.value.trim().toLowerCase();const min=Number(minDegree.value)||0;const kind=edgeKind.value;const nodes=graphData.nodes.filter(n=>n.degree>=min&&(!term||n.name.toLowerCase().includes(term)||n.path.toLowerCase().includes(term)));const keep=new Set(nodes.map(n=>n.id));const edges=graphData.edges.filter(e=>(kind==="all"||e.kind===kind)&&keep.has(e.source)&&keep.has(e.target));return{nodes,edges,term}}
-        \\function color(n){if(n.path.endsWith(".zig"))return"#3fb950";if(n.path.endsWith(".ts")||n.path.endsWith(".js"))return"#58a6ff";if(n.path.endsWith(".md"))return"#d29922";return"#a371f7"}
-        \\function render(){const view=filtered();svg.textContent="";const g=document.createElementNS("http://www.w3.org/2000/svg","g");svg.appendChild(g);for(const e of view.edges){const a=nodesById.get(e.source),b=nodesById.get(e.target);const line=document.createElementNS(svg.namespaceURI,"line");line.setAttribute("class","edge "+e.kind);line.setAttribute("x1",a.x);line.setAttribute("y1",a.y);line.setAttribute("x2",b.x);line.setAttribute("y2",b.y);g.appendChild(line)}for(const n of view.nodes){const circle=document.createElementNS(svg.namespaceURI,"circle");circle.setAttribute("class","node"+(view.term&&(n.name.toLowerCase().includes(view.term)||n.path.toLowerCase().includes(view.term))?" hit":""));circle.setAttribute("cx",n.x);circle.setAttribute("cy",n.y);circle.setAttribute("r",Math.min(18,5+n.degree));circle.setAttribute("fill",color(n));circle.addEventListener("click",()=>details.textContent=n.name+"\\n"+n.path+":"+n.line+"-"+n.endLine+"\\ndegree "+n.degree);g.appendChild(circle);if(n.degree>2||view.nodes.length<140){const label=document.createElementNS(svg.namespaceURI,"text");label.setAttribute("class","label");label.setAttribute("x",n.x+9);label.setAttribute("y",n.y+4);label.textContent=n.name;g.appendChild(label)}}document.getElementById("nodesCount").textContent=view.nodes.length+"/"+graphData.nodes.length;document.getElementById("edgesCount").textContent=view.edges.length+"/"+graphData.edges.length;fit()}
-        \\function fit(){const box=svg.getBBox();const pad=80;svg.setAttribute("viewBox",[box.x-pad,box.y-pad,box.width+pad*2||200,box.height+pad*2||200].join(" "))}
-        \\prepare();summary.textContent=graphData.nodes.length+" nodes, "+graphData.edges.length+" edges";document.getElementById("filesCount").textContent=graphData.indexedFiles;q.addEventListener("input",render);edgeKind.addEventListener("change",render);minDegree.addEventListener("input",render);document.getElementById("fit").addEventListener("click",fit);render();
+        \\const outEdges=new Map(),inEdges=new Map(),fileMaxLine=new Map();
+        \\for(const n of graphData.nodes){fileMaxLine.set(n.path,Math.max(fileMaxLine.get(n.path)||1,n.endLine||n.line||1))}
+        \\for(const e of graphData.edges){if(!outEdges.has(e.source))outEdges.set(e.source,[]);if(!inEdges.has(e.target))inEdges.set(e.target,[]);outEdges.get(e.source).push(e);inEdges.get(e.target).push(e)}
+        \\function fileName(path){const i=path.lastIndexOf("/");return i>=0?path.slice(i+1):path}
+        \\function dirName(path){const i=path.lastIndexOf("/");return i>=0?path.slice(0,i):"."}
+        \\function match(n,term){return !term||n.name.toLowerCase().includes(term)||n.path.toLowerCase().includes(term)}
+        \\function filtered(){const term=q.value.trim().toLowerCase();const min=Number(minDegree.value)||0;const kind=edgeKind.value;const cap=Number(limit.value)||0;let nodes=graphData.nodes.filter(n=>n.degree>=min&&match(n,term));nodes.sort((a,b)=>term?((a.path+a.name).localeCompare(b.path+b.name)):(b.degree-a.degree||a.path.localeCompare(b.path)||a.line-b.line));if(cap>0&&nodes.length>cap)nodes=nodes.slice(0,cap);nodes.sort((a,b)=>a.path.localeCompare(b.path)||a.line-b.line||a.name.localeCompare(b.name));const keep=new Set(nodes.map(n=>n.id));const edges=graphData.edges.filter(e=>(kind==="all"||e.kind===kind)&&keep.has(e.source)&&keep.has(e.target));return{nodes,edges,keep,term}}
+        \\function color(n){if(n.path.endsWith(".zig"))return"#3fb950";if(n.path.endsWith(".ts")||n.path.endsWith(".js"))return"#58a6ff";if(n.path.endsWith(".md"))return"#d29922";return"#bc8cff"}
+        \\function focusedSet(){if(selected==null)return null;const set=new Set([selected]);for(const e of outEdges.get(selected)||[])set.add(e.target);for(const e of inEdges.get(selected)||[])set.add(e.source);return set}
+        \\function place(view){const paths=[...new Set(view.nodes.map(n=>n.path))];const laneH=76,left=220,right=90,top=52,w=Math.max(980,svg.clientWidth*1.8);const lanes=new Map();paths.forEach((path,i)=>lanes.set(path,{path,y:top+i*laneH,h:laneH-16}));for(const n of view.nodes){const lane=lanes.get(n.path);const max=fileMaxLine.get(n.path)||Math.max(1,n.endLine||n.line||1);const t=Math.max(0,Math.min(1,(n.line||1)/max));n._x=left+t*(w-left-right);n._y=lane.y+Math.min(lane.h-12,14+((n.line*17+n.id*7)%(lane.h-24)));}return{lanes,w,h:top+paths.length*laneH+40,left,right}}
+        \\function add(tag,attrs,parent=svg){const el=document.createElementNS(svg.namespaceURI,tag);for(const [k,v] of Object.entries(attrs||{}))el.setAttribute(k,v);parent.appendChild(el);return el}
+        \\function pathFor(a,b,kind){const dx=Math.max(70,Math.abs(b._x-a._x)*.45);const bend=kind==="imports"?120:40;return `M${a._x},${a._y} C${a._x+dx},${a._y+bend} ${b._x-dx},${b._y-bend} ${b._x},${b._y}`}
+        \\function nodeText(n){const outs=(outEdges.get(n.id)||[]).map(e=>nodesById.get(e.target)).filter(Boolean).slice(0,12).map(x=>"  -> "+x.name+"  "+x.path).join("\\n");const ins=(inEdges.get(n.id)||[]).map(e=>nodesById.get(e.source)).filter(Boolean).slice(0,12).map(x=>"  <- "+x.name+"  "+x.path).join("\\n");return n.name+"\\n"+n.path+":"+n.line+"-"+n.endLine+"\\ndegree "+n.degree+"\\n\\nOutgoing\\n"+(outs||"  none")+"\\n\\nIncoming\\n"+(ins||"  none")}
+        \\function render(resetView=false){const view=filtered();const focus=focusedSet();const layout=place(view);svg.textContent="";const defs=add("defs",{});const marker=add("marker",{id:"arrow",viewBox:"0 0 10 10",refX:"9",refY:"5",markerWidth:"6",markerHeight:"6",orient:"auto-start-reverse"},defs);add("path",{d:"M0,0 L10,5 L0,10 z",fill:"#6e7681"},marker);const lanes=[...layout.lanes.values()];for(const lane of lanes){add("rect",{class:"lane",x:12,y:lane.y-12,width:layout.w-24,height:lane.h+16,rx:6});add("line",{class:"axis",x1:layout.left,y1:lane.y+lane.h,x2:layout.w-layout.right,y2:lane.y+lane.h});add("text",{class:"lane-label",x:24,y:lane.y+8}).textContent=fileName(lane.path);add("text",{class:"lane-sub",x:24,y:lane.y+24}).textContent=dirName(lane.path)}for(const e of view.edges){const a=nodesById.get(e.source),b=nodesById.get(e.target);const inFocus=!focus||focus.has(e.source)&&focus.has(e.target);const cls="edge "+e.kind+(inFocus?"":" dim")+(selected!=null&&(e.source===selected||e.target===selected)?" focus":"");add("path",{class:cls,d:pathFor(a,b,e.kind),"marker-end":"url(#arrow)"})}for(const n of view.nodes){const inFocus=!focus||focus.has(n.id);const isHit=view.term&&match(n,view.term);const cls="node"+(inFocus?"":" dim")+(selected===n.id?" focus":"")+(isHit?" hit":"");const r=Math.min(18,5+n.degree);const c=add("circle",{class:cls,cx:n._x,cy:n._y,r,fill:color(n)});c.addEventListener("click",()=>{selected=n.id;details.textContent=nodeText(n);render()});if(n.degree>2||view.nodes.length<140||isHit){const l=add("text",{class:"label"+(inFocus?"":" dim"),x:n._x+r+4,y:n._y+4});l.textContent=n.name}}document.getElementById("nodesCount").textContent=view.nodes.length+"/"+graphData.nodes.length;document.getElementById("edgesCount").textContent=view.edges.length+"/"+graphData.edges.length;document.getElementById("focusCount").textContent=selected==null?"none":(nodesById.get(selected)?.name||"missing");setBase(layout);if(resetView||!viewBox)viewBox={...baseBox};applyViewBox()}
+        \\function applyViewBox(){svg.setAttribute("viewBox",[viewBox.x,viewBox.y,viewBox.w,viewBox.h].join(" "));zoomPct.textContent=Math.round((baseBox.w/viewBox.w)*100)+"%"}
+        \\function setBase(layout){const pad=28;baseBox={x:0,y:0,w:Math.max(300,layout?.w||1000)+pad,h:Math.max(200,layout?.h||600)}}
+        \\function fit(layout){setBase(layout);viewBox={...baseBox};applyViewBox()}
+        \\function zoomAt(factor,cx,cy){const pt=svg.createSVGPoint();pt.x=cx;pt.y=cy;const p=pt.matrixTransform(svg.getScreenCTM().inverse());const nw=Math.max(80,Math.min(baseBox.w*6,viewBox.w*factor));const nh=Math.max(80,Math.min(baseBox.h*6,viewBox.h*factor));const rx=(p.x-viewBox.x)/viewBox.w,ry=(p.y-viewBox.y)/viewBox.h;viewBox={x:p.x-rx*nw,y:p.y-ry*nh,w:nw,h:nh};applyViewBox()}
+        \\function clientPoint(ev){const pt=svg.createSVGPoint();pt.x=ev.clientX;pt.y=ev.clientY;return pt.matrixTransform(svg.getScreenCTM().inverse())}
+        \\svg.addEventListener("wheel",ev=>{ev.preventDefault();zoomAt(ev.deltaY<0?.82:1.22,ev.clientX,ev.clientY)},{passive:false});
+        \\svg.addEventListener("pointerdown",ev=>{if(ev.target.classList?.contains("node"))return;isPanning=true;panStart={client:{x:ev.clientX,y:ev.clientY},box:{...viewBox}};svg.setPointerCapture(ev.pointerId)});
+        \\svg.addEventListener("pointermove",ev=>{if(!isPanning)return;const a=clientPoint({clientX:panStart.client.x,clientY:panStart.client.y}),b=clientPoint(ev);viewBox={...panStart.box,x:panStart.box.x+(a.x-b.x),y:panStart.box.y+(a.y-b.y)};applyViewBox()});
+        \\svg.addEventListener("pointerup",ev=>{isPanning=false;try{svg.releasePointerCapture(ev.pointerId)}catch{}});
+        \\summary.textContent=graphData.nodes.length+" nodes, "+graphData.edges.length+" edges";document.getElementById("filesCount").textContent=graphData.indexedFiles;q.addEventListener("input",()=>{selected=null;render(true)});edgeKind.addEventListener("change",()=>render(true));limit.addEventListener("change",()=>{selected=null;render(true)});minDegree.addEventListener("input",()=>{selected=null;render(true)});document.getElementById("fit").addEventListener("click",()=>render(true));document.getElementById("zoomFit").addEventListener("click",()=>render(true));document.getElementById("zoomIn").addEventListener("click",()=>zoomAt(.82,svg.clientWidth/2,svg.clientHeight/2));document.getElementById("zoomOut").addEventListener("click",()=>zoomAt(1.22,svg.clientWidth/2,svg.clientHeight/2));document.getElementById("clear").addEventListener("click",()=>{selected=null;details.textContent="Click a node.";render()});render(true);
         \\</script>
         \\</body>
         \\</html>
@@ -786,6 +831,13 @@ test "caveman graph writes standalone local html" {
     try std.testing.expect(std.mem.indexOf(u8, html, "\"nodes\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "\"edges\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "src/code_graph.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "Lane = file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "Clear focus") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "function place(view)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "marker-end") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "id=\"zoomIn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "addEventListener(\"wheel\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "function zoomAt") != null);
 }
 
 fn hasCandidate(candidates: []const Candidate, path: []const u8, symbol: []const u8) bool {
