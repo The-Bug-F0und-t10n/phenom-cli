@@ -37,6 +37,7 @@ test "default system prompt is loaded from template file" {
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "before a relevant memory lookup") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "promote a concise interpreted SKILLS rule") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "separate known, inferred, and unknown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "safe read-only context/search can verify") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Do not fill gaps") != null);
 }
 

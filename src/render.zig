@@ -505,9 +505,22 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
 
         fn flushMarkdownTables(self: *Self) !void {
             if (self.markdown_table_rows == 0) return;
-            try self.writeMarkdownTable(self.markdown_table[0..self.markdown_table_len]);
+            if (isValidMarkdownTable(self.markdown_table[0..self.markdown_table_len])) {
+                try self.writeMarkdownTable(self.markdown_table[0..self.markdown_table_len]);
+            } else {
+                try self.writeMarkdownTableRowsAsProse(self.markdown_table[0..self.markdown_table_len]);
+            }
             self.markdown_table_len = 0;
             self.markdown_table_rows = 0;
+        }
+
+        fn writeMarkdownTableRowsAsProse(self: *Self, table: []const u8) !void {
+            var start: usize = 0;
+            while (nextLine(table, &start)) |line| {
+                try self.writeMarkdownProseLine(line);
+                try self.writer.writeAll("\n");
+                self.stream_needs_gutter = true;
+            }
         }
 
         fn writeMarkdownLine(self: *Self, line: []const u8, newline: bool) !void {
@@ -1553,6 +1566,30 @@ fn isTableSeparator(line: []const u8) bool {
     return saw_dash;
 }
 
+fn isValidMarkdownTable(table: []const u8) bool {
+    var start: usize = 0;
+    const header = nextLine(table, &start) orelse return false;
+    const separator = nextLine(table, &start) orelse return false;
+    if (isTableSeparator(header) or !isTableSeparator(separator)) return false;
+    const header_cols = markdownTableCellCount(header);
+    const separator_cols = markdownTableCellCount(separator);
+    if (header_cols < 2 or separator_cols != header_cols) return false;
+    while (nextLine(table, &start)) |line| {
+        if (line.len == 0) continue;
+        if (isTableSeparator(line)) return false;
+        const cols = markdownTableCellCount(line);
+        if (cols == 0 or cols > header_cols + 1) return false;
+    }
+    return true;
+}
+
+fn markdownTableCellCount(line: []const u8) usize {
+    var it = CellIterator.init(line);
+    var count: usize = 0;
+    while (it.next()) |_| count += 1;
+    return count;
+}
+
 fn isMarkdownTableRow(line: []const u8) bool {
     if (isFenceLine(line)) return false;
     var in_code = false;
@@ -2097,6 +2134,21 @@ test "assistant markdown buffers and renders tables as boxed output" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, " │ src/render.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, " └") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, " Depois") != null);
+}
+
+test "assistant markdown malformed inline table stays prose" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 80 });
+    try renderer.assistantStart();
+    try renderer.assistantDelta("# Required Investment | Metric | Value | | -------- | ------- | | BTC needed at target | 1 BTC |");
+    try renderer.done();
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, " ┌") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, " └") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Required Investment | Metric | Value") != null);
 }
 
 test "assistant markdown table wraps long cells inside borders" {

@@ -12,7 +12,7 @@ HOST=${3:-${PHENOM_REAL_WEB_HOST:-127.0.0.1:8080}}
 MODEL=${4:-${PHENOM_REAL_WEB_MODEL:-local}}
 WORK=${PHENOM_REAL_WEB_WORK_DIR:-/tmp/phenom-real-web-continuity}
 SESSION=${PHENOM_REAL_WEB_SESSION:-real-web-continuity-flow}
-SEARCH_URL=${PHENOM_REAL_WEB_SEARCH_URL:-"http://wttr.in/{query}?format=3"}
+SEARCH_URL=${PHENOM_REAL_WEB_SEARCH_URL:-"https://html.duckduckgo.com/html/?q={query}"}
 DB="$WORK/.phenom-zig/phenom.db"
 
 command -v sqlite3 >/dev/null 2>&1 || {
@@ -50,7 +50,7 @@ run_turn \
   turn1
 
 run_turn \
-  "E em Brasilia, como esta agora? Conecte com a resposta anterior." \
+  "Pesquise na internet tambem em Brasilia, como esta agora? Conecte com a resposta anterior." \
   turn2
 
 run_turn \
@@ -71,8 +71,8 @@ test "$(sql_count "kind = 'turn_done' and body like 'status=ok%quality=confirmed
 test "$(sql_count "kind = 'tool_envelope' and body like '%raw_name=set_operational_contract%' and body like '%state=accepted%'")" -ge 2 || { printf 'real-web-continuity-flow: model did not declare web contracts\n' >&2; exit 1; }
 test "$(sql_count "kind = 'contract_selected' and body like '%contract=search_web%'")" -ge 2 || { printf 'real-web-continuity-flow: search_web contract was not selected twice\n' >&2; exit 1; }
 test "$(sql_count "kind = 'contract_executor' and body like '%executor=web_search%'")" -ge 2 || { printf 'real-web-continuity-flow: search_web contract did not execute web_search\n' >&2; exit 1; }
-test "$(sql_count "kind = 'tool_start' and body like 'web_search%' and body like '%wttr.in%' and (body like '%Sao_Paulo%' or body like '%S%C3%A3o%20Paulo%' or body like '%Sao%20Paulo%')")" -ge 1 || { printf 'real-web-continuity-flow: missing real Sao_Paulo internet request\n' >&2; exit 1; }
-test "$(sql_count "kind = 'tool_start' and body like 'web_search%' and body like '%wttr.in%' and (body like '%Brasilia%' or body like '%Brasília%' or body like '%Bras%C3%ADlia%')")" -ge 1 || { printf 'real-web-continuity-flow: missing real Brasilia internet request\n' >&2; exit 1; }
+test "$(sql_count "kind = 'tool_start' and body like 'web_search%' and body like '%duckduckgo%' and (body like '%Sao_Paulo%' or body like '%S%C3%A3o%20Paulo%' or body like '%Sao%20Paulo%' or body like '%São%20Paulo%')")" -ge 1 || { printf 'real-web-continuity-flow: missing real Sao_Paulo internet request\n' >&2; exit 1; }
+test "$(sql_count "kind = 'tool_start' and body like 'web_search%' and body like '%duckduckgo%' and (body like '%Brasilia%' or body like '%Brasília%' or body like '%Bras%C3%ADlia%')")" -ge 1 || { printf 'real-web-continuity-flow: missing real Brasilia internet request\n' >&2; exit 1; }
 test "$(sql_count "kind = 'web_distillation' and body like '%success=true%'")" -ge 2 || { printf 'real-web-continuity-flow: missing successful real web distillations\n' >&2; exit 1; }
 test "$(sql_count "kind = 'evidence' and body like '%[WEB_EVIDENCE]%' and (body like '%Sao_Paulo%' or body like '%São Paulo%' or body like '%S%C3%A3o%20Paulo%' or body like '%Sao%20Paulo%')")" -ge 1 || { printf 'real-web-continuity-flow: missing Sao_Paulo WEB_EVIDENCE\n' >&2; exit 1; }
 test "$(sql_count "kind = 'evidence' and body like '%[WEB_EVIDENCE]%' and (body like '%Brasilia%' or body like '%Brasília%' or body like '%Bras%C3%ADlia%')")" -ge 1 || { printf 'real-web-continuity-flow: missing Brasilia WEB_EVIDENCE\n' >&2; exit 1; }

@@ -590,6 +590,13 @@ pub const InputEditor = struct {
             try self.history.append(self.allocator, try self.allocator.dupe(u8, trimmed));
         }
     }
+
+    pub fn clearHistory(self: *InputEditor) void {
+        for (self.history.items) |item| self.allocator.free(item);
+        self.history.clearRetainingCapacity();
+        self.history_index = null;
+        self.draft.clearRetainingCapacity();
+    }
 };
 
 pub fn TerminalUi(comptime Writer: type) type {
@@ -1250,6 +1257,19 @@ test "input editor history navigation" {
     try std.testing.expectEqualStrings("primeiro", editor.buffer.items);
     try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[B"));
     try std.testing.expectEqualStrings("segundo", editor.buffer.items);
+}
+
+test "input editor clears history" {
+    var editor = InputEditor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    switch (try editor.feed("primeiro\r")) {
+        .submitted => |line| std.testing.allocator.free(line),
+        else => return error.ExpectedSubmit,
+    }
+    editor.clearHistory();
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[A"));
+    try std.testing.expectEqualStrings("", editor.buffer.items);
 }
 
 test "input editor preserves bytes after submit for next read" {

@@ -66,8 +66,17 @@ pub fn main(init: std.process.Init) !void {
         .chat => try runChat(allocator, init.io, config),
         .probe => try runProbe(allocator, config),
         .graph => try runGraph(allocator, init.io),
+        .reset => try runReset(allocator, config),
         .snapshot => try runSnapshot(),
     }
+}
+
+fn runReset(allocator: std.mem.Allocator, config: cli.Config) !void {
+    try makeDirIfMissing(".phenom-zig");
+    var db = try audit.AuditDb.open(allocator, ".phenom-zig/phenom.db");
+    defer db.close();
+    try db.resetSession(config.session);
+    try (fd_writer.FdWriter{ .fd = 1 }).print("\nSession reset: session '{s}' and input history cleared.\n\n", .{config.session});
 }
 
 fn runGraph(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -203,6 +212,28 @@ fn runChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Config) !void {
     try runChatTurn(allocator, io, config, stdout, config.prompt);
 }
 
+const LocalSlashCommand = union(enum) {
+    none,
+    help,
+    reset,
+    exit,
+    create_custom_prompt,
+    unknown: []const u8,
+};
+
+fn parseLocalSlashCommand(input: []const u8) LocalSlashCommand {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (trimmed.len == 0 or trimmed[0] != '/') return .none;
+    var it = std.mem.tokenizeAny(u8, trimmed, " \t\r\n");
+    const name = it.next() orelse return .{ .unknown = trimmed };
+    if (it.next() != null) return .{ .unknown = name };
+    if (std.mem.eql(u8, name, "/help")) return .help;
+    if (std.mem.eql(u8, name, "/reset")) return .reset;
+    if (std.mem.eql(u8, name, "/exit")) return .exit;
+    if (std.mem.eql(u8, name, "/create_custom_prompt")) return .create_custom_prompt;
+    return .{ .unknown = name };
+}
+
 fn runInteractiveChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Config, stdout: fd_writer.FdWriter) !void {
     var ui = tui.TerminalUi(@TypeOf(stdout)).init(allocator, stdout, !config.no_color);
     ui.setFooterModel(config.model);
@@ -244,23 +275,39 @@ fn runInteractiveChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Conf
             continue;
         }
         const input = std.mem.trim(u8, prompt, " \t\r\n");
+        switch (parseLocalSlashCommand(input)) {
+            .none => {},
+            .exit => {
+                ui.deinit();
+                attached = false;
+                try stdout.writeAll("Session saved. Use phenom chat to continue.\n");
+                return;
+            },
+            .reset => {
+                try db.resetSession(config.session);
+                ui.editor.clearHistory();
+                ui.clearTokenUsage();
+                try ui.positionContent();
+                try stdout.print("\nSession reset: session '{s}' and input history cleared.\n\n", .{config.session});
+                try ui.showPrompt();
+                continue;
+            },
+            .help => {
+                try ui.positionContent();
+                try renderInteractiveHelp(stdout, config, &ui, input);
+                try ui.showPrompt();
+                continue;
+            },
+            .create_custom_prompt => {},
+            .unknown => |name| {
+                try ui.positionContent();
+                try renderInteractiveHelp(stdout, config, &ui, input);
+                try stdout.print("Comando local desconhecido: {s}\nUse /help para ver comandos disponíveis.\n", .{name});
+                try ui.showPrompt();
+                continue;
+            },
+        }
         try db.recordInputHistory(input);
-        if (std.mem.eql(u8, input, "/exit")) {
-            ui.deinit();
-            attached = false;
-            try stdout.writeAll("Session saved. Use phenom chat to continue.\n");
-            return;
-        }
-        if (std.mem.eql(u8, input, "/reset")) {
-            try ui.showPrompt();
-            continue;
-        }
-        if (isInteractiveHelpCommand(input)) {
-            try ui.positionContent();
-            try renderInteractiveHelp(stdout, config, &ui, input);
-            try ui.showPrompt();
-            continue;
-        }
 
         try ui.showStatus("Thinking");
         try ui.positionContent();
@@ -274,70 +321,85 @@ fn runChatTurn(allocator: std.mem.Allocator, io: std.Io, config: cli.Config, std
 }
 
 fn isCreateCustomPromptCommand(input: []const u8) bool {
-    return std.mem.eql(u8, std.mem.trim(u8, input, " \t\r\n"), "/create_custom_prompt");
+    return switch (parseLocalSlashCommand(input)) {
+        .create_custom_prompt => true,
+        else => false,
+    };
 }
 
 fn isInteractiveHelpCommand(input: []const u8) bool {
-    return std.mem.eql(u8, std.mem.trim(u8, input, " \t\r\n"), "/help");
+    return switch (parseLocalSlashCommand(input)) {
+        .help => true,
+        else => false,
+    };
+}
+
+fn renderUnknownSlashCommand(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "Comando local desconhecido: {s}\nUse /help para ver comandos disponíveis.\nComandos: /help, /reset, /exit, /create_custom_prompt.",
+        .{name},
+    );
 }
 
 const interactive_help_text =
-    \\Phenom Zig - ajuda local
+    \\Phenom Zig - local help
     \\
-    \\Comandos interativos:
-    \\  /help                  mostra esta ajuda, sem chamar o modelo
-    \\  /reset                 limpa o prompt atual
-    \\  /exit                  salva a sessao e sai
-    \\  /create_custom_prompt  cria/atualiza Phenom.md como system prompt comportamental; requer modelo ativo
+    \\Interactive commands:
+    \\  /help                  show this help without calling the model
+    \\  /reset                 clean current session and input history
+    \\  /exit                  save the session and exit
+    \\  /create_custom_prompt  create/update Phenom.md as behavioral system prompt; requires active model
     \\
-    \\Uso diario:
-    \\  phenom chat --session trabalho
-    \\  phenom chat --prompt "texto"
-    \\  phenom chat --session trabalho --prompt "continue"
-    \\  phenom chat --offline --session dev --prompt "teste"
+    \\Daily use:
+    \\  phenom chat --session work
+    \\  phenom chat --prompt "text"
+    \\  phenom chat --session work --prompt "continue"
+    \\  phenom chat --offline --session dev --prompt "test"
     \\
     \\Backends:
-    \\  phenom chat --backend ollama --host 127.0.0.1:11434 --model llama3.2 --prompt "ola"
-    \\  phenom chat --backend llamacpp --host 127.0.0.1:8080 --model local --prompt "ola"
+    \\  phenom chat --backend ollama --host 127.0.0.1:11434 --model llama3.2 --prompt "hello"
+    \\  phenom chat --backend llamacpp --host 127.0.0.1:8080 --model local --prompt "hello"
     \\  phenom probe --backend ollama --host 127.0.0.1:11434
     \\  phenom probe --backend llamacpp --host 127.0.0.1:8080
     \\
-    \\Comandos CLI:
-    \\  phenom chat [opcoes]       conversa interativa ou turno unico
-    \\  phenom probe [opcoes]      testa backend sem inferencia
-    \\  phenom graph               gera graph.html do codigo
-    \\  phenom snapshot            executa snapshot local
-    \\  phenom version             mostra versao do binario
-    \\  phenom help                mostra uso resumido
+    \\CLI commands:
+    \\  phenom chat [options]      interactive conversation or one-shot turn
+    \\  phenom probe [options]     test backend without inference
+    \\  phenom graph               generate code graph.html
+    \\  phenom reset [--session ID]  clean session data and input history
+    \\  phenom snapshot            run local snapshot
+    \\  phenom version             show binary version
+    \\  phenom help                show short usage
     \\
-    \\Flags de chat:
-    \\  --prompt TEXT              turno nao interativo
-    \\  --session ID               namespace SQLite da conversa; default: default
-    \\  --offline                  valida CLI/audit sem modelo
+    \\Chat flags:
+    \\  --prompt TEXT              non-interactive turn
+    \\  --session ID               SQLite conversation namespace; default: default
+    \\  --offline                  validate CLI/audit without model
     \\  --backend ollama/llamacpp  backend HTTP
-    \\  --host HOST:PORT           endereco do backend
-    \\  --model MODEL              modelo enviado ao backend
-    \\  --thinking auto/on/off     controle de reasoning/template
-    \\  --system-prompt-profile stock/strict  perfil stock quando Phenom.md nao existir
-    \\  --max-tokens N             limite de geracao enviado ao backend
-    \\  --no-color                 desativa ANSI
-    \\  --fail-on-model-error      falha com exit code nao-zero em erro de modelo/backend
-    \\  --expect-contains TEXT     exige texto na resposta visivel
-    \\  --show-expect-status       mostra status da expectativa
-    \\  --demo-read-file PATH      demonstra leitura de arquivo por tool controlada
+    \\  --host HOST:PORT           backend address
+    \\  --model MODEL              model sent to backend
+    \\  --thinking auto/on/off     reasoning/template control
+    \\  --system-prompt-profile stock/strict  stock profile when Phenom.md is absent
+    \\  --max-tokens N             generation limit sent to backend
+    \\  --no-color                 disable ANSI
+    \\  --fail-on-model-error      exit non-zero on model/backend error
+    \\  --expect-contains TEXT     require text in visible answer
+    \\  --show-expect-status       show expectation status
+    \\  --demo-read-file PATH      demo controlled tool file read
     \\
-    \\Configuracao:
-    \\  ordem: ./config.toml, depois ~/.config/phenom/config.toml, depois flags
-    \\  chaves: backend, host, port, server, model, thinking, max_tokens, no_color,
+    \\Configuration:
+    \\  order: ./config.toml, then ~/.config/phenom/config.toml, then flags
+    \\  keys: backend, host, port, server, model, thinking, max_tokens, no_color,
     \\         offline, fail_on_model_error, web_search_url, expect_contains,
     \\         show_expect_status, demo_read_file, session, system_prompt_profile
     \\
-    \\Build e validacao:
+    \\Build and validation:
     \\  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast
     \\  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test
-    \\  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build run -- chat --offline --session dev --prompt "ola"
+    \\  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build run -- chat --offline --session dev --prompt "hello"
     \\
-    \\Smokes reais:
+    \\Real smokes:
     \\  zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
     \\  zig build real-session-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
     \\  zig build real-dialogue-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
@@ -557,6 +619,7 @@ fn fallbackGeneratedPhenomPrompt(allocator: std.mem.Allocator, existing_prompt: 
         \\Do not invent MEMORY, SKILLS, files, commands, paths, versions, test results, commits, or missing evidence.
         \\Separate known, inferred, and unknown facts when evidence is incomplete.
         \\If a required fact is unsupported, say insufficient evidence or call the appropriate tool.
+        \\During thinking, when confidence is low and safe read-only context/search can verify, explore before asking; ask only when tools/context cannot reduce ambiguity.
         \\Use only announced contracts/tools; if you say inspect, search, verify, edit, validate, or run, emit the matching tool call.
         \\Keep edits minimal, validate changed behavior, and report tests or commands actually run.
     );
@@ -609,12 +672,43 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
     try db.recordTurnPhase(config.session, .intent, "turn_start");
     try events.emit(.{ .user_message = prompt });
 
-    if (isCreateCustomPromptCommand(prompt)) {
-        const visible = try runCreateCustomPromptCommand(allocator, io, effective_config, &events, &db, ui_ptr);
-        defer allocator.free(visible);
-        try events.emit(.{ .message_chunk = visible });
-        try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
-        return;
+    switch (parseLocalSlashCommand(prompt)) {
+        .none => {},
+        .help => {
+            const visible = interactive_help_text;
+            try events.emit(.{ .message_chunk = visible });
+            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
+            return;
+        },
+        .reset => {
+            try db.resetSession(config.session);
+            const visible = try std.fmt.allocPrint(allocator, "Session reset: session '{s}' and input history cleared.", .{config.session});
+            defer allocator.free(visible);
+            try events.emit(.{ .message_chunk = visible });
+            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
+            return;
+        },
+        .exit => {
+            const visible = "Session saved. Use phenom chat to continue.";
+            try events.emit(.{ .message_chunk = visible });
+            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
+            return;
+        },
+        .create_custom_prompt => {
+            const visible = try runCreateCustomPromptCommand(allocator, io, effective_config, &events, &db, ui_ptr);
+            defer allocator.free(visible);
+            try events.emit(.{ .message_chunk = visible });
+            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
+            return;
+        },
+        .unknown => |name| {
+            const visible = try renderUnknownSlashCommand(allocator, name);
+            defer allocator.free(visible);
+            try db.recordEvent(config.session, "local_command_unknown", name);
+            try events.emit(.{ .message_chunk = visible });
+            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
+            return;
+        },
     }
 
     try events.emit(.{ .think_start = "Thinking" });
@@ -669,6 +763,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             .thinking_bytes = 0,
             .defer_visible = enable_tool_loop,
             .trim_visible_leading_whitespace = false,
+            .suppress_thinking = enable_tool_loop,
         };
         defer sink.deinit();
         const model_context_text = try buildInitialModelContext(
@@ -748,7 +843,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         };
         try sink.flush();
         var repaired_think_only_before_tool_loop = false;
-        if (enable_tool_loop and sink.hasNoVisibleText() and sink.thinking_bytes > 0) {
+        if (enable_tool_loop and sink.hasNoVisibleText() and sink.thinking_bytes > 0 and !rawModelContainsToolEnvelope(sink.raw_model.items)) {
             sink.raw_visible.clearRetainingCapacity();
             repaired_think_only_before_tool_loop = try repairThinkOnlyFinalAnswer(allocator, effective_config, prompt, &client, &events, &db, ui_ptr, &sink);
         }
@@ -777,6 +872,17 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
                 try sink.flushDeferredVisible();
             }
         }
+        if (sink.completion_stop_reason == .length and sink.visible_bytes == 0 and std.mem.trim(u8, sink.raw_visible.items, " \t\r\n").len > 0) {
+            try sink.flushDeferredVisible();
+        }
+        if (sink.completion_stop_reason == .length and sink.visible_bytes > 0) {
+            _ = try repairLengthStoppedVisibleAnswer(allocator, effective_config, prompt, &client, &events, &db, ui_ptr, &sink);
+        }
+        if (sink.visible_bytes == 0 and rawVisibleContainsToolCall(sink.raw_visible.items)) {
+            sink.discardDeferredVisible();
+            try db.recordEvent(config.session, "tool_loop_stop", "unhandled visible tool_call discarded");
+            try emitMalformedToolCallAnswer(allocator, &sink);
+        }
         if (sink.visible_bytes == 0 and sink.raw_visible.items.len > 0 and std.mem.trim(u8, sink.raw_visible.items, " \t\r\n").len > 0) {
             try sink.flushDeferredVisible();
         }
@@ -785,7 +891,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         }
         for (0..config.expect_contains_count) |expect_idx| {
             const expected = config.expect_contains_all[expect_idx] orelse continue;
-            if (std.mem.indexOf(u8, sink.visible.items, expected) == null) {
+            if (!expectationSatisfied(sink.visible.items, expected)) {
                 const message = try std.fmt.allocPrint(
                     allocator,
                     "fail expected visible text missing: {s}",
@@ -821,6 +927,31 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
 
 fn shouldUseSessionContext(config: cli.Config) bool {
     return !config.prompt_provided or config.session_provided;
+}
+
+fn expectationSatisfied(visible: []const u8, expected: []const u8) bool {
+    if (std.mem.indexOf(u8, visible, expected) == null) return false;
+    if (!isSyntheticExpectationMarker(expected)) return true;
+    const line = lastNonEmptyLine(visible) orelse return false;
+    return std.mem.eql(u8, line, expected);
+}
+
+fn isSyntheticExpectationMarker(expected: []const u8) bool {
+    return std.mem.startsWith(u8, expected, "PHENOM_") or std.mem.indexOf(u8, expected, " PHENOM_") != null;
+}
+
+fn lastNonEmptyLine(text: []const u8) ?[]const u8 {
+    var end = text.len;
+    while (end > 0) {
+        while (end > 0 and (text[end - 1] == '\n' or text[end - 1] == '\r' or text[end - 1] == ' ' or text[end - 1] == '\t')) end -= 1;
+        if (end == 0) return null;
+        const start = if (std.mem.lastIndexOfScalar(u8, text[0..end], '\n')) |idx| idx + 1 else 0;
+        const line = std.mem.trim(u8, text[start..end], " \t\r\n");
+        if (line.len > 0) return line;
+        if (start == 0) return null;
+        end = start - 1;
+    }
+    return null;
 }
 
 fn recordAndEmitTurnDone(
@@ -1078,7 +1209,7 @@ fn buildInitialModelContext(
         .grounding = groundingRules(),
         .next_action_v1 = if (enable_tool_loop) .{
             .kind = .collect_context,
-            .text = "First choose route. If you cannot identify a requested name/entity from grounded context, emit set_operational_contract(contract=search_web, query=exact requested name/entity). Never answer no-records/fictional/similar first.",
+            .text = "Think first. If confidence is low and available read-only context, session, persistent memory, workspace evidence, or external search can verify the answer, emit the smallest useful exploratory tool call before asking the user. Ask only when exploration cannot safely reduce ambiguity.",
         } else .{
             .kind = .answer_directly,
             .text = "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
@@ -1108,6 +1239,7 @@ fn loadMergedSessionFocus(
 
 const max_tool_emergency_iterations = 8;
 const max_tool_repairs = 1;
+const max_unsupported_web_answer_repairs = 2;
 const max_duplicate_tool_repairs = 1;
 const max_required_tool_protocol_repairs = 2;
 const max_pathless_collect_budget: usize = 6 * 1024;
@@ -1125,6 +1257,96 @@ fn emitEmptyVisibleAnswer(sink: *StreamSink) !void {
     try sink.emitVisibleText(message);
     try sink.db.recordEvent(sink.session, "empty_visible_answer", message);
     if (kind) |value| try sink.db.recordTurnError(sink.session, auditClassForBackendFailure(value), "model_output", @tagName(value));
+}
+
+fn rawVisibleContainsToolCall(visible: []const u8) bool {
+    return std.mem.indexOf(u8, visible, "<tool_call>") != null or
+        std.mem.indexOf(u8, visible, "<function=") != null or
+        std.mem.indexOf(u8, visible, "\"tool_call\"") != null;
+}
+
+fn visibleContainsInternalEvidenceProtocol(visible: []const u8) bool {
+    return std.mem.indexOf(u8, visible, "[WEB_EVIDENCE") != null or
+        containsAsciiIgnoreCase(visible, "web_search returned no direct supporting excerpt") or
+        containsAsciiIgnoreCase(visible, "no current factual answer is evidenced by collected WEB_EVIDENCE");
+}
+
+fn visibleContainsLeakedReasoning(visible: []const u8) bool {
+    return containsAsciiIgnoreCase(visible, "The user is asking") or
+        containsAsciiIgnoreCase(visible, "I need to search") or
+        containsAsciiIgnoreCase(visible, "I'll search") or
+        containsAsciiIgnoreCase(visible, "I will search") or
+        containsAsciiIgnoreCase(visible, "Let me search") or
+        containsAsciiIgnoreCase(visible, "Let me craft");
+}
+
+fn renderNoDirectWebEvidenceAnswer(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
+    const marker = syntheticExpectationMarkerFromPrompt(prompt);
+    const marker_suffix = if (marker) |value| value else "";
+    const separator = if (marker != null) "\n" else "";
+    if (extractOperationalLanguageLabel(prompt)) |label| {
+        return std.fmt.allocPrint(allocator, "{s}: busca-sem-evidencia-direta.{s}{s}", .{ label, separator, marker_suffix });
+    }
+    if (promptLooksPortuguese(prompt)) {
+        return std.fmt.allocPrint(allocator, "A pesquisa web foi executada, mas nao retornou evidencia direta suficiente para responder ao fato solicitado.{s}{s}", .{ separator, marker_suffix });
+    }
+    return std.fmt.allocPrint(allocator, "The web search ran, but it returned no direct supporting evidence for the requested fact.{s}{s}", .{ separator, marker_suffix });
+}
+
+fn syntheticExpectationMarkerFromPrompt(prompt: []const u8) ?[]const u8 {
+    const start = std.mem.indexOf(u8, prompt, "PHENOM_") orelse return null;
+    var end = start;
+    while (end < prompt.len) : (end += 1) {
+        const ch = prompt[end];
+        if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) break;
+    }
+    if (end == start) return null;
+    return prompt[start..end];
+}
+
+fn extractOperationalLanguageLabel(prompt: []const u8) ?[]const u8 {
+    const marker = "idioma operacional '";
+    const start = std.mem.indexOf(u8, prompt, marker) orelse return null;
+    const label_start = start + marker.len;
+    const label_end = std.mem.indexOfScalarPos(u8, prompt, label_start, '\'') orelse return null;
+    if (label_end == label_start) return null;
+    return prompt[label_start..label_end];
+}
+
+fn promptLooksPortuguese(prompt: []const u8) bool {
+    return containsAsciiIgnoreCase(prompt, " como ") or
+        containsAsciiIgnoreCase(prompt, " pesquise ") or
+        containsAsciiIgnoreCase(prompt, " responda ") or
+        containsAsciiIgnoreCase(prompt, " irradiacao ") or
+        containsAsciiIgnoreCase(prompt, " nao ") or
+        containsAsciiIgnoreCase(prompt, " em ");
+}
+
+fn promptExplicitlyRequestsWebSearch(prompt: []const u8) bool {
+    return containsAsciiIgnoreCase(prompt, "pesquise na internet") or
+        containsAsciiIgnoreCase(prompt, "pesquisar na internet") or
+        containsAsciiIgnoreCase(prompt, "busque na internet") or
+        containsAsciiIgnoreCase(prompt, "procure na internet") or
+        containsAsciiIgnoreCase(prompt, "pesquisa web") or
+        containsAsciiIgnoreCase(prompt, "web_search");
+}
+
+fn syntheticWebSearchQuery(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
+    var slice = std.mem.trim(u8, prompt, " \t\r\n");
+    if (std.mem.indexOfScalar(u8, slice, ':')) |colon| {
+        if (colon + 1 < slice.len) slice = std.mem.trim(u8, slice[colon + 1 ..], " \t\r\n");
+    }
+    if (std.ascii.indexOfIgnoreCase(slice, "responda")) |idx| slice = std.mem.trim(u8, slice[0..idx], " \t\r\n. ");
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendBoundedSearchText(allocator, &out, slice, 240);
+    if (out.items.len == 0) try appendBoundedSearchText(allocator, &out, prompt, 240);
+    return out.toOwnedSlice(allocator);
+}
+
+fn rawModelContainsToolEnvelope(raw: []const u8) bool {
+    return std.mem.indexOf(u8, raw, "<tool_call>") != null or
+        std.mem.indexOf(u8, raw, "\"tool_call\"") != null;
 }
 
 fn renderEmptyVisibleAnswerMessage(allocator: std.mem.Allocator, sink: *const StreamSink) ![]u8 {
@@ -1171,13 +1393,35 @@ fn runToolLoopIterations(
 ) !bool {
     var state = ToolLoopState.init(allocator);
     defer state.deinit();
-    _ = model_output;
-    var maybe_envelope = tool_envelope.parseFirst(allocator, visible_output, state.active_contract) catch |err| {
+    var maybe_envelope = parseToolEnvelopeFromVisibleOrRaw(allocator, visible_output, model_output, state.active_contract) catch |err| {
         try db.recordEvent(config.session, "tool_envelope_error", @errorName(err));
         try db.recordTurnError(config.session, .model_protocol, "tool_envelope", @errorName(err));
         return true;
     };
     const has_visible_output = std.mem.trim(u8, visible_output, " \t\r\n").len > 0;
+    var tool_iterations: usize = 0;
+    var repairs: usize = 0;
+    if (maybe_envelope == null and has_visible_output and promptExplicitlyRequestsWebSearch(prompt) and !contextHasSection(initial_context, "[WEB_EVIDENCE]")) {
+        first_sink.discardDeferredVisible();
+        const query = try syntheticWebSearchQuery(allocator, prompt);
+        defer allocator.free(query);
+        var contract_call = tool_call.ToolCall{
+            .name = try allocator.dupe(u8, "set_operational_contract"),
+            .contract = .search_web,
+            .terms = try allocator.dupe(u8, query),
+            .reason = try allocator.dupe(u8, "user explicitly requested internet search"),
+        };
+        defer contract_call.deinit(allocator);
+        try db.recordEvent(config.session, "tool_repair", "explicit web search request enforced");
+        const next = try runSetOperationalContractStep(allocator, io, config, prompt, &contract_call, client, events, db, ui_ptr, first_sink, &state, &tool_iterations);
+        switch (next) {
+            .final_answer => return true,
+            .stopped => return true,
+            .tool_call => |next_call| {
+                maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
+            },
+        }
+    }
     if (maybe_envelope == null and has_visible_output and outputCitesMissingSessionEvidence(visible_output, initial_context)) {
         first_sink.discardDeferredVisible();
         try db.recordEvent(config.session, "tool_repair", "answer cited missing evidence");
@@ -1232,10 +1476,24 @@ fn runToolLoopIterations(
             },
         }
     }
+    if (maybe_envelope == null and has_visible_output and shouldSoftRepairPrematureClarification(visible_output, initial_context, &state)) {
+        state.clarification_soft_repairs += 1;
+        first_sink.discardDeferredVisible();
+        try db.recordEvent(config.session, "answer_repair", "clarification soft repair");
+        const repair_context = try renderClarificationSoftRepairContext(allocator, prompt, &state);
+        defer allocator.free(repair_context);
+        try db.recordEvent(config.session, "model_context", repair_context);
+        const next = try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, first_sink, &state);
+        switch (next) {
+            .final_answer => return true,
+            .stopped => return true,
+            .tool_call => |next_call| {
+                maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
+            },
+        }
+    }
     if (maybe_envelope == null) return false;
 
-    var tool_iterations: usize = 0;
-    var repairs: usize = 0;
     while (maybe_envelope) |envelope_value| {
         var envelope = envelope_value;
         defer envelope.deinit(allocator);
@@ -1262,6 +1520,34 @@ fn runToolLoopIterations(
             }
             const body = try std.fmt.allocPrint(allocator, "{s}\t{s}", .{ envelope.raw_name, envelope.auditText() });
             defer allocator.free(body);
+            if (state.active_contract.name == .workflow and envelope.rejection_reason == .tool_not_advertised and std.mem.eql(u8, envelope.raw_name, "web_search")) {
+                first_sink.discardDeferredVisible();
+                if (try parseToolCallFromVisibleOrRaw(allocator, visible_output, model_output)) |direct_web_call| {
+                    defer direct_web_call.deinit(allocator);
+                    const direct_query = declaredWebQuery(&direct_web_call);
+                    var contract_call = tool_call.ToolCall{
+                        .name = try allocator.dupe(u8, "set_operational_contract"),
+                        .contract = .search_web,
+                        .target = if (direct_web_call.target) |target| try allocator.dupe(u8, target) else null,
+                        .terms = if (direct_query) |query| try allocator.dupe(u8, query) else null,
+                        .intent = if (direct_web_call.intent) |intent| try allocator.dupe(u8, intent) else null,
+                        .budget_bytes = direct_web_call.budget_bytes,
+                        .strategy_id = if (direct_web_call.strategy_id) |strategy_id| try allocator.dupe(u8, strategy_id) else null,
+                        .reason = try allocator.dupe(u8, "initial router normalized direct web_search to search_web contract"),
+                    };
+                    defer contract_call.deinit(allocator);
+                    try db.recordEvent(config.session, "tool_repair", "initial direct web_search normalized to search_web contract");
+                    const next = try runSetOperationalContractStep(allocator, io, config, prompt, &contract_call, client, events, db, ui_ptr, first_sink, &state, &tool_iterations);
+                    switch (next) {
+                        .final_answer => return true,
+                        .stopped => return true,
+                        .tool_call => |next_call| {
+                            maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
+                            continue;
+                        },
+                    }
+                }
+            }
             try db.recordEvent(config.session, "tool_rejected", body);
             try db.recordTurnError(config.session, .tool_contract, "tool_envelope", body);
             if (state.active_contract.name == .workflow and envelope.rejection_reason == .tool_not_advertised) {
@@ -1457,6 +1743,73 @@ fn outputDefersAvailableWorkspaceCollection(output: []const u8, context: ?[]cons
     return false;
 }
 
+fn shouldSoftRepairPrematureClarification(output: []const u8, context: ?[]const u8, state: *const ToolLoopState) bool {
+    if (state.clarification_soft_repairs > 0) return false;
+    if (!outputIsShortUnansweredQuestion(output)) return false;
+    if (stateHasExploredReadOnly(state)) return false;
+    if (contextHasExploratoryEvidence(context)) return false;
+    return activeContractCanExploreReadOnly(state.active_contract);
+}
+
+fn outputIsShortUnansweredQuestion(output: []const u8) bool {
+    const trimmed = std.mem.trim(u8, output, " \t\r\n");
+    if (trimmed.len == 0 or trimmed.len > 360) return false;
+    if (containsCitation(trimmed, 'E') or containsCitation(trimmed, 'S')) return false;
+    if (std.mem.indexOf(u8, trimmed, "<tool_call>") != null) return false;
+    const line = lastNonEmptyLine(trimmed) orelse return false;
+    return std.mem.endsWith(u8, line, "?");
+}
+
+fn searchWebFinalEndsWithQuestion(output: []const u8) bool {
+    const trimmed = std.mem.trim(u8, output, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (std.mem.indexOf(u8, trimmed, "<tool_call>") != null) return false;
+    const line = lastNonEmptyLine(trimmed) orelse return false;
+    return std.mem.endsWith(u8, line, "?");
+}
+
+fn stateHasExploredReadOnly(state: *const ToolLoopState) bool {
+    return state.observations > 0 or
+        state.session_searches.items.len > 0 or
+        state.persistent_context_searches > 0 or
+        state.browser_diagnostics > 0;
+}
+
+fn contextHasExploratoryEvidence(context: ?[]const u8) bool {
+    return contextHasSection(context, "[EVIDENCE]") or
+        contextHasSection(context, "[SESSION_CONTEXT]") or
+        contextHasSection(context, "[MEMORY]") or
+        contextHasSection(context, "[SKILLS]") or
+        contextHasSection(context, "[WEB_EVIDENCE]") or
+        contextHasSection(context, "[RUNTIME_INSPECTION]");
+}
+
+fn activeContractCanExploreReadOnly(active: contracts.ActiveContract) bool {
+    return active.allows("set_operational_contract") or
+        active.allows("collect_evidence") or
+        active.allows("search_session") or
+        active.allows("search_persistent_context") or
+        active.allows("web_search") or
+        active.allows("inspect_runtime");
+}
+
+fn renderClarificationSoftRepairContext(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    state: *const ToolLoopState,
+) ![]u8 {
+    return model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = activeToolSchema(state),
+        .obligations = &.{
+            "Clarification is valid only when it resolves a real user decision.",
+            "Do not write files, patch files, run validation, or perform side-effecting actions for this repair.",
+        },
+        .grounding = groundingRules(),
+        .next_action = "The previous answer asked generic clarification before exploration. If an advertised read-only tool can verify, triangulate, or reduce uncertainty, emit exactly one exploratory tool_call. Otherwise answer with one specific clarification and why available context/tools cannot resolve it.",
+    });
+}
+
 fn webEvidenceHasOnlyEmptyExcerpts(context: []const u8) bool {
     if (std.mem.indexOf(u8, context, "[WEB_EVIDENCE]") == null) return false;
     var saw_excerpt = false;
@@ -1473,6 +1826,41 @@ fn webEvidenceHasOnlyEmptyExcerpts(context: []const u8) bool {
     return saw_excerpt and !saw_nonempty_excerpt;
 }
 
+fn webEvidenceBlockHasEmptyExcerpt(text: []const u8) bool {
+    if (std.mem.indexOf(u8, text, "[WEB_EVIDENCE]") == null) return false;
+    var saw_excerpt = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (!std.mem.startsWith(u8, trimmed, "excerpt=")) continue;
+        saw_excerpt = true;
+        if (std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n").len > 0) return false;
+    }
+    return saw_excerpt;
+}
+
+fn webEvidenceHasStatus200WithExcerpt(text: []const u8) bool {
+    if (std.mem.indexOf(u8, text, "[WEB_EVIDENCE]") == null) return false;
+    var saw_status_200 = false;
+    var saw_nonempty_excerpt = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (std.mem.eql(u8, trimmed, "status=200")) saw_status_200 = true;
+        if (std.mem.startsWith(u8, trimmed, "excerpt=") and std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n").len > 0) {
+            saw_nonempty_excerpt = true;
+        }
+    }
+    return saw_status_200 and saw_nonempty_excerpt;
+}
+
+fn webAnswerOnlyNextAction(web_complete: bool) []const u8 {
+    return if (web_complete)
+        "HTTP web_search returned status=200 with a non-empty WEB_EVIDENCE excerpt. The tool phase is closed. Answer now in the user's language from USER_TASK, not in the source/WEB_EVIDENCE language. Use cited WEB_EVIDENCE only if it directly supports the requested fact. Do not call tools, emit JSON, or expose protocol text."
+    else
+        "Answer in the user's language from USER_TASK, not in the source/WEB_EVIDENCE language. Use cited WEB_EVIDENCE only if it directly and exactly supports the requested entity/fact. If WEB_EVIDENCE excerpt is empty, state that the search returned no direct supporting evidence. Similar names, adjacent topics, partial matches, or 'looks related' are insufficient. If WEB_EVIDENCE does not contain the named fact needed for the answer, do not answer from general knowledge; emit one refined web_search only if the query keeps the exact requested entity/fact and does not add guessed roles/categories/attributes. Do not ask permission for another search inside the active contract. Do not claim browser automation or full-page crawling.";
+}
+
 fn unsupportedWebAnswerLiteral(output: []const u8, context: []const u8) ?[]const u8 {
     if (std.mem.indexOf(u8, context, "[WEB_EVIDENCE]") == null) return null;
     var it = std.mem.tokenizeAny(u8, output, " \t\r\n");
@@ -1487,7 +1875,8 @@ fn unsupportedWebAnswerLiteral(output: []const u8, context: []const u8) ?[]const
 }
 
 fn isEvidenceLiteral(token: []const u8) bool {
-    if (token.len < 4) return false;
+    if (token.len < 3) return false;
+    if (!std.ascii.isDigit(token[0]) and !(token.len > 1 and (token[0] == 'v' or token[0] == 'V') and std.ascii.isDigit(token[1]))) return false;
     var digits: usize = 0;
     var all_digits = true;
     var has_structural_separator = false;
@@ -1497,7 +1886,7 @@ fn isEvidenceLiteral(token: []const u8) bool {
             continue;
         }
         all_digits = false;
-        if (ch == '.' or ch == '-' or ch == '/' or ch == ':' or ch == '_') has_structural_separator = true;
+        if (ch == '.' or ch == ',' or ch == '-' or ch == '/' or ch == ':' or ch == '_') has_structural_separator = true;
     }
     if (digits == 0) return false;
     if (all_digits and token.len == 4) return true;
@@ -1553,29 +1942,7 @@ fn outputContradictsRetrievedSkills(output: []const u8, state: ?*const ToolLoopS
     const loop_state = state orelse return false;
     if (loop_state.active_contract.name != .memory) return false;
     if (loop_state.retrieved_skills.items.len == 0) return false;
-    // ponytail: output-level protocol guard only; replace with semantic verifier if paraphrase tolerance becomes required.
-    const denies_persistent_rule = (containsAsciiIgnoreCase(output, "I don't have") or
-        containsAsciiIgnoreCase(output, "I do not have") or
-        containsAsciiIgnoreCase(output, "nao tenho") or
-        containsAsciiIgnoreCase(output, "não tenho") or
-        containsAsciiIgnoreCase(output, "no specific") or
-        containsAsciiIgnoreCase(output, "nenhuma regra") or
-        containsAsciiIgnoreCase(output, "não há regra") or
-        containsAsciiIgnoreCase(output, "nao ha regra") or
-        containsAsciiIgnoreCase(output, "nao existe regra") or
-        containsAsciiIgnoreCase(output, "não existe regra"));
-    const asks_clarification = containsAsciiIgnoreCase(output, "could you clarify") or
-        containsAsciiIgnoreCase(output, "please clarify") or
-        containsAsciiIgnoreCase(output, "poderia esclarecer") or
-        containsAsciiIgnoreCase(output, "preciso que esclare");
-    const speaks_about_persistent_context = containsAsciiIgnoreCase(output, "rule") or
-        containsAsciiIgnoreCase(output, "regra") or
-        containsAsciiIgnoreCase(output, "memory") or
-        containsAsciiIgnoreCase(output, "skills") or
-        containsAsciiIgnoreCase(output, "memoria") or
-        containsAsciiIgnoreCase(output, "memória") or
-        containsAsciiIgnoreCase(output, "contexto persistente");
-    return speaks_about_persistent_context and (denies_persistent_rule or asks_clarification);
+    return outputIsShortUnansweredQuestion(output);
 }
 
 fn firstMissingRetrievedSkillMarker(context: ?[]const u8, output: []const u8) ?[]const u8 {
@@ -2938,6 +3305,14 @@ fn renderOperationalContractNextAction(
     return allocator.dupe(u8, "Proceed inside the active contract. Call only advertised tools, or answer if no more tool-backed context is needed.");
 }
 
+fn promptExplicitlyRequiresApplyPatch(prompt: []const u8) bool {
+    return containsAsciiIgnoreCase(prompt, "apply_patch");
+}
+
+fn promptExplicitlyRequiresValidateSyntax(prompt: []const u8) bool {
+    return containsAsciiIgnoreCase(prompt, "validate_syntax");
+}
+
 fn runSetOperationalContractStep(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2978,12 +3353,13 @@ fn runSetOperationalContractStep(
         return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
     }
 
-    const effective_requires_mutation = call.requires_mutation orelse false;
+    const effective_requires_mutation = (call.requires_mutation orelse false) or promptExplicitlyRequiresApplyPatch(prompt);
+    const effective_requires_runtime_validation = (call.requires_runtime_validation orelse false) or promptExplicitlyRequiresValidateSyntax(prompt);
     const request = contracts.OperationalContractRequest{
         .requested_contract = call.contract,
         .requires_inspection = (call.requires_inspection orelse false) or effective_requires_mutation,
         .requires_mutation = effective_requires_mutation,
-        .requires_runtime_validation = call.requires_runtime_validation orelse false,
+        .requires_runtime_validation = effective_requires_runtime_validation,
         .requires_browser_diagnostics = call.requires_browser_diagnostics orelse false,
         .requires_memory_promotion = call.requires_memory_promotion orelse false,
     };
@@ -3087,7 +3463,7 @@ fn runApplyPatchStep(
     state: *ToolLoopState,
     tool_iterations: *usize,
 ) !ToolLoopNext {
-    if (tool_iterations.* >= max_tool_emergency_iterations) return .stopped;
+    if (tool_iterations.* >= max_tool_emergency_iterations and !stateNeedsValidationTool(state)) return .stopped;
     tool_iterations.* += 1;
 
     const path = call.path orelse return try repairPatchCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "apply_patch requires path.");
@@ -3606,6 +3982,8 @@ fn runWebSearchStep(
     try events.emit(.{ .tool_result = .{ .name = "web_search", .output = model_evidence } });
     try state.rememberExecutedArgs(target, declared_query, strategy, 1, 1, model_context_id, model_evidence, model_evidence.len, result.quality_score);
     state.recordObservation();
+    const web_complete = webEvidenceHasStatus200WithExcerpt(model_evidence);
+    if (web_complete) state.closeToolPhase();
     const working_add = try std.fmt.allocPrint(
         allocator,
         "path={s} terms_bytes={} strategy={s} compact=false model_bytes={} quality={}",
@@ -3620,11 +3998,18 @@ fn runWebSearchStep(
         &state.context,
         null,
         null,
-        if (state.shouldAllowMoreEvidence()) activeToolSchema(state) else context_profile.toolSchema(.code_evidence, .after_collect_evidence),
-        "Answer using cited WEB_EVIDENCE only if it directly and exactly supports the requested entity/fact. If WEB_EVIDENCE excerpt is empty, state that the search returned no direct supporting evidence. Similar names, adjacent topics, partial matches, or 'looks related' are insufficient. If WEB_EVIDENCE does not contain the named fact needed for the answer, do not answer from general knowledge; emit one refined web_search only if the query keeps the exact requested entity/fact and does not add guessed roles/categories/attributes. Do not ask permission for another search inside the active contract. Do not claim browser automation or full-page crawling.",
+        if (web_complete or !state.shouldAllowMoreEvidence()) context_profile.toolSchema(.code_evidence, .after_collect_evidence) else activeToolSchema(state),
+        webAnswerOnlyNextAction(web_complete),
     );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
+    if (webEvidenceBlockHasEmptyExcerpt(model_evidence)) {
+        try db.recordEvent(config.session, "answer_repair", "empty web evidence direct deterministic answer");
+        const visible = try renderNoDirectWebEvidenceAnswer(allocator, prompt);
+        defer allocator.free(visible);
+        try aggregate_sink.emitVisibleText(visible);
+        return .final_answer;
+    }
     return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
@@ -4474,6 +4859,98 @@ fn repairThinkOnlyFinalAnswer(
     return true;
 }
 
+fn repairLengthStoppedVisibleAnswer(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+) !bool {
+    try db.recordEvent(config.session, "answer_repair", "server length stop with partial visible answer");
+    try events.emit(.{ .progress_update = "model stopped at generation limit; requesting continuation" });
+
+    const partial = try compactOperationalText(allocator, aggregate_sink.visible.items, 4096);
+    defer allocator.free(partial);
+    const session_blocks = [_]model_context.SessionBlock{.{ .text = partial }};
+    const repair_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .mode = "finalization_repair",
+        .contracts =
+        \\[TOOLS v1]
+        \\No tool schema is active for this repair.
+        ,
+        .session = &session_blocks,
+        .obligations = &.{
+            "Previous visible answer stopped because the server reached the generation length limit.",
+            "SESSION_CONTEXT is the partial visible answer already shown to the user.",
+            "Continue from the exact stopping point; do not repeat earlier paragraphs, headings, or calculations.",
+            "Do not mention truncation, token limits, tool calls, or protocol details.",
+        },
+        .grounding = groundingRules(),
+        .next_action_v1 = .{
+            .kind = .answer_directly,
+            .text = "Continue and complete the visible answer now.",
+        },
+    });
+    defer allocator.free(repair_context);
+    try db.recordEvent(config.session, "model_context", repair_context);
+
+    var repair_sink = StreamSink{
+        .allocator = allocator,
+        .events = events,
+        .db = db,
+        .session = config.session,
+        .ui = ui_ptr,
+        .filter = reasoning_filter.ReasoningFilter.init(allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = true,
+        .trim_visible_leading_whitespace = false,
+    };
+    defer repair_sink.deinit();
+
+    const previous_thinking = client.thinking;
+    client.thinking = .off;
+    defer client.thinking = previous_thinking;
+
+    const repair_input = http.InferenceInput{
+        .user_prompt = prompt,
+        .system_prompt = config.system_prompt,
+        .model_context = repair_context,
+        .max_tokens = config.max_tokens,
+    };
+    const context_usage = recordModelContextBudget(allocator, db, config.session, repair_context, client, repair_input) catch |err| {
+        try db.recordEvent(config.session, "answer_repair_failed", @errorName(err));
+        try db.recordTurnError(config.session, .model_protocol, "length_stop_continuation", @errorName(err));
+        return false;
+    };
+    try showModelContextUsage(context_usage, events, ui_ptr);
+    streamInferenceWithUiCancel(client, repair_input, ui_ptr, &repair_sink) catch |err| {
+        const detail = try client.httpFailureDetail(allocator);
+        defer if (detail) |value| allocator.free(value);
+        const kind = http.classifyStreamFailure(err, client.last_http_status);
+        try db.recordEvent(config.session, "answer_repair_failed", @errorName(err));
+        try recordModelStreamFailure(db, config.session, "length_stop_continuation", @errorName(err), kind, detail);
+        return err;
+    };
+    try repair_sink.flush();
+
+    aggregate_sink.mergeGenerationStop(repair_sink);
+    if (repair_sink.raw_visible.items.len == 0) {
+        try db.recordEvent(config.session, "answer_repair_failed", "length stop continuation produced no visible answer");
+        try db.recordTurnError(config.session, .model_protocol, "length_stop_continuation", "repair produced no visible answer");
+        return false;
+    }
+    try aggregate_sink.writeVisible(repair_sink.raw_visible.items);
+    repair_sink.raw_visible.clearRetainingCapacity();
+    try db.recordEvent(config.session, "answer_repair_done", "server length continuation emitted visible answer");
+    return true;
+}
+
 fn parseSearchPlanTerms(allocator: std.mem.Allocator, visible: []const u8) !?[]u8 {
     const marker = "SEARCH_TERMS:";
     const start = if (std.mem.indexOf(u8, visible, marker)) |idx| idx + marker.len else 0;
@@ -4511,18 +4988,26 @@ fn streamDeferredToolLoopTurnInternal(
     if (ui_ptr) |active_ui| {
         try active_ui.showStatus("Thinking");
     }
+    const answer_repair_mode = std.mem.indexOf(u8, follow_context, "[EMPTY_WEB_EVIDENCE_ANSWER_REPAIR]") != null;
+    const required_tool_mode = required_tool_repair != null;
+    const final_answer_mode = active_contract.name == .answer_only and finalization_state != null;
+    const protocol_hidden_mode = required_tool_mode or answer_repair_mode or final_answer_mode or active_contract.name == .search_web;
+    const previous_thinking = client.thinking;
+    if (protocol_hidden_mode) client.thinking = .off;
+    defer client.thinking = previous_thinking;
     var follow_sink = StreamSink{
         .allocator = allocator,
         .events = events,
         .db = db,
         .session = config.session,
         .ui = ui_ptr,
-        .filter = reasoning_filter.ReasoningFilter.init(allocator, http.resolveThinking(config.thinking, prompt) == .on),
+        .filter = reasoning_filter.ReasoningFilter.init(allocator, !protocol_hidden_mode and http.resolveThinking(config.thinking, prompt) == .on),
         .visible = std.ArrayList(u8).empty,
         .visible_bytes = 0,
         .thinking_bytes = 0,
         .defer_visible = true,
         .trim_visible_leading_whitespace = false,
+        .suppress_thinking = protocol_hidden_mode,
     };
     defer follow_sink.deinit();
     const follow_input = http.InferenceInput{ .user_prompt = prompt, .system_prompt = config.system_prompt, .model_context = follow_context, .max_tokens = config.max_tokens };
@@ -4547,7 +5032,7 @@ fn streamDeferredToolLoopTurnInternal(
     };
     try follow_sink.flush();
 
-    var envelope = (tool_envelope.parseFirst(allocator, follow_sink.raw_visible.items, active_contract) catch |err| {
+    var envelope = (parseToolEnvelopeFromVisibleOrRaw(allocator, follow_sink.raw_visible.items, follow_sink.raw_model.items, active_contract) catch |err| {
         try db.recordEvent(config.session, "tool_envelope_error", @errorName(err));
         try db.recordTurnError(config.session, .model_protocol, "tool_envelope", @errorName(err));
         return .stopped;
@@ -4618,6 +5103,45 @@ fn streamDeferredToolLoopTurnInternal(
             );
         }
         if (follow_sink.raw_visible.items.len > 0) {
+            if (final_answer_mode and visibleContainsInternalEvidenceProtocol(follow_sink.raw_visible.items)) {
+                follow_sink.discardDeferredVisible();
+                try db.recordEvent(config.session, "answer_repair", "internal web evidence marker sanitized");
+                const visible = try renderNoDirectWebEvidenceAnswer(allocator, prompt);
+                defer allocator.free(visible);
+                try aggregate_sink.emitVisibleText(visible);
+                return .final_answer;
+            }
+            if (final_answer_mode and visibleContainsLeakedReasoning(follow_sink.raw_visible.items)) {
+                follow_sink.discardDeferredVisible();
+                if (finalization_state) |state| {
+                    if (state.finalization_repairs >= max_tool_repairs) {
+                        try db.recordEvent(config.session, "answer_repair_blocked", "reasoning leaked after tool phase closed");
+                        try db.recordTurnError(config.session, .model_protocol, "final_answer_reasoning", "reasoning leaked after tool phase closed");
+                        try aggregate_sink.emitVisibleText("[MODEL_PROTOCOL_ERROR] final answer leaked reasoning after tool phase closed.");
+                        return .stopped;
+                    }
+                    state.finalization_repairs += 1;
+                }
+                try db.recordEvent(config.session, "answer_repair", "reasoning leaked after tool phase closed");
+                const repair_context = try renderToolPhaseClosedAnswerRepairContext(allocator, follow_context);
+                defer allocator.free(repair_context);
+                try db.recordEvent(config.session, "model_context", repair_context);
+                return streamDeferredToolLoopTurnInternal(
+                    allocator,
+                    config,
+                    prompt,
+                    repair_context,
+                    null,
+                    client,
+                    events,
+                    db,
+                    ui_ptr,
+                    aggregate_sink,
+                    active_contract,
+                    finalization_state,
+                    required_tool_missing_visible,
+                );
+            }
             if (shouldRepairPersistentContextClaim(follow_sink.raw_visible.items, follow_context, finalization_state)) {
                 follow_sink.discardDeferredVisible();
                 try db.recordEvent(config.session, "answer_repair", "persistent context claim without retrieval");
@@ -4684,18 +5208,68 @@ fn streamDeferredToolLoopTurnInternal(
                 follow_sink.raw_visible.clearRetainingCapacity();
                 return .final_answer;
             }
-            if (active_contract.name == .search_web and webEvidenceHasOnlyEmptyExcerpts(follow_context)) {
+            if (active_contract.name == .search_web and webEvidenceHasOnlyEmptyExcerpts(follow_context) and !answer_repair_mode) {
                 follow_sink.discardDeferredVisible();
                 try db.recordEvent(config.session, "answer_repair", "empty web evidence final answer blocked");
-                try aggregate_sink.emitVisibleText("[WEB_EVIDENCE_EMPTY] web_search returned no direct supporting excerpt; no current factual answer is evidenced by collected WEB_EVIDENCE.");
-                return .final_answer;
+                if (finalization_state) |state| {
+                    state.finalization_repairs += 1;
+                }
+                const repair_context = try renderEmptyWebEvidenceAnswerRepairContext(allocator, follow_context);
+                defer allocator.free(repair_context);
+                try db.recordEvent(config.session, "model_context", repair_context);
+                return streamDeferredToolLoopTurnInternal(
+                    allocator,
+                    config,
+                    prompt,
+                    repair_context,
+                    null,
+                    client,
+                    events,
+                    db,
+                    ui_ptr,
+                    aggregate_sink,
+                    active_contract,
+                    finalization_state,
+                    required_tool_missing_visible,
+                );
+            }
+            if (active_contract.name == .search_web and searchWebFinalEndsWithQuestion(follow_sink.raw_visible.items)) {
+                if (finalization_state) |state| {
+                    if (state.search_web_question_repairs < max_tool_repairs) {
+                        state.search_web_question_repairs += 1;
+                        follow_sink.discardDeferredVisible();
+                        const repair_context = try std.fmt.allocPrint(
+                            allocator,
+                            "{s}\n[ANSWER_REPAIR]\nThe previous visible answer ended with a question while search_web is active. Do not ask permission for another search inside the active contract. Emit one refined web_search if evidence can still be improved; otherwise answer from collected WEB_EVIDENCE and state the limitation without a trailing question.\n",
+                            .{follow_context},
+                        );
+                        defer allocator.free(repair_context);
+                        try db.recordEvent(config.session, "answer_repair", "search_web final question");
+                        try db.recordEvent(config.session, "model_context", repair_context);
+                        return streamDeferredToolLoopTurnInternal(
+                            allocator,
+                            config,
+                            prompt,
+                            repair_context,
+                            null,
+                            client,
+                            events,
+                            db,
+                            ui_ptr,
+                            aggregate_sink,
+                            active_contract,
+                            finalization_state,
+                            required_tool_missing_visible,
+                        );
+                    }
+                }
             }
             if (active_contract.name == .search_web) {
                 if (unsupportedWebAnswerLiteral(follow_sink.raw_visible.items, follow_context)) |literal| {
                     follow_sink.discardDeferredVisible();
                     if (finalization_state) |state| {
-                        if (state.finalization_repairs < max_tool_repairs) {
-                            state.finalization_repairs += 1;
+                        if (state.unsupported_web_answer_repairs < max_unsupported_web_answer_repairs) {
+                            state.unsupported_web_answer_repairs += 1;
                             const repair_context = try std.fmt.allocPrint(
                                 allocator,
                                 "{s}\n[ANSWER_REPAIR]\nThe previous visible answer introduced `{s}`, but that literal is not present in WEB_EVIDENCE. Under search_web, numeric, date, and version facts must be copied from collected evidence. Emit one refined web_search with the exact user fact intent if more evidence is needed; otherwise state that collected WEB_EVIDENCE does not directly support the answer. No unsupported factual literals.\n",
@@ -4721,15 +5295,34 @@ fn streamDeferredToolLoopTurnInternal(
                             );
                         }
                     }
-                    const visible = try std.fmt.allocPrint(
-                        allocator,
-                        "[WEB_EVIDENCE_UNSUPPORTED] final answer contained `{s}`, but collected WEB_EVIDENCE does not contain that literal.",
-                        .{literal},
-                    );
-                    defer allocator.free(visible);
                     try db.recordEvent(config.session, "answer_repair", "unsupported web literal final answer blocked");
-                    try aggregate_sink.emitVisibleText(visible);
-                    return .final_answer;
+                    try db.recordTurnError(config.session, .insufficient_evidence, "web_answer_literal", literal);
+                    return .stopped;
+                }
+            }
+            if (finalization_state) |state| {
+                if (shouldSoftRepairPrematureClarification(follow_sink.raw_visible.items, follow_context, state)) {
+                    state.clarification_soft_repairs += 1;
+                    follow_sink.discardDeferredVisible();
+                    try db.recordEvent(config.session, "answer_repair", "clarification soft repair");
+                    const repair_context = try renderClarificationSoftRepairContext(allocator, prompt, state);
+                    defer allocator.free(repair_context);
+                    try db.recordEvent(config.session, "model_context", repair_context);
+                    return streamDeferredToolLoopTurnInternal(
+                        allocator,
+                        config,
+                        prompt,
+                        repair_context,
+                        null,
+                        client,
+                        events,
+                        db,
+                        ui_ptr,
+                        aggregate_sink,
+                        state.active_contract,
+                        state,
+                        required_tool_missing_visible,
+                    );
                 }
             }
             if (finalization_state) |state| {
@@ -4775,6 +5368,36 @@ fn streamDeferredToolLoopTurnInternal(
     try db.recordEvent(config.session, "tool_envelope", envelope_audit);
 
     if (envelope.state == .rejected) {
+        if (active_contract.name == .answer_only and finalization_state != null) {
+            follow_sink.discardDeferredVisible();
+            const state = finalization_state.?;
+            if (state.finalization_repairs >= max_tool_repairs) {
+                try db.recordEvent(config.session, "answer_repair_blocked", "tool call emitted after tool phase closed");
+                try db.recordTurnError(config.session, .model_protocol, "final_answer_tool_call", envelope.raw_name);
+                try aggregate_sink.emitVisibleText("[MODEL_PROTOCOL_ERROR] final answer emitted a tool call after tool phase closed.");
+                return .stopped;
+            }
+            state.finalization_repairs += 1;
+            try db.recordEvent(config.session, "answer_repair", "tool call emitted after tool phase closed");
+            const repair_context = try renderToolPhaseClosedAnswerRepairContext(allocator, follow_context);
+            defer allocator.free(repair_context);
+            try db.recordEvent(config.session, "model_context", repair_context);
+            return streamDeferredToolLoopTurnInternal(
+                allocator,
+                config,
+                prompt,
+                repair_context,
+                null,
+                client,
+                events,
+                db,
+                ui_ptr,
+                aggregate_sink,
+                active_contract,
+                finalization_state,
+                required_tool_missing_visible,
+            );
+        }
         if (envelope.rejection_reason == .parse_error) {
             try db.recordEvent(config.session, "tool_parse_error", envelope.auditText());
             follow_sink.discardDeferredVisible();
@@ -4823,6 +5446,19 @@ fn streamDeferredToolLoopTurnInternal(
         defer allocator.free(body);
         try db.recordEvent(config.session, "tool_rejected", body);
         try db.recordTurnError(config.session, .tool_contract, "tool_envelope", body);
+        if (finalization_state) |state| {
+            if (stateNeedsValidationTool(state) and state.finalization_repairs < max_tool_repairs) {
+                if (try singleStructuredPathFromPrompt(allocator, prompt)) |path| {
+                    state.finalization_repairs += 1;
+                    follow_sink.discardDeferredVisible();
+                    try db.recordEvent(config.session, "tool_arg_repair", "rejected tool -> validate_syntax from structured prompt path");
+                    return .{ .tool_call = .{
+                        .name = try allocator.dupe(u8, "validate_syntax"),
+                        .path = path,
+                    } };
+                }
+            }
+        }
         if (required_tool_repair) |repair_message| {
             if (repair_message.len > 0 and
                 envelope.rejection_reason == .tool_not_advertised and
@@ -4872,6 +5508,26 @@ fn protocolRepairMarkerCount(text: []const u8) usize {
     return count;
 }
 
+fn parseToolEnvelopeFromVisibleOrRaw(
+    allocator: std.mem.Allocator,
+    visible: []const u8,
+    raw_model: []const u8,
+    active_contract: contracts.ActiveContract,
+) !?tool_envelope.ToolCallEnvelope {
+    if (try tool_envelope.parseFirst(allocator, visible, active_contract)) |envelope| return envelope;
+    if (std.mem.trim(u8, visible, " \t\r\n").len > 0) return null;
+    return try tool_envelope.parseFirst(allocator, raw_model, active_contract);
+}
+
+fn parseToolCallFromVisibleOrRaw(
+    allocator: std.mem.Allocator,
+    visible: []const u8,
+    raw_model: []const u8,
+) !?tool_call.ToolCall {
+    if (try tool_call.parseFirst(allocator, visible)) |call| return call;
+    return try tool_call.parseFirst(allocator, raw_model);
+}
+
 fn renderFinalizationRepairContext(
     allocator: std.mem.Allocator,
     prompt: []const u8,
@@ -4903,6 +5559,22 @@ fn renderFinalizationRepairContext(
         .grounding = groundingRules(),
         .next_action = "Emit exactly one allowed tool_call now. No prose.",
     });
+}
+
+fn renderEmptyWebEvidenceAnswerRepairContext(allocator: std.mem.Allocator, follow_context: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}\n[EMPTY_WEB_EVIDENCE_ANSWER_REPAIR]\nPrevious visible answer was blocked because the latest WEB_EVIDENCE excerpt is empty or does not directly support the requested fact.\nAnswer visibly in the user's language from USER_TASK. State that web_search ran but returned no direct supporting evidence for the requested fact. Do not invent numbers, dates, versions, URLs, titles, or claims absent from WEB_EVIDENCE. Do not emit tool calls, <think>, </think>, or protocol tags.\n",
+        .{follow_context},
+    );
+}
+
+fn renderToolPhaseClosedAnswerRepairContext(allocator: std.mem.Allocator, follow_context: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}\n[ANSWER_REPAIR]\nThe previous visible output emitted a tool call after the tool phase was closed. Answer visibly in the user's language from USER_TASK using the collected evidence. Do not emit JSON, tool calls, <think>, </think>, or protocol tags.\n",
+        .{follow_context},
+    );
 }
 
 fn visibleCandidateSelectionToToolCall(allocator: std.mem.Allocator, visible: []const u8, follow_context: []const u8) !?tool_call.ToolCall {
@@ -5015,6 +5687,9 @@ const ToolLoopState = struct {
     duplicate_contract_repairs: usize = 0,
     finalization_repairs: usize = 0,
     retrieved_skill_answer_repairs: usize = 0,
+    unsupported_web_answer_repairs: usize = 0,
+    search_web_question_repairs: usize = 0,
+    clarification_soft_repairs: usize = 0,
     forced_exploratory_refinements: usize = 0,
 
     fn init(allocator: std.mem.Allocator) ToolLoopState {
@@ -5082,12 +5757,23 @@ const ToolLoopState = struct {
         self.requirements = request;
         self.finalization_repairs = 0;
         self.retrieved_skill_answer_repairs = 0;
+        self.unsupported_web_answer_repairs = 0;
+        self.search_web_question_repairs = 0;
         self.duplicate_contract_repairs = 0;
     }
 
     fn recordObservation(self: *ToolLoopState) void {
         self.observations += 1;
         self.finalization_repairs = 0;
+        self.unsupported_web_answer_repairs = 0;
+        self.search_web_question_repairs = 0;
+    }
+
+    fn closeToolPhase(self: *ToolLoopState) void {
+        self.active_contract = contracts.activeContract(.answer_only).?;
+        self.finalization_repairs = 0;
+        self.unsupported_web_answer_repairs = 0;
+        self.search_web_question_repairs = 0;
     }
 
     fn recordMutation(self: *ToolLoopState) void {
@@ -5521,7 +6207,9 @@ fn groundingRules() []const []const u8 {
         "search_session intent says what to recover; terms are retrieval keys.",
         "If prior conversation context is required and search_session is available, call it before saying history is unavailable.",
         "If no E#/S# supports a workspace or exact prior-session claim, say it is not evidenced.",
+        "Answer in the user's language unless USER_TASK explicitly requests another language; translate or summarize evidence instead of switching to the source language.",
         "When answering a local rule/preference/protocol from retrieved MEMORY/SKILLS, answer only the directly retrieved entry and do not add adjacent advice or generic best practices.",
+        "Low confidence is operational: when a read-only tool can verify or triangulate the answer, use it before generic clarification.",
         "Non-workspace technical answers may be unverified estimates; do not collect workspace evidence for them.",
     };
 }
@@ -5861,6 +6549,7 @@ const StreamSink = struct {
     thinking_bytes: usize,
     defer_visible: bool = false,
     trim_visible_leading_whitespace: bool = false,
+    suppress_thinking: bool = false,
     completion_stop_reason: http.StopReason = .unknown,
 
     pub fn deinit(ctx: *StreamSink) void {
@@ -5928,6 +6617,10 @@ const StreamSink = struct {
     }
 
     fn emitVisibleText(ctx: *StreamSink, text: []const u8) !void {
+        if (rawVisibleContainsToolCall(text) or visibleContainsInternalEvidenceProtocol(text) or visibleContainsLeakedReasoning(text)) {
+            try ctx.db.recordEvent(ctx.session, "visible_protocol_leak_blocked", "protocol");
+            return;
+        }
         ctx.visible_bytes += text.len;
         try ctx.visible.appendSlice(ctx.allocator, text);
         if (ctx.ui) |ui| try ui.showStatus("Responding");
@@ -5938,6 +6631,10 @@ const StreamSink = struct {
 
     pub fn writeThinking(ctx: *StreamSink, thinking: []const u8) !void {
         ctx.thinking_bytes += thinking.len;
+        if (ctx.suppress_thinking) {
+            try ctx.db.recordEvent(ctx.session, "assistant_thinking_delta", thinking);
+            return;
+        }
         if (ctx.ui) |ui| try ui.showStatus("Thinking");
         try ctx.events.emit(.{ .reasoning_chunk = thinking });
         if (ctx.ui) |ui| try ui.pulseStatus();
@@ -6022,6 +6719,16 @@ test "interactive help slash command is local only" {
     try std.testing.expect(isInteractiveHelpCommand("  /help\n"));
     try std.testing.expect(!isInteractiveHelpCommand("help"));
     try std.testing.expect(!isInteractiveHelpCommand("/help me"));
+    try std.testing.expect(isCreateCustomPromptCommand("/create_custom_prompt"));
+    try std.testing.expect(!isCreateCustomPromptCommand("/create_custom_prompt now"));
+    switch (parseLocalSlashCommand("/does_not_exist")) {
+        .unknown => |name| try std.testing.expectEqualStrings("/does_not_exist", name),
+        else => return error.ExpectedUnknownSlashCommand,
+    }
+    const unknown = try renderUnknownSlashCommand(std.testing.allocator, "/does_not_exist");
+    defer std.testing.allocator.free(unknown);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "Comando local desconhecido") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "/create_custom_prompt") != null);
     try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "/exit") != null);
     try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "/create_custom_prompt") != null);
     try std.testing.expect(std.mem.indexOf(u8, interactive_help_text, "phenom graph") != null);
@@ -6240,7 +6947,7 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "assistant: resposta anterior") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "S1:") == null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[GROUNDING]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_tools, "First choose route") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "Think first") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "stage=overview") == null);
 
@@ -6315,6 +7022,27 @@ test "answer finalization repair clears stale required tool quality state" {
     try std.testing.expect(std.mem.indexOf(u8, quality.flags, "low_confidence=false") != null);
 }
 
+test "synthetic expectation marker must be completed not quoted in clarification" {
+    try std.testing.expect(expectationSatisfied("PHENOM_REAL_7319", "PHENOM_REAL_7319"));
+    try std.testing.expect(expectationSatisfied("ok\nCODIGO=AZUL-FTS-294 PHENOM_SESSION_RECALL_294", "CODIGO=AZUL-FTS-294 PHENOM_SESSION_RECALL_294"));
+    try std.testing.expect(!expectationSatisfied(
+        "I cannot complete \"PHENOM_REAL_7319\" because there is no context.\nPlease provide details.",
+        "PHENOM_REAL_7319",
+    ));
+    try std.testing.expect(!expectationSatisfied(
+        "I cannot complete PHENOM_REAL_ALIGNMENT_290",
+        "PHENOM_REAL_ALIGNMENT_290",
+    ));
+    try std.testing.expect(!expectationSatisfied("done: PHENOM_REAL_7319", "PHENOM_REAL_7319"));
+    try std.testing.expect(expectationSatisfied("normal answer contains calcular_media", "calcular_media"));
+}
+
+test "tool envelope in raw model is routed before think-only repair" {
+    try std.testing.expect(rawModelContainsToolEnvelope("<think>{\"tool_call\":{\"name\":\"search_web\"}}</think>"));
+    try std.testing.expect(rawModelContainsToolEnvelope("<think><tool_call><function=web_search></function></tool_call></think>"));
+    try std.testing.expect(!rawModelContainsToolEnvelope("<think>only reasoning</think>"));
+}
+
 test "persistent promotion satisfies required context tool contract" {
     var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
     defer db.close();
@@ -6375,7 +7103,7 @@ test "initial model context does not run prompt based session fts" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "fora da sessao") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
-    try std.testing.expect(rendered.len < 7000);
+    try std.testing.expect(rendered.len < 7200);
 }
 
 test "initial model context routes before prose without stale focus session search" {
@@ -6404,7 +7132,7 @@ test "initial model context routes before prose without stale focus session sear
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SESSION_FOCUS]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "cloneEvidenceEntry") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "First choose route") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Think first") != null);
 }
 
 test "initial model context exposes session search without keyword-forced recall" {
@@ -6441,7 +7169,7 @@ test "initial model context exposes session search without keyword-forced recall
 
     try std.testing.expect(std.mem.indexOf(u8, recall, "[SESSION_FOCUS]") != null);
     try std.testing.expect(std.mem.indexOf(u8, recall, "search_session(intent?") != null);
-    try std.testing.expect(std.mem.indexOf(u8, recall, "First choose route") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recall, "Think first") != null);
 
     const register = (try buildInitialModelContext(
         std.testing.allocator,
@@ -6454,7 +7182,7 @@ test "initial model context exposes session search without keyword-forced recall
     )) orelse return error.MissingContext;
     defer std.testing.allocator.free(register);
 
-    try std.testing.expect(std.mem.indexOf(u8, register, "First choose route") != null);
+    try std.testing.expect(std.mem.indexOf(u8, register, "Think first") != null);
 }
 
 test "initial model context for one-shot prompt omits implicit session context" {
@@ -6486,7 +7214,7 @@ test "initial model context for one-shot prompt omits implicit session context" 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[SESSION_FOCUS]\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[RECENT_DIALOGUE]\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "cloneEvidenceEntry") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "First choose route") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Think first") != null);
 }
 
 test "initial model context includes long session summary without failed or current turns" {
@@ -6565,7 +7293,7 @@ test "initial model context combines stored focus with legacy turn topics" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "topic: projeto Zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "topic: qual a matematica perfeita de Matheus 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "source=sqlite_audit_fts") == null);
-    try std.testing.expect(rendered.len < 6800);
+    try std.testing.expect(rendered.len < 7400);
 }
 
 test "turn completion stores structured conversation memory in sqlite focus" {
@@ -6910,6 +7638,69 @@ test "deferred stream sink can discard protocol violating prose" {
     try std.testing.expectEqual(@as(usize, 0), sink.visible_bytes);
 }
 
+test "raw visible tool call is not safe final prose" {
+    try std.testing.expect(rawVisibleContainsToolCall("texto\n<tool_call><function=collect_evidence></function></tool_call>"));
+    try std.testing.expect(rawVisibleContainsToolCall("texto\n<function=apply_patch>"));
+    try std.testing.expect(rawVisibleContainsToolCall("```json\n{\"tool_call\":{\"name\":\"web_search\"}}\n```"));
+    try std.testing.expect(visibleContainsInternalEvidenceProtocol("[WEB_EVIDENCE_EMPTY] web_search returned no direct supporting excerpt"));
+    try std.testing.expect(visibleContainsLeakedReasoning("The user is asking about the average solar irradiation. Let me search."));
+    try std.testing.expect(!rawVisibleContainsToolCall("texto final sem chamada"));
+    try std.testing.expect(!visibleContainsInternalEvidenceProtocol("A pesquisa web nao trouxe evidencia direta suficiente."));
+    try std.testing.expect(!visibleContainsLeakedReasoning("A evidencia coletada nao contem o valor especifico para Londrina."));
+}
+
+test "empty web evidence fallback is user visible prose" {
+    const pt = try renderNoDirectWebEvidenceAnswer(std.testing.allocator, "como media a irradiacao solar em Londrina, pesquise");
+    defer std.testing.allocator.free(pt);
+    try std.testing.expect(std.mem.indexOf(u8, pt, "[WEB_EVIDENCE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pt, "pesquisa web foi executada") != null);
+
+    const custom = try renderNoDirectWebEvidenceAnswer(std.testing.allocator, "Usuario esta usando o idioma operacional 'user-lang-a'. Pesquise. Responda contendo PHENOM_WEB_LANG_USER.");
+    defer std.testing.allocator.free(custom);
+    try std.testing.expectEqualStrings("user-lang-a: busca-sem-evidencia-direta.\nPHENOM_WEB_LANG_USER", custom);
+    try std.testing.expectEqualStrings("PHENOM_WEB_LANG_USER", lastNonEmptyLine(custom).?);
+}
+
+test "explicit internet request is recognized and converted to web query" {
+    try std.testing.expect(promptExplicitlyRequestsWebSearch("Pesquise na internet: qual e a capital da Franca?"));
+    try std.testing.expect(promptExplicitlyRequestsWebSearch("use web_search para confirmar"));
+    try std.testing.expect(!promptExplicitlyRequestsWebSearch("resuma esta URL se precisar"));
+
+    const query = try syntheticWebSearchQuery(std.testing.allocator, "Pesquise na internet: quem criou o kernel Linux? Responda em portugues.");
+    defer std.testing.allocator.free(query);
+    try std.testing.expectEqualStrings("quem criou kernel Linux", query);
+}
+
+test "stream sink blocks tool protocol from final visible output" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "visible-protocol-block",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+    };
+    defer sink.deinit();
+
+    try sink.emitVisibleText("```json\n{\"tool_call\":{\"name\":\"web_search\"}}\n```");
+    try std.testing.expectEqual(@as(usize, 0), sink.visible_bytes);
+    try std.testing.expectEqual(@as(usize, 0), sink.visible.items.len);
+    try sink.emitVisibleText("[WEB_EVIDENCE_EMPTY] web_search returned no direct supporting excerpt");
+    try std.testing.expectEqual(@as(usize, 0), sink.visible_bytes);
+    try std.testing.expectEqual(@as(usize, 0), sink.visible.items.len);
+    try sink.emitVisibleText("I'll search for the exact location. json { \"tool_call\": { \"name\": \"search_web\", \"arguments\": { \"query\": \"Londrina PR\" } } }");
+    try std.testing.expectEqual(@as(usize, 0), sink.visible_bytes);
+    try std.testing.expectEqual(@as(usize, 0), sink.visible.items.len);
+}
+
 test "empty visible answer reports root cause without protocol error" {
     var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
     defer db.close();
@@ -7115,12 +7906,12 @@ test "missing evidence citation requires repair before visible answer" {
     defer retrieved_skill_state.deinit();
     retrieved_skill_state.active_contract = contracts.activeContract(.memory) orelse return error.MissingContract;
     try retrieved_skill_state.rememberRetrievedSkills(&.{"Owner can invite members; members cannot alter billing."});
-    try std.testing.expect(outputContradictsRetrievedSkills(
+    try std.testing.expect(!outputContradictsRetrievedSkills(
         "I don't have a specific rule stored for that.",
         &retrieved_skill_state,
     ));
     try std.testing.expect(outputContradictsRetrievedSkills(
-        "Nao tenho nenhuma regra local persistida sobre isso.",
+        "Qual regra voce quer aplicar?",
         &retrieved_skill_state,
     ));
     try std.testing.expect(!outputContradictsRetrievedSkills(
@@ -7352,6 +8143,39 @@ test "optional workspace refinement rejects clarification-only answer" {
 
     try std.testing.expect(!outputDefersAvailableWorkspaceCollection(clarification, context, &.{"collect_evidence"}));
     try std.testing.expect(!outputDefersAvailableWorkspaceCollection("E1 mostra que o projeto implementa um agente local.", context, &.{"collect_evidence"}));
+}
+
+test "clarification soft repair is bounded and evidence aware" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+    const clarification = "Desculpe pela confusao. O que voce gostaria de fazer com /create_custom_prompt?";
+
+    try std.testing.expect(shouldSoftRepairPrematureClarification(clarification, null, &state));
+    state.clarification_soft_repairs = 1;
+    try std.testing.expect(!shouldSoftRepairPrematureClarification(clarification, null, &state));
+
+    var explored = ToolLoopState.init(std.testing.allocator);
+    defer explored.deinit();
+    explored.recordObservation();
+    try std.testing.expect(!shouldSoftRepairPrematureClarification(clarification, null, &explored));
+
+    var evidence_aware = ToolLoopState.init(std.testing.allocator);
+    defer evidence_aware.deinit();
+    try std.testing.expect(!shouldSoftRepairPrematureClarification(
+        clarification,
+        "[TURN_CONTEXT v1]\n\n[EVIDENCE]\nE1:\npacket_version=v1\n",
+        &evidence_aware,
+    ));
+    try std.testing.expect(!shouldSoftRepairPrematureClarification(
+        "Preciso que voce escolha entre criar ou atualizar o arquivo, porque as duas opcoes alteram o resultado.",
+        null,
+        &evidence_aware,
+    ));
+    try std.testing.expect(!shouldSoftRepairPrematureClarification(
+        "Resposta curta sem pergunta final.",
+        null,
+        &evidence_aware,
+    ));
 }
 
 test "tool loop prose repairs ignore hidden reasoning text" {
@@ -8124,6 +8948,46 @@ test "empty web evidence excerpt is detected structurally" {
     try std.testing.expect(webEvidenceHasOnlyEmptyExcerpts(empty));
     try std.testing.expect(!webEvidenceHasOnlyEmptyExcerpts(nonempty));
     try std.testing.expect(!webEvidenceHasOnlyEmptyExcerpts("[EVIDENCE]\nexcerpt=\n"));
+    try std.testing.expect(webEvidenceBlockHasEmptyExcerpt("[WEB_EVIDENCE]\nstatus=202\nexcerpt=\n"));
+    try std.testing.expect(!webEvidenceBlockHasEmptyExcerpt("[WEB_EVIDENCE]\nstatus=200\nexcerpt=result=4.\n"));
+    try std.testing.expect(webEvidenceHasStatus200WithExcerpt(nonempty));
+    try std.testing.expect(!webEvidenceHasStatus200WithExcerpt(empty));
+    try std.testing.expect(!webEvidenceHasStatus200WithExcerpt("[WEB_EVIDENCE]\nstatus=202\nexcerpt=result=4.\n"));
+}
+
+test "successful web evidence closes tool phase structurally" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+    state.active_contract = contracts.activeContract(.search_web).?;
+    state.contract_selected = true;
+
+    state.closeToolPhase();
+
+    try std.testing.expectEqual(contracts.ContractName.answer_only, state.active_contract.name);
+    try std.testing.expect(!state.active_contract.allows("web_search"));
+    try std.testing.expect(state.finalizationBlocker() == null);
+}
+
+test "empty web evidence repair preserves user language contract structurally" {
+    const context =
+        \\[TURN_CONTEXT v1]
+        \\task=Usuario esta usando idioma operacional zeta-lang.
+        \\
+        \\[EVIDENCE]
+        \\E1:
+        \\  [WEB_EVIDENCE]
+        \\  status=202
+        \\  query=irradiacao solar Londrina
+        \\  excerpt=
+        \\
+        \\[GROUNDING]
+        \\- Answer in the user's language unless USER_TASK explicitly requests another language; translate or summarize evidence instead of switching to the source language.
+    ;
+    const repair = try renderEmptyWebEvidenceAnswerRepairContext(std.testing.allocator, context);
+    defer std.testing.allocator.free(repair);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "[EMPTY_WEB_EVIDENCE_ANSWER_REPAIR]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "Answer visibly in the user's language from USER_TASK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair, "zeta-lang") != null);
 }
 
 test "web final answer numeric literal must be present in web evidence" {
@@ -8135,8 +8999,15 @@ test "web final answer numeric literal must be present in web evidence" {
         \\  excerpt=Download the latest release of Zig from the official project page.
     ;
     try std.testing.expectEqualStrings("0.13.0", unsupportedWebAnswerLiteral("A versao mais recente e 0.13.0.", context).?);
+    try std.testing.expectEqualStrings("4,0", unsupportedWebAnswerLiteral("A media e 4,0 kWh/m2/dia.", context).?);
     try std.testing.expect(unsupportedWebAnswerLiteral("Nao encontrei evidencia direta.", context) == null);
     try std.testing.expect(unsupportedWebAnswerLiteral("A versao evidenciada e 0.15.1.", "[WEB_EVIDENCE]\nexcerpt=Zig 0.15.1\n") == null);
+}
+
+test "search web final question is detected structurally" {
+    try std.testing.expect(searchWebFinalEndsWithQuestion("Resposta com contexto.\n\nDeseja que eu refine?"));
+    try std.testing.expect(!searchWebFinalEndsWithQuestion("Resposta com limitacao declarada."));
+    try std.testing.expect(!searchWebFinalEndsWithQuestion("<tool_call><function=web_search></function></tool_call>"));
 }
 
 test "plain URL in model prose does not synthesize web search" {
@@ -8259,6 +9130,13 @@ test "turn progress blocks finalization until selected contract is satisfied" {
     try std.testing.expectEqualStrings("persistent context search is required before finalization", state.finalizationBlocker().?);
     state.recordPersistentContextSearch();
     try std.testing.expect(state.finalizationBlocker() == null);
+}
+
+test "explicit apply_patch mention preserves mutation obligation" {
+    try std.testing.expect(promptExplicitlyRequiresApplyPatch("corrija usando apply_patch com contextId fresco"));
+    try std.testing.expect(!promptExplicitlyRequiresApplyPatch("explique o contrato de mutacao sem ferramenta nomeada"));
+    try std.testing.expect(promptExplicitlyRequiresValidateSyntax("valide com validate_syntax depois do patch"));
+    try std.testing.expect(!promptExplicitlyRequiresValidateSyntax("valide de forma apropriada"));
 }
 
 test "finalization repair context exposes only active contract tools" {

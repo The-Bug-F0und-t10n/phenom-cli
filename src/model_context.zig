@@ -289,11 +289,12 @@ test "system prompt stays compact and stable" {
     const prompt = try renderSystemPrompt(std.testing.allocator, null);
     defer std.testing.allocator.free(prompt);
 
-    try std.testing.expect(prompt.len < 1200);
+    try std.testing.expect(prompt.len < 1400);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "You are Phenom") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Model decides when contracts/tools are needed") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Answer directly for social turns") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "separate known, inferred, and unknown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "safe read-only context/search can verify") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not invent MEMORY/SKILLS") != null);
 }
 

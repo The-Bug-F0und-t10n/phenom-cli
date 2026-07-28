@@ -21,8 +21,9 @@ const c_dim = "\x1b[2m";
 const c_bold = "\x1b[1m";
 const c_accent = "\x1b[38;2;127;178;201m"; // soft cyan, echoes the status/tool tones
 const c_violet = "\x1b[38;2;164;142;199m"; // soft violet, echoes markdown keyword tone
+const c_yellow = "\x1b[38;2;226;203;139m"; // pastel yellow for one-line hints
 
-const Style = enum { plain, dim, accent, accent_bold, violet };
+const Style = enum { plain, dim, accent, accent_bold, violet, yellow };
 
 fn styleCode(style: Style) []const u8 {
     return switch (style) {
@@ -31,6 +32,7 @@ fn styleCode(style: Style) []const u8 {
         .accent => c_accent,
         .accent_bold => c_bold ++ c_accent,
         .violet => c_violet,
+        .yellow => c_yellow,
     };
 }
 
@@ -59,19 +61,18 @@ pub fn render(writer: anytype, info: Info) !void {
     const version_line = std.fmt.bufPrint(&version_buf, "v{s}", .{info.version}) catch info.version;
 
     const info_rows = [_][]const Seg{
-        &.{ .{ .text = "sessão  ", .style = .dim }, .{ .text = info.session, .style = .plain } },
-        &.{ .{ .text = "modelo  ", .style = .dim }, .{ .text = model_line, .style = .plain } },
+        &.{ .{ .text = "session ", .style = .dim }, .{ .text = info.session, .style = .plain } },
+        &.{ .{ .text = "model   ", .style = .dim }, .{ .text = model_line, .style = .plain } },
         &.{ .{ .text = "cwd     ", .style = .dim }, .{ .text = info.cwd, .style = .plain } },
     };
-    const cmd_row = [_]Seg{
-        .{ .text = "/help", .style = .violet },  .{ .text = "  comandos    ", .style = .dim },
-        .{ .text = "/reset", .style = .violet }, .{ .text = "  limpa    ", .style = .dim },
-        .{ .text = "/exit", .style = .violet },  .{ .text = "  sair", .style = .dim },
+    const hint_row = [_]Seg{
+        .{ .text = "!hint", .style = .yellow },
+        .{ .text = " for help send /help on chat.", .style = .dim },
     };
 
     // Box interior width = widest content row + 2 left pad + 2 right pad,
     // clamped to the terminal so the border never wraps.
-    var content_w: usize = rowWidth(&cmd_row);
+    var content_w: usize = rowWidth(&hint_row);
     for (info_rows) |r| content_w = @max(content_w, rowWidth(r));
     var inner = content_w + 4;
     const max_inner = if (info.columns > 6) info.columns - 3 else 12;
@@ -96,9 +97,9 @@ pub fn render(writer: anytype, info: Info) !void {
 
     // --- info + command box ---
     try boxLine(writer, info.color, .top, inner);
-    for (info_rows) |r| try boxRow(writer, info.color, r, inner);
+    try boxRow(writer, info.color, &hint_row, inner);
     try boxLine(writer, info.color, .mid, inner);
-    try boxRow(writer, info.color, &cmd_row, inner);
+    for (info_rows) |r| try boxRow(writer, info.color, r, inner);
     try boxLine(writer, info.color, .bottom, inner);
     try writer.writeAll("\n");
 }
@@ -194,10 +195,11 @@ test "welcome banner monochrome has no escape codes and shows key fields" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "v0.1.2-dev") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "phenom  v") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "agente local") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "sessão") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "session") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "dev") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "ollama@127.0.0.1:11434") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "/help") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "!hint") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "for help send /help on chat.") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "╭") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "╯") != null);
 }

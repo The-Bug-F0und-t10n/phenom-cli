@@ -258,12 +258,12 @@ pub fn activeContract(name: ContractName) ?ActiveContract {
 }
 
 pub fn selectOperationalContract(request: OperationalContractRequest) ContractName {
-    if (request.requested_contract) |contract| return contract;
     if (request.requires_memory_promotion) return .memory;
     if (request.requires_mutation) return .mutate_file;
     if (request.requires_browser_diagnostics) return .inspect_runtime;
     if (request.requires_runtime_validation) return .validate_work;
     if (request.requires_inspection) return .collect_evidence;
+    if (request.requested_contract) |contract| return contract;
     return .answer_only;
 }
 
@@ -362,6 +362,15 @@ test "workflow router exposes contract selection without evidence executor" {
         .requires_browser_diagnostics = false,
     });
     try std.testing.expectEqual(ContractName.search_web, web);
+
+    const mutation_over_requested_collect = selectOperationalContract(.{
+        .requested_contract = .collect_evidence,
+        .requires_inspection = true,
+        .requires_mutation = true,
+        .requires_runtime_validation = false,
+        .requires_browser_diagnostics = false,
+    });
+    try std.testing.expectEqual(ContractName.mutate_file, mutation_over_requested_collect);
 }
 
 test "compact model visible tools excludes internal collectors" {

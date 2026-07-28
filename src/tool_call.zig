@@ -71,7 +71,7 @@ pub const ToolCall = struct {
 };
 
 pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
-    const call_start = std.mem.indexOf(u8, output, "<tool_call>") orelse return null;
+    const call_start = std.mem.indexOf(u8, output, "<tool_call>") orelse return try parseFirstJsonToolCall(allocator, output);
     const call_end = std.mem.indexOf(u8, output[call_start..], "</tool_call>") orelse return null;
     const body = output[call_start + "<tool_call>".len .. call_start + call_end];
 
@@ -110,6 +110,11 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
     const reason = normalizeOptionalText(parseParameter(body, "reason"));
     const strategy_id = normalizeOptionalText(parseParameter(body, "strategyId") orelse parseParameter(body, "strategy_id"));
     const strategy = try parseStrategyParameter(body);
+    const strategy_id_as_strategy = if (strategy == null)
+        if (strategy_id) |value| parseStrategyName(value) else null
+    else
+        null;
+    const effective_strategy_id = if (strategy_id_as_strategy == null) strategy_id else null;
 
     return .{
         .name = try allocator.dupe(u8, name),
@@ -139,8 +144,8 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
         .contract = contract,
         .budget_bytes = parseIntParameter(body, "budget_bytes") orelse parseIntParameter(body, "max_bytes"),
         .http_search = parseBoolParameter(body, "httpSearch") orelse parseBoolParameter(body, "http_search"),
-        .strategy_id = if (strategy_id) |value| try allocator.dupe(u8, value) else null,
-        .strategy = strategy,
+        .strategy_id = if (effective_strategy_id) |value| try allocator.dupe(u8, value) else null,
+        .strategy = strategy orelse strategy_id_as_strategy,
         .start_line = parseIntParameter(body, "start_line") orelse 1,
         .max_lines = parseIntParameter(body, "max_lines") orelse 12,
         .compact = parseBoolParameter(body, "compact") orelse false,
@@ -150,6 +155,142 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
         .requires_browser_diagnostics = parseBoolParameter(body, "requiresBrowserDiagnostics"),
         .requires_memory_promotion = parseBoolParameter(body, "requiresMemoryPromotion"),
         .reason = if (reason) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
+fn parseFirstJsonToolCall(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
+    const marker = "\"tool_call\"";
+    const marker_pos = std.mem.indexOf(u8, output, marker) orelse return null;
+    const start = jsonObjectStartBefore(output, marker_pos) orelse return null;
+    const end = jsonObjectEnd(output, start) orelse return error.InvalidToolCallJson;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, output[start..end], .{}) catch return error.InvalidToolCallJson;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const raw_tool = root.get("tool_call") orelse return null;
+    const tool = switch (raw_tool) {
+        .object => |object| object,
+        else => return error.InvalidToolCallJson,
+    };
+    const raw_name = jsonStringField(tool, "name") orelse jsonStringField(tool, "function") orelse return error.InvalidToolCallJson;
+    const name = normalizeJsonToolName(raw_name);
+    const args = if (tool.get("arguments")) |value| switch (value) {
+        .object => |object| object,
+        else => tool,
+    } else if (tool.get("parameters")) |value| switch (value) {
+        .object => |object| object,
+        else => tool,
+    } else tool;
+
+    const path = normalizeOptionalPath(jsonStringField(args, "path"));
+    const session = normalizeOptionalText(jsonStringField(args, "session"));
+    const scope = normalizeOptionalText(jsonStringField(args, "scope"));
+    const intent = normalizeOptionalText(jsonStringField(args, "intent"));
+    const need = normalizeOptionalText(jsonStringField(args, "need"));
+    const terms = normalizeOptionalText(jsonStringField(args, "terms") orelse jsonStringField(args, "query"));
+    const target = normalizeOptionalText(jsonStringField(args, "target") orelse jsonStringField(args, "url"));
+    const reason = normalizeOptionalText(jsonStringField(args, "reason"));
+    const strategy_id = normalizeOptionalText(jsonStringField(args, "strategyId") orelse jsonStringField(args, "strategy_id"));
+    const strategy = if (jsonStringField(args, "strategy")) |value| parseStrategyName(value) orelse return error.InvalidStrategy else null;
+    const strategy_id_as_strategy = if (strategy == null)
+        if (strategy_id) |value| parseStrategyName(value) else null
+    else
+        null;
+    const effective_strategy_id = if (strategy_id_as_strategy == null) strategy_id else null;
+
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .path = if (path) |value| try allocator.dupe(u8, value) else null,
+        .session = if (session) |value| try allocator.dupe(u8, value) else null,
+        .scope = if (scope) |value| try allocator.dupe(u8, value) else null,
+        .intent = if (intent) |value| try allocator.dupe(u8, value) else null,
+        .need = if (need) |value| try allocator.dupe(u8, value) else null,
+        .terms = if (terms) |value| try allocator.dupe(u8, value) else null,
+        .target = if (target) |value| try allocator.dupe(u8, value) else null,
+        .contract = if (jsonStringField(args, "contract")) |value| parseContractName(value) orelse return error.InvalidContract else null,
+        .budget_bytes = jsonUsizeField(args, "budget_bytes") orelse jsonUsizeField(args, "max_bytes"),
+        .http_search = jsonBoolField(args, "httpSearch") orelse jsonBoolField(args, "http_search"),
+        .strategy_id = if (effective_strategy_id) |value| try allocator.dupe(u8, value) else null,
+        .strategy = strategy orelse strategy_id_as_strategy,
+        .start_line = jsonUsizeField(args, "start_line") orelse 1,
+        .max_lines = jsonUsizeField(args, "max_lines") orelse 12,
+        .compact = jsonBoolField(args, "compact") orelse false,
+        .requires_inspection = jsonBoolField(args, "requiresInspection"),
+        .requires_mutation = jsonBoolField(args, "requiresMutation"),
+        .requires_runtime_validation = jsonBoolField(args, "requiresRuntimeValidation"),
+        .requires_browser_diagnostics = jsonBoolField(args, "requiresBrowserDiagnostics"),
+        .requires_memory_promotion = jsonBoolField(args, "requiresMemoryPromotion"),
+        .reason = if (reason) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
+fn normalizeJsonToolName(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "search_web") or std.mem.eql(u8, name, "rag_web") or std.mem.eql(u8, name, "ragweb")) return "web_search";
+    return name;
+}
+
+fn jsonObjectStartBefore(text: []const u8, marker_pos: usize) ?usize {
+    var i = marker_pos;
+    while (i > 0) {
+        i -= 1;
+        if (text[i] == '{') return i;
+    }
+    return null;
+}
+
+fn jsonObjectEnd(text: []const u8, start: usize) ?usize {
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    var i = start;
+    while (i < text.len) : (i += 1) {
+        const ch = text[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (ch == '"') {
+            in_string = true;
+        } else if (ch == '{') {
+            depth += 1;
+        } else if (ch == '}') {
+            if (depth == 0) return null;
+            depth -= 1;
+            if (depth == 0) return i + 1;
+        }
+    }
+    return null;
+}
+
+fn jsonStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn jsonBoolField(object: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .bool => |flag| flag,
+        else => null,
+    };
+}
+
+fn jsonUsizeField(object: std.json.ObjectMap, key: []const u8) ?usize {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .integer => |number| if (number >= 0) @intCast(number) else null,
+        else => null,
     };
 }
 
@@ -240,6 +381,10 @@ fn parseBoolParameter(body: []const u8, comptime name: []const u8) ?bool {
 
 fn parseStrategyParameter(body: []const u8) !?contracts.StrategyName {
     const value = parseParameter(body, "strategy") orelse return null;
+    return parseStrategyName(value) orelse error.InvalidStrategy;
+}
+
+fn parseStrategyName(value: []const u8) ?contracts.StrategyName {
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "path")) return .path;
     if (std.mem.eql(u8, value, "lexical")) return .lexical;
@@ -254,11 +399,15 @@ fn parseStrategyParameter(body: []const u8) !?contracts.StrategyName {
     if (std.mem.eql(u8, value, "semantic")) return .semantic;
     if (std.mem.eql(u8, value, "news_table")) return .news_table;
     if (std.mem.eql(u8, value, "document_summary")) return .document_summary;
-    return error.InvalidStrategy;
+    return null;
 }
 
 fn parseContractParameter(body: []const u8) !?contracts.ContractName {
     const value = parseParameter(body, "contract") orelse return null;
+    return parseContractName(value) orelse error.InvalidContract;
+}
+
+fn parseContractName(value: []const u8) ?contracts.ContractName {
     if (std.ascii.eqlIgnoreCase(value, "answer_only")) return .answer_only;
     if (std.ascii.eqlIgnoreCase(value, "collect_evidence")) return .collect_evidence;
     if (std.ascii.eqlIgnoreCase(value, "mutate_file")) return .mutate_file;
@@ -268,7 +417,7 @@ fn parseContractParameter(body: []const u8) !?contracts.ContractName {
     if (std.ascii.eqlIgnoreCase(value, "rag_web")) return .search_web;
     if (std.ascii.eqlIgnoreCase(value, "ragweb")) return .search_web;
     if (std.ascii.eqlIgnoreCase(value, "memory")) return .memory;
-    return error.InvalidContract;
+    return null;
 }
 
 fn parseSourceParameter(body: []const u8) !?contracts.SourceName {
@@ -515,6 +664,22 @@ test "collect evidence parses descriptive strategy id" {
     try std.testing.expect(call.strategy == null);
 }
 
+test "collect evidence accepts legacy strategy value sent in strategy id field" {
+    const output =
+        \\<tool_call>
+        \\<function=collect_evidence>
+        \\<parameter=strategyId>path</parameter>
+        \\<parameter=path>src/math.zig</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("collect_evidence", call.name);
+    try std.testing.expect(call.strategy_id == null);
+    try std.testing.expectEqual(contracts.StrategyName.path, call.strategy.?);
+}
+
 test "apply patch parses context id search and replace" {
     const output =
         \\<tool_call>
@@ -630,6 +795,42 @@ test "web search parses url alias and byte budget" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8080/page.html", call.target.?);
     try std.testing.expectEqualStrings("phenom rag web", call.terms.?);
     try std.testing.expectEqual(@as(?usize, 4096), call.budget_bytes);
+}
+
+test "json tool call is normalized to executable web_search" {
+    const output =
+        \\I'll search for that.
+        \\```json
+        \\{
+        \\  "tool_call": {
+        \\    "name": "search_web",
+        \\    "arguments": {
+        \\      "query": "irradiacao solar media Londrina PR kWh m2 dia Atlas Solarimetrico INPE",
+        \\      "budget_bytes": 4096
+        \\    }
+        \\  }
+        \\}
+        \\```
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("web_search", call.name);
+    try std.testing.expectEqualStrings("irradiacao solar media Londrina PR kWh m2 dia Atlas Solarimetrico INPE", call.terms.?);
+    try std.testing.expectEqual(@as(?usize, 4096), call.budget_bytes);
+}
+
+test "inline json tool call is normalized to executable web_search" {
+    const output =
+        \\I'll search for the exact location of Londrina in Brazil. json { "tool_call": { "name": "search_web", "arguments": { "query": "Londrina PR Brasil onde fica localização estado" } } }
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("web_search", call.name);
+    try std.testing.expectEqualStrings("Londrina PR Brasil onde fica localização estado", call.terms.?);
+}
+
+test "json without tool_call is not a tool" {
+    try std.testing.expect((try parseFirst(std.testing.allocator, "{\"answer\":\"ok\"}")) == null);
 }
 
 test "collect evidence parses explicit http search toggle" {

@@ -233,9 +233,16 @@ pub fn byId(id: []const u8) ?StrategyDescriptor {
 
 pub fn resolveCollectEvidence(input: ResolveInput) !StrategyDescriptor {
     if (input.strategy_id) |id| {
-        const descriptor = byId(id) orelse return error.InvalidStrategyId;
-        if (descriptor.contract != .collect_evidence) return error.StrategyContractMismatch;
-        return descriptor;
+        if (byId(id)) |descriptor| {
+            if (descriptor.contract != .collect_evidence) return error.StrategyContractMismatch;
+            return descriptor;
+        }
+        if (input.path != null or input.target != null or input.source != .auto or input.strategy != .auto) {
+            var fallback = input;
+            fallback.strategy_id = null;
+            return resolveCollectEvidence(fallback);
+        }
+        return error.InvalidStrategyId;
     }
     const collector = try evidence_collectors.resolve(.{
         .source = input.source,
@@ -286,6 +293,19 @@ test "git reflog strategy is a descriptor not a model visible git tool" {
     try std.testing.expectEqual(contracts.StrategyName.reflog, descriptor.strategy);
     try std.testing.expectEqual(evidence_collectors.CollectorKind.git, descriptor.collector);
     try std.testing.expect(!contracts.isModelVisible("git_reflog"));
+}
+
+test "collect evidence ignores invalid strategy id when legacy routing is sufficient" {
+    const descriptor = try resolveCollectEvidence(.{
+        .strategy_id = "path",
+        .path = "src/math.zig",
+    });
+    try std.testing.expectEqual(evidence_collectors.CollectorKind.path, descriptor.collector);
+    try std.testing.expectEqual(contracts.StrategyName.path, descriptor.strategy);
+
+    try std.testing.expectError(error.InvalidStrategyId, resolveCollectEvidence(.{
+        .strategy_id = "not_registered",
+    }));
 }
 
 test "collect evidence can delegate web retrieval through search web contract" {

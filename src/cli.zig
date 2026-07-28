@@ -16,6 +16,7 @@ pub const Command = enum {
     chat,
     probe,
     graph,
+    reset,
     snapshot,
     version,
     help,
@@ -59,6 +60,8 @@ pub fn parseArgsWithBase(base: Config, args: []const []const u8) !Config {
         cfg.command = .probe;
     } else if (std.mem.eql(u8, args[1], "graph")) {
         cfg.command = .graph;
+    } else if (std.mem.eql(u8, args[1], "reset")) {
+        cfg.command = .reset;
     } else if (std.mem.eql(u8, args[1], "snapshot")) {
         cfg.command = .snapshot;
     } else if (std.mem.eql(u8, args[1], "version") or std.mem.eql(u8, args[1], "--version")) {
@@ -151,6 +154,7 @@ pub fn printUsage(writer: anytype) !void {
         \\  chat --backend ollama|llamacpp --host HOST:PORT --model MODEL --prompt TEXT
         \\  probe --backend ollama|llamacpp --host HOST:PORT
         \\  graph
+        \\  reset [--session ID]
         \\  snapshot
         \\  version
         \\
@@ -205,6 +209,13 @@ test "parse graph args" {
     const args = &.{ "phenom", "graph" };
     const cfg = try parseArgs(args);
     try std.testing.expectEqual(Command.graph, cfg.command);
+}
+
+test "parse reset args" {
+    const args = &.{ "phenom", "reset", "--session", "s1" };
+    const cfg = try parseArgs(args);
+    try std.testing.expectEqual(Command.reset, cfg.command);
+    try std.testing.expectEqualStrings("s1", cfg.session);
 }
 
 test "parse chat args" {

@@ -164,6 +164,28 @@ pub const AuditDb = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteStepFailed;
     }
 
+    pub fn resetSession(self: *AuditDb, session: []const u8) !void {
+        try self.exec("begin immediate transaction;");
+        errdefer self.exec("rollback;") catch {};
+        try self.deleteSessionRows("events", session);
+        try self.deleteSessionRows("session_focus", session);
+        try self.exec("delete from input_history;");
+        try self.exec("commit;");
+    }
+
+    fn deleteSessionRows(self: *AuditDb, comptime table: []const u8, session: []const u8) !void {
+        const sql = "delete from " ++ table ++ " where session = ?1";
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        try bindText(stmt, 1, session);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteStepFailed;
+    }
+
     pub fn recordTurnPhase(self: *AuditDb, session: []const u8, phase: OperationalPhase, reason: []const u8) !void {
         const body = try std.fmt.allocPrint(self.allocator, "phase={s} reason={s}", .{ @tagName(phase), reason });
         defer self.allocator.free(body);
@@ -925,6 +947,38 @@ test "input history loads newest distinct sqlite lines" {
     try std.testing.expectEqual(@as(usize, 2), lines.items.len);
     try std.testing.expectEqualStrings("primeiro", lines.items[0]);
     try std.testing.expectEqualStrings("segundo", lines.items[1]);
+}
+
+test "reset session clears active session focus and input history" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.recordEvent("active", "turn_start", "limpar isto");
+    try db.recordEvent("other", "turn_start", "manter isto");
+    try db.recordSessionFocus("active", "tema", "intencao", "fato", "confirmed", "");
+    try db.recordInputHistory("pedido antigo");
+
+    try db.resetSession("active");
+
+    var active_events = try db.loadSessionEvents(std.testing.allocator, "active", 20);
+    defer freeAuditEvents(std.testing.allocator, &active_events);
+    try std.testing.expectEqual(@as(usize, 0), active_events.items.len);
+
+    var other_events = try db.loadSessionEvents(std.testing.allocator, "other", 20);
+    defer freeAuditEvents(std.testing.allocator, &other_events);
+    try std.testing.expectEqual(@as(usize, 1), other_events.items.len);
+
+    var focus = try db.loadRecentSessionFocus(std.testing.allocator, "active", 20);
+    defer freeSessionFocus(std.testing.allocator, &focus);
+    try std.testing.expectEqual(@as(usize, 0), focus.items.len);
+
+    var lines = try db.loadInputHistoryNewestFirst(std.testing.allocator, 200);
+    defer freeHistoryLines(std.testing.allocator, &lines);
+    try std.testing.expectEqual(@as(usize, 0), lines.items.len);
+
+    var hits = try db.searchSessionEventsFts(std.testing.allocator, "active", "turn_start", "limpar", 10);
+    defer freeSessionSearchHits(std.testing.allocator, &hits);
+    try std.testing.expectEqual(@as(usize, 0), hits.items.len);
 }
 
 test "session events load in insertion order" {
