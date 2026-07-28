@@ -9250,6 +9250,22 @@ test "turn progress blocks finalization until selected contract is satisfied" {
     try std.testing.expect(state.finalizationBlocker() == null);
 }
 
+test "search web finalization can require and satisfy inspection evidence" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+
+    state.selectContract(contracts.activeContract(.search_web).?, .{
+        .requires_inspection = true,
+        .requires_mutation = false,
+        .requires_runtime_validation = false,
+        .requires_browser_diagnostics = false,
+        .requires_memory_promotion = false,
+    });
+    try std.testing.expectEqualStrings("inspection evidence is required before finalization", state.finalizationBlocker().?);
+    state.recordObservation();
+    try std.testing.expect(state.finalizationBlocker() == null);
+}
+
 test "explicit apply_patch mention preserves mutation obligation" {
     try std.testing.expect(promptExplicitlyRequiresApplyPatch("corrija usando apply_patch com contextId fresco"));
     try std.testing.expect(!promptExplicitlyRequiresApplyPatch("explique o contrato de mutacao sem ferramenta nomeada"));

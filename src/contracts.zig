@@ -262,8 +262,8 @@ pub fn selectOperationalContract(request: OperationalContractRequest) ContractNa
     if (request.requires_mutation) return .mutate_file;
     if (request.requires_browser_diagnostics) return .inspect_runtime;
     if (request.requires_runtime_validation) return .validate_work;
-    if (request.requires_inspection) return .collect_evidence;
     if (request.requested_contract) |contract| return contract;
+    if (request.requires_inspection) return .collect_evidence;
     return .answer_only;
 }
 
@@ -362,6 +362,15 @@ test "workflow router exposes contract selection without evidence executor" {
         .requires_browser_diagnostics = false,
     });
     try std.testing.expectEqual(ContractName.search_web, web);
+
+    const web_with_inspection_flag = selectOperationalContract(.{
+        .requested_contract = .search_web,
+        .requires_inspection = true,
+        .requires_mutation = false,
+        .requires_runtime_validation = false,
+        .requires_browser_diagnostics = false,
+    });
+    try std.testing.expectEqual(ContractName.search_web, web_with_inspection_flag);
 
     const mutation_over_requested_collect = selectOperationalContract(.{
         .requested_contract = .collect_evidence,
