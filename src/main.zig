@@ -1823,7 +1823,7 @@ fn webEvidenceHasStatus200WithExcerpt(text: []const u8) bool {
 }
 
 fn webEvidenceCanCloseToolPhase(http_success: bool, summary: WebEvidenceSummary) bool {
-    return http_success and summary.status200WithExcerpt() and summary.has_source;
+    return http_success and summary.status200WithExcerpt() and summary.has_source and !summary.needsSourceFollowup();
 }
 
 const WebEvidenceSummary = struct {
@@ -1831,6 +1831,10 @@ const WebEvidenceSummary = struct {
     saw_excerpt: bool = false,
     has_excerpt: bool = false,
     has_source: bool = false,
+    has_search_result_excerpt: bool = false,
+    first_source_url: ?[]const u8 = null,
+    preferred_source_url: ?[]const u8 = null,
+    preferred_result_index: ?usize = null,
     status_code: ?u16 = null,
 
     fn onlyEmptyExcerpt(self: WebEvidenceSummary) bool {
@@ -1843,6 +1847,10 @@ const WebEvidenceSummary = struct {
 
     fn status200WithExcerpt(self: WebEvidenceSummary) bool {
         return self.status_code == 200 and self.has_excerpt;
+    }
+
+    fn needsSourceFollowup(self: WebEvidenceSummary) bool {
+        return self.status200WithExcerpt() and self.has_search_result_excerpt and self.first_source_url != null;
     }
 };
 
@@ -1861,17 +1869,48 @@ fn summarizeWebEvidence(text: []const u8) WebEvidenceSummary {
             saw_status_200 = summary.status_code == 200;
         }
         if (std.mem.startsWith(u8, trimmed, "excerpt=") and std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n").len > 0) {
+            const excerpt = std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n");
             summary.saw_excerpt = true;
             summary.has_excerpt = true;
+            if (std.mem.startsWith(u8, excerpt, "result=") or std.mem.indexOf(u8, excerpt, "\nresult=") != null) summary.has_search_result_excerpt = true;
+            if (summary.preferred_result_index == null) summary.preferred_result_index = firstSearchResultIndex(excerpt);
         } else if (std.mem.startsWith(u8, trimmed, "excerpt=")) {
             summary.saw_excerpt = true;
         }
         if (std.mem.startsWith(u8, trimmed, "source_url=") and std.mem.trim(u8, trimmed["source_url=".len..], " \t\r\n").len > 0) {
             summary.has_source = true;
+            if (summary.first_source_url == null) summary.first_source_url = std.mem.trim(u8, trimmed["source_url=".len..], " \t\r\n");
+        }
+    }
+    if (summary.preferred_result_index) |result_index| {
+        var source_index: usize = 0;
+        lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r\n");
+            if (!std.mem.startsWith(u8, trimmed, "source_url=")) continue;
+            const source_url = std.mem.trim(u8, trimmed["source_url=".len..], " \t\r\n");
+            if (source_url.len == 0) continue;
+            source_index += 1;
+            if (source_index == result_index) {
+                summary.preferred_source_url = source_url;
+                break;
+            }
         }
     }
     if (saw_status_200) summary.status_code = 200;
     return summary;
+}
+
+fn firstSearchResultIndex(excerpt: []const u8) ?usize {
+    var cursor: usize = 0;
+    while (std.mem.indexOf(u8, excerpt[cursor..], "result=")) |rel| {
+        const start = cursor + rel + "result=".len;
+        var end = start;
+        while (end < excerpt.len and std.ascii.isDigit(excerpt[end])) : (end += 1) {}
+        if (end > start) return std.fmt.parseInt(usize, excerpt[start..end], 10) catch null;
+        cursor = start;
+    }
+    return null;
 }
 
 fn webAnswerOnlyNextAction(web_complete: bool) []const u8 {
@@ -3831,6 +3870,11 @@ fn optimizeWebSearchQueryForFetch(
             try recordWebQueryOptimizationAudit(allocator, db, config.session, query, query, false, "lossy_query");
             return null;
         }
+        if (!optimizedQueryKeepsDeclaredTerms(query, value)) {
+            allocator.free(value);
+            try recordWebQueryOptimizationAudit(allocator, db, config.session, query, query, false, "enriched_query");
+            return null;
+        }
     }
     try recordWebQueryOptimizationAudit(allocator, db, config.session, query, optimized orelse query, optimized != null, "");
     return optimized;
@@ -3899,6 +3943,24 @@ fn optimizedQueryKeepsDeclaredCoverage(original_query: []const u8, optimized_que
     return covered_terms * 2 >= original_terms;
 }
 
+fn optimizedQueryKeepsDeclaredTerms(original_query: []const u8, optimized_query: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, optimized_query, " \t\r\n\"'`()[]{}<>:;,./\\|+-_*=");
+    while (it.next()) |raw| {
+        const term = std.mem.trim(u8, raw, " \t\r\n");
+        if (!significantQueryToken(term)) continue;
+        if (!containsIgnoreCaseAscii(original_query, term)) return false;
+    }
+    return true;
+}
+
+fn significantQueryToken(token: []const u8) bool {
+    if (token.len >= 3) return true;
+    for (token) |ch| {
+        if (std.ascii.isDigit(ch)) return true;
+    }
+    return false;
+}
+
 fn containsIgnoreCaseAscii(haystack: []const u8, needle: []const u8) bool {
     if (needle.len > haystack.len) return false;
     var i: usize = 0;
@@ -3942,7 +4004,15 @@ fn runWebSearchStep(
 ) !ToolLoopNext {
     if (tool_iterations.* >= max_tool_emergency_iterations or !state.hasBudgetForMoreEvidence()) {
         try db.recordEvent(config.session, "tool_loop_stop", "web evidence budget exhausted");
-        return .stopped;
+        const evidence_text = try renderWorkingContextEvidenceText(allocator, &state.context);
+        defer allocator.free(evidence_text);
+        const visible = if (std.mem.indexOf(u8, evidence_text, "[WEB_EVIDENCE]") != null)
+            try renderUnsupportedWebEvidenceLiteralAnswer(allocator, evidence_text)
+        else
+            try renderNoDirectWebEvidenceAnswer(allocator, prompt);
+        defer allocator.free(visible);
+        try aggregate_sink.emitVisibleText(visible);
+        return .final_answer;
     }
     tool_iterations.* += 1;
     if (!webEvidenceHasModelIntent(call)) return try repairWebEvidenceIntentCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "web_search requires model-selected query matching the user's external-evidence intent");
@@ -4027,6 +4097,18 @@ fn runWebSearchStep(
     try events.emit(.{ .tool_result = .{ .name = "web_search", .output = model_evidence } });
     try state.rememberExecutedArgs(target, declared_query, strategy, 1, 1, model_context_id, model_evidence, model_evidence.len, result.quality_score);
     state.recordObservation();
+    const follow_source = webEvidenceSourceFollowupTarget(distilled_web.summary, target, state, strategy) orelse
+        webEvidenceContextFollowupTarget(distilled_web.summary, target, state, strategy);
+    if (follow_source) |source_url| {
+        try db.recordEvent(config.session, "web_search_follow_source", source_url);
+        var follow_call = tool_call.ToolCall{
+            .name = "web_search",
+            .target = source_url,
+            .terms = query orelse declared_query,
+            .budget_bytes = call.budget_bytes,
+        };
+        return try runWebSearchStep(allocator, io, config, prompt, &follow_call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
+    }
     const web_complete = webEvidenceCanCloseToolPhase(result.http_success, distilled_web.summary);
     if (web_complete) state.closeToolPhase();
     const working_add = try std.fmt.allocPrint(
@@ -4056,6 +4138,41 @@ fn runWebSearchStep(
         return .final_answer;
     }
     return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
+}
+
+fn renderWorkingContextEvidenceText(allocator: std.mem.Allocator, context: *const working_context.WorkingContext) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (context.entries.items) |entry| {
+        if (out.items.len > 0) try out.append(allocator, '\n');
+        try out.appendSlice(allocator, entry.evidence_text);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn webEvidenceSourceFollowupTarget(summary: WebEvidenceSummary, current_target: []const u8, state: *const ToolLoopState, strategy: contracts.StrategyName) ?[]const u8 {
+    if (!summary.needsSourceFollowup() or !state.shouldAllowMoreEvidence()) return null;
+    const source_url = summary.preferred_source_url orelse summary.first_source_url orelse return null;
+    if (std.mem.eql(u8, source_url, current_target)) return null;
+    if (state.hasExecutedWebTarget(source_url, strategy)) return null;
+    return source_url;
+}
+
+fn webEvidenceContextFollowupTarget(summary: WebEvidenceSummary, current_target: []const u8, state: *const ToolLoopState, strategy: contracts.StrategyName) ?[]const u8 {
+    if (!summary.emptyExcerptBlock() or !state.shouldAllowMoreEvidence()) return null;
+    for (state.context.entries.items) |entry| {
+        var lines = std.mem.splitScalar(u8, entry.evidence_text, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r\n");
+            if (!std.mem.startsWith(u8, trimmed, "source_url=")) continue;
+            const source_url = std.mem.trim(u8, trimmed["source_url=".len..], " \t\r\n");
+            if (!web_rag.isHttpTarget(source_url)) continue;
+            if (std.mem.eql(u8, source_url, current_target)) continue;
+            if (state.hasExecutedWebTarget(source_url, strategy)) continue;
+            return source_url;
+        }
+    }
+    return null;
 }
 
 fn stopWebSearchConfigurationError(
@@ -9009,6 +9126,8 @@ test "web query optimization output is one bounded query and rejects tool calls"
 
     try std.testing.expect(!optimizedQueryKeepsDeclaredCoverage("quem criou o kernel Linux", "quem"));
     try std.testing.expect(optimizedQueryKeepsDeclaredCoverage("quem criou o kernel Linux", "criador kernel Linux"));
+    try std.testing.expect(optimizedQueryKeepsDeclaredTerms("console R36S especificacoes tecnicas", "R36S especificacoes tecnicas"));
+    try std.testing.expect(!optimizedQueryKeepsDeclaredTerms("console R36S especificacoes tecnicas", "console R36S especificacoes tecnicas termoExtra"));
     try std.testing.expect((try normalizeWebQueryOptimizationOutput(std.testing.allocator, "<tool_call><function=web_search></function></tool_call>")) == null);
 }
 
@@ -9140,6 +9259,50 @@ test "successful web evidence closes tool phase structurally" {
     try std.testing.expectEqual(contracts.ContractName.answer_only, state.active_contract.name);
     try std.testing.expect(!state.active_contract.allows("web_search"));
     try std.testing.expect(state.finalizationBlocker() == null);
+}
+
+test "search result evidence follows source before closing" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+    state.active_contract = contracts.activeContract(.search_web).?;
+    state.contract_selected = true;
+
+    const serp = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nsource_url=https://r36s.org/articles/r36s-specs-hardware-details\nexcerpt=result=2 title=R36S specs snippet=Technical details page\n");
+    try std.testing.expect(serp.needsSourceFollowup());
+    try std.testing.expect(!webEvidenceCanCloseToolPhase(true, serp));
+    try std.testing.expectEqualStrings("https://r36s.org/articles/r36s-specs-hardware-details", webEvidenceSourceFollowupTarget(serp, "https://html.duckduckgo.com/html/?q=r36s", &state, .document_summary).?);
+
+    const indexed_serp = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nsource_url=https://example.test/first\nsource_url=https://example.test/second\nexcerpt=result=2 title=Second source\n");
+    try std.testing.expectEqual(@as(?usize, 2), indexed_serp.preferred_result_index);
+    try std.testing.expectEqualStrings("https://example.test/second", indexed_serp.preferred_source_url.?);
+    try std.testing.expectEqualStrings("https://example.test/second", webEvidenceSourceFollowupTarget(indexed_serp, "https://html.duckduckgo.com/html/?q=r36s", &state, .document_summary).?);
+
+    try state.rememberExecutedArgs("https://r36s.org/articles/r36s-specs-hardware-details", null, .document_summary, 1, 1, "ctx_web", "[WEB_EVIDENCE]\nstatus=200\n", 80, 30);
+    try std.testing.expect(webEvidenceSourceFollowupTarget(serp, "https://html.duckduckgo.com/html/?q=r36s", &state, .document_summary) == null);
+
+    const direct = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nsource_url=https://r36s.org/articles/r36s-specs-hardware-details\nexcerpt=R36S uses RK3326 and 1GB RAM.\n");
+    try std.testing.expect(!direct.needsSourceFollowup());
+    try std.testing.expect(webEvidenceCanCloseToolPhase(true, direct));
+}
+
+test "empty followed source tries next collected source url" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+    state.active_contract = contracts.activeContract(.search_web).?;
+    state.contract_selected = true;
+
+    const serp_evidence =
+        \\[WEB_EVIDENCE]
+        \\status=200
+        \\source_url=https://example.test/empty
+        \\source_url=https://example.test/specs
+        \\excerpt=result=1 title=empty result
+    ;
+    try state.rememberExecutedArgs("https://search.test/?q=r36s", null, .document_summary, 1, 1, "ctx_serp", serp_evidence, serp_evidence.len, 80);
+    try state.rememberExecutedArgs("https://example.test/empty", null, .document_summary, 1, 1, "ctx_empty", "[WEB_EVIDENCE]\nstatus=200\nsource_url=https://example.test/empty\nexcerpt=\n", 80, 30);
+
+    const empty = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nsource_url=https://example.test/empty\nexcerpt=\n");
+    try std.testing.expectEqualStrings("https://example.test/specs", webEvidenceContextFollowupTarget(empty, "https://example.test/empty", &state, .document_summary).?);
 }
 
 test "web evidence without source keeps refinement structurally available" {

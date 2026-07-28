@@ -13,6 +13,7 @@ const c = @cImport({
 const Scenario = enum {
     initial_json_web,
     duplicate_web_json,
+    web_source_followup,
     web_language,
     web_language_empty,
 };
@@ -40,6 +41,7 @@ const ServerState = struct {
     fd: c_int,
     port: u16,
     completion_count: usize = 0,
+    completion_buf: [4096]u8 = undefined,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -58,6 +60,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(bin);
     try runScenario(allocator, init.io, bin, .initial_json_web);
     try runScenario(allocator, init.io, bin, .duplicate_web_json);
+    try runScenario(allocator, init.io, bin, .web_source_followup);
     try runScenario(allocator, init.io, bin, .web_language);
     try runScenario(allocator, init.io, bin, .web_language_empty);
     writeFd(1, "agent-flow-smoke: ok\n");
@@ -165,7 +168,11 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
 
     const db_path = try std.fmt.allocPrint(allocator, "{s}/.phenom-zig/phenom.db", .{work});
     defer allocator.free(db_path);
-    try expectCount(allocator, db_path, "select count(*) from events where kind='tool_start' and body like 'web_search%'", if (scenario == .web_language_empty) 2 else 1);
+    try expectCount(allocator, db_path, "select count(*) from events where kind='tool_start' and body like 'web_search%'", switch (scenario) {
+        .web_language_empty => 2,
+        .web_source_followup => 3,
+        else => 1,
+    });
     try expectCount(allocator, db_path, "select count(*) from events where kind='assistant_delta' and (body like '%tool_call%' or body like '%WEB_EVIDENCE%' or body like '%```json%' or body like '%PHENOM_WEB_LANG_EN%')", 0);
     try expectCount(allocator, db_path, "select count(*) from events where kind='turn_error'", 0);
     try expectAtLeast(allocator, db_path, "select count(*) from events where kind='turn_done' and body like '%used_evidence=true%'", 1);
@@ -203,6 +210,7 @@ fn serverMain(state: *ServerState) void {
     const max: usize = switch (state.scenario) {
         .initial_json_web => 4,
         .duplicate_web_json => 5,
+        .web_source_followup => 9,
         .web_language => 4,
         .web_language_empty => 7,
     };
@@ -245,6 +253,12 @@ fn handleClient(state: *ServerState, client: c_int) !void {
     if (std.mem.startsWith(u8, first_line, "GET /search")) {
         return send(client, "200 OK", "text/html", searchHtml(state.scenario));
     }
+    if (std.mem.startsWith(u8, first_line, "GET /source ")) {
+        return send(client, "200 OK", "text/html", sourceHtml(state.scenario));
+    }
+    if (std.mem.startsWith(u8, first_line, "GET /source-empty ")) {
+        return send(client, "200 OK", "text/html", sourceEmptyHtml(state.scenario));
+    }
     if (std.mem.startsWith(u8, first_line, "POST /completion ")) {
         const prompt = request[header_end .. header_end + body_len];
         const text = completionText(state, prompt);
@@ -254,10 +268,11 @@ fn handleClient(state: *ServerState, client: c_int) !void {
     return send(client, "404 Not Found", "text/plain", "not found");
 }
 
-fn completionText(state: *const ServerState, prompt: []const u8) []const u8 {
+fn completionText(state: *ServerState, prompt: []const u8) []const u8 {
     return switch (state.scenario) {
         .initial_json_web => initialJsonCompletion(prompt),
         .duplicate_web_json => duplicateWebCompletion(prompt),
+        .web_source_followup => sourceFollowupCompletion(state, prompt),
         .web_language => languageCompletion(prompt, false, state.completion_count),
         .web_language_empty => languageCompletion(prompt, true, state.completion_count),
     };
@@ -276,6 +291,36 @@ fn duplicateWebCompletion(prompt: []const u8) []const u8 {
     if (contains(prompt, "tool call after the tool phase was closed")) return "A evidencia coletada informa irradiacao solar em Londrina de 4,8 kWh/m2/dia.\nPHENOM_WEB_JSON_NORMALIZED";
     if (contains(prompt, "tool phase is closed")) return "Vou pesquisar de novo. json { \"tool_call\": { \"name\": \"search_web\", \"arguments\": { \"query\": \"irradiacao solar media Londrina PR Atlas Solarimetrico INPE\" } } }";
     return "preciso pesquisar\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>irradiacao solar media Londrina PR kWh m2 dia</parameter><parameter=reason>buscar dado externo solicitado</parameter></function></tool_call>";
+}
+
+fn sourceFollowupCompletion(state: *ServerState, prompt: []const u8) []const u8 {
+    if (contains(prompt, "MODEL_DECLARED_QUERY")) return "R36S especificacoes tecnicas RK3326 RAM tela";
+    if (contains(prompt, "WEB_EVIDENCE_INPUT") and modelWebTargetContains(prompt, "/source-empty")) {
+        return "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/source-empty\nstatus=200\nquery=R36S especificacoes tecnicas RK3326 RAM tela\ntitle=R36S Empty\nsource_url=http://127.0.0.1/source-empty\nexcerpt=";
+    }
+    if (contains(prompt, "WEB_EVIDENCE_INPUT") and modelWebTargetContains(prompt, "/source")) {
+        return "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/source\nstatus=200\nquery=R36S especificacoes tecnicas RK3326 RAM tela\ntitle=R36S Specs\nsource_url=http://127.0.0.1/source\nexcerpt=Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.";
+    }
+    if (contains(prompt, "WEB_EVIDENCE_INPUT")) {
+        return std.fmt.bufPrint(
+            &state.completion_buf,
+            "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/search\nstatus=200\nquery=R36S especificacoes tecnicas RK3326 RAM tela\ntitle=R36S results\nsource_url=http://127.0.0.1:{}/source-empty\nsource_url=http://127.0.0.1:{}/source\nexcerpt=result=1 title=R36S Specs snippet=Dados tecnicos do console R36S",
+            .{ state.port, state.port },
+        ) catch unreachable;
+    }
+    if (contains(prompt, "tool phase is closed")) return "Specs verificadas: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_SOURCE_FOLLOWED";
+    return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S especificacoes tecnicas RK3326 RAM tela</parameter><parameter=reason>buscar dados tecnicos externos</parameter></function></tool_call>";
+}
+
+fn modelWebTargetContains(prompt: []const u8, needle: []const u8) bool {
+    return modelWebTargetContainsWithMarker(prompt, "[MODEL_WEB_TARGET]\n", "\n", needle) or
+        modelWebTargetContainsWithMarker(prompt, "[MODEL_WEB_TARGET]\\n", "\\n", needle);
+}
+
+fn modelWebTargetContainsWithMarker(prompt: []const u8, marker: []const u8, line_end_marker: []const u8, needle: []const u8) bool {
+    const start = (std.mem.indexOf(u8, prompt, marker) orelse return false) + marker.len;
+    const end = if (std.mem.indexOfPos(u8, prompt, start, line_end_marker)) |rel| rel else prompt.len;
+    return contains(prompt[start..end], needle);
 }
 
 fn languageCompletion(prompt: []const u8, empty: bool, completion_count: usize) []const u8 {
@@ -297,7 +342,22 @@ fn searchHtml(scenario: Scenario) []const u8 {
     return switch (scenario) {
         .initial_json_web => "<html><head><title>Londrina Location</title></head><body><p>Londrina fica no norte do Paraná, na região Sul do Brasil.</p></body></html>",
         .duplicate_web_json => "<html><head><title>Londrina Solar</title></head><body><p>Irradiacao solar em Londrina: 4,8 kWh/m2/dia.</p></body></html>",
+        .web_source_followup => "<html><head><title>R36S results</title></head><body><p>result=1 title=R36S Specs url=http://127.0.0.1/source-empty snippet=Dados tecnicos do console R36S</p><p>result=2 title=R36S Specs url=http://127.0.0.1/source snippet=Ficha tecnica do console R36S</p></body></html>",
         .web_language, .web_language_empty => "<html><head><title>Solar Cost</title></head><body><p>Solar off-grid systems require batteries, inverter, panels, and charge controllers.</p></body></html>",
+    };
+}
+
+fn sourceHtml(scenario: Scenario) []const u8 {
+    return switch (scenario) {
+        .web_source_followup => "<html><head><title>R36S Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
+        else => "not found",
+    };
+}
+
+fn sourceEmptyHtml(scenario: Scenario) []const u8 {
+    return switch (scenario) {
+        .web_source_followup => "<html><head><title>R36S Empty</title></head><body><p>Pagina sem specs capturaveis.</p></body></html>",
+        else => "not found",
     };
 }
 
@@ -305,6 +365,7 @@ fn scenarioPrompt(scenario: Scenario) []const u8 {
     return switch (scenario) {
         .initial_json_web => "onde fica localizado Londrina no Brasil , pesquise na internet",
         .duplicate_web_json => "como media a irradiacao solar em Londrina - PR, pesquise na internet. Responda contendo PHENOM_WEB_JSON_NORMALIZED.",
+        .web_source_followup => "busque as informacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_SOURCE_FOLLOWED.",
         .web_language, .web_language_empty => "Usuario esta usando o idioma operacional 'user-lang-a'. Pesquise e explique nesse idioma operacional o que entra no custo de uma casa off-grid solar. Responda contendo PHENOM_WEB_LANG_USER.",
     };
 }
@@ -313,6 +374,7 @@ fn scenarioExpect(scenario: Scenario) []const u8 {
     return switch (scenario) {
         .initial_json_web => "PHENOM_INITIAL_JSON_WEB_OK",
         .duplicate_web_json => "PHENOM_WEB_JSON_NORMALIZED",
+        .web_source_followup => "PHENOM_WEB_SOURCE_FOLLOWED",
         .web_language, .web_language_empty => "PHENOM_WEB_LANG_USER",
     };
 }
