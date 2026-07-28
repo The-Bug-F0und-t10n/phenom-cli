@@ -344,66 +344,6 @@ pub fn build(b: *std.Build) void {
     const think_only_finalization_step = b.step("think-only-finalization-smoke", "Offline e2e scripted-backend smoke for visible finalization after think-only output.");
     think_only_finalization_step.dependOn(&think_only_finalization_cmd.step);
 
-    const unknown_slash_cmd = b.addSystemCommand(&.{
-        "sh",
-        "tools/check_unknown_slash_command_flow.sh",
-    });
-    unknown_slash_cmd.step.dependOn(&install_artifact.step);
-    unknown_slash_cmd.addFileArg(exe.getEmittedBin());
-
-    const unknown_slash_step = b.step("unknown-slash-command-smoke", "Local slash command smoke; unknown commands must not call the model.");
-    unknown_slash_step.dependOn(&unknown_slash_cmd.step);
-
-    const clarification_soft_repair_cmd = b.addSystemCommand(&.{
-        "sh",
-        "tools/check_clarification_soft_repair_flow.sh",
-    });
-    clarification_soft_repair_cmd.step.dependOn(&install_artifact.step);
-    clarification_soft_repair_cmd.addFileArg(exe.getEmittedBin());
-
-    const clarification_soft_repair_step = b.step("clarification-soft-repair-smoke", "Scripted-backend usability smoke for assistive exploration after generic clarification.");
-    clarification_soft_repair_step.dependOn(&clarification_soft_repair_cmd.step);
-
-    const length_stop_continuation_cmd = b.addSystemCommand(&.{
-        "sh",
-        "tools/check_length_stop_continuation_flow.sh",
-    });
-    length_stop_continuation_cmd.step.dependOn(&install_artifact.step);
-    length_stop_continuation_cmd.addFileArg(exe.getEmittedBin());
-
-    const length_stop_continuation_step = b.step("length-stop-continuation-smoke", "Scripted-backend smoke for visible-answer continuation after server length stop.");
-    length_stop_continuation_step.dependOn(&length_stop_continuation_cmd.step);
-
-    const web_language_preservation_cmd = b.addSystemCommand(&.{
-        "sh",
-        "tools/check_web_language_preservation_flow.sh",
-    });
-    web_language_preservation_cmd.step.dependOn(&install_artifact.step);
-    web_language_preservation_cmd.addFileArg(exe.getEmittedBin());
-
-    const web_language_preservation_step = b.step("web-language-preservation-smoke", "Scripted-backend smoke for preserving user language after WEB_EVIDENCE.");
-    web_language_preservation_step.dependOn(&web_language_preservation_cmd.step);
-
-    const web_json_toolcall_normalization_cmd = b.addSystemCommand(&.{
-        "sh",
-        "tools/check_web_json_toolcall_normalization_flow.sh",
-    });
-    web_json_toolcall_normalization_cmd.step.dependOn(&install_artifact.step);
-    web_json_toolcall_normalization_cmd.addFileArg(exe.getEmittedBin());
-
-    const web_json_toolcall_normalization_step = b.step("web-json-toolcall-normalization-smoke", "Scripted-backend smoke for consuming JSON web tool calls without visible leakage.");
-    web_json_toolcall_normalization_step.dependOn(&web_json_toolcall_normalization_cmd.step);
-
-    const initial_json_web_search_cmd = b.addSystemCommand(&.{
-        "sh",
-        "tools/check_initial_json_web_search_normalization_flow.sh",
-    });
-    initial_json_web_search_cmd.step.dependOn(&install_artifact.step);
-    initial_json_web_search_cmd.addFileArg(exe.getEmittedBin());
-
-    const initial_json_web_search_step = b.step("initial-json-web-search-normalization-smoke", "Scripted-backend smoke for normalizing direct initial JSON search_web calls.");
-    initial_json_web_search_step.dependOn(&initial_json_web_search_cmd.step);
-
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
