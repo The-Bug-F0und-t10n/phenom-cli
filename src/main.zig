@@ -1823,7 +1823,7 @@ fn webEvidenceHasStatus200WithExcerpt(text: []const u8) bool {
 }
 
 fn webEvidenceCanCloseToolPhase(http_success: bool, summary: WebEvidenceSummary) bool {
-    return http_success and summary.status200WithExcerpt() and summary.has_source and !summary.needsSourceFollowup();
+    return http_success and summary.status200WithExcerpt() and summary.has_source and !summary.has_source_excerpt and !summary.needsSourceFollowup();
 }
 
 const WebEvidenceSummary = struct {
@@ -1832,6 +1832,8 @@ const WebEvidenceSummary = struct {
     has_excerpt: bool = false,
     has_source: bool = false,
     has_search_result_excerpt: bool = false,
+    has_source_excerpt: bool = false,
+    has_model_verified_excerpt: bool = false,
     first_source_url: ?[]const u8 = null,
     preferred_source_url: ?[]const u8 = null,
     preferred_result_index: ?usize = null,
@@ -1867,6 +1869,12 @@ fn summarizeWebEvidence(text: []const u8) WebEvidenceSummary {
             const raw = std.mem.trim(u8, trimmed["status=".len..], " \t\r\n");
             summary.status_code = std.fmt.parseInt(u16, raw, 10) catch null;
             saw_status_200 = summary.status_code == 200;
+        }
+        if (std.mem.startsWith(u8, trimmed, "source=") and std.mem.indexOf(u8, trimmed, "distill=source_excerpt") != null) {
+            summary.has_source_excerpt = true;
+        }
+        if (std.mem.startsWith(u8, trimmed, "source=") and std.mem.indexOf(u8, trimmed, "distill=model_verified_excerpt") != null) {
+            summary.has_model_verified_excerpt = true;
         }
         if (std.mem.startsWith(u8, trimmed, "excerpt=") and std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n").len > 0) {
             const excerpt = std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n");
@@ -1907,7 +1915,11 @@ fn firstSearchResultIndex(excerpt: []const u8) ?usize {
         const start = cursor + rel + "result=".len;
         var end = start;
         while (end < excerpt.len and std.ascii.isDigit(excerpt[end])) : (end += 1) {}
-        if (end > start) return std.fmt.parseInt(usize, excerpt[start..end], 10) catch null;
+        const line_end = std.mem.indexOfScalarPos(u8, excerpt, end, '\n') orelse excerpt.len;
+        const result_line = excerpt[start..line_end];
+        if (end > start and std.mem.indexOf(u8, result_line, " url=") != null) {
+            return std.fmt.parseInt(usize, excerpt[start..end], 10) catch null;
+        }
         cursor = start;
     }
     return null;
@@ -1927,7 +1939,9 @@ fn unsupportedWebAnswerLiteral(output: []const u8, context: []const u8) ?[]const
         const token = std.mem.trim(u8, raw, ".,;:!?()[]{}<>\"'`*");
         if (!isEvidenceLiteral(token)) continue;
         if (containsAsciiIgnoreCase(context, token)) continue;
+        if (containsLooseEvidenceLiteral(context, token)) continue;
         if (token.len > 1 and (token[0] == 'v' or token[0] == 'V') and containsAsciiIgnoreCase(context, token[1..])) continue;
+        if (token.len > 1 and (token[0] == 'v' or token[0] == 'V') and containsLooseEvidenceLiteral(context, token[1..])) continue;
         return token;
     }
     return null;
@@ -1937,6 +1951,7 @@ fn isEvidenceLiteral(token: []const u8) bool {
     if (token.len < 3) return false;
     if (!std.ascii.isDigit(token[0]) and !(token.len > 1 and (token[0] == 'v' or token[0] == 'V') and std.ascii.isDigit(token[1]))) return false;
     var digits: usize = 0;
+    var letters: usize = 0;
     var all_digits = true;
     var has_structural_separator = false;
     for (token) |ch| {
@@ -1944,11 +1959,13 @@ fn isEvidenceLiteral(token: []const u8) bool {
             digits += 1;
             continue;
         }
+        if (std.ascii.isAlphabetic(ch)) letters += 1;
         all_digits = false;
         if (ch == '.' or ch == ',' or ch == '-' or ch == '/' or ch == ':' or ch == '_' or ch == 'x' or ch == 'X') has_structural_separator = true;
     }
     if (digits == 0) return false;
     if (all_digits and token.len == 4) return true;
+    if (letters > 0) return true;
     // ponytail: this enforces numeric/version/date literal support; upgrade to semantic entailment when a verifier model exists.
     return has_structural_separator;
 }
@@ -2086,6 +2103,36 @@ fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
     }
     return false;
+}
+
+fn containsLooseEvidenceLiteral(haystack: []const u8, needle: []const u8) bool {
+    var normalized_needle: [128]u8 = undefined;
+    var needle_len: usize = 0;
+    for (needle) |ch| {
+        const normalized = normalizeEvidenceLiteralByte(ch) orelse continue;
+        if (needle_len == normalized_needle.len) return false;
+        normalized_needle[needle_len] = normalized;
+        needle_len += 1;
+    }
+    if (needle_len == 0) return false;
+
+    var matched: usize = 0;
+    for (haystack) |ch| {
+        const normalized = normalizeEvidenceLiteralByte(ch) orelse continue;
+        if (normalized == normalized_needle[matched]) {
+            matched += 1;
+            if (matched == needle_len) return true;
+            continue;
+        }
+        matched = if (normalized == normalized_needle[0]) 1 else 0;
+    }
+    return false;
+}
+
+fn normalizeEvidenceLiteralByte(ch: u8) ?u8 {
+    if (std.ascii.isDigit(ch)) return ch;
+    if (std.ascii.isAlphabetic(ch)) return std.ascii.toLower(ch);
+    return null;
 }
 
 fn evidenceRepairTermsFromOutput(
@@ -4159,7 +4206,7 @@ fn webEvidenceSourceFollowupTarget(summary: WebEvidenceSummary, current_target: 
 }
 
 fn webEvidenceContextFollowupTarget(summary: WebEvidenceSummary, current_target: []const u8, state: *const ToolLoopState, strategy: contracts.StrategyName) ?[]const u8 {
-    if (!summary.emptyExcerptBlock() or !state.shouldAllowMoreEvidence()) return null;
+    if ((!summary.emptyExcerptBlock() and !summary.has_source_excerpt) or !state.shouldAllowMoreEvidence()) return null;
     for (state.context.entries.items) |entry| {
         var lines = std.mem.splitScalar(u8, entry.evidence_text, '\n');
         while (lines.next()) |line| {
@@ -5428,6 +5475,8 @@ fn streamDeferredToolLoopTurnInternal(
             }
             if (std.mem.indexOf(u8, follow_context, "[WEB_EVIDENCE]") != null) {
                 if (unsupportedWebAnswerLiteral(follow_sink.raw_visible.items, follow_context)) |literal| {
+                    const literal_copy = try allocator.dupe(u8, literal);
+                    defer allocator.free(literal_copy);
                     follow_sink.discardDeferredVisible();
                     if (finalization_state) |state| {
                         if (state.unsupported_web_answer_repairs < max_unsupported_web_answer_repairs) {
@@ -5439,10 +5488,12 @@ fn streamDeferredToolLoopTurnInternal(
                             const repair_context = try std.fmt.allocPrint(
                                 allocator,
                                 "{s}\n[ANSWER_REPAIR]\nThe previous visible answer introduced `{s}`, but that literal is not present in WEB_EVIDENCE. Numeric, date, version, resolution, and technical spec facts must be copied from collected evidence. {s} No unsupported factual literals.\n",
-                                .{ follow_context, literal, action },
+                                .{ follow_context, literal_copy, action },
                             );
                             defer allocator.free(repair_context);
-                            try db.recordEvent(config.session, "answer_repair", "unsupported web literal");
+                            const repair_audit = try std.fmt.allocPrint(allocator, "unsupported web literal={s}", .{literal_copy});
+                            defer allocator.free(repair_audit);
+                            try db.recordEvent(config.session, "answer_repair", repair_audit);
                             try db.recordEvent(config.session, "model_context", repair_context);
                             return streamDeferredToolLoopTurnInternal(
                                 allocator,
@@ -6306,6 +6357,7 @@ fn renderWebDistillationPrompt(
         \\Compress fetched web evidence before permanent context insertion.
         \\Return exactly one [WEB_EVIDENCE] block. No prose, no tool calls, no markdown fences.
         \\Use only WEB_EVIDENCE_INPUT. Preserve target, retrieved_at, timezone, status, query, title, and source_url lines if present.
+        \\The excerpt must be copied or tightly compressed from WEB_EVIDENCE_INPUT excerpt text. Do not translate, rename, infer, or add specs absent from that input.
         \\Keep only facts that directly and exactly match USER_TASK and MODEL_WEB_QUERY. Similar names, adjacent topics, partial matches, and "probably the same" are not evidence.
         \\If the input has only similar/unrelated results, return [WEB_EVIDENCE] with the original metadata and an empty excerpt. Exclude raw HTML, logs, and long explanations.
         \\Maximum output: 1600 bytes.
@@ -6357,20 +6409,141 @@ fn normalizeWebDistillationOutput(
     if (trimmed.len == 0) return allocator.dupe(u8, fallback);
     if (std.mem.indexOf(u8, trimmed, "[WEB_EVIDENCE]")) |start| {
         const normalized = try allocator.dupe(u8, trimmed[start..@min(trimmed.len, start + max_web_distillation_output_bytes)]);
-        return ensureWebEvidenceSources(allocator, normalized, fallback);
+        const with_sources = try ensureWebEvidenceSources(allocator, normalized, fallback);
+        errdefer allocator.free(with_sources);
+        if (!webDistillationExcerptGrounded(with_sources, fallback)) {
+            allocator.free(with_sources);
+            return allocator.dupe(u8, fallback);
+        }
+        if (summarizeWebEvidence(fallback).has_source_excerpt and summarizeWebEvidence(with_sources).has_excerpt) {
+            return try rewriteWebEvidenceDistill(allocator, with_sources, "model_verified_excerpt");
+        }
+        return with_sources;
     }
     _ = target;
     _ = query;
     return allocator.dupe(u8, fallback);
 }
 
+fn webDistillationExcerptGrounded(generated: []const u8, fallback: []const u8) bool {
+    const generated_excerpt = webEvidenceExcerptText(generated);
+    if (generated_excerpt.len == 0) return true;
+    if (web_rag.isStyleLikeText(generated_excerpt)) return false;
+    const source_excerpt = webEvidenceExcerptText(fallback);
+    if (source_excerpt.len == 0) return false;
+
+    var checked: usize = 0;
+    var it = std.mem.tokenizeAny(u8, generated_excerpt, " \t\r\n\"'`()[]{}<>:;!?/\\|+=*&^%$#@~");
+    while (it.next()) |raw| {
+        const token = std.mem.trim(u8, raw, ".,-_");
+        if (!isGroundedEvidenceToken(token)) continue;
+        checked += 1;
+        if (containsAsciiIgnoreCase(source_excerpt, token)) continue;
+        if (containsLooseEvidenceLiteral(source_excerpt, token)) continue;
+        return false;
+    }
+    return checked > 0;
+}
+
+fn isGroundedEvidenceToken(token: []const u8) bool {
+    if (token.len < 3) return false;
+    for (token) |ch| {
+        if (std.ascii.isAlphanumeric(ch)) return true;
+    }
+    return false;
+}
+
+fn webEvidenceExcerptText(text: []const u8) []const u8 {
+    const marker = "excerpt=";
+    const found = std.mem.indexOf(u8, text, marker) orelse return "";
+    const start = found + marker.len;
+    var end = if (std.mem.indexOf(u8, text[start..], "\n[")) |rel| start + rel else text.len;
+    var cursor = start;
+    while (cursor < end) {
+        const line_end = std.mem.indexOfScalarPos(u8, text, cursor, '\n') orelse end;
+        if (line_end > cursor) {
+            const line = std.mem.trim(u8, text[cursor..line_end], " \t\r");
+            if (cursor > start and webEvidenceMetadataLine(line)) {
+                end = cursor - 1;
+                break;
+            }
+        }
+        if (line_end >= end) break;
+        cursor = line_end + 1;
+    }
+    return std.mem.trim(u8, text[start..end], " \t\r\n");
+}
+
+fn webEvidenceMetadataLine(line: []const u8) bool {
+    const fields = [_][]const u8{
+        "source=",
+        "target=",
+        "retrieved_at=",
+        "timezone=",
+        "status=",
+        "server=",
+        "error=",
+        "query=",
+        "title=",
+        "source_url=",
+        "excerpt_budget_bytes=",
+    };
+    for (fields) |field| {
+        if (std.mem.startsWith(u8, line, field)) return true;
+    }
+    return false;
+}
+
+fn rewriteWebEvidenceDistill(allocator: std.mem.Allocator, text: []u8, distill: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var rewritten = false;
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (!rewritten and std.mem.startsWith(u8, trimmed, "source=")) {
+            try appendSourceLineWithDistill(allocator, &out, trimmed, distill);
+            rewritten = true;
+        } else {
+            try out.appendSlice(allocator, line);
+        }
+        try out.append(allocator, '\n');
+    }
+    allocator.free(text);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendSourceLineWithDistill(allocator: std.mem.Allocator, out: *std.ArrayList(u8), line: []const u8, distill: []const u8) !void {
+    const marker = "distill=";
+    if (std.mem.indexOf(u8, line, marker)) |start| {
+        var end = start + marker.len;
+        while (end < line.len and !std.ascii.isWhitespace(line[end])) : (end += 1) {}
+        try out.appendSlice(allocator, line[0 .. start + marker.len]);
+        try out.appendSlice(allocator, distill);
+        try out.appendSlice(allocator, line[end..]);
+        return;
+    }
+    try out.appendSlice(allocator, line);
+    try out.appendSlice(allocator, " distill=");
+    try out.appendSlice(allocator, distill);
+}
+
 fn ensureWebEvidenceSources(allocator: std.mem.Allocator, normalized: []u8, fallback: []const u8) ![]u8 {
     if (summarizeWebEvidence(normalized).has_source or !summarizeWebEvidence(fallback).has_source) return normalized;
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, normalized);
-    if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
-    try appendWebEvidenceSourceLines(allocator, &out, fallback);
+    var inserted = false;
+    var lines = std.mem.splitScalar(u8, normalized, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (!inserted and std.mem.startsWith(u8, trimmed, "excerpt=")) {
+            try appendWebEvidenceSourceLines(allocator, &out, fallback);
+            inserted = true;
+        }
+        try out.appendSlice(allocator, line);
+        try out.append(allocator, '\n');
+    }
+    if (!inserted) try appendWebEvidenceSourceLines(allocator, &out, fallback);
     allocator.free(normalized);
     return out.toOwnedSlice(allocator);
 }
@@ -9243,6 +9416,56 @@ test "web distillation reinjects source urls from evidence packet fallback" {
     try std.testing.expect(std.mem.indexOf(u8, normalized, "source_url=http://127.0.0.1/search?q=zig") != null);
 }
 
+test "web distillation promotes grounded source excerpts structurally" {
+    const fallback =
+        \\[WEB_EVIDENCE]
+        \\source=http_get raw_context_persisted=false distill=source_excerpt target=https://example.test/r36s
+        \\status=200
+        \\source_url=https://example.test/r36s
+        \\excerpt=Ficha tecnica R36S. Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.
+    ;
+    const generated =
+        \\[WEB_EVIDENCE]
+        \\source=http_get raw_context_persisted=false distill=model_summary target=https://example.test/r36s
+        \\status=200
+        \\source_url=https://example.test/r36s
+        \\excerpt=Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.
+    ;
+    const normalized = try normalizeWebDistillationOutput(std.testing.allocator, "https://example.test/r36s", "R36S especificacoes tecnicas", fallback, generated);
+    defer std.testing.allocator.free(normalized);
+
+    const summary = summarizeWebEvidence(normalized);
+    try std.testing.expect(summary.has_model_verified_excerpt);
+    try std.testing.expect(!summary.has_source_excerpt);
+    try std.testing.expect(webEvidenceCanCloseToolPhase(true, summary));
+}
+
+test "web distillation rejects ungrounded model additions" {
+    const fallback =
+        \\[WEB_EVIDENCE]
+        \\source=http_get raw_context_persisted=false distill=source_excerpt target=https://example.test/r36s
+        \\status=200
+        \\source_url=https://example.test/r36s
+        \\excerpt=Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.
+    ;
+    const generated =
+        \\[WEB_EVIDENCE]
+        \\source=http_get raw_context_persisted=false distill=model_summary target=https://example.test/r36s
+        \\status=200
+        \\source_url=https://example.test/r36s
+        \\excerpt=Console R36S: RK3326, 1GB RAM, Wi-Fi, Steam e tela IPS 3.5 polegadas 480x320.
+    ;
+    const normalized = try normalizeWebDistillationOutput(std.testing.allocator, "https://example.test/r36s", "R36S especificacoes tecnicas", fallback, generated);
+    defer std.testing.allocator.free(normalized);
+
+    const summary = summarizeWebEvidence(normalized);
+    try std.testing.expect(summary.has_source_excerpt);
+    try std.testing.expect(!summary.has_model_verified_excerpt);
+    try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summary));
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "Wi-Fi") == null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "Steam") == null);
+}
+
 test "successful web evidence closes tool phase structurally" {
     var state = ToolLoopState.init(std.testing.allocator);
     defer state.deinit();
@@ -9253,6 +9476,7 @@ test "successful web evidence closes tool phase structurally" {
     try std.testing.expect(webEvidenceCanCloseToolPhase(true, summary));
     try std.testing.expect(!webEvidenceCanCloseToolPhase(false, summary));
     try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nexcerpt=Londrina fica no Parana.\n")));
+    try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nsource=http_get distill=source_excerpt target=https://example.test/r36s\nstatus=200\nsource_url=https://example.test/r36s\nexcerpt=R36S title and surrounding page text.\n")));
 
     state.closeToolPhase();
 
@@ -9272,10 +9496,18 @@ test "search result evidence follows source before closing" {
     try std.testing.expect(!webEvidenceCanCloseToolPhase(true, serp));
     try std.testing.expectEqualStrings("https://r36s.org/articles/r36s-specs-hardware-details", webEvidenceSourceFollowupTarget(serp, "https://html.duckduckgo.com/html/?q=r36s", &state, .document_summary).?);
 
-    const indexed_serp = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nsource_url=https://example.test/first\nsource_url=https://example.test/second\nexcerpt=result=2 title=Second source\n");
+    const indexed_serp = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nsource_url=https://example.test/first\nsource_url=https://example.test/second\nexcerpt=result=2 title=Second source url=https://example.test/second\n");
     try std.testing.expectEqual(@as(?usize, 2), indexed_serp.preferred_result_index);
     try std.testing.expectEqualStrings("https://example.test/second", indexed_serp.preferred_source_url.?);
     try std.testing.expectEqualStrings("https://example.test/second", webEvidenceSourceFollowupTarget(indexed_serp, "https://html.duckduckgo.com/html/?q=r36s", &state, .document_summary).?);
+
+    const title_only = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nsource_url=https://example.test/first\nsource_url=https://example.test/second\nexcerpt=result=2 title=Second source\n");
+    try std.testing.expect(title_only.preferred_result_index == null);
+    try std.testing.expectEqualStrings("https://example.test/first", webEvidenceSourceFollowupTarget(title_only, "https://html.duckduckgo.com/html/?q=r36s", &state, .document_summary).?);
+
+    const snippet_only = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nsource_url=https://example.test/first\nsource_url=https://example.test/eighth\nexcerpt=result=8 snippet=Generic technical specifications overview.\n");
+    try std.testing.expect(snippet_only.preferred_result_index == null);
+    try std.testing.expectEqualStrings("https://example.test/first", webEvidenceSourceFollowupTarget(snippet_only, "https://html.duckduckgo.com/html/?q=r36s", &state, .document_summary).?);
 
     try state.rememberExecutedArgs("https://r36s.org/articles/r36s-specs-hardware-details", null, .document_summary, 1, 1, "ctx_web", "[WEB_EVIDENCE]\nstatus=200\n", 80, 30);
     try std.testing.expect(webEvidenceSourceFollowupTarget(serp, "https://html.duckduckgo.com/html/?q=r36s", &state, .document_summary) == null);
@@ -9303,6 +9535,9 @@ test "empty followed source tries next collected source url" {
 
     const empty = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nsource_url=https://example.test/empty\nexcerpt=\n");
     try std.testing.expectEqualStrings("https://example.test/specs", webEvidenceContextFollowupTarget(empty, "https://example.test/empty", &state, .document_summary).?);
+
+    const source_excerpt = summarizeWebEvidence("[WEB_EVIDENCE]\nsource=http_get distill=source_excerpt target=https://example.test/empty\nstatus=200\nsource_url=https://example.test/empty\nexcerpt=R36S title and noisy page text.\n");
+    try std.testing.expectEqualStrings("https://example.test/specs", webEvidenceContextFollowupTarget(source_excerpt, "https://example.test/empty", &state, .document_summary).?);
 }
 
 test "web evidence without source keeps refinement structurally available" {
@@ -9344,8 +9579,11 @@ test "web final answer numeric literal must be present in web evidence" {
     try std.testing.expectEqualStrings("0.13.0", unsupportedWebAnswerLiteral("A versao mais recente e 0.13.0.", context).?);
     try std.testing.expectEqualStrings("4,0", unsupportedWebAnswerLiteral("A media e 4,0 kWh/m2/dia.", context).?);
     try std.testing.expectEqualStrings("480x320", unsupportedWebAnswerLiteral("Tela IPS com resolucao de 480x320 pixels.", context).?);
+    try std.testing.expectEqualStrings("64GB", unsupportedWebAnswerLiteral("Armazenamento de 64GB.", context).?);
     try std.testing.expect(unsupportedWebAnswerLiteral("Nao encontrei evidencia direta.", context) == null);
     try std.testing.expect(unsupportedWebAnswerLiteral("A versao evidenciada e 0.15.1.", "[WEB_EVIDENCE]\nexcerpt=Zig 0.15.1\n") == null);
+    try std.testing.expect(unsupportedWebAnswerLiteral("Armazenamento de 1GB.", "[WEB_EVIDENCE]\nexcerpt=R36S 1GB RAM\n") == null);
+    try std.testing.expect(unsupportedWebAnswerLiteral("CPU RK3326 Cortex-A35 1.5GHz e tela 640x480.", "[WEB_EVIDENCE]\nexcerpt=Rockchip RK3326 (Quad-Core ARM Cortex-A35 1. 5GHz) Display 640 x 480 resolution\n") == null);
     const limited = try renderUnsupportedWebEvidenceLiteralAnswer(std.testing.allocator, "[WEB_EVIDENCE]\nsource_url=https://r36s.org/articles/r36s-specs-hardware-details\nexcerpt=result=2 title=R36S specs\n");
     defer std.testing.allocator.free(limited);
     try std.testing.expect(std.mem.indexOf(u8, limited, "nao contem detalhes tecnicos suficientes") != null);

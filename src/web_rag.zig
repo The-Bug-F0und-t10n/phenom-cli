@@ -44,19 +44,19 @@ pub fn fetch(allocator: std.mem.Allocator, io: std.Io, target: []const u8, query
 
     const title = try extractTitle(allocator, inspected.body_snippet);
     defer allocator.free(title);
-    const plain_text = try distillText(allocator, inspected.body_snippet, inspected.body_snippet.len);
+    const plain_text_raw = try distillText(allocator, inspected.body_snippet, inspected.body_snippet.len);
+    defer allocator.free(plain_text_raw);
+    const plain_text = try stripStyleLikeText(allocator, plain_text_raw, plain_text_raw.len);
     defer allocator.free(plain_text);
     const searchable_text = try structuredTextForDistillation(allocator, inspected.target, inspected.body_snippet, plain_text);
     defer allocator.free(searchable_text);
     const distilled = try distillTextForQuery(allocator, searchable_text, query, budget_bytes);
     defer allocator.free(distilled);
-    const excerpt = if (distilled.len == 0 and isDirectStructuredSummary(searchable_text))
-        searchable_text[0..@min(searchable_text.len, budget_bytes)]
-    else
-        distilled;
-    const source_urls = try sourceUrlsForEvidence(allocator, inspected.target, searchable_text, excerpt);
+    const selected_excerpt = try selectWebExcerpt(allocator, inspected.target, searchable_text, distilled, query, budget_bytes);
+    defer selected_excerpt.deinit(allocator);
+    const source_urls = try sourceUrlsForEvidence(allocator, inspected.target, searchable_text, selected_excerpt.text);
     defer allocator.free(source_urls);
-    const web_block = try renderWebEvidenceBlock(allocator, inspected, title, source_urls, excerpt, query, budget_bytes);
+    const web_block = try renderWebEvidenceBlock(allocator, inspected, title, source_urls, selected_excerpt.text, selected_excerpt.distill, query, budget_bytes);
     defer allocator.free(web_block);
     const status_text = try renderStatusText(allocator, inspected.status);
     defer allocator.free(status_text);
@@ -102,7 +102,7 @@ pub fn fetch(allocator: std.mem.Allocator, io: std.Io, target: []const u8, query
         .has_direct_excerpt = distilled.len > 0,
         .raw_bytes_read = inspected.body_snippet.len,
         .model_bytes = evidence_text.len,
-        .quality_score = if (http_ok and distilled.len > 0) 82 else 30,
+        .quality_score = if (http_ok and distilled.len > 0) 82 else if (http_ok and selected_excerpt.text.len > 0) 45 else 30,
     };
 }
 
@@ -223,6 +223,7 @@ fn renderWebEvidenceBlock(
     title: []const u8,
     source_urls: []const u8,
     excerpt: []const u8,
+    distill: []const u8,
     query: ?[]const u8,
     budget_bytes: usize,
 ) ![]u8 {
@@ -232,8 +233,9 @@ fn renderWebEvidenceBlock(
     const retrieved_at = temporal.currentUtcDateText(&retrieved_buf);
     return std.fmt.allocPrint(
         allocator,
-        "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=query_chunks target={s}\nretrieved_at={s}\ntimezone=UTC\nstatus={s}\nserver={s}\nerror={s}\nquery={s}\ntitle={s}\n{s}excerpt_budget_bytes={}\nexcerpt={s}\n",
+        "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill={s} target={s}\nretrieved_at={s}\ntimezone=UTC\nstatus={s}\nserver={s}\nerror={s}\nquery={s}\ntitle={s}\n{s}excerpt_budget_bytes={}\nexcerpt={s}\n",
         .{
+            distill,
             inspected.target,
             retrieved_at,
             status_text,
@@ -257,6 +259,11 @@ pub fn distillText(allocator: std.mem.Allocator, input: []const u8, budget_bytes
     while (i < input.len and out.items.len < budget_bytes) {
         const ch = input[i];
         if (ch == '<') {
+            if (skipHtmlNonContent(input, i)) |next| {
+                pending_space = out.items.len > 0;
+                i = next;
+                continue;
+            }
             in_tag = true;
             pending_space = out.items.len > 0;
             i += 1;
@@ -288,6 +295,84 @@ pub fn distillText(allocator: std.mem.Allocator, input: []const u8, budget_bytes
     return out.toOwnedSlice(allocator);
 }
 
+fn skipHtmlNonContent(input: []const u8, start: usize) ?usize {
+    const names = [_][]const u8{ "script", "style", "noscript", "svg" };
+    for (names) |name| {
+        if (!htmlStartTagNameAt(input, start, name)) continue;
+        var closing_buf: [32]u8 = undefined;
+        const closing = std.fmt.bufPrint(&closing_buf, "</{s}", .{name}) catch return null;
+        const close_start = indexOfIgnoreCase(input[start..], closing) orelse return null;
+        const after_close = start + close_start;
+        const close_end = std.mem.indexOfScalarPos(u8, input, after_close, '>') orelse return input.len;
+        return close_end + 1;
+    }
+    return null;
+}
+
+fn htmlStartTagNameAt(input: []const u8, start: usize, name: []const u8) bool {
+    if (start >= input.len or input[start] != '<') return false;
+    var i = start + 1;
+    if (i < input.len and input[i] == '/') return false;
+    while (i < input.len and std.ascii.isWhitespace(input[i])) : (i += 1) {}
+    if (i + name.len > input.len) return false;
+    if (!std.ascii.eqlIgnoreCase(input[i .. i + name.len], name)) return false;
+    const end = i + name.len;
+    return end >= input.len or std.ascii.isWhitespace(input[end]) or input[end] == '>' or input[end] == '/';
+}
+
+fn stripStyleLikeText(allocator: std.mem.Allocator, text: []const u8, budget_bytes: usize) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var cursor: usize = 0;
+    while (cursor < text.len and out.items.len < budget_bytes) {
+        const chunk = nextChunk(text, &cursor);
+        const trimmed = std.mem.trim(u8, chunk, " \t\r\n");
+        if (trimmed.len == 0 or isStyleLikeText(trimmed)) continue;
+        try appendBudgetedSlice(allocator, &out, trimmed, budget_bytes);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn isStyleLikeText(text: []const u8) bool {
+    var braces: usize = 0;
+    var colons: usize = 0;
+    var semicolons: usize = 0;
+    var important: usize = 0;
+    for (text) |ch| {
+        switch (ch) {
+            '{', '}' => braces += 1,
+            ':' => colons += 1,
+            ';' => semicolons += 1,
+            '!' => important += 1,
+            else => {},
+        }
+    }
+    if (braces >= 2 and colons > 0 and semicolons > 0) return true;
+    if (colons >= 2 and semicolons >= 2 and important > 0) return true;
+    if (containsIgnoreCase(text, "@font-face")) return true;
+    if (containsIgnoreCase(text, "font-family:") and containsIgnoreCase(text, "sans-serif")) return true;
+    if (containsIgnoreCase(text, "src:") and containsIgnoreCase(text, "url(")) return true;
+    if (cssSelectorTokenCount(text) >= 2) return true;
+    return false;
+}
+
+fn cssSelectorTokenCount(text: []const u8) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] != '.' and text[i] != '#') continue;
+        var j = i + 1;
+        while (j < text.len and std.ascii.isWhitespace(text[j])) : (j += 1) {}
+        const start = j;
+        while (j < text.len and (std.ascii.isAlphanumeric(text[j]) or text[j] == '-' or text[j] == '_')) : (j += 1) {}
+        if (j == start) continue;
+        const token = text[start..j];
+        if (std.mem.indexOfScalar(u8, token, '-') == null and token.len < 8) continue;
+        count += 1;
+    }
+    return count;
+}
+
 pub fn distillTextForQuery(allocator: std.mem.Allocator, text: []const u8, query: ?[]const u8, budget_bytes: usize) ![]u8 {
     if (budget_bytes == 0) return allocator.dupe(u8, "");
     const intent = std.mem.trim(u8, query orelse "", " \t\r\n");
@@ -302,6 +387,28 @@ pub fn distillTextForQuery(allocator: std.mem.Allocator, text: []const u8, query
         if (trimmed.len == 0) continue;
         if (!queryCoverageSufficient(trimmed, intent)) continue;
         try appendBudgetedSlice(allocator, &out, trimmed, budget_bytes);
+    }
+    if (out.items.len == 0) return allocator.dupe(u8, "");
+    return out.toOwnedSlice(allocator);
+}
+
+fn distillTextForAnyQueryTerm(allocator: std.mem.Allocator, text: []const u8, query: ?[]const u8, budget_bytes: usize) ![]u8 {
+    if (budget_bytes == 0) return allocator.dupe(u8, "");
+    const intent = std.mem.trim(u8, query orelse "", " \t\r\n");
+    if (intent.len == 0) return budgetedCopy(allocator, text, budget_bytes);
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var cursor: usize = 0;
+    var trailing_chunks: usize = 0;
+    while (cursor < text.len and out.items.len < budget_bytes) {
+        const chunk = nextChunk(text, &cursor);
+        const trimmed = std.mem.trim(u8, chunk, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const matched = queryCoverageScore(trimmed, intent) > 0;
+        if (!matched and trailing_chunks == 0) continue;
+        try appendBudgetedSlice(allocator, &out, trimmed, budget_bytes);
+        trailing_chunks = if (matched) 2 else trailing_chunks - 1;
     }
     if (out.items.len == 0) return allocator.dupe(u8, "");
     return out.toOwnedSlice(allocator);
@@ -330,6 +437,27 @@ fn structuredTextForDistillation(allocator: std.mem.Allocator, target: []const u
 
 fn isDirectStructuredSummary(text: []const u8) bool {
     return std.mem.startsWith(u8, std.mem.trim(u8, text, " \t\r\n"), "release=");
+}
+
+const SelectedWebExcerpt = struct {
+    text: []u8,
+    distill: []const u8,
+
+    fn deinit(self: SelectedWebExcerpt, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+    }
+};
+
+fn selectWebExcerpt(allocator: std.mem.Allocator, target: []const u8, searchable_text: []const u8, distilled: []const u8, query: ?[]const u8, budget_bytes: usize) !SelectedWebExcerpt {
+    if (distilled.len > 0) return .{ .text = try allocator.dupe(u8, distilled), .distill = "query_chunks" };
+    if (isDirectStructuredSummary(searchable_text)) return .{ .text = try budgetedCopy(allocator, searchable_text, budget_bytes), .distill = "query_chunks" };
+    if (!isDuckDuckGoSearchTarget(target) and std.mem.trim(u8, searchable_text, " \t\r\n").len > 0) {
+        const relaxed = try distillTextForAnyQueryTerm(allocator, searchable_text, query, budget_bytes);
+        defer allocator.free(relaxed);
+        if (relaxed.len > 0) return .{ .text = try allocator.dupe(u8, relaxed), .distill = "source_excerpt" };
+        return .{ .text = try budgetedCopy(allocator, searchable_text, @min(budget_bytes, 2048)), .distill = "source_excerpt" };
+    }
+    return .{ .text = try allocator.dupe(u8, ""), .distill = "query_chunks" };
 }
 
 fn isDuckDuckGoSearchTarget(target: []const u8) bool {
@@ -774,6 +902,25 @@ test "distill strips html and decodes common entities" {
     try std.testing.expectEqualStrings("A & B Texto forte <x>", out);
 }
 
+test "distill skips non content html blocks" {
+    const out = try distillText(std.testing.allocator, "<html><style>.x{color:red}</style><script>alert(1)</script><body>Console R36S RK3326 1GB RAM.</body></html>", 1024);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Console R36S") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "color:red") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "alert") == null);
+}
+
+test "distill skips inline css-like text chunks" {
+    const page = "Console R36S body {font-family: 'Poppins', sans-serif ! important;background: #F3F4F8;font-weight: 300 ! important;} R36S RK3326 1GB RAM tela IPS 480x320.";
+    const out = try stripStyleLikeText(std.testing.allocator, page, 1024);
+    defer std.testing.allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "RK3326") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "font-family") == null);
+    try std.testing.expect(isStyleLikeText("body {font-family: 'Poppins', sans-serif ! important;background: #F3F4F8;}"));
+    try std.testing.expect(isStyleLikeText("Dados tecnicos . product-shop-page . shop-list-view . sidebar-widget"));
+}
+
 test "title extraction is case insensitive and budgeted" {
     const title = try extractTitle(std.testing.allocator, "<HTML><TITLE> Phenom &amp; Web </TITLE></HTML>");
     defer std.testing.allocator.free(title);
@@ -796,6 +943,19 @@ test "query distillation does not fall back to similar unrelated text" {
     defer std.testing.allocator.free(out);
 
     try std.testing.expectEqualStrings("", out);
+}
+
+test "direct page excerpt falls back to real page text when strict coverage is empty" {
+    const page = "Ficha técnica completa do Console Portátil R36S. Tela IPS 3.5 polegadas 480x320. Sistema Linux e armazenamento 64GB.";
+    const strict = try distillTextForQuery(std.testing.allocator, page, "especificações técnicas R36S console portátil", 512);
+    defer std.testing.allocator.free(strict);
+    try std.testing.expectEqualStrings("", strict);
+
+    const excerpt = try selectWebExcerpt(std.testing.allocator, "https://example.test/r36s", page, strict, "especificações técnicas R36S console portátil", 512);
+    defer excerpt.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("source_excerpt", excerpt.distill);
+    try std.testing.expect(std.mem.indexOf(u8, excerpt.text, "R36S") != null);
+    try std.testing.expect(std.mem.indexOf(u8, excerpt.text, "480x320") != null);
 }
 
 test "json search payload is converted to readable evidence before query ranking" {
