@@ -344,6 +344,24 @@ pub fn build(b: *std.Build) void {
     const think_only_finalization_step = b.step("think-only-finalization-smoke", "Offline e2e scripted-backend smoke for visible finalization after think-only output.");
     think_only_finalization_step.dependOn(&think_only_finalization_cmd.step);
 
+    const agent_flow_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent_flow_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    agent_flow_smoke_mod.link_libc = true;
+    agent_flow_smoke_mod.linkSystemLibrary("sqlite3", .{});
+    const agent_flow_smoke_exe = b.addExecutable(.{
+        .name = "agent-flow-smoke",
+        .root_module = agent_flow_smoke_mod,
+    });
+    const agent_flow_smoke_cmd = b.addRunArtifact(agent_flow_smoke_exe);
+    agent_flow_smoke_cmd.step.dependOn(&install_artifact.step);
+    agent_flow_smoke_cmd.addFileArg(exe.getEmittedBin());
+
+    const agent_flow_smoke_step = b.step("agent-flow-smoke", "Zig e2e scripted backend smoke for agent web/tool protocol flows.");
+    agent_flow_smoke_step.dependOn(&agent_flow_smoke_cmd.step);
+
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
