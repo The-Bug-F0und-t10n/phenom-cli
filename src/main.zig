@@ -1906,7 +1906,7 @@ fn isEvidenceLiteral(token: []const u8) bool {
             continue;
         }
         all_digits = false;
-        if (ch == '.' or ch == ',' or ch == '-' or ch == '/' or ch == ':' or ch == '_') has_structural_separator = true;
+        if (ch == '.' or ch == ',' or ch == '-' or ch == '/' or ch == ':' or ch == '_' or ch == 'x' or ch == 'X') has_structural_separator = true;
     }
     if (digits == 0) return false;
     if (all_digits and token.len == 4) return true;
@@ -1939,16 +1939,40 @@ fn outputCitesMissingSessionEvidence(output: []const u8, context: ?[]const u8) b
 }
 
 fn outputClaimsPersistentContextWithoutRetrieval(output: []const u8, context: ?[]const u8) bool {
-    const mentions_persistent_protocol = containsAsciiIgnoreCase(output, "MEMORY") or
-        containsAsciiIgnoreCase(output, "SKILLS") or
-        containsAsciiIgnoreCase(output, "memoria") or
-        containsAsciiIgnoreCase(output, "memória") or
-        containsAsciiIgnoreCase(output, "contexto persistente");
-    if (!mentions_persistent_protocol) return false;
+    if (!outputMentionsPersistentContextProtocol(output)) return false;
     if (contextHasSection(context, "[MEMORY]")) return false;
     if (contextHasSection(context, "[SKILLS]")) return false;
     if (contextHasSection(context, "[PERSISTENT_CONTEXT]")) return false;
     return true;
+}
+
+fn outputMentionsPersistentContextProtocol(output: []const u8) bool {
+    const markers = [_][]const u8{
+        "MEMORY.md",
+        "SKILLS.md",
+        "MEMORY/SKILLS",
+        "MEMORY ou SKILLS",
+        "[MEMORY]",
+        "[SKILLS]",
+        "contexto persistente",
+        "persistent context",
+        "memória persistente",
+        "memoria persistente",
+        "memória atual",
+        "memoria atual",
+        "memória do projeto",
+        "memoria do projeto",
+        "memória do workspace",
+        "memoria do workspace",
+        "skills persistidos",
+        "skills persistidas",
+        "memory persistido",
+        "memory persistida",
+    };
+    for (markers) |marker| {
+        if (containsAsciiIgnoreCase(output, marker)) return true;
+    }
+    return false;
 }
 
 fn shouldRepairPersistentContextClaim(output: []const u8, context: ?[]const u8, state: ?*const ToolLoopState) bool {
@@ -5285,16 +5309,20 @@ fn streamDeferredToolLoopTurnInternal(
                     }
                 }
             }
-            if (active_contract.name == .search_web) {
+            if (std.mem.indexOf(u8, follow_context, "[WEB_EVIDENCE]") != null) {
                 if (unsupportedWebAnswerLiteral(follow_sink.raw_visible.items, follow_context)) |literal| {
                     follow_sink.discardDeferredVisible();
                     if (finalization_state) |state| {
                         if (state.unsupported_web_answer_repairs < max_unsupported_web_answer_repairs) {
                             state.unsupported_web_answer_repairs += 1;
+                            const action = if (active_contract.name == .search_web)
+                                "Emit one refined web_search with the exact user fact intent if more evidence is needed; otherwise state that collected WEB_EVIDENCE does not directly support the answer."
+                            else
+                                "The web tool phase is closed. Answer from collected WEB_EVIDENCE only, or state that collected WEB_EVIDENCE does not directly support the requested technical detail.";
                             const repair_context = try std.fmt.allocPrint(
                                 allocator,
-                                "{s}\n[ANSWER_REPAIR]\nThe previous visible answer introduced `{s}`, but that literal is not present in WEB_EVIDENCE. Under search_web, numeric, date, and version facts must be copied from collected evidence. Emit one refined web_search with the exact user fact intent if more evidence is needed; otherwise state that collected WEB_EVIDENCE does not directly support the answer. No unsupported factual literals.\n",
-                                .{ follow_context, literal },
+                                "{s}\n[ANSWER_REPAIR]\nThe previous visible answer introduced `{s}`, but that literal is not present in WEB_EVIDENCE. Numeric, date, version, resolution, and technical spec facts must be copied from collected evidence. {s} No unsupported factual literals.\n",
+                                .{ follow_context, literal, action },
                             );
                             defer allocator.free(repair_context);
                             try db.recordEvent(config.session, "answer_repair", "unsupported web literal");
@@ -5317,8 +5345,11 @@ fn streamDeferredToolLoopTurnInternal(
                         }
                     }
                     try db.recordEvent(config.session, "answer_repair", "unsupported web literal final answer blocked");
-                    try db.recordTurnError(config.session, .insufficient_evidence, "web_answer_literal", literal);
-                    return .stopped;
+                    const visible = try renderUnsupportedWebEvidenceLiteralAnswer(allocator, follow_context);
+                    defer allocator.free(visible);
+                    try aggregate_sink.emitVisibleText(visible);
+                    follow_sink.raw_visible.clearRetainingCapacity();
+                    return .final_answer;
                 }
             }
             if (finalization_state) |state| {
@@ -5588,6 +5619,29 @@ fn renderEmptyWebEvidenceAnswerRepairContext(allocator: std.mem.Allocator, follo
         "{s}\n[EMPTY_WEB_EVIDENCE_ANSWER_REPAIR]\nPrevious visible answer was blocked because the latest WEB_EVIDENCE excerpt is empty or does not directly support the requested fact.\nAnswer visibly in the user's language from USER_TASK. State that web_search ran but returned no direct supporting evidence for the requested fact. Do not invent numbers, dates, versions, URLs, titles, or claims absent from WEB_EVIDENCE. Do not emit tool calls, <think>, </think>, or protocol tags.\n",
         .{follow_context},
     );
+}
+
+fn renderUnsupportedWebEvidenceLiteralAnswer(allocator: std.mem.Allocator, context: []const u8) ![]u8 {
+    const source = firstWebEvidenceSourceUrl(context) orelse "";
+    if (source.len > 0) {
+        return std.fmt.allocPrint(
+            allocator,
+            "A pesquisa web foi executada, mas o trecho de WEB_EVIDENCE coletado nao contem detalhes tecnicos suficientes para listar especificacoes verificadas. O resultado encontrado aponta para fontes relevantes, incluindo {s}, mas specs numericas e tecnicas precisam aparecer no trecho coletado antes de serem afirmadas.",
+            .{source},
+        );
+    }
+    return allocator.dupe(u8, "A pesquisa web foi executada, mas o trecho de WEB_EVIDENCE coletado nao contem detalhes tecnicos suficientes para listar especificacoes verificadas.");
+}
+
+fn firstWebEvidenceSourceUrl(context: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, context, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (!std.mem.startsWith(u8, trimmed, "source_url=")) continue;
+        const url = std.mem.trim(u8, trimmed["source_url=".len..], " \t\r\n");
+        if (url.len > 0) return url;
+    }
+    return null;
 }
 
 fn renderToolPhaseClosedAnswerRepairContext(allocator: std.mem.Allocator, follow_context: []const u8) ![]u8 {
@@ -7953,6 +8007,14 @@ test "missing evidence citation requires repair before visible answer" {
         "[TURN_CONTEXT v1]\n\n[CONTRACTS]\nset_operational_contract(contract=memory)\n",
     ));
     try std.testing.expect(!outputClaimsPersistentContextWithoutRetrieval(
+        "Especificacoes tecnicas: processador RK3326, 1 GB de memória RAM DDR3L e armazenamento microSD.",
+        "[TURN_CONTEXT v1]\n\n[EVIDENCE]\nE1:\n  [WEB_EVIDENCE]\n  excerpt=R36S specs\n",
+    ));
+    try std.testing.expect(!outputClaimsPersistentContextWithoutRetrieval(
+        "Specs: Memory: 1GB DDR3L; storage: TF card; display: 3.5-inch IPS.",
+        "[TURN_CONTEXT v1]\n\n[EVIDENCE]\nE1:\n  [WEB_EVIDENCE]\n  excerpt=R36S specs\n",
+    ));
+    try std.testing.expect(!outputClaimsPersistentContextWithoutRetrieval(
         "MEMORY recuperada: protocolo local.",
         "[TURN_CONTEXT v1]\n\n[MEMORY]\n- protocolo local\n",
     ));
@@ -9118,8 +9180,13 @@ test "web final answer numeric literal must be present in web evidence" {
     ;
     try std.testing.expectEqualStrings("0.13.0", unsupportedWebAnswerLiteral("A versao mais recente e 0.13.0.", context).?);
     try std.testing.expectEqualStrings("4,0", unsupportedWebAnswerLiteral("A media e 4,0 kWh/m2/dia.", context).?);
+    try std.testing.expectEqualStrings("480x320", unsupportedWebAnswerLiteral("Tela IPS com resolucao de 480x320 pixels.", context).?);
     try std.testing.expect(unsupportedWebAnswerLiteral("Nao encontrei evidencia direta.", context) == null);
     try std.testing.expect(unsupportedWebAnswerLiteral("A versao evidenciada e 0.15.1.", "[WEB_EVIDENCE]\nexcerpt=Zig 0.15.1\n") == null);
+    const limited = try renderUnsupportedWebEvidenceLiteralAnswer(std.testing.allocator, "[WEB_EVIDENCE]\nsource_url=https://r36s.org/articles/r36s-specs-hardware-details\nexcerpt=result=2 title=R36S specs\n");
+    defer std.testing.allocator.free(limited);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "nao contem detalhes tecnicos suficientes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "https://r36s.org/articles/r36s-specs-hardware-details") != null);
 }
 
 test "search web final question is detected structurally" {
