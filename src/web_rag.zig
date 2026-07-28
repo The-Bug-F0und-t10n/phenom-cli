@@ -566,8 +566,8 @@ fn appendResultField(allocator: std.mem.Allocator, out: *std.ArrayList(u8), idx:
 fn sourceUrlsForEvidence(allocator: std.mem.Allocator, target: []const u8, searchable_text: []const u8, distilled: []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
+    try appendSourceUrlsFromText(allocator, &out, searchable_text);
     try appendSourceUrlsFromText(allocator, &out, distilled);
-    if (out.items.len == 0) try appendSourceUrlsFromText(allocator, &out, searchable_text);
     if (out.items.len == 0 and !isDuckDuckGoSearchTarget(target) and (std.mem.trim(u8, distilled, " \t\r\n").len > 0 or std.mem.trim(u8, searchable_text, " \t\r\n").len > 0)) {
         try appendSourceUrlLine(allocator, &out, target);
     }
@@ -580,13 +580,29 @@ fn appendSourceUrlsFromText(allocator: std.mem.Allocator, out: *std.ArrayList(u8
         if (out.items.len >= 2048) return;
         const marker = " url=";
         const idx = std.mem.indexOf(u8, line, marker) orelse continue;
-        const raw = std.mem.trim(u8, line[idx + marker.len ..], " \t\r\n");
+        const raw_tail = std.mem.trim(u8, line[idx + marker.len ..], " \t\r\n");
+        const raw_end = std.mem.indexOfAny(u8, raw_tail, " \t\r\n") orelse raw_tail.len;
+        const raw = raw_tail[0..raw_end];
         if (raw.len == 0) continue;
         const url = try normalizeSearchResultUrl(allocator, raw);
         defer allocator.free(url);
-        if (!isHttpTarget(url) or containsSourceUrl(out.items, url)) continue;
+        if (!isHttpTarget(url) or !sourceUrlLooksComplete(url) or containsSourceUrl(out.items, url)) continue;
         try appendSourceUrlLine(allocator, out, url);
     }
+}
+
+fn sourceUrlLooksComplete(url: []const u8) bool {
+    if (std.mem.indexOfAny(u8, url, " \t\r\n") != null) return false;
+    if (std.mem.endsWith(u8, url, ".")) return false;
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return false;
+    const host_start = scheme_end + "://".len;
+    if (host_start >= url.len) return false;
+    var host_end = host_start;
+    while (host_end < url.len and url[host_end] != '/' and url[host_end] != '?' and url[host_end] != '#') : (host_end += 1) {}
+    const host = url[host_start..host_end];
+    if (host.len == 0) return false;
+    if (std.mem.endsWith(u8, host, ".")) return false;
+    return true;
 }
 
 fn appendSourceUrlLine(allocator: std.mem.Allocator, out: *std.ArrayList(u8), url: []const u8) !void {
@@ -1007,6 +1023,28 @@ test "duckduckgo result urls become web evidence source urls" {
     defer std.testing.allocator.free(urls);
 
     try std.testing.expectEqualStrings("source_url=https://ziglang.org/download/\n", urls);
+}
+
+test "structured result url wins over text-distorted url" {
+    const searchable_text =
+        \\result=1 title=R36S Specs
+        \\result=1 url=http://127.0.0.1/source-empty
+        \\result=1 snippet=Dados tecnicos do console R36S.
+    ;
+    const distilled = "R36S result=1 title=R36S Specs url=http://127. 0. 0. 1/source-empty snippet=Dados tecnicos.";
+    const urls = try sourceUrlsForEvidence(std.testing.allocator, "https://html.duckduckgo.com/html/?q=r36s", searchable_text, distilled);
+    defer std.testing.allocator.free(urls);
+
+    try std.testing.expectEqualStrings("source_url=http://127.0.0.1/source-empty\n", urls);
+}
+
+test "source urls are extracted from plain result text with port" {
+    const searchable_text = "R36S results result=1 title=R36S Specs url=http://127.0.0.1:43337/source-empty snippet=Dados tecnicos do console R36S result=2 title=R36S Specs url=http://127.0.0.1:43337/source snippet=Ficha tecnica do console R36S";
+    const distilled = "R36S results result=1 title=R36S Specs url=http://127. 0. 0. 1/source-empty snippet=Dados tecnicos do console R36S";
+    const urls = try sourceUrlsForEvidence(std.testing.allocator, "http://127.0.0.1:43337/search?q=R36S", searchable_text, distilled);
+    defer std.testing.allocator.free(urls);
+
+    try std.testing.expectEqualStrings("source_url=http://127.0.0.1:43337/source-empty\n", urls);
 }
 
 test "duckduckgo redirect result url is decoded before source evidence" {

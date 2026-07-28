@@ -1239,7 +1239,6 @@ fn loadMergedSessionFocus(
 
 const max_tool_emergency_iterations = 8;
 const max_tool_repairs = 1;
-const max_unsupported_web_answer_repairs = 2;
 const max_duplicate_tool_repairs = 1;
 const max_required_tool_protocol_repairs = 2;
 const max_pathless_collect_budget: usize = 6 * 1024;
@@ -1278,48 +1277,6 @@ fn visibleContainsLeakedReasoning(visible: []const u8) bool {
         containsAsciiIgnoreCase(visible, "I will search") or
         containsAsciiIgnoreCase(visible, "Let me search") or
         containsAsciiIgnoreCase(visible, "Let me craft");
-}
-
-fn renderNoDirectWebEvidenceAnswer(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
-    const marker = syntheticExpectationMarkerFromPrompt(prompt);
-    const marker_suffix = if (marker) |value| value else "";
-    const separator = if (marker != null) "\n" else "";
-    if (extractOperationalLanguageLabel(prompt)) |label| {
-        return std.fmt.allocPrint(allocator, "{s}: busca-sem-evidencia-direta.{s}{s}", .{ label, separator, marker_suffix });
-    }
-    if (promptLooksPortuguese(prompt)) {
-        return std.fmt.allocPrint(allocator, "A pesquisa web foi executada, mas nao retornou evidencia direta suficiente para responder ao fato solicitado.{s}{s}", .{ separator, marker_suffix });
-    }
-    return std.fmt.allocPrint(allocator, "The web search ran, but it returned no direct supporting evidence for the requested fact.{s}{s}", .{ separator, marker_suffix });
-}
-
-fn syntheticExpectationMarkerFromPrompt(prompt: []const u8) ?[]const u8 {
-    const start = std.mem.indexOf(u8, prompt, "PHENOM_") orelse return null;
-    var end = start;
-    while (end < prompt.len) : (end += 1) {
-        const ch = prompt[end];
-        if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) break;
-    }
-    if (end == start) return null;
-    return prompt[start..end];
-}
-
-fn extractOperationalLanguageLabel(prompt: []const u8) ?[]const u8 {
-    const marker = "idioma operacional '";
-    const start = std.mem.indexOf(u8, prompt, marker) orelse return null;
-    const label_start = start + marker.len;
-    const label_end = std.mem.indexOfScalarPos(u8, prompt, label_start, '\'') orelse return null;
-    if (label_end == label_start) return null;
-    return prompt[label_start..label_end];
-}
-
-fn promptLooksPortuguese(prompt: []const u8) bool {
-    return containsAsciiIgnoreCase(prompt, " como ") or
-        containsAsciiIgnoreCase(prompt, " pesquise ") or
-        containsAsciiIgnoreCase(prompt, " responda ") or
-        containsAsciiIgnoreCase(prompt, " irradiacao ") or
-        containsAsciiIgnoreCase(prompt, " nao ") or
-        containsAsciiIgnoreCase(prompt, " em ");
 }
 
 fn promptExplicitlyRequestsWebSearch(prompt: []const u8) bool {
@@ -1823,11 +1780,7 @@ fn webEvidenceHasStatus200WithExcerpt(text: []const u8) bool {
 }
 
 fn webEvidenceCanCloseToolPhase(http_success: bool, summary: WebEvidenceSummary) bool {
-    return http_success and summary.status200WithExcerpt() and summary.has_source and !summary.has_source_excerpt and !summary.has_title_only_excerpt and !summary.needsSourceFollowup();
-}
-
-fn webEvidenceNeedsDeterministicLimitation(web_complete: bool, summary: WebEvidenceSummary, allow_more_evidence: bool) bool {
-    return summary.saw_block and !web_complete and !allow_more_evidence;
+    return http_success and summary.status200WithExcerpt() and summary.has_source and !summary.has_source_excerpt and !summary.has_title_only_excerpt and !summary.needsSourceFollowup() and webEvidenceSummarySupportsQuery(summary);
 }
 
 const WebEvidenceSummary = struct {
@@ -1843,6 +1796,8 @@ const WebEvidenceSummary = struct {
     preferred_source_url: ?[]const u8 = null,
     preferred_result_index: ?usize = null,
     status_code: ?u16 = null,
+    query: ?[]const u8 = null,
+    excerpt_text: ?[]const u8 = null,
 
     fn onlyEmptyExcerpt(self: WebEvidenceSummary) bool {
         return self.saw_block and self.saw_excerpt and !self.has_excerpt;
@@ -1877,6 +1832,10 @@ fn summarizeWebEvidence(text: []const u8) WebEvidenceSummary {
             summary.status_code = std.fmt.parseInt(u16, raw, 10) catch null;
             saw_status_200 = summary.status_code == 200;
         }
+        if (std.mem.startsWith(u8, trimmed, "query=")) {
+            const value = std.mem.trim(u8, trimmed["query=".len..], " \t\r\n");
+            if (value.len > 0) summary.query = value;
+        }
         if (std.mem.startsWith(u8, trimmed, "source=") and std.mem.indexOf(u8, trimmed, "distill=source_excerpt") != null) {
             summary.has_source_excerpt = true;
         }
@@ -1890,6 +1849,7 @@ fn summarizeWebEvidence(text: []const u8) WebEvidenceSummary {
         if (std.mem.startsWith(u8, trimmed, "excerpt=") and std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n").len > 0) {
             const excerpt = std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n");
             excerpt_value = excerpt;
+            summary.excerpt_text = excerpt;
             summary.saw_excerpt = true;
             summary.has_excerpt = true;
             if (std.mem.startsWith(u8, excerpt, "result=") or std.mem.indexOf(u8, excerpt, "\nresult=") != null) summary.has_search_result_excerpt = true;
@@ -1924,6 +1884,50 @@ fn summarizeWebEvidence(text: []const u8) WebEvidenceSummary {
     return summary;
 }
 
+fn webEvidenceSummarySupportsQuery(summary: WebEvidenceSummary) bool {
+    const query = std.mem.trim(u8, summary.query orelse "", " \t\r\n");
+    if (query.len == 0) return true;
+    const excerpt = std.mem.trim(u8, summary.excerpt_text orelse "", " \t\r\n");
+    if (excerpt.len == 0) return false;
+    return evidenceTextCoversQuery(excerpt, query);
+}
+
+fn evidenceTextCoversQuery(text: []const u8, query: []const u8) bool {
+    var total_terms: usize = 0;
+    var matched_terms: usize = 0;
+    var anchor_terms: usize = 0;
+    var matched_anchors: usize = 0;
+    var has_entity_match = false;
+    var it = std.mem.tokenizeAny(u8, query, " \t\r\n\"'`()[]{}<>:;,./\\|+-_*=");
+    while (it.next()) |raw| {
+        const term = std.mem.trim(u8, raw, " \t\r\n");
+        if (term.len < 3) continue;
+        total_terms += 1;
+        const is_anchor = queryTermLooksEntity(term);
+        if (is_anchor) anchor_terms += 1;
+        if (!containsAsciiIgnoreCase(text, term)) continue;
+        matched_terms += 1;
+        if (is_anchor) {
+            matched_anchors += 1;
+            has_entity_match = true;
+        }
+    }
+    if (total_terms == 0) return true;
+    if (total_terms == 1) return matched_terms == 1;
+    if (anchor_terms > 0) return has_entity_match and matched_terms * 2 >= @max(total_terms, 2) and matched_anchors > 0;
+    return matched_terms * 2 >= total_terms;
+}
+
+fn queryTermLooksEntity(term: []const u8) bool {
+    var has_digit = false;
+    var has_letter = false;
+    for (term) |ch| {
+        if (std.ascii.isDigit(ch)) has_digit = true;
+        if (std.ascii.isAlphabetic(ch)) has_letter = true;
+    }
+    return has_digit and has_letter;
+}
+
 fn firstSearchResultIndex(excerpt: []const u8) ?usize {
     var cursor: usize = 0;
     while (std.mem.indexOf(u8, excerpt[cursor..], "result=")) |rel| {
@@ -1945,21 +1949,6 @@ fn webAnswerOnlyNextAction(web_complete: bool) []const u8 {
         "HTTP web_search returned status=200 with non-empty WEB_EVIDENCE excerpt and source_url. The tool phase is closed. Answer now in the user's language from USER_TASK, not in the source/WEB_EVIDENCE language. Cite or name the source_url when making the web-supported claim. Do not call tools, emit JSON, or expose protocol text."
     else
         "Answer in the user's language from USER_TASK, not in the source/WEB_EVIDENCE language. Use WEB_EVIDENCE only if it directly and exactly supports the requested entity/fact and includes source_url. If WEB_EVIDENCE excerpt is empty or lacks source_url, emit one refined web_search with the exact requested entity/fact while budget remains; otherwise state the limitation. Similar names, adjacent topics, partial matches, or 'looks related' are insufficient. Do not ask permission for another search inside the active contract. Do not claim browser automation or full-page crawling.";
-}
-
-fn unsupportedWebAnswerLiteral(output: []const u8, context: []const u8) ?[]const u8 {
-    if (std.mem.indexOf(u8, context, "[WEB_EVIDENCE]") == null) return null;
-    var it = std.mem.tokenizeAny(u8, output, " \t\r\n");
-    while (it.next()) |raw| {
-        const token = std.mem.trim(u8, raw, ".,;:!?()[]{}<>\"'`*");
-        if (!isEvidenceLiteral(token)) continue;
-        if (containsAsciiIgnoreCase(context, token)) continue;
-        if (containsLooseEvidenceLiteral(context, token)) continue;
-        if (token.len > 1 and (token[0] == 'v' or token[0] == 'V') and containsAsciiIgnoreCase(context, token[1..])) continue;
-        if (token.len > 1 and (token[0] == 'v' or token[0] == 'V') and containsLooseEvidenceLiteral(context, token[1..])) continue;
-        return token;
-    }
-    return null;
 }
 
 fn webEvidenceExcerptOnlyRepeatsTitle(excerpt: []const u8, title: []const u8) bool {
@@ -2007,29 +1996,6 @@ fn tokenLooksLikeEntityId(token: []const u8) bool {
         has_alpha = has_alpha or std.ascii.isAlphabetic(ch);
     }
     return has_digit and has_alpha;
-}
-
-fn isEvidenceLiteral(token: []const u8) bool {
-    if (token.len < 3) return false;
-    if (!std.ascii.isDigit(token[0]) and !(token.len > 1 and (token[0] == 'v' or token[0] == 'V') and std.ascii.isDigit(token[1]))) return false;
-    var digits: usize = 0;
-    var letters: usize = 0;
-    var all_digits = true;
-    var has_structural_separator = false;
-    for (token) |ch| {
-        if (std.ascii.isDigit(ch)) {
-            digits += 1;
-            continue;
-        }
-        if (std.ascii.isAlphabetic(ch)) letters += 1;
-        all_digits = false;
-        if (ch == '.' or ch == ',' or ch == '-' or ch == '/' or ch == ':' or ch == '_' or ch == 'x' or ch == 'X') has_structural_separator = true;
-    }
-    if (digits == 0) return false;
-    if (all_digits and token.len == 4) return true;
-    if (letters > 0) return true;
-    // ponytail: this enforces numeric/version/date literal support; upgrade to semantic entailment when a verifier model exists.
-    return has_structural_separator;
 }
 
 fn outputClaimsEvidenceWithoutBlock(output: []const u8) bool {
@@ -4113,15 +4079,17 @@ fn runWebSearchStep(
 ) !ToolLoopNext {
     if (tool_iterations.* >= max_tool_emergency_iterations or !state.hasBudgetForMoreEvidence()) {
         try db.recordEvent(config.session, "tool_loop_stop", "web evidence budget exhausted");
-        const evidence_text = try renderWorkingContextEvidenceText(allocator, &state.context);
-        defer allocator.free(evidence_text);
-        const visible = if (std.mem.indexOf(u8, evidence_text, "[WEB_EVIDENCE]") != null)
-            try renderUnsupportedWebEvidenceLiteralAnswer(allocator, evidence_text)
-        else
-            try renderNoDirectWebEvidenceAnswer(allocator, prompt);
-        defer allocator.free(visible);
-        try aggregate_sink.emitVisibleText(visible);
-        return .final_answer;
+        state.closeToolPhase();
+        const follow_context = try renderAnnotatedWebEvidenceContext(
+            allocator,
+            prompt,
+            &state.context,
+            context_profile.toolSchema(.code_evidence, .after_collect_evidence),
+            "Web evidence budget is exhausted. Tools are unavailable now. Answer in the user's language from the annotated WEB_EVIDENCE. If evidence is weak or empty, state the specific limitation instead of inventing missing facts.",
+        );
+        defer allocator.free(follow_context);
+        try db.recordEvent(config.session, "model_context", follow_context);
+        return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
     }
     tool_iterations.* += 1;
     if (!webEvidenceHasModelIntent(call)) return try repairWebEvidenceIntentCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "web_search requires model-selected query matching the user's external-evidence intent");
@@ -4229,7 +4197,7 @@ fn runWebSearchStep(
     try db.recordEvent(config.session, "working_context_add", working_add);
 
     const follow_context = if (web_complete)
-        try renderCollectedStrongWebEvidenceContext(
+        try renderAnnotatedWebEvidenceContext(
             allocator,
             prompt,
             &state.context,
@@ -4248,27 +4216,7 @@ fn runWebSearchStep(
         );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
-    if (webEvidenceNeedsDeterministicLimitation(web_complete, distilled_web.summary, state.shouldAllowMoreEvidence())) {
-        try db.recordEvent(config.session, "answer_repair", "weak web evidence direct deterministic answer");
-        const visible = if (distilled_web.summary.emptyExcerptBlock())
-            try renderNoDirectWebEvidenceAnswer(allocator, prompt)
-        else
-            try renderUnsupportedWebEvidenceLiteralAnswer(allocator, follow_context);
-        defer allocator.free(visible);
-        try aggregate_sink.emitVisibleText(visible);
-        return .final_answer;
-    }
     return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
-}
-
-fn renderWorkingContextEvidenceText(allocator: std.mem.Allocator, context: *const working_context.WorkingContext) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    for (context.entries.items) |entry| {
-        if (out.items.len > 0) try out.append(allocator, '\n');
-        try out.appendSlice(allocator, entry.evidence_text);
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn webEvidenceSourceFollowupTarget(summary: WebEvidenceSummary, current_target: []const u8, state: *const ToolLoopState, strategy: contracts.StrategyName) ?[]const u8 {
@@ -5388,11 +5336,34 @@ fn streamDeferredToolLoopTurnInternal(
         if (follow_sink.raw_visible.items.len > 0) {
             if (final_answer_mode and visibleContainsInternalEvidenceProtocol(follow_sink.raw_visible.items)) {
                 follow_sink.discardDeferredVisible();
-                try db.recordEvent(config.session, "answer_repair", "internal web evidence marker sanitized");
-                const visible = try renderNoDirectWebEvidenceAnswer(allocator, prompt);
-                defer allocator.free(visible);
-                try aggregate_sink.emitVisibleText(visible);
-                return .final_answer;
+                if (finalization_state) |state| {
+                    if (state.finalization_repairs >= max_tool_repairs) {
+                        try db.recordEvent(config.session, "answer_repair_blocked", "internal evidence protocol after tool phase closed");
+                        try db.recordTurnError(config.session, .model_protocol, "final_answer_protocol", "internal evidence protocol after tool phase closed");
+                        try aggregate_sink.emitVisibleText("[MODEL_PROTOCOL_ERROR] final answer leaked internal evidence protocol after tool phase closed.");
+                        return .stopped;
+                    }
+                    state.finalization_repairs += 1;
+                }
+                try db.recordEvent(config.session, "answer_repair", "internal evidence protocol after tool phase closed");
+                const repair_context = try renderToolPhaseClosedAnswerRepairContext(allocator, follow_context);
+                defer allocator.free(repair_context);
+                try db.recordEvent(config.session, "model_context", repair_context);
+                return streamDeferredToolLoopTurnInternal(
+                    allocator,
+                    config,
+                    prompt,
+                    repair_context,
+                    null,
+                    client,
+                    events,
+                    db,
+                    ui_ptr,
+                    aggregate_sink,
+                    active_contract,
+                    finalization_state,
+                    required_tool_missing_visible,
+                );
             }
             if (final_answer_mode and visibleContainsLeakedReasoning(follow_sink.raw_visible.items)) {
                 follow_sink.discardDeferredVisible();
@@ -5545,53 +5516,6 @@ fn streamDeferredToolLoopTurnInternal(
                             required_tool_missing_visible,
                         );
                     }
-                }
-            }
-            if (std.mem.indexOf(u8, follow_context, "[WEB_EVIDENCE]") != null) {
-                if (unsupportedWebAnswerLiteral(follow_sink.raw_visible.items, follow_context)) |literal| {
-                    const literal_copy = try allocator.dupe(u8, literal);
-                    defer allocator.free(literal_copy);
-                    follow_sink.discardDeferredVisible();
-                    if (finalization_state) |state| {
-                        if (state.unsupported_web_answer_repairs < max_unsupported_web_answer_repairs) {
-                            state.unsupported_web_answer_repairs += 1;
-                            const action = if (active_contract.name == .search_web)
-                                "Emit one refined web_search with the exact user fact intent if more evidence is needed; otherwise state that collected WEB_EVIDENCE does not directly support the answer."
-                            else
-                                "The web tool phase is closed. Answer from collected WEB_EVIDENCE only, or state that collected WEB_EVIDENCE does not directly support the requested technical detail.";
-                            const repair_context = try std.fmt.allocPrint(
-                                allocator,
-                                "{s}\n[ANSWER_REPAIR]\nThe previous visible answer introduced `{s}`, but that literal is not present in WEB_EVIDENCE. Numeric, date, version, resolution, and technical spec facts must be copied from collected evidence. {s} No unsupported factual literals.\n",
-                                .{ follow_context, literal_copy, action },
-                            );
-                            defer allocator.free(repair_context);
-                            const repair_audit = try std.fmt.allocPrint(allocator, "unsupported web literal={s}", .{literal_copy});
-                            defer allocator.free(repair_audit);
-                            try db.recordEvent(config.session, "answer_repair", repair_audit);
-                            try db.recordEvent(config.session, "model_context", repair_context);
-                            return streamDeferredToolLoopTurnInternal(
-                                allocator,
-                                config,
-                                prompt,
-                                repair_context,
-                                null,
-                                client,
-                                events,
-                                db,
-                                ui_ptr,
-                                aggregate_sink,
-                                active_contract,
-                                finalization_state,
-                                required_tool_missing_visible,
-                            );
-                        }
-                    }
-                    try db.recordEvent(config.session, "answer_repair", "unsupported web literal final answer blocked");
-                    const visible = try renderUnsupportedWebEvidenceLiteralAnswer(allocator, follow_context);
-                    defer allocator.free(visible);
-                    try aggregate_sink.emitVisibleText(visible);
-                    follow_sink.raw_visible.clearRetainingCapacity();
-                    return .final_answer;
                 }
             }
             if (finalization_state) |state| {
@@ -5863,29 +5787,6 @@ fn renderEmptyWebEvidenceAnswerRepairContext(allocator: std.mem.Allocator, follo
     );
 }
 
-fn renderUnsupportedWebEvidenceLiteralAnswer(allocator: std.mem.Allocator, context: []const u8) ![]u8 {
-    const source = firstWebEvidenceSourceUrl(context) orelse "";
-    if (source.len > 0) {
-        return std.fmt.allocPrint(
-            allocator,
-            "A pesquisa web foi executada, mas o trecho coletado nao contem detalhes tecnicos suficientes para listar especificacoes verificadas. O resultado encontrado aponta para fontes relevantes, incluindo {s}, mas specs numericas e tecnicas precisam aparecer no trecho coletado antes de serem afirmadas.",
-            .{source},
-        );
-    }
-    return allocator.dupe(u8, "A pesquisa web foi executada, mas o trecho coletado nao contem detalhes tecnicos suficientes para listar especificacoes verificadas.");
-}
-
-fn firstWebEvidenceSourceUrl(context: []const u8) ?[]const u8 {
-    var lines = std.mem.splitScalar(u8, context, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
-        if (!std.mem.startsWith(u8, trimmed, "source_url=")) continue;
-        const url = std.mem.trim(u8, trimmed["source_url=".len..], " \t\r\n");
-        if (url.len > 0) return url;
-    }
-    return null;
-}
-
 fn renderToolPhaseClosedAnswerRepairContext(allocator: std.mem.Allocator, follow_context: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
@@ -6004,7 +5905,6 @@ const ToolLoopState = struct {
     duplicate_contract_repairs: usize = 0,
     finalization_repairs: usize = 0,
     retrieved_skill_answer_repairs: usize = 0,
-    unsupported_web_answer_repairs: usize = 0,
     search_web_question_repairs: usize = 0,
     clarification_soft_repairs: usize = 0,
     forced_exploratory_refinements: usize = 0,
@@ -6074,7 +5974,6 @@ const ToolLoopState = struct {
         self.requirements = request;
         self.finalization_repairs = 0;
         self.retrieved_skill_answer_repairs = 0;
-        self.unsupported_web_answer_repairs = 0;
         self.search_web_question_repairs = 0;
         self.duplicate_contract_repairs = 0;
     }
@@ -6082,14 +5981,12 @@ const ToolLoopState = struct {
     fn recordObservation(self: *ToolLoopState) void {
         self.observations += 1;
         self.finalization_repairs = 0;
-        self.unsupported_web_answer_repairs = 0;
         self.search_web_question_repairs = 0;
     }
 
     fn closeToolPhase(self: *ToolLoopState) void {
         self.active_contract = contracts.activeContract(.answer_only).?;
         self.finalization_repairs = 0;
-        self.unsupported_web_answer_repairs = 0;
         self.search_web_question_repairs = 0;
     }
 
@@ -6262,48 +6159,67 @@ fn renderCollectedEvidenceContext(
     return renderCollectedEvidenceContextInternal(allocator, prompt, context, session_text, focus_text, contracts_text, next_action, null);
 }
 
-fn renderCollectedStrongWebEvidenceContext(
+fn renderAnnotatedWebEvidenceContext(
     allocator: std.mem.Allocator,
     prompt: []const u8,
     context: *const working_context.WorkingContext,
     contracts_text: []const u8,
     next_action: []const u8,
 ) ![]u8 {
-    const evidence_blocks = try renderStrongWebEvidenceBlocks(allocator, context);
+    var owned_annotations = std.ArrayList([]u8).empty;
+    defer {
+        for (owned_annotations.items) |text| allocator.free(text);
+        owned_annotations.deinit(allocator);
+    }
+    const evidence_blocks = try allocator.alloc(model_context.EvidenceBlock, context.entries.items.len);
     defer allocator.free(evidence_blocks);
+    for (context.entries.items, 0..) |entry, i| {
+        const text = entry.evidence_text;
+        if (std.mem.indexOf(u8, text, "[WEB_EVIDENCE]") == null) {
+            evidence_blocks[i] = .{ .text = text };
+            continue;
+        }
+        const summary = summarizeWebEvidence(text);
+        const quality = if (webEvidenceStrongForFinalAnswerFromSummary(summary)) "strong" else "weak";
+        const reason = webEvidenceQualityReason(summary);
+        const annotated = try std.fmt.allocPrint(
+            allocator,
+            "[WEB_EVIDENCE_QUALITY]\nweb_quality={s}\nquality_reason={s}\n{s}",
+            .{ quality, reason, text },
+        );
+        owned_annotations.append(allocator, annotated) catch |err| {
+            allocator.free(annotated);
+            return err;
+        };
+        evidence_blocks[i] = .{ .text = annotated };
+    }
     return model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
         .contracts = contracts_text,
         .evidence = evidence_blocks,
         .obligations = &.{
-            "Use only strong WEB_EVIDENCE for web factual claims.",
-            "Weak web evidence, source-only excerpts, empty excerpts, and title-only excerpts are not answer evidence.",
+            "Every WEB_EVIDENCE block is visible for reasoning and audit.",
+            "Treat web_quality=weak as context about attempts, sources, and gaps; do not promote weak evidence into unsupported facts.",
+            "For factual web claims, cite or name the source_url that directly supports the claim. If direct support is missing, state the limitation.",
         },
         .grounding = groundingRules(),
         .next_action = next_action,
     });
 }
 
-fn renderStrongWebEvidenceBlocks(allocator: std.mem.Allocator, context: *const working_context.WorkingContext) ![]model_context.EvidenceBlock {
-    var count: usize = 0;
-    for (context.entries.items) |entry| {
-        if (webEvidenceStrongForFinalAnswer(entry.evidence_text)) count += 1;
-    }
-    var blocks = try allocator.alloc(model_context.EvidenceBlock, count);
-    errdefer allocator.free(blocks);
-    var index: usize = 0;
-    for (context.entries.items) |entry| {
-        const text = entry.evidence_text;
-        if (!webEvidenceStrongForFinalAnswer(text)) continue;
-        blocks[index] = .{ .text = text };
-        index += 1;
-    }
-    return blocks;
+fn webEvidenceStrongForFinalAnswerFromSummary(summary: WebEvidenceSummary) bool {
+    return webEvidenceCanCloseToolPhase(summary.status_code != null and summary.status_code.? >= 200 and summary.status_code.? < 300, summary);
 }
 
-fn webEvidenceStrongForFinalAnswer(text: []const u8) bool {
-    const summary = summarizeWebEvidence(text);
-    return webEvidenceCanCloseToolPhase(summary.status_code != null and summary.status_code.? >= 200 and summary.status_code.? < 300, summary);
+fn webEvidenceQualityReason(summary: WebEvidenceSummary) []const u8 {
+    if (!summary.saw_block) return "not_web_evidence";
+    if (webEvidenceStrongForFinalAnswerFromSummary(summary)) return "direct_excerpt_with_source";
+    if (!summary.has_source) return "missing_source_url";
+    if (!summary.has_excerpt) return "empty_excerpt";
+    if (summary.has_search_result_excerpt) return "search_result_excerpt_requires_source_followup";
+    if (summary.has_source_excerpt) return "source_excerpt_not_model_verified";
+    if (summary.has_title_only_excerpt) return "title_only_excerpt";
+    return "insufficient_direct_support";
 }
 
 fn renderCollectedEvidenceContextRequiringCollection(
@@ -6533,14 +6449,26 @@ fn normalizeWebDistillationOutput(
             allocator.free(with_sources);
             return allocator.dupe(u8, fallback);
         }
+        if (!webDistillationExcerptCoversQuery(with_sources, query)) {
+            allocator.free(with_sources);
+            return allocator.dupe(u8, fallback);
+        }
         if (summarizeWebEvidence(fallback).has_source_excerpt and summarizeWebEvidence(with_sources).has_excerpt) {
             return try rewriteWebEvidenceDistill(allocator, with_sources, "model_verified_excerpt");
         }
         return with_sources;
     }
     _ = target;
-    _ = query;
     return allocator.dupe(u8, fallback);
+}
+
+fn webDistillationExcerptCoversQuery(generated: []const u8, query: ?[]const u8) bool {
+    const query_text = std.mem.trim(u8, query orelse "", " \t\r\n");
+    if (query_text.len == 0) return true;
+    const generated_excerpt = webEvidenceExcerptText(generated);
+    if (generated_excerpt.len == 0) return true;
+    if (std.mem.startsWith(u8, generated_excerpt, "result=") or std.mem.indexOf(u8, generated_excerpt, "\nresult=") != null) return true;
+    return evidenceTextCoversQuery(generated_excerpt, query_text);
 }
 
 fn webDistillationExcerptGrounded(generated: []const u8, fallback: []const u8) bool {
@@ -7144,10 +7072,6 @@ const StreamSink = struct {
     }
 
     fn emitVisibleText(ctx: *StreamSink, text: []const u8) !void {
-        if (rawVisibleContainsToolCall(text) or visibleContainsInternalEvidenceProtocol(text) or visibleContainsLeakedReasoning(text)) {
-            try ctx.db.recordEvent(ctx.session, "visible_protocol_leak_blocked", "protocol");
-            return;
-        }
         ctx.visible_bytes += text.len;
         try ctx.visible.appendSlice(ctx.allocator, text);
         if (ctx.ui) |ui| try ui.showStatus("Responding");
@@ -8176,18 +8100,6 @@ test "raw visible tool call is not safe final prose" {
     try std.testing.expect(!visibleContainsLeakedReasoning("A evidencia coletada nao contem o valor especifico para Londrina."));
 }
 
-test "empty web evidence fallback is user visible prose" {
-    const pt = try renderNoDirectWebEvidenceAnswer(std.testing.allocator, "como media a irradiacao solar em Londrina, pesquise");
-    defer std.testing.allocator.free(pt);
-    try std.testing.expect(std.mem.indexOf(u8, pt, "[WEB_EVIDENCE") == null);
-    try std.testing.expect(std.mem.indexOf(u8, pt, "pesquisa web foi executada") != null);
-
-    const custom = try renderNoDirectWebEvidenceAnswer(std.testing.allocator, "Usuario esta usando o idioma operacional 'user-lang-a'. Pesquise. Responda contendo PHENOM_WEB_LANG_USER.");
-    defer std.testing.allocator.free(custom);
-    try std.testing.expectEqualStrings("user-lang-a: busca-sem-evidencia-direta.\nPHENOM_WEB_LANG_USER", custom);
-    try std.testing.expectEqualStrings("PHENOM_WEB_LANG_USER", lastNonEmptyLine(custom).?);
-}
-
 test "explicit internet request is recognized and converted to web query" {
     try std.testing.expect(promptExplicitlyRequestsWebSearch("Pesquise na internet: qual e a capital da Franca?"));
     try std.testing.expect(promptExplicitlyRequestsWebSearch("use web_search para confirmar"));
@@ -8198,7 +8110,7 @@ test "explicit internet request is recognized and converted to web query" {
     try std.testing.expectEqualStrings("quem criou kernel Linux", query);
 }
 
-test "stream sink blocks tool protocol from final visible output" {
+test "stream sink emits caller-selected final text byte-for-byte" {
     var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
     defer db.close();
 
@@ -8217,15 +8129,10 @@ test "stream sink blocks tool protocol from final visible output" {
     };
     defer sink.deinit();
 
-    try sink.emitVisibleText("```json\n{\"tool_call\":{\"name\":\"web_search\"}}\n```");
-    try std.testing.expectEqual(@as(usize, 0), sink.visible_bytes);
-    try std.testing.expectEqual(@as(usize, 0), sink.visible.items.len);
-    try sink.emitVisibleText("[WEB_EVIDENCE_EMPTY] web_search returned no direct supporting excerpt");
-    try std.testing.expectEqual(@as(usize, 0), sink.visible_bytes);
-    try std.testing.expectEqual(@as(usize, 0), sink.visible.items.len);
-    try sink.emitVisibleText("I'll search for the exact location. json { \"tool_call\": { \"name\": \"search_web\", \"arguments\": { \"query\": \"Londrina PR\" } } }");
-    try std.testing.expectEqual(@as(usize, 0), sink.visible_bytes);
-    try std.testing.expectEqual(@as(usize, 0), sink.visible.items.len);
+    const final_text = "I'll search is valid user-visible text when the caller has already selected final_text.";
+    try sink.emitVisibleText(final_text);
+    try std.testing.expectEqualStrings(final_text, sink.visible.items);
+    try std.testing.expectEqual(final_text.len, sink.visible_bytes);
 }
 
 test "empty visible answer reports root cause without protocol error" {
@@ -9549,7 +9456,7 @@ test "web distillation promotes grounded source excerpts structurally" {
         \\source_url=https://example.test/r36s
         \\excerpt=Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.
     ;
-    const normalized = try normalizeWebDistillationOutput(std.testing.allocator, "https://example.test/r36s", "R36S especificacoes tecnicas", fallback, generated);
+    const normalized = try normalizeWebDistillationOutput(std.testing.allocator, "https://example.test/r36s", "R36S RK3326 RAM", fallback, generated);
     defer std.testing.allocator.free(normalized);
 
     const summary = summarizeWebEvidence(normalized);
@@ -9584,6 +9491,32 @@ test "web distillation rejects ungrounded model additions" {
     try std.testing.expect(std.mem.indexOf(u8, normalized, "Steam") == null);
 }
 
+test "web distillation keeps query-mismatched excerpts weak" {
+    const fallback =
+        \\[WEB_EVIDENCE]
+        \\source=http_get raw_context_persisted=false distill=source_excerpt target=https://example.test/r36s
+        \\status=200
+        \\query=console R36S especificações técnicas
+        \\source_url=https://example.test/r36s
+        \\excerpt=Mercado Livre Olá! Para continuar, acesse sua conta. Usamos cookies para melhorar sua experiência.
+    ;
+    const generated =
+        \\[WEB_EVIDENCE]
+        \\source=http_get raw_context_persisted=false distill=model_summary target=https://example.test/r36s
+        \\status=200
+        \\query=console R36S especificações técnicas
+        \\source_url=https://example.test/r36s
+        \\excerpt=Mercado Livre Olá! Para continuar, acesse sua conta. Usamos cookies para melhorar sua experiência.
+    ;
+    const normalized = try normalizeWebDistillationOutput(std.testing.allocator, "https://example.test/r36s", "console R36S especificações técnicas", fallback, generated);
+    defer std.testing.allocator.free(normalized);
+
+    const summary = summarizeWebEvidence(normalized);
+    try std.testing.expect(summary.has_source_excerpt);
+    try std.testing.expect(!summary.has_model_verified_excerpt);
+    try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summary));
+}
+
 test "successful web evidence closes tool phase structurally" {
     var state = ToolLoopState.init(std.testing.allocator);
     defer state.deinit();
@@ -9592,6 +9525,8 @@ test "successful web evidence closes tool phase structurally" {
 
     const summary = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nsource_url=https://example.test/londrina\nexcerpt=Londrina fica no Parana.\n");
     try std.testing.expect(webEvidenceCanCloseToolPhase(true, summary));
+    try std.testing.expect(webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nquery=console R36S especificacoes tecnicas\nsource_url=https://example.test/r36s\nexcerpt=Console R36S usa RK3326 e 1GB RAM.\n")));
+    try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nquery=console R36S especificacoes tecnicas\nsource_url=https://example.test/r36s\nexcerpt=Mercado Livre login e cookies.\n")));
     try std.testing.expect(!webEvidenceCanCloseToolPhase(false, summary));
     try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nexcerpt=Londrina fica no Parana.\n")));
     try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nsource=http_get distill=source_excerpt target=https://example.test/r36s\nstatus=200\nsource_url=https://example.test/r36s\nexcerpt=R36S title and surrounding page text.\n")));
@@ -9599,9 +9534,6 @@ test "successful web evidence closes tool phase structurally" {
     try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\ntitle=Ficha tecnica completa do Console Portatil R36S 64g Linux Tela IPS 3.5 Polegadas\nsource_url=https://example.test/r36s\nexcerpt=Ficha tecnica completa do Console Portatil R36S 64g Linux Tela IPS 3.5 Polegad\n")));
     try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\ntitle=Console Portatil R36S 64GB com o Melhor Preco\nsource_url=https://example.test/r36s\nexcerpt=Console Portatil R36S 64GB com o Melhor Preco Categorias Celulares iPhone 17 Samsung Galaxy\n")));
     try std.testing.expect(webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\ntitle=R36S Specs Hardware Details\nsource_url=https://example.test/r36s\nexcerpt=R36S Specs Hardware Details. R36S uses RK3326 and 1GB RAM.\n")));
-    try std.testing.expect(webEvidenceNeedsDeterministicLimitation(false, summarizeWebEvidence("[WEB_EVIDENCE]\nsource=http_get distill=source_excerpt target=https://example.test/r36s\nstatus=200\nsource_url=https://example.test/r36s\nexcerpt=R36S title and surrounding page text.\n"), false));
-    try std.testing.expect(!webEvidenceNeedsDeterministicLimitation(false, summarizeWebEvidence("[WEB_EVIDENCE]\nsource=http_get distill=source_excerpt target=https://example.test/r36s\nstatus=200\nsource_url=https://example.test/r36s\nexcerpt=R36S title and surrounding page text.\n"), true));
-    try std.testing.expect(!webEvidenceNeedsDeterministicLimitation(true, summary, false));
 
     state.closeToolPhase();
 
@@ -9610,7 +9542,7 @@ test "successful web evidence closes tool phase structurally" {
     try std.testing.expect(state.finalizationBlocker() == null);
 }
 
-test "web final context excludes weak web evidence" {
+test "web final context annotates weak evidence instead of hiding it" {
     var ctx = working_context.WorkingContext.init(std.testing.allocator);
     defer ctx.deinit();
 
@@ -9631,11 +9563,13 @@ test "web final context excludes weak web evidence" {
     try ctx.remember(.{ .path = "https://example.test/weak", .strategy = .document_summary, .start_line = 1, .max_lines = 1, .evidence_text = weak, .model_bytes = weak.len, .quality_score = 45 });
     try ctx.remember(.{ .path = "https://example.test/strong", .strategy = .document_summary, .start_line = 1, .max_lines = 1, .evidence_text = strong, .model_bytes = strong.len, .quality_score = 82 });
 
-    const rendered = try renderCollectedStrongWebEvidenceContext(std.testing.allocator, "R36S specs", &ctx, "", "answer");
+    const rendered = try renderAnnotatedWebEvidenceContext(std.testing.allocator, "R36S specs", &ctx, "", "answer");
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "RK3326") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "64GB") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Linux") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "64GB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Linux") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "web_quality=weak") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "web_quality=strong") != null);
 }
 
 test "search result evidence follows source before closing" {
@@ -9722,29 +9656,6 @@ test "empty web evidence repair preserves user language contract structurally" {
     try std.testing.expect(std.mem.indexOf(u8, repair, "[EMPTY_WEB_EVIDENCE_ANSWER_REPAIR]") != null);
     try std.testing.expect(std.mem.indexOf(u8, repair, "Answer visibly in the user's language from USER_TASK") != null);
     try std.testing.expect(std.mem.indexOf(u8, repair, "zeta-lang") != null);
-}
-
-test "web final answer numeric literal must be present in web evidence" {
-    const context =
-        \\[EVIDENCE]
-        \\E1:
-        \\  [WEB_EVIDENCE]
-        \\  query=latest zig
-        \\  excerpt=Download the latest release of Zig from the official project page.
-    ;
-    try std.testing.expectEqualStrings("0.13.0", unsupportedWebAnswerLiteral("A versao mais recente e 0.13.0.", context).?);
-    try std.testing.expectEqualStrings("4,0", unsupportedWebAnswerLiteral("A media e 4,0 kWh/m2/dia.", context).?);
-    try std.testing.expectEqualStrings("480x320", unsupportedWebAnswerLiteral("Tela IPS com resolucao de 480x320 pixels.", context).?);
-    try std.testing.expectEqualStrings("64GB", unsupportedWebAnswerLiteral("Armazenamento de 64GB.", context).?);
-    try std.testing.expect(unsupportedWebAnswerLiteral("Nao encontrei evidencia direta.", context) == null);
-    try std.testing.expect(unsupportedWebAnswerLiteral("A versao evidenciada e 0.15.1.", "[WEB_EVIDENCE]\nexcerpt=Zig 0.15.1\n") == null);
-    try std.testing.expect(unsupportedWebAnswerLiteral("Armazenamento de 1GB.", "[WEB_EVIDENCE]\nexcerpt=R36S 1GB RAM\n") == null);
-    try std.testing.expect(unsupportedWebAnswerLiteral("CPU RK3326 Cortex-A35 1.5GHz e tela 640x480.", "[WEB_EVIDENCE]\nexcerpt=CPU Rockchip RK3326 (Quad-Core ARM Cortex-A35 1. 5GHz) Display 640 x 480 resolution\n") == null);
-    const limited = try renderUnsupportedWebEvidenceLiteralAnswer(std.testing.allocator, "[WEB_EVIDENCE]\nsource_url=https://r36s.org/articles/r36s-specs-hardware-details\nexcerpt=result=2 title=R36S specs\n");
-    defer std.testing.allocator.free(limited);
-    try std.testing.expect(std.mem.indexOf(u8, limited, "nao contem detalhes tecnicos suficientes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, limited, "https://r36s.org/articles/r36s-specs-hardware-details") != null);
-    try std.testing.expect(std.mem.indexOf(u8, limited, "WEB_EVIDENCE") == null);
 }
 
 test "search web final question is detected structurally" {
