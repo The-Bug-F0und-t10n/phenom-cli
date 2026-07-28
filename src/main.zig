@@ -1811,47 +1811,63 @@ fn renderClarificationSoftRepairContext(
 }
 
 fn webEvidenceHasOnlyEmptyExcerpts(context: []const u8) bool {
-    if (std.mem.indexOf(u8, context, "[WEB_EVIDENCE]") == null) return false;
-    var saw_excerpt = false;
-    var saw_nonempty_excerpt = false;
-    var lines = std.mem.splitScalar(u8, context, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t");
-        if (!std.mem.startsWith(u8, trimmed, "excerpt=")) continue;
-        saw_excerpt = true;
-        if (std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n").len > 0) {
-            saw_nonempty_excerpt = true;
-        }
-    }
-    return saw_excerpt and !saw_nonempty_excerpt;
+    return summarizeWebEvidence(context).onlyEmptyExcerpt();
 }
 
 fn webEvidenceBlockHasEmptyExcerpt(text: []const u8) bool {
-    if (std.mem.indexOf(u8, text, "[WEB_EVIDENCE]") == null) return false;
-    var saw_excerpt = false;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t");
-        if (!std.mem.startsWith(u8, trimmed, "excerpt=")) continue;
-        saw_excerpt = true;
-        if (std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n").len > 0) return false;
-    }
-    return saw_excerpt;
+    return summarizeWebEvidence(text).emptyExcerptBlock();
 }
 
 fn webEvidenceHasStatus200WithExcerpt(text: []const u8) bool {
-    if (std.mem.indexOf(u8, text, "[WEB_EVIDENCE]") == null) return false;
+    return summarizeWebEvidence(text).status200WithExcerpt();
+}
+
+fn webEvidenceCanCloseToolPhase(http_success: bool, summary: WebEvidenceSummary) bool {
+    return http_success and summary.status200WithExcerpt();
+}
+
+const WebEvidenceSummary = struct {
+    saw_block: bool = false,
+    saw_excerpt: bool = false,
+    has_excerpt: bool = false,
+    status_code: ?u16 = null,
+
+    fn onlyEmptyExcerpt(self: WebEvidenceSummary) bool {
+        return self.saw_block and self.saw_excerpt and !self.has_excerpt;
+    }
+
+    fn emptyExcerptBlock(self: WebEvidenceSummary) bool {
+        return self.saw_block and self.saw_excerpt and !self.has_excerpt;
+    }
+
+    fn status200WithExcerpt(self: WebEvidenceSummary) bool {
+        return self.status_code == 200 and self.has_excerpt;
+    }
+};
+
+fn summarizeWebEvidence(text: []const u8) WebEvidenceSummary {
+    var summary: WebEvidenceSummary = .{
+        .saw_block = std.mem.indexOf(u8, text, "[WEB_EVIDENCE]") != null,
+    };
+    if (!summary.saw_block) return summary;
     var saw_status_200 = false;
-    var saw_nonempty_excerpt = false;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
-        if (std.mem.eql(u8, trimmed, "status=200")) saw_status_200 = true;
+        if (std.mem.startsWith(u8, trimmed, "status=")) {
+            const raw = std.mem.trim(u8, trimmed["status=".len..], " \t\r\n");
+            summary.status_code = std.fmt.parseInt(u16, raw, 10) catch null;
+            saw_status_200 = summary.status_code == 200;
+        }
         if (std.mem.startsWith(u8, trimmed, "excerpt=") and std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n").len > 0) {
-            saw_nonempty_excerpt = true;
+            summary.saw_excerpt = true;
+            summary.has_excerpt = true;
+        } else if (std.mem.startsWith(u8, trimmed, "excerpt=")) {
+            summary.saw_excerpt = true;
         }
     }
-    return saw_status_200 and saw_nonempty_excerpt;
+    if (saw_status_200) summary.status_code = 200;
+    return summary;
 }
 
 fn webAnswerOnlyNextAction(web_complete: bool) []const u8 {
@@ -3973,8 +3989,9 @@ fn runWebSearchStep(
     };
     defer result.deinit(allocator);
 
-    const model_evidence = try distillWebEvidenceForContext(allocator, config, prompt, target, query, result.evidence_text, client, db, &state.context);
-    defer allocator.free(model_evidence);
+    const distilled_web = try distillWebEvidenceForContextTyped(allocator, config, prompt, target, query, result.evidence_text, client, db, &state.context);
+    defer distilled_web.deinit(allocator);
+    const model_evidence = distilled_web.text;
     const model_context_id = try webEvidenceContextId(allocator, model_evidence);
     defer allocator.free(model_context_id);
     try db.recordEvent(config.session, "tool_event", result.audit_text);
@@ -3982,7 +3999,7 @@ fn runWebSearchStep(
     try events.emit(.{ .tool_result = .{ .name = "web_search", .output = model_evidence } });
     try state.rememberExecutedArgs(target, declared_query, strategy, 1, 1, model_context_id, model_evidence, model_evidence.len, result.quality_score);
     state.recordObservation();
-    const web_complete = webEvidenceHasStatus200WithExcerpt(model_evidence);
+    const web_complete = webEvidenceCanCloseToolPhase(result.http_success, distilled_web.summary);
     if (web_complete) state.closeToolPhase();
     const working_add = try std.fmt.allocPrint(
         allocator,
@@ -4003,7 +4020,7 @@ fn runWebSearchStep(
     );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
-    if (webEvidenceBlockHasEmptyExcerpt(model_evidence)) {
+    if (distilled_web.summary.emptyExcerptBlock()) {
         try db.recordEvent(config.session, "answer_repair", "empty web evidence direct deterministic answer");
         const visible = try renderNoDirectWebEvidenceAnswer(allocator, prompt);
         defer allocator.free(visible);
@@ -6034,6 +6051,15 @@ const max_web_distillation_input_bytes: usize = 8192;
 const max_web_distillation_context_bytes: usize = 1400;
 const max_web_distillation_output_bytes: usize = 1600;
 
+const DistilledWebEvidence = struct {
+    text: []u8,
+    summary: WebEvidenceSummary,
+
+    fn deinit(self: DistilledWebEvidence, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+    }
+};
+
 fn distillWebEvidenceForContext(
     allocator: std.mem.Allocator,
     config: cli.Config,
@@ -6045,6 +6071,21 @@ fn distillWebEvidenceForContext(
     db: *audit.AuditDb,
     context: *const working_context.WorkingContext,
 ) ![]u8 {
+    const distilled = try distillWebEvidenceForContextTyped(allocator, config, prompt, target, query, local_evidence, client, db, context);
+    return distilled.text;
+}
+
+fn distillWebEvidenceForContextTyped(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    target: []const u8,
+    query: ?[]const u8,
+    local_evidence: []const u8,
+    client: *http.LocalModelClient,
+    db: *audit.AuditDb,
+    context: *const working_context.WorkingContext,
+) !DistilledWebEvidence {
     const active_summary = try renderWebDistillationContextSummary(allocator, context);
     defer allocator.free(active_summary);
     const distill_prompt = try renderWebDistillationPrompt(allocator, prompt, target, query, active_summary, local_evidence);
@@ -6067,13 +6108,14 @@ fn distillWebEvidenceForContext(
         .max_tokens = 512,
     }, &sink) catch |err| {
         try recordWebDistillationAudit(allocator, db, config.session, target, query, false, @errorName(err), local_evidence.len, local_evidence.len);
-        return allocator.dupe(u8, local_evidence);
+        const fallback = try allocator.dupe(u8, local_evidence);
+        return .{ .text = fallback, .summary = summarizeWebEvidence(fallback) };
     };
     try sink.flush();
 
     const distilled = try normalizeWebDistillationOutput(allocator, target, query, local_evidence, sink.visible.items);
     try recordWebDistillationAudit(allocator, db, config.session, target, query, true, "", local_evidence.len, distilled.len);
-    return distilled;
+    return .{ .text = distilled, .summary = summarizeWebEvidence(distilled) };
 }
 
 fn renderWebDistillationPrompt(
@@ -6141,12 +6183,9 @@ fn normalizeWebDistillationOutput(
     if (std.mem.indexOf(u8, trimmed, "[WEB_EVIDENCE]")) |start| {
         return allocator.dupe(u8, trimmed[start..@min(trimmed.len, start + max_web_distillation_output_bytes)]);
     }
-    const clipped = trimmed[0..@min(trimmed.len, max_web_distillation_output_bytes)];
-    return std.fmt.allocPrint(
-        allocator,
-        "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target={s}\nretrieved_at=unknown\ntimezone=UTC\nquery={s}\nexcerpt={s}\n",
-        .{ target, query orelse "", clipped },
-    );
+    _ = target;
+    _ = query;
+    return allocator.dupe(u8, fallback);
 }
 
 fn appendBudgeted(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8, budget: usize) !void {
@@ -8953,6 +8992,19 @@ test "empty web evidence excerpt is detected structurally" {
     try std.testing.expect(webEvidenceHasStatus200WithExcerpt(nonempty));
     try std.testing.expect(!webEvidenceHasStatus200WithExcerpt(empty));
     try std.testing.expect(!webEvidenceHasStatus200WithExcerpt("[WEB_EVIDENCE]\nstatus=202\nexcerpt=result=4.\n"));
+
+    const summary = summarizeWebEvidence(nonempty);
+    try std.testing.expectEqual(@as(?u16, 200), summary.status_code);
+    try std.testing.expect(summary.has_excerpt);
+    try std.testing.expect(summary.status200WithExcerpt());
+}
+
+test "web distillation fallback preserves structured evidence" {
+    const fallback = "[WEB_EVIDENCE]\nstatus=200\nquery=latest zig\nexcerpt=Zig stable release\n";
+    const normalized = try normalizeWebDistillationOutput(std.testing.allocator, "https://html.duckduckgo.com/html/?q=zig", "latest zig", fallback, "Zig stable release");
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectEqualStrings(fallback, normalized);
+    try std.testing.expect(summarizeWebEvidence(normalized).status200WithExcerpt());
 }
 
 test "successful web evidence closes tool phase structurally" {
@@ -8960,6 +9012,10 @@ test "successful web evidence closes tool phase structurally" {
     defer state.deinit();
     state.active_contract = contracts.activeContract(.search_web).?;
     state.contract_selected = true;
+
+    const summary = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nexcerpt=Londrina fica no Parana.\n");
+    try std.testing.expect(webEvidenceCanCloseToolPhase(true, summary));
+    try std.testing.expect(!webEvidenceCanCloseToolPhase(false, summary));
 
     state.closeToolPhase();
 
