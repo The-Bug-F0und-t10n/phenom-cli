@@ -165,7 +165,7 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
 
     const db_path = try std.fmt.allocPrint(allocator, "{s}/.phenom-zig/phenom.db", .{work});
     defer allocator.free(db_path);
-    try expectCount(allocator, db_path, "select count(*) from events where kind='tool_start' and body like 'web_search%'", 1);
+    try expectCount(allocator, db_path, "select count(*) from events where kind='tool_start' and body like 'web_search%'", if (scenario == .web_language_empty) 2 else 1);
     try expectCount(allocator, db_path, "select count(*) from events where kind='assistant_delta' and (body like '%tool_call%' or body like '%WEB_EVIDENCE%' or body like '%```json%' or body like '%PHENOM_WEB_LANG_EN%')", 0);
     try expectCount(allocator, db_path, "select count(*) from events where kind='turn_error'", 0);
     try expectAtLeast(allocator, db_path, "select count(*) from events where kind='turn_done' and body like '%used_evidence=true%'", 1);
@@ -204,7 +204,7 @@ fn serverMain(state: *ServerState) void {
         .initial_json_web => 4,
         .duplicate_web_json => 5,
         .web_language => 4,
-        .web_language_empty => 3,
+        .web_language_empty => 7,
     };
     while (state.completion_count < max) {
         var addr: c.sockaddr_in = undefined;
@@ -258,8 +258,8 @@ fn completionText(state: *const ServerState, prompt: []const u8) []const u8 {
     return switch (state.scenario) {
         .initial_json_web => initialJsonCompletion(prompt),
         .duplicate_web_json => duplicateWebCompletion(prompt),
-        .web_language => languageCompletion(prompt, false),
-        .web_language_empty => languageCompletion(prompt, true),
+        .web_language => languageCompletion(prompt, false, state.completion_count),
+        .web_language_empty => languageCompletion(prompt, true, state.completion_count),
     };
 }
 
@@ -278,12 +278,17 @@ fn duplicateWebCompletion(prompt: []const u8) []const u8 {
     return "preciso pesquisar\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>irradiacao solar media Londrina PR kWh m2 dia</parameter><parameter=reason>buscar dado externo solicitado</parameter></function></tool_call>";
 }
 
-fn languageCompletion(prompt: []const u8, empty: bool) []const u8 {
-    if (contains(prompt, "MODEL_DECLARED_QUERY")) return "solar off-grid house cost batteries inverter panels";
+fn languageCompletion(prompt: []const u8, empty: bool, completion_count: usize) []const u8 {
+    if (contains(prompt, "MODEL_DECLARED_QUERY")) {
+        if (empty and completion_count > 3) return "solar off-grid house cost components batteries inverter panels";
+        return "solar off-grid house cost batteries inverter panels";
+    }
     if (contains(prompt, "WEB_EVIDENCE_INPUT")) {
-        if (empty) return "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/search\nstatus=200\nquery=solar off-grid house cost batteries inverter panels\ntitle=Solar Cost\nexcerpt=";
+        if (empty and completion_count < 5) return "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/search\nstatus=200\nquery=solar off-grid house cost batteries inverter panels\ntitle=Solar Cost\nexcerpt=";
         return "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/search\nstatus=200\nquery=solar off-grid house cost batteries inverter panels\ntitle=Solar Cost\nexcerpt=Solar off-grid systems require batteries, inverter, panels, and charge controllers.";
     }
+    if (contains(prompt, "tool phase is closed")) return "user-lang-a: soma-bateria soma-inversor soma-painel soma-controlador.\nPHENOM_WEB_LANG_USER";
+    if (empty and contains(prompt, "excerpt=")) return "refinar busca vazia\n</think>\n\n<tool_call><function=web_search><parameter=query>solar off-grid house cost components batteries inverter panels</parameter></function></tool_call>";
     if (contains(prompt, "source/WEB_EVIDENCE language")) return "user-lang-a: soma-bateria soma-inversor soma-painel soma-controlador.\nPHENOM_WEB_LANG_USER";
     return "precisa de evidencia externa\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>solar off-grid house cost batteries inverter panels</parameter><parameter=reason>estimar custo externo com evidencia</parameter></function></tool_call>";
 }

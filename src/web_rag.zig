@@ -54,7 +54,9 @@ pub fn fetch(allocator: std.mem.Allocator, io: std.Io, target: []const u8, query
         searchable_text[0..@min(searchable_text.len, budget_bytes)]
     else
         distilled;
-    const web_block = try renderWebEvidenceBlock(allocator, inspected, title, excerpt, query, budget_bytes);
+    const source_urls = try sourceUrlsForEvidence(allocator, inspected.target, searchable_text, excerpt);
+    defer allocator.free(source_urls);
+    const web_block = try renderWebEvidenceBlock(allocator, inspected, title, source_urls, excerpt, query, budget_bytes);
     defer allocator.free(web_block);
     const status_text = try renderStatusText(allocator, inspected.status);
     defer allocator.free(status_text);
@@ -219,6 +221,7 @@ fn renderWebEvidenceBlock(
     allocator: std.mem.Allocator,
     inspected: http.RuntimeHttpResult,
     title: []const u8,
+    source_urls: []const u8,
     excerpt: []const u8,
     query: ?[]const u8,
     budget_bytes: usize,
@@ -229,7 +232,7 @@ fn renderWebEvidenceBlock(
     const retrieved_at = temporal.currentUtcDateText(&retrieved_buf);
     return std.fmt.allocPrint(
         allocator,
-        "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=query_chunks target={s}\nretrieved_at={s}\ntimezone=UTC\nstatus={s}\nserver={s}\nerror={s}\nquery={s}\ntitle={s}\nexcerpt_budget_bytes={}\nexcerpt={s}\n",
+        "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=query_chunks target={s}\nretrieved_at={s}\ntimezone=UTC\nstatus={s}\nserver={s}\nerror={s}\nquery={s}\ntitle={s}\n{s}excerpt_budget_bytes={}\nexcerpt={s}\n",
         .{
             inspected.target,
             retrieved_at,
@@ -238,6 +241,7 @@ fn renderWebEvidenceBlock(
             inspected.error_name orelse "",
             query orelse "",
             title,
+            source_urls,
             budget_bytes,
             excerpt,
         },
@@ -429,6 +433,83 @@ fn appendResultField(allocator: std.mem.Allocator, out: *std.ArrayList(u8), idx:
     const line = try std.fmt.allocPrint(allocator, "result={d} {s}={s}\n", .{ idx, name, value });
     defer allocator.free(line);
     try out.appendSlice(allocator, line);
+}
+
+fn sourceUrlsForEvidence(allocator: std.mem.Allocator, target: []const u8, searchable_text: []const u8, distilled: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendSourceUrlsFromText(allocator, &out, distilled);
+    if (out.items.len == 0) try appendSourceUrlsFromText(allocator, &out, searchable_text);
+    if (out.items.len == 0 and !isDuckDuckGoSearchTarget(target) and (std.mem.trim(u8, distilled, " \t\r\n").len > 0 or std.mem.trim(u8, searchable_text, " \t\r\n").len > 0)) {
+        try appendSourceUrlLine(allocator, &out, target);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendSourceUrlsFromText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (out.items.len >= 2048) return;
+        const marker = " url=";
+        const idx = std.mem.indexOf(u8, line, marker) orelse continue;
+        const raw = std.mem.trim(u8, line[idx + marker.len ..], " \t\r\n");
+        if (raw.len == 0) continue;
+        const url = try normalizeSearchResultUrl(allocator, raw);
+        defer allocator.free(url);
+        if (!isHttpTarget(url) or containsSourceUrl(out.items, url)) continue;
+        try appendSourceUrlLine(allocator, out, url);
+    }
+}
+
+fn appendSourceUrlLine(allocator: std.mem.Allocator, out: *std.ArrayList(u8), url: []const u8) !void {
+    try out.appendSlice(allocator, "source_url=");
+    try out.appendSlice(allocator, url);
+    try out.append(allocator, '\n');
+}
+
+fn containsSourceUrl(text: []const u8, url: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (!std.mem.startsWith(u8, trimmed, "source_url=")) continue;
+        if (std.mem.eql(u8, trimmed["source_url=".len..], url)) return true;
+    }
+    return false;
+}
+
+fn normalizeSearchResultUrl(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    if (std.mem.indexOf(u8, raw, "uddg=")) |idx| {
+        const value_start = idx + "uddg=".len;
+        var value_end = value_start;
+        while (value_end < raw.len and raw[value_end] != '&' and !std.ascii.isWhitespace(raw[value_end])) : (value_end += 1) {}
+        return percentDecodeBytes(allocator, raw[value_start..value_end]);
+    }
+    return allocator.dupe(u8, raw);
+}
+
+fn percentDecodeBytes(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '%' and i + 2 < text.len) {
+            if (parseHexByte(text[i + 1 .. i + 3])) |value| {
+                try out.append(allocator, value);
+                i += 3;
+                continue;
+            }
+        }
+        try out.append(allocator, if (text[i] == '+') ' ' else text[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseHexByte(bytes: []const u8) ?u8 {
+    if (bytes.len != 2) return null;
+    const hi = std.fmt.charToDigit(bytes[0], 16) catch return null;
+    const lo = std.fmt.charToDigit(bytes[1], 16) catch return null;
+    return @intCast(hi * 16 + lo);
 }
 
 fn htmlReleaseEntriesText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -750,6 +831,43 @@ test "duckduckgo html search results become structured snippets" {
     try std.testing.expect(std.mem.indexOf(u8, text, "result=1 url=https://ziglang.org/download/") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "result=1 snippet=Download the latest release") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "<a") == null);
+}
+
+test "duckduckgo result urls become web evidence source urls" {
+    const searchable_text =
+        \\result=1 title=Download - Zig Programming Language
+        \\result=1 url=https://ziglang.org/download/
+        \\result=1 snippet=Download the latest release of Zig from the official project page.
+    ;
+    const distilled =
+        \\result=1 title=Download - Zig Programming Language
+        \\result=1 snippet=Download the latest release of Zig from the official project page.
+    ;
+    const urls = try sourceUrlsForEvidence(std.testing.allocator, "https://html.duckduckgo.com/html/?q=zig", searchable_text, distilled);
+    defer std.testing.allocator.free(urls);
+
+    try std.testing.expectEqualStrings("source_url=https://ziglang.org/download/\n", urls);
+}
+
+test "duckduckgo redirect result url is decoded before source evidence" {
+    const url = try normalizeSearchResultUrl(std.testing.allocator, "/l/?kh=-1&uddg=https%3A%2F%2Fziglang.org%2Fdownload%2F&rut=abc");
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expectEqualStrings("https://ziglang.org/download/", url);
+}
+
+test "direct http evidence uses fetched target as source url" {
+    const urls = try sourceUrlsForEvidence(std.testing.allocator, "http://127.0.0.1/search?q=zig", "Zig stable release", "Zig stable release");
+    defer std.testing.allocator.free(urls);
+
+    try std.testing.expectEqualStrings("source_url=http://127.0.0.1/search?q=zig\n", urls);
+}
+
+test "direct http evidence keeps source when lexical excerpt is empty" {
+    const urls = try sourceUrlsForEvidence(std.testing.allocator, "http://127.0.0.1/search?q=londrina", "Londrina fica no norte do Parana.", "");
+    defer std.testing.allocator.free(urls);
+
+    try std.testing.expectEqualStrings("source_url=http://127.0.0.1/search?q=londrina\n", urls);
 }
 
 test "duckduckgo challenge page does not become query echo evidence" {

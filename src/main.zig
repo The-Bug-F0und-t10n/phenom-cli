@@ -1823,13 +1823,14 @@ fn webEvidenceHasStatus200WithExcerpt(text: []const u8) bool {
 }
 
 fn webEvidenceCanCloseToolPhase(http_success: bool, summary: WebEvidenceSummary) bool {
-    return http_success and summary.status200WithExcerpt();
+    return http_success and summary.status200WithExcerpt() and summary.has_source;
 }
 
 const WebEvidenceSummary = struct {
     saw_block: bool = false,
     saw_excerpt: bool = false,
     has_excerpt: bool = false,
+    has_source: bool = false,
     status_code: ?u16 = null,
 
     fn onlyEmptyExcerpt(self: WebEvidenceSummary) bool {
@@ -1865,6 +1866,9 @@ fn summarizeWebEvidence(text: []const u8) WebEvidenceSummary {
         } else if (std.mem.startsWith(u8, trimmed, "excerpt=")) {
             summary.saw_excerpt = true;
         }
+        if (std.mem.startsWith(u8, trimmed, "source_url=") and std.mem.trim(u8, trimmed["source_url=".len..], " \t\r\n").len > 0) {
+            summary.has_source = true;
+        }
     }
     if (saw_status_200) summary.status_code = 200;
     return summary;
@@ -1872,9 +1876,9 @@ fn summarizeWebEvidence(text: []const u8) WebEvidenceSummary {
 
 fn webAnswerOnlyNextAction(web_complete: bool) []const u8 {
     return if (web_complete)
-        "HTTP web_search returned status=200 with a non-empty WEB_EVIDENCE excerpt. The tool phase is closed. Answer now in the user's language from USER_TASK, not in the source/WEB_EVIDENCE language. Use cited WEB_EVIDENCE only if it directly supports the requested fact. Do not call tools, emit JSON, or expose protocol text."
+        "HTTP web_search returned status=200 with non-empty WEB_EVIDENCE excerpt and source_url. The tool phase is closed. Answer now in the user's language from USER_TASK, not in the source/WEB_EVIDENCE language. Cite or name the source_url when making the web-supported claim. Do not call tools, emit JSON, or expose protocol text."
     else
-        "Answer in the user's language from USER_TASK, not in the source/WEB_EVIDENCE language. Use cited WEB_EVIDENCE only if it directly and exactly supports the requested entity/fact. If WEB_EVIDENCE excerpt is empty, state that the search returned no direct supporting evidence. Similar names, adjacent topics, partial matches, or 'looks related' are insufficient. If WEB_EVIDENCE does not contain the named fact needed for the answer, do not answer from general knowledge; emit one refined web_search only if the query keeps the exact requested entity/fact and does not add guessed roles/categories/attributes. Do not ask permission for another search inside the active contract. Do not claim browser automation or full-page crawling.";
+        "Answer in the user's language from USER_TASK, not in the source/WEB_EVIDENCE language. Use WEB_EVIDENCE only if it directly and exactly supports the requested entity/fact and includes source_url. If WEB_EVIDENCE excerpt is empty or lacks source_url, emit one refined web_search with the exact requested entity/fact while budget remains; otherwise state the limitation. Similar names, adjacent topics, partial matches, or 'looks related' are insufficient. Do not ask permission for another search inside the active contract. Do not claim browser automation or full-page crawling.";
 }
 
 fn unsupportedWebAnswerLiteral(output: []const u8, context: []const u8) ?[]const u8 {
@@ -4020,7 +4024,7 @@ fn runWebSearchStep(
     );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
-    if (distilled_web.summary.emptyExcerptBlock()) {
+    if (distilled_web.summary.emptyExcerptBlock() and !state.shouldAllowMoreEvidence()) {
         try db.recordEvent(config.session, "answer_repair", "empty web evidence direct deterministic answer");
         const visible = try renderNoDirectWebEvidenceAnswer(allocator, prompt);
         defer allocator.free(visible);
@@ -6130,7 +6134,7 @@ fn renderWebDistillationPrompt(
         \\[WEB_DISTILLATION_TASK]
         \\Compress fetched web evidence before permanent context insertion.
         \\Return exactly one [WEB_EVIDENCE] block. No prose, no tool calls, no markdown fences.
-        \\Use only WEB_EVIDENCE_INPUT. Preserve target, retrieved_at, timezone, status, query, and title if present.
+        \\Use only WEB_EVIDENCE_INPUT. Preserve target, retrieved_at, timezone, status, query, title, and source_url lines if present.
         \\Keep only facts that directly and exactly match USER_TASK and MODEL_WEB_QUERY. Similar names, adjacent topics, partial matches, and "probably the same" are not evidence.
         \\If the input has only similar/unrelated results, return [WEB_EVIDENCE] with the original metadata and an empty excerpt. Exclude raw HTML, logs, and long explanations.
         \\Maximum output: 1600 bytes.
@@ -6181,11 +6185,33 @@ fn normalizeWebDistillationOutput(
     const trimmed = std.mem.trim(u8, generated, " \t\r\n");
     if (trimmed.len == 0) return allocator.dupe(u8, fallback);
     if (std.mem.indexOf(u8, trimmed, "[WEB_EVIDENCE]")) |start| {
-        return allocator.dupe(u8, trimmed[start..@min(trimmed.len, start + max_web_distillation_output_bytes)]);
+        const normalized = try allocator.dupe(u8, trimmed[start..@min(trimmed.len, start + max_web_distillation_output_bytes)]);
+        return ensureWebEvidenceSources(allocator, normalized, fallback);
     }
     _ = target;
     _ = query;
     return allocator.dupe(u8, fallback);
+}
+
+fn ensureWebEvidenceSources(allocator: std.mem.Allocator, normalized: []u8, fallback: []const u8) ![]u8 {
+    if (summarizeWebEvidence(normalized).has_source or !summarizeWebEvidence(fallback).has_source) return normalized;
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, normalized);
+    if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
+    try appendWebEvidenceSourceLines(allocator, &out, fallback);
+    allocator.free(normalized);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendWebEvidenceSourceLines(allocator: std.mem.Allocator, out: *std.ArrayList(u8), evidence_text: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, evidence_text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (!std.mem.startsWith(u8, trimmed, "source_url=")) continue;
+        try out.appendSlice(allocator, trimmed);
+        try out.append(allocator, '\n');
+    }
 }
 
 fn appendBudgeted(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8, budget: usize) !void {
@@ -8982,6 +9008,7 @@ test "empty web evidence excerpt is detected structurally" {
         \\  [WEB_EVIDENCE]
         \\  status=200
         \\  query=latest zig
+        \\  source_url=https://ziglang.org/download/
         \\  excerpt=Zig 0.16.0
     ;
     try std.testing.expect(webEvidenceHasOnlyEmptyExcerpts(empty));
@@ -8996,15 +9023,43 @@ test "empty web evidence excerpt is detected structurally" {
     const summary = summarizeWebEvidence(nonempty);
     try std.testing.expectEqual(@as(?u16, 200), summary.status_code);
     try std.testing.expect(summary.has_excerpt);
+    try std.testing.expect(summary.has_source);
     try std.testing.expect(summary.status200WithExcerpt());
 }
 
 test "web distillation fallback preserves structured evidence" {
-    const fallback = "[WEB_EVIDENCE]\nstatus=200\nquery=latest zig\nexcerpt=Zig stable release\n";
+    const fallback = "[WEB_EVIDENCE]\nstatus=200\nquery=latest zig\nsource_url=https://ziglang.org/download/\nexcerpt=Zig stable release\n";
     const normalized = try normalizeWebDistillationOutput(std.testing.allocator, "https://html.duckduckgo.com/html/?q=zig", "latest zig", fallback, "Zig stable release");
     defer std.testing.allocator.free(normalized);
     try std.testing.expectEqualStrings(fallback, normalized);
     try std.testing.expect(summarizeWebEvidence(normalized).status200WithExcerpt());
+    try std.testing.expect(summarizeWebEvidence(normalized).has_source);
+}
+
+test "web distillation reinjects source urls omitted by model summary" {
+    const fallback = "[WEB_EVIDENCE]\nstatus=200\nquery=latest zig\nsource_url=https://ziglang.org/download/\nexcerpt=Zig stable release\n";
+    const generated = "[WEB_EVIDENCE]\nstatus=200\nquery=latest zig\nexcerpt=Zig stable release\n";
+    const normalized = try normalizeWebDistillationOutput(std.testing.allocator, "https://html.duckduckgo.com/html/?q=zig", "latest zig", fallback, generated);
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expect(summarizeWebEvidence(normalized).has_source);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "source_url=https://ziglang.org/download/") != null);
+}
+
+test "web distillation reinjects source urls from evidence packet fallback" {
+    const fallback =
+        \\[EVIDENCE]
+        \\E1:
+        \\  [WEB_EVIDENCE]
+        \\  status=200
+        \\  source_url=http://127.0.0.1/search?q=zig
+        \\  excerpt=Zig stable release
+    ;
+    const generated = "[WEB_EVIDENCE]\nstatus=200\nquery=latest zig\nexcerpt=Zig stable release\n";
+    const normalized = try normalizeWebDistillationOutput(std.testing.allocator, "http://127.0.0.1/search?q=zig", "latest zig", fallback, generated);
+    defer std.testing.allocator.free(normalized);
+
+    try std.testing.expect(summarizeWebEvidence(normalized).has_source);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "source_url=http://127.0.0.1/search?q=zig") != null);
 }
 
 test "successful web evidence closes tool phase structurally" {
@@ -9013,15 +9068,22 @@ test "successful web evidence closes tool phase structurally" {
     state.active_contract = contracts.activeContract(.search_web).?;
     state.contract_selected = true;
 
-    const summary = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nexcerpt=Londrina fica no Parana.\n");
+    const summary = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nsource_url=https://example.test/londrina\nexcerpt=Londrina fica no Parana.\n");
     try std.testing.expect(webEvidenceCanCloseToolPhase(true, summary));
     try std.testing.expect(!webEvidenceCanCloseToolPhase(false, summary));
+    try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nexcerpt=Londrina fica no Parana.\n")));
 
     state.closeToolPhase();
 
     try std.testing.expectEqual(contracts.ContractName.answer_only, state.active_contract.name);
     try std.testing.expect(!state.active_contract.allows("web_search"));
     try std.testing.expect(state.finalizationBlocker() == null);
+}
+
+test "web evidence without source keeps refinement structurally available" {
+    const summary = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nexcerpt=Londrina fica no Parana.\n");
+    try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summary));
+    try std.testing.expect(std.mem.indexOf(u8, webAnswerOnlyNextAction(false), "emit one refined web_search") != null);
 }
 
 test "empty web evidence repair preserves user language contract structurally" {
