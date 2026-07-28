@@ -1823,7 +1823,11 @@ fn webEvidenceHasStatus200WithExcerpt(text: []const u8) bool {
 }
 
 fn webEvidenceCanCloseToolPhase(http_success: bool, summary: WebEvidenceSummary) bool {
-    return http_success and summary.status200WithExcerpt() and summary.has_source and !summary.has_source_excerpt and !summary.needsSourceFollowup();
+    return http_success and summary.status200WithExcerpt() and summary.has_source and !summary.has_source_excerpt and !summary.has_title_only_excerpt and !summary.needsSourceFollowup();
+}
+
+fn webEvidenceNeedsDeterministicLimitation(web_complete: bool, summary: WebEvidenceSummary, allow_more_evidence: bool) bool {
+    return summary.saw_block and !web_complete and !allow_more_evidence;
 }
 
 const WebEvidenceSummary = struct {
@@ -1834,6 +1838,7 @@ const WebEvidenceSummary = struct {
     has_search_result_excerpt: bool = false,
     has_source_excerpt: bool = false,
     has_model_verified_excerpt: bool = false,
+    has_title_only_excerpt: bool = false,
     first_source_url: ?[]const u8 = null,
     preferred_source_url: ?[]const u8 = null,
     preferred_result_index: ?usize = null,
@@ -1862,6 +1867,8 @@ fn summarizeWebEvidence(text: []const u8) WebEvidenceSummary {
     };
     if (!summary.saw_block) return summary;
     var saw_status_200 = false;
+    var title: ?[]const u8 = null;
+    var excerpt_value: ?[]const u8 = null;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
@@ -1876,8 +1883,13 @@ fn summarizeWebEvidence(text: []const u8) WebEvidenceSummary {
         if (std.mem.startsWith(u8, trimmed, "source=") and std.mem.indexOf(u8, trimmed, "distill=model_verified_excerpt") != null) {
             summary.has_model_verified_excerpt = true;
         }
+        if (std.mem.startsWith(u8, trimmed, "title=")) {
+            const value = std.mem.trim(u8, trimmed["title=".len..], " \t\r\n");
+            if (value.len > 0) title = value;
+        }
         if (std.mem.startsWith(u8, trimmed, "excerpt=") and std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n").len > 0) {
             const excerpt = std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n");
+            excerpt_value = excerpt;
             summary.saw_excerpt = true;
             summary.has_excerpt = true;
             if (std.mem.startsWith(u8, excerpt, "result=") or std.mem.indexOf(u8, excerpt, "\nresult=") != null) summary.has_search_result_excerpt = true;
@@ -1889,6 +1901,9 @@ fn summarizeWebEvidence(text: []const u8) WebEvidenceSummary {
             summary.has_source = true;
             if (summary.first_source_url == null) summary.first_source_url = std.mem.trim(u8, trimmed["source_url=".len..], " \t\r\n");
         }
+    }
+    if (title) |title_text| {
+        if (excerpt_value) |excerpt_text| summary.has_title_only_excerpt = webEvidenceExcerptOnlyRepeatsTitle(excerpt_text, title_text);
     }
     if (summary.preferred_result_index) |result_index| {
         var source_index: usize = 0;
@@ -1945,6 +1960,53 @@ fn unsupportedWebAnswerLiteral(output: []const u8, context: []const u8) ?[]const
         return token;
     }
     return null;
+}
+
+fn webEvidenceExcerptOnlyRepeatsTitle(excerpt: []const u8, title: []const u8) bool {
+    var excerpt_buf: [512]u8 = undefined;
+    var title_buf: [512]u8 = undefined;
+    const normalized_excerpt = normalizeEvidenceTextAscii(&excerpt_buf, excerpt);
+    const normalized_title = normalizeEvidenceTextAscii(&title_buf, title);
+    if (normalized_excerpt.len == 0 or normalized_title.len == 0) return false;
+    if (std.mem.eql(u8, normalized_excerpt, normalized_title)) return true;
+    if (std.mem.startsWith(u8, normalized_title, normalized_excerpt)) return true;
+    if (!std.mem.startsWith(u8, normalized_excerpt, normalized_title)) return false;
+    return titleEntityTokenMissingFromTail(title, normalized_excerpt[normalized_title.len..]);
+}
+
+fn normalizeEvidenceTextAscii(buf: []u8, text: []const u8) []const u8 {
+    var len: usize = 0;
+    for (text) |ch| {
+        if (!std.ascii.isAlphanumeric(ch)) continue;
+        if (len == buf.len) break;
+        buf[len] = std.ascii.toLower(ch);
+        len += 1;
+    }
+    return buf[0..len];
+}
+
+fn titleEntityTokenMissingFromTail(title: []const u8, normalized_tail: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, title, " \t\r\n.,;:!?()[]{}<>\"'`*/\\|+-_=~");
+    while (it.next()) |raw| {
+        const token = std.mem.trim(u8, raw, " \t\r\n.,;:!?()[]{}<>\"'`*/\\|+-_=~");
+        if (!tokenLooksLikeEntityId(token)) continue;
+        var token_buf: [64]u8 = undefined;
+        const normalized_token = normalizeEvidenceTextAscii(&token_buf, token);
+        if (normalized_token.len == 0) continue;
+        return std.mem.indexOf(u8, normalized_tail, normalized_token) == null;
+    }
+    return false;
+}
+
+fn tokenLooksLikeEntityId(token: []const u8) bool {
+    if (token.len < 3) return false;
+    var has_digit = false;
+    var has_alpha = false;
+    for (token) |ch| {
+        has_digit = has_digit or std.ascii.isDigit(ch);
+        has_alpha = has_alpha or std.ascii.isAlphabetic(ch);
+    }
+    return has_digit and has_alpha;
 }
 
 fn isEvidenceLiteral(token: []const u8) bool {
@@ -4166,20 +4228,32 @@ fn runWebSearchStep(
     defer allocator.free(working_add);
     try db.recordEvent(config.session, "working_context_add", working_add);
 
-    const follow_context = try renderCollectedEvidenceContext(
-        allocator,
-        prompt,
-        &state.context,
-        null,
-        null,
-        if (web_complete or !state.shouldAllowMoreEvidence()) context_profile.toolSchema(.code_evidence, .after_collect_evidence) else activeToolSchema(state),
-        webAnswerOnlyNextAction(web_complete),
-    );
+    const follow_context = if (web_complete)
+        try renderCollectedStrongWebEvidenceContext(
+            allocator,
+            prompt,
+            &state.context,
+            context_profile.toolSchema(.code_evidence, .after_collect_evidence),
+            webAnswerOnlyNextAction(true),
+        )
+    else
+        try renderCollectedEvidenceContext(
+            allocator,
+            prompt,
+            &state.context,
+            null,
+            null,
+            if (!state.shouldAllowMoreEvidence()) context_profile.toolSchema(.code_evidence, .after_collect_evidence) else activeToolSchema(state),
+            webAnswerOnlyNextAction(false),
+        );
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
-    if (distilled_web.summary.emptyExcerptBlock() and !state.shouldAllowMoreEvidence()) {
-        try db.recordEvent(config.session, "answer_repair", "empty web evidence direct deterministic answer");
-        const visible = try renderNoDirectWebEvidenceAnswer(allocator, prompt);
+    if (webEvidenceNeedsDeterministicLimitation(web_complete, distilled_web.summary, state.shouldAllowMoreEvidence())) {
+        try db.recordEvent(config.session, "answer_repair", "weak web evidence direct deterministic answer");
+        const visible = if (distilled_web.summary.emptyExcerptBlock())
+            try renderNoDirectWebEvidenceAnswer(allocator, prompt)
+        else
+            try renderUnsupportedWebEvidenceLiteralAnswer(allocator, follow_context);
         defer allocator.free(visible);
         try aggregate_sink.emitVisibleText(visible);
         return .final_answer;
@@ -4206,7 +4280,7 @@ fn webEvidenceSourceFollowupTarget(summary: WebEvidenceSummary, current_target: 
 }
 
 fn webEvidenceContextFollowupTarget(summary: WebEvidenceSummary, current_target: []const u8, state: *const ToolLoopState, strategy: contracts.StrategyName) ?[]const u8 {
-    if ((!summary.emptyExcerptBlock() and !summary.has_source_excerpt) or !state.shouldAllowMoreEvidence()) return null;
+    if ((!summary.emptyExcerptBlock() and !summary.has_source_excerpt and !summary.has_title_only_excerpt) or !state.shouldAllowMoreEvidence()) return null;
     for (state.context.entries.items) |entry| {
         var lines = std.mem.splitScalar(u8, entry.evidence_text, '\n');
         while (lines.next()) |line| {
@@ -5794,11 +5868,11 @@ fn renderUnsupportedWebEvidenceLiteralAnswer(allocator: std.mem.Allocator, conte
     if (source.len > 0) {
         return std.fmt.allocPrint(
             allocator,
-            "A pesquisa web foi executada, mas o trecho de WEB_EVIDENCE coletado nao contem detalhes tecnicos suficientes para listar especificacoes verificadas. O resultado encontrado aponta para fontes relevantes, incluindo {s}, mas specs numericas e tecnicas precisam aparecer no trecho coletado antes de serem afirmadas.",
+            "A pesquisa web foi executada, mas o trecho coletado nao contem detalhes tecnicos suficientes para listar especificacoes verificadas. O resultado encontrado aponta para fontes relevantes, incluindo {s}, mas specs numericas e tecnicas precisam aparecer no trecho coletado antes de serem afirmadas.",
             .{source},
         );
     }
-    return allocator.dupe(u8, "A pesquisa web foi executada, mas o trecho de WEB_EVIDENCE coletado nao contem detalhes tecnicos suficientes para listar especificacoes verificadas.");
+    return allocator.dupe(u8, "A pesquisa web foi executada, mas o trecho coletado nao contem detalhes tecnicos suficientes para listar especificacoes verificadas.");
 }
 
 fn firstWebEvidenceSourceUrl(context: []const u8) ?[]const u8 {
@@ -6186,6 +6260,50 @@ fn renderCollectedEvidenceContext(
     next_action: []const u8,
 ) ![]u8 {
     return renderCollectedEvidenceContextInternal(allocator, prompt, context, session_text, focus_text, contracts_text, next_action, null);
+}
+
+fn renderCollectedStrongWebEvidenceContext(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    context: *const working_context.WorkingContext,
+    contracts_text: []const u8,
+    next_action: []const u8,
+) ![]u8 {
+    const evidence_blocks = try renderStrongWebEvidenceBlocks(allocator, context);
+    defer allocator.free(evidence_blocks);
+    return model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = contracts_text,
+        .evidence = evidence_blocks,
+        .obligations = &.{
+            "Use only strong WEB_EVIDENCE for web factual claims.",
+            "Weak web evidence, source-only excerpts, empty excerpts, and title-only excerpts are not answer evidence.",
+        },
+        .grounding = groundingRules(),
+        .next_action = next_action,
+    });
+}
+
+fn renderStrongWebEvidenceBlocks(allocator: std.mem.Allocator, context: *const working_context.WorkingContext) ![]model_context.EvidenceBlock {
+    var count: usize = 0;
+    for (context.entries.items) |entry| {
+        if (webEvidenceStrongForFinalAnswer(entry.evidence_text)) count += 1;
+    }
+    var blocks = try allocator.alloc(model_context.EvidenceBlock, count);
+    errdefer allocator.free(blocks);
+    var index: usize = 0;
+    for (context.entries.items) |entry| {
+        const text = entry.evidence_text;
+        if (!webEvidenceStrongForFinalAnswer(text)) continue;
+        blocks[index] = .{ .text = text };
+        index += 1;
+    }
+    return blocks;
+}
+
+fn webEvidenceStrongForFinalAnswer(text: []const u8) bool {
+    const summary = summarizeWebEvidence(text);
+    return webEvidenceCanCloseToolPhase(summary.status_code != null and summary.status_code.? >= 200 and summary.status_code.? < 300, summary);
 }
 
 fn renderCollectedEvidenceContextRequiringCollection(
@@ -9477,12 +9595,47 @@ test "successful web evidence closes tool phase structurally" {
     try std.testing.expect(!webEvidenceCanCloseToolPhase(false, summary));
     try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nexcerpt=Londrina fica no Parana.\n")));
     try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nsource=http_get distill=source_excerpt target=https://example.test/r36s\nstatus=200\nsource_url=https://example.test/r36s\nexcerpt=R36S title and surrounding page text.\n")));
+    try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\ntitle=Dados tecnicos e especificacoes do R36S\nsource_url=https://example.test/r36s\nexcerpt=Dados tecnicos e especificacoes do R36S.\n")));
+    try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\ntitle=Ficha tecnica completa do Console Portatil R36S 64g Linux Tela IPS 3.5 Polegadas\nsource_url=https://example.test/r36s\nexcerpt=Ficha tecnica completa do Console Portatil R36S 64g Linux Tela IPS 3.5 Polegad\n")));
+    try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\ntitle=Console Portatil R36S 64GB com o Melhor Preco\nsource_url=https://example.test/r36s\nexcerpt=Console Portatil R36S 64GB com o Melhor Preco Categorias Celulares iPhone 17 Samsung Galaxy\n")));
+    try std.testing.expect(webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\ntitle=R36S Specs Hardware Details\nsource_url=https://example.test/r36s\nexcerpt=R36S Specs Hardware Details. R36S uses RK3326 and 1GB RAM.\n")));
+    try std.testing.expect(webEvidenceNeedsDeterministicLimitation(false, summarizeWebEvidence("[WEB_EVIDENCE]\nsource=http_get distill=source_excerpt target=https://example.test/r36s\nstatus=200\nsource_url=https://example.test/r36s\nexcerpt=R36S title and surrounding page text.\n"), false));
+    try std.testing.expect(!webEvidenceNeedsDeterministicLimitation(false, summarizeWebEvidence("[WEB_EVIDENCE]\nsource=http_get distill=source_excerpt target=https://example.test/r36s\nstatus=200\nsource_url=https://example.test/r36s\nexcerpt=R36S title and surrounding page text.\n"), true));
+    try std.testing.expect(!webEvidenceNeedsDeterministicLimitation(true, summary, false));
 
     state.closeToolPhase();
 
     try std.testing.expectEqual(contracts.ContractName.answer_only, state.active_contract.name);
     try std.testing.expect(!state.active_contract.allows("web_search"));
     try std.testing.expect(state.finalizationBlocker() == null);
+}
+
+test "web final context excludes weak web evidence" {
+    var ctx = working_context.WorkingContext.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    const weak =
+        \\[WEB_EVIDENCE]
+        \\status=200
+        \\title=Ficha tecnica completa R36S 64GB Linux Tela IPS
+        \\source_url=https://example.test/weak
+        \\excerpt=Ficha tecnica completa R36S 64GB Linux Tela IPS
+    ;
+    const strong =
+        \\[WEB_EVIDENCE]
+        \\source=http_get raw_context_persisted=false distill=model_verified_excerpt target=https://example.test/strong
+        \\status=200
+        \\source_url=https://example.test/strong
+        \\excerpt=CPU Rockchip RK3326. RAM 1GB DDR3L.
+    ;
+    try ctx.remember(.{ .path = "https://example.test/weak", .strategy = .document_summary, .start_line = 1, .max_lines = 1, .evidence_text = weak, .model_bytes = weak.len, .quality_score = 45 });
+    try ctx.remember(.{ .path = "https://example.test/strong", .strategy = .document_summary, .start_line = 1, .max_lines = 1, .evidence_text = strong, .model_bytes = strong.len, .quality_score = 82 });
+
+    const rendered = try renderCollectedStrongWebEvidenceContext(std.testing.allocator, "R36S specs", &ctx, "", "answer");
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "RK3326") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "64GB") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Linux") == null);
 }
 
 test "search result evidence follows source before closing" {
@@ -9538,6 +9691,9 @@ test "empty followed source tries next collected source url" {
 
     const source_excerpt = summarizeWebEvidence("[WEB_EVIDENCE]\nsource=http_get distill=source_excerpt target=https://example.test/empty\nstatus=200\nsource_url=https://example.test/empty\nexcerpt=R36S title and noisy page text.\n");
     try std.testing.expectEqualStrings("https://example.test/specs", webEvidenceContextFollowupTarget(source_excerpt, "https://example.test/empty", &state, .document_summary).?);
+
+    const title_only = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\ntitle=Dados tecnicos e especificacoes do R36S\nsource_url=https://example.test/empty\nexcerpt=Dados tecnicos e especificacoes do R36S.\n");
+    try std.testing.expectEqualStrings("https://example.test/specs", webEvidenceContextFollowupTarget(title_only, "https://example.test/empty", &state, .document_summary).?);
 }
 
 test "web evidence without source keeps refinement structurally available" {
@@ -9583,11 +9739,12 @@ test "web final answer numeric literal must be present in web evidence" {
     try std.testing.expect(unsupportedWebAnswerLiteral("Nao encontrei evidencia direta.", context) == null);
     try std.testing.expect(unsupportedWebAnswerLiteral("A versao evidenciada e 0.15.1.", "[WEB_EVIDENCE]\nexcerpt=Zig 0.15.1\n") == null);
     try std.testing.expect(unsupportedWebAnswerLiteral("Armazenamento de 1GB.", "[WEB_EVIDENCE]\nexcerpt=R36S 1GB RAM\n") == null);
-    try std.testing.expect(unsupportedWebAnswerLiteral("CPU RK3326 Cortex-A35 1.5GHz e tela 640x480.", "[WEB_EVIDENCE]\nexcerpt=Rockchip RK3326 (Quad-Core ARM Cortex-A35 1. 5GHz) Display 640 x 480 resolution\n") == null);
+    try std.testing.expect(unsupportedWebAnswerLiteral("CPU RK3326 Cortex-A35 1.5GHz e tela 640x480.", "[WEB_EVIDENCE]\nexcerpt=CPU Rockchip RK3326 (Quad-Core ARM Cortex-A35 1. 5GHz) Display 640 x 480 resolution\n") == null);
     const limited = try renderUnsupportedWebEvidenceLiteralAnswer(std.testing.allocator, "[WEB_EVIDENCE]\nsource_url=https://r36s.org/articles/r36s-specs-hardware-details\nexcerpt=result=2 title=R36S specs\n");
     defer std.testing.allocator.free(limited);
     try std.testing.expect(std.mem.indexOf(u8, limited, "nao contem detalhes tecnicos suficientes") != null);
     try std.testing.expect(std.mem.indexOf(u8, limited, "https://r36s.org/articles/r36s-specs-hardware-details") != null);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "WEB_EVIDENCE") == null);
 }
 
 test "search web final question is detected structurally" {
