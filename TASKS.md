@@ -12450,3 +12450,52 @@ Invariantes afetadas:
 Risco residual:
 
 - O bootstrap micro depende do modelo emitir tool call quando precisar operar. Isso e intencional e alinhado a regra model-driven; a etapa seguinte reduz a superficie do router quando houver estado operacional em vez de reintroduzir heuristica de prompt.
+
+## T338 - Context economy etapa 2: initial router minimo
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: mesmo apos o bootstrap micro, quando havia SESSION_FOCUS/RECENT_DIALOGUE/MEMORY/SKILLS o router inicial ainda carregava explicacoes longas de decisao, regras de web, memoria, sessao e exemplos multiplos. Isso duplicava o system prompt e antecipava detalhes que pertencem ao contrato ativo.
+
+Referencia TS consultada:
+
+- `../phenom-cli-ts/src/agent.ts`: contexto inicial separa prompt estavel de mensagens/contexto volateis.
+- `../phenom-cli-ts/src/use-cases/run-tool-loop.ts`: schema e budget sao considerados na execucao do tool loop, nao despejados integralmente sempre.
+
+Passos de implementacao:
+
+1. Reduzir `initialRouterSchema` para assinatura de `set_operational_contract` e `search_session`.
+2. Manter somente tres regras curtas: responder quando suficiente, usar query/terms model-selected e declarar contrato antes de executor.
+3. Remover exemplos redundantes de memoria, collect_evidence e regras completas de web do router inicial.
+4. Preservar schemas detalhados nos contratos ativos.
+5. Atualizar testes para exigir ausencia de estrategias/detalhes no router inicial.
+
+Implementacao:
+
+- `phenom-zig/src/context_profile.zig`: `initialRouterSchema` passa a ter router minimo, abaixo de 1500 bytes.
+- `phenom-zig/src/main.zig`: teste do contexto inicial com estado exige `Full executor schema appears only after`, ausencia de strategies e contexto total menor.
+
+Criterio de aceite:
+
+- Router inicial nao expõe `collect_evidence(` nem `stage=candidates`.
+- Router inicial nao carrega detalhes de diagnostic/runtime/diff.
+- Contratos ativos continuam expondo executores completos quando selecionados.
+- Nenhuma decisao por keyword de prompt foi adicionada.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-context-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/context_profile.zig -lc -lsqlite3 --cache-dir /tmp/phenom-context-test-cache` -> passou; 13 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-main-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test-cache` -> passou; 466 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-build-local-cache bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-build-cache` -> passou.
+
+Invariantes afetadas:
+
+- 1. Tool nao anunciada nunca executa: preservada; contratos ativos continuam vindo de `contracts.zig`.
+- 2. Contexto bruto nao vaza para o modelo: preservada; schema menor nao injeta bruto.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; schema enviado continua no `model_context` auditado.
+
+Risco residual:
+
+- `activeContractSchemaFor(.workflow)` ainda usa o router inicial como fallback ativo de workflow. A proxima etapa separa esse fallback para impedir router generico como active_contract.

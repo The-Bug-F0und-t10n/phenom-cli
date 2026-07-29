@@ -94,19 +94,10 @@ pub fn initialRouterSchema() []const u8 {
     \\[TOOLS v1]
     \\set_operational_contract(contract=answer_only|collect_evidence|mutate_file|validate_work|inspect_runtime|search_web|rag_web|memory, strategyId?, query?, intent?, terms?, target?, budget_bytes?, requiresInspection?, requiresMutation?, requiresRuntimeValidation?, requiresBrowserDiagnostics?, requiresMemoryPromotion?, reason?)
     \\search_session(intent?, terms, scope=current|all, session?)
-    \\Initial router. The model chooses either a direct final answer or one contract declaration. The controller does not infer missing external/workspace intent for you.
-    \\Assistive exploration is model-driven: if confidence is low and a read-only tool can verify, triangulate, or reduce ambiguity, use the smallest useful contract before asking the user.
-    \\Decision: answer_only when enough. collect_evidence for workspace/project/source-code claims. memory for durable local lookup/promotion, including user-confirmed future-turn rules/preferences/operational constraints. search_web/rag_web for external grounding, current facts, requested sources/citations, named real-world entities/facts, obscure names/handles/entities, public-record/existence claims, or facts not grounded in dialogue, persistent context, session context, E#, or stable knowledge. Other contracts: search_session prior recovery; mutate_file edits; validate_work validation; inspect_runtime diagnostics.
-    \\Local persisted claims need memory before unknown/absent.
-    \\search_web/rag_web query must be narrow and match the user's external evidence intent; the controller activates the contract and executes web_search from that declared query. Omitted target uses the built-in search provider or configured web_search_url/PHENOM_WEB_SEARCH_URL. Only include target for user-supplied HTTP/HTTPS URL or URL already in E#.
-    \\For named entity/fact lookup, query must include the exact requested entity/fact. Refined queries must not add guessed roles, categories, locations, nationality, platform, biography, or accusations unless present in USER_TASK or E#. Similar names, adjacent topics, partial matches, and probably-the-same matches are not evidence.
-    \\Router state: declare contracts before executors. Short social turns answer directly.
-    \\search_session: terms=concrete keys from SESSION_FOCUS/reasoning. Prior-session claims require directly supporting S#. Retrieved S# is not confirmed truth; judge direct support before citing. Do not pass generic user words unless remembered content.
-    \\If you cannot identify the requested name/entity from grounded context, do not answer no-records/fictitious/similar; emit search_web:
-    \\<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>exact requested name or entity</parameter></function></tool_call>
-    \\<tool_call><function=set_operational_contract><parameter=contract>memory</parameter><parameter=requiresMemoryPromotion>true</parameter><parameter=reason>persist user-confirmed durable rule or preference</parameter></function></tool_call>
-    \\<tool_call><function=set_operational_contract><parameter=contract>memory</parameter><parameter=query>local project rule preference protocol or durable fact</parameter></function></tool_call>
-    \\<tool_call><function=set_operational_contract><parameter=contract>collect_evidence</parameter><parameter=reason>inspect workspace</parameter></function></tool_call>
+    \\Initial router. Answer directly when enough; otherwise emit one contract declaration or one search_session call. Controller never infers intent from prompt keywords.
+    \\Use model-selected query/terms only: exact external fact/entity for search_web/rag_web, concrete workspace keys for collect_evidence, concrete prior-session keys for search_session, concise durable rule text for memory promotion.
+    \\Declare before executors. Full executor schema appears only after the selected contract is active.
+    \\<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>exact external fact or entity</parameter></function></tool_call>
     \\<tool_call><function=search_session><parameter=intent>recover prior decision</parameter><parameter=terms>TopicName EntityName DecisionKey</parameter><parameter=scope>current</parameter></function></tool_call>
     ;
 }
@@ -257,18 +248,11 @@ test "schemas are state scoped" {
     try std.testing.expect(std.mem.indexOf(u8, evidence, "collect_evidence(") == null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "set_operational_contract") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "Initial router") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "collect_evidence for workspace/project/source-code claims") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "not grounded in dialogue") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "persistent context") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "Local persisted claims need memory") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "named real-world entities/facts") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "stable knowledge") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "The model chooses either a direct final answer or one contract declaration") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "The controller does not infer missing external/workspace intent for you") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "controller activates the contract and executes web_search from that declared query") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "generic user words") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "directly supporting S#") != null);
-    try std.testing.expect(std.mem.indexOf(u8, evidence, "Retrieved S# is not confirmed truth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "Controller never infers intent from prompt keywords") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "Use model-selected query/terms only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "Full executor schema appears only after") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "exact external fact or entity") != null);
+    try std.testing.expect(evidence.len < 1500);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "stage=overview") == null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "stage=candidates") == null);
 

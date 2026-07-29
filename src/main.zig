@@ -7463,7 +7463,7 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "lexical") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "symbol") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "semantic") == null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "diagnostic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "diagnostic") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=runtime") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "strategy=diff") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "search_session") != null);
@@ -7489,6 +7489,7 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "contract=answer_only|collect_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "search_web|rag_web") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "Full executor schema appears only after") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[CONTRACTS]") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[RECENT_DIALOGUE]") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "user: falamos de groundedness") != null);
@@ -7498,6 +7499,7 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "Think first") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "search_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "stage=overview") == null);
+    try std.testing.expect(with_tools.len < 5200);
 
     try std.testing.expect((try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test-empty", "analise esse projeto", false, true)) == null);
 }
