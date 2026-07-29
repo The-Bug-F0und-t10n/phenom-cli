@@ -11863,3 +11863,64 @@ Invariantes afetadas:
 Risco residual:
 
 - Fallback e deliberadamente generico. Prompt comportamental altamente customizado ainda depende de uma geracao valida do modelo ou edicao manual posterior de `Phenom.md`.
+
+## T328 - RAG Web etapa 1: evidencia deterministica no hot path
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: o fluxo de RAG web ainda dependia de uma redestilacao obrigatoria pelo modelo depois do `web_search`. Isso reintroduzia latencia, duplicava chamadas, podia vazar JSON/protocolo e deixava o agente trocar o output final por reparos deterministas. A direcao correta e o agente coletar e normalizar evidencia objetiva em Zig, entregar contexto anotado ao modelo e preservar o texto final produzido pelo modelo.
+
+Referencia TS consultada:
+
+- `../phenom-cli-ts/src/tools/registrars/search-tools.ts`: `web_search` coleta, deduplica e retorna fonte/snippet sem exigir redestilacao por modelo no caminho quente.
+
+Falha apontada no AUDIT/TASKS:
+
+- Pesquisa web ampla precisa de ranking, confiabilidade de fonte e citacoes.
+- Tool output bruto nao deve ir ao prompt; deve virar evidencia destilada.
+- Controller nao deve substituir resposta final do modelo por regra de negocio hardcoded.
+
+Passos de implementacao:
+
+1. Adicionar teste para promocao deterministica apenas quando o excerpt cobre a query.
+2. Remover chamada obrigatoria de modelo em `distillWebEvidenceForContextTyped`.
+3. Normalizar evidencia web localmente e marcar `distill=deterministic_excerpt` somente quando a evidencia tem fonte, excerpt nao vazio, nao e title-only e cobre a query.
+4. Preservar fontes extraidas do HTML bruto antes da destilacao textual distorcer URLs.
+5. Ajustar smoke real para a busca local fornecer URLs completas e testar follow-up de fonte sem depender de redestilacao fake.
+6. Rodar unitarios, build e `agent-flow-smoke`.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: `distillWebEvidenceForContextTyped` passou a usar normalizacao deterministica em Zig e audita `web_distillation error=deterministic`.
+- `phenom-zig/src/main.zig`: `WebEvidenceSummary` reconhece `deterministic_excerpt` e os testes provam que evidencia fraca continua fraca.
+- `phenom-zig/src/web_rag.zig`: `sourceUrlsForEvidence` agora le HTML bruto, texto estruturado e excerpt final, preservando multiplas fontes antes da destilacao textual.
+- `phenom-zig/src/agent_flow_smoke.zig`: o cenario `web_source_followup` valida busca inicial, fonte vazia, segunda fonte util e resposta final do modelo.
+- `phenom-zig/src/agent_flow_smoke.zig`: o cenario `web_language_empty` voltou a provar refinamento quando a primeira busca nao traz suporte direto.
+
+Criterio de aceite:
+
+- `web_search` com evidencia suficiente fecha a fase sem segunda busca duplicada.
+- Busca que retorna apenas lista de fontes segue fonte relevante antes de finalizar.
+- Evidence vazia/fraca nao vira resposta inventada; o modelo recebe contexto para refinar ou declarar limitacao.
+- JSON/tool call nao aparece como `assistant_delta`.
+- Final visivel continua sendo texto do modelo.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-main-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; 455 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-web-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/web_rag.zig -lc -lsqlite3 --cache-dir /tmp/phenom-web-rag-test` -> passou; 82 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-build-local-cache bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-smoke-local-cache bin/zig-x86_64-linux-0.16.0/zig build agent-flow-smoke` -> passou; cenarios `initial_json_web`, `duplicate_web_json`, `web_query_intent_optimization`, `web_source_followup`, `web_language`, `web_language_empty`.
+
+Invariantes afetadas:
+
+- 1. Tool nao anunciada nunca executa: preservada; `web_search` continua fechado pelo contrato `search_web`.
+- 2. Contexto bruto nao vaza para o modelo: preservada; HTML bruto fica no agente e somente evidencia destilada entra no contexto.
+- 6. Falha de modelo nao parece falha de infraestrutura: ampliada; evidencia fraca fica anotada em vez de virar resposta falsa.
+- 7. Cada turno consegue ser auditado e reproduzido: ampliada; `web_distillation`, `web_search_follow_source`, `tool_start`, `turn_done` e `assistant_delta` sao auditados no smoke.
+
+Risco residual:
+
+- Esta etapa nao implementa ainda fan-out multi-fonte, cache persistente, score de confiabilidade por dominio ou ranking amplo de citacoes. Esses itens ficam para as proximas etapas do RAG web.

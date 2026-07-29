@@ -258,7 +258,7 @@ fn handleClient(state: *ServerState, client: c_int) !void {
         return send(client, "200 OK", "application/json", "{\"tokens\":[1,2,3,4,5,6,7,8]}");
     }
     if (std.mem.startsWith(u8, first_line, "GET /search")) {
-        return send(client, "200 OK", "text/html", searchHtml(state.scenario));
+        return send(client, "200 OK", "text/html", searchHtml(state, first_line));
     }
     if (std.mem.startsWith(u8, first_line, "GET /source ")) {
         return send(client, "200 OK", "text/html", sourceHtml(state.scenario));
@@ -353,13 +353,21 @@ fn languageCompletion(prompt: []const u8, empty: bool, completion_count: usize) 
     return "precisa de evidencia externa\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>solar off-grid house cost batteries inverter panels</parameter><parameter=reason>estimar custo externo com evidencia</parameter></function></tool_call>";
 }
 
-fn searchHtml(scenario: Scenario) []const u8 {
-    return switch (scenario) {
+fn searchHtml(state: *ServerState, request_line: []const u8) []const u8 {
+    return switch (state.scenario) {
         .initial_json_web => "<html><head><title>Londrina Location</title></head><body><p>Londrina fica no norte do Paraná, na região Sul do Brasil.</p></body></html>",
         .duplicate_web_json => "<html><head><title>Londrina Solar</title></head><body><p>Irradiacao solar em Londrina: 4,8 kWh/m2/dia.</p></body></html>",
         .web_query_intent_optimization => "<html><head><title>R36S Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
-        .web_source_followup => "<html><head><title>R36S results</title></head><body><p>result=1 title=R36S Specs url=http://127.0.0.1/source-empty snippet=Dados tecnicos do console R36S</p><p>result=2 title=R36S Specs url=http://127.0.0.1/source snippet=Ficha tecnica do console R36S</p></body></html>",
-        .web_language, .web_language_empty => "<html><head><title>Solar Cost</title></head><body><p>Solar off-grid systems require batteries, inverter, panels, and charge controllers.</p></body></html>",
+        .web_source_followup => std.fmt.bufPrint(
+            &state.completion_buf,
+            "<html><head><title>R36S results</title></head><body><p>result=1 title=R36S Specs url=http://127.0.0.1:{}/source-empty snippet=Dados tecnicos do console R36S</p><p>result=2 title=R36S Specs url=http://127.0.0.1:{}/source snippet=Ficha tecnica do console R36S</p></body></html>",
+            .{ state.port, state.port },
+        ) catch unreachable,
+        .web_language => "<html><head><title>Solar Cost</title></head><body><p>Solar off-grid systems require batteries, inverter, panels, and charge controllers.</p></body></html>",
+        .web_language_empty => if (contains(request_line, "components"))
+            "<html><head><title>Solar Cost</title></head><body><p>Solar off-grid systems require batteries, inverter, panels, and charge controllers.</p></body></html>"
+        else
+            "<html><head><title>No Direct Support</title></head><body><p>Pagina sem dados relacionados.</p></body></html>",
     };
 }
 

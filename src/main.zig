@@ -1792,6 +1792,7 @@ const WebEvidenceSummary = struct {
     has_search_result_excerpt: bool = false,
     has_source_excerpt: bool = false,
     has_model_verified_excerpt: bool = false,
+    has_deterministic_excerpt: bool = false,
     has_title_only_excerpt: bool = false,
     first_source_url: ?[]const u8 = null,
     preferred_source_url: ?[]const u8 = null,
@@ -1842,6 +1843,9 @@ fn summarizeWebEvidence(text: []const u8) WebEvidenceSummary {
         }
         if (std.mem.startsWith(u8, trimmed, "source=") and std.mem.indexOf(u8, trimmed, "distill=model_verified_excerpt") != null) {
             summary.has_model_verified_excerpt = true;
+        }
+        if (std.mem.startsWith(u8, trimmed, "source=") and std.mem.indexOf(u8, trimmed, "distill=deterministic_excerpt") != null) {
+            summary.has_deterministic_excerpt = true;
         }
         if (std.mem.startsWith(u8, trimmed, "title=")) {
             const value = std.mem.trim(u8, trimmed["title=".len..], " \t\r\n");
@@ -6351,37 +6355,23 @@ fn distillWebEvidenceForContextTyped(
     context: *const working_context.WorkingContext,
     ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
 ) !DistilledWebEvidence {
-    const active_summary = try renderWebDistillationContextSummary(allocator, context);
-    defer allocator.free(active_summary);
-    const distill_prompt = try renderWebDistillationPrompt(allocator, prompt, target, query, active_summary, local_evidence);
-    defer allocator.free(distill_prompt);
-
-    var sink = InternalCaptureSink{
-        .allocator = allocator,
-        .filter = reasoning_filter.ReasoningFilter.init(allocator, false),
-        .visible = std.ArrayList(u8).empty,
-        .thinking = std.ArrayList(u8).empty,
-    };
-    defer sink.deinit();
-
-    const old_thinking = client.thinking;
-    client.thinking = .off;
-    defer client.thinking = old_thinking;
-
-    streamInferenceWithUiCancel(client, .{
-        .user_prompt = distill_prompt,
-        .max_tokens = 512,
-    }, ui_ptr, &sink) catch |err| {
-        if (err == error.Cancelled) return err;
-        try recordWebDistillationAudit(allocator, db, config.session, target, query, false, @errorName(err), local_evidence.len, local_evidence.len);
-        const fallback = try allocator.dupe(u8, local_evidence);
-        return .{ .text = fallback, .summary = summarizeWebEvidence(fallback) };
-    };
-    try sink.flush();
-
-    const distilled = try normalizeWebDistillationOutput(allocator, target, query, local_evidence, sink.visible.items);
-    try recordWebDistillationAudit(allocator, db, config.session, target, query, true, "", local_evidence.len, distilled.len);
+    _ = prompt;
+    _ = client;
+    _ = context;
+    _ = ui_ptr;
+    const distilled = try normalizeDeterministicWebEvidenceForContext(allocator, local_evidence, query);
+    try recordWebDistillationAudit(allocator, db, config.session, target, query, true, "deterministic", local_evidence.len, distilled.len);
     return .{ .text = distilled, .summary = summarizeWebEvidence(distilled) };
+}
+
+fn normalizeDeterministicWebEvidenceForContext(allocator: std.mem.Allocator, local_evidence: []const u8, query: ?[]const u8) ![]u8 {
+    const out = try allocator.dupe(u8, local_evidence);
+    errdefer allocator.free(out);
+    const summary = summarizeWebEvidence(out);
+    if (!summary.has_source_excerpt or !summary.has_excerpt or summary.has_title_only_excerpt) return out;
+    if (!webEvidenceSummarySupportsQuery(summary)) return out;
+    if (!webDistillationExcerptCoversQuery(out, query)) return out;
+    return try rewriteWebEvidenceDistill(allocator, out, "deterministic_excerpt");
 }
 
 fn renderWebDistillationPrompt(
@@ -9470,6 +9460,38 @@ test "web distillation promotes grounded source excerpts structurally" {
     try std.testing.expect(summary.has_model_verified_excerpt);
     try std.testing.expect(!summary.has_source_excerpt);
     try std.testing.expect(webEvidenceCanCloseToolPhase(true, summary));
+}
+
+test "web deterministic distillation promotes only query-covered source excerpts" {
+    const grounded =
+        \\[WEB_EVIDENCE]
+        \\source=http_get raw_context_persisted=false distill=source_excerpt target=https://example.test/r36s
+        \\status=200
+        \\query=R36S RK3326 RAM
+        \\source_url=https://example.test/r36s
+        \\excerpt=Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.
+    ;
+    const promoted = try normalizeDeterministicWebEvidenceForContext(std.testing.allocator, grounded, "R36S RK3326 RAM");
+    defer std.testing.allocator.free(promoted);
+    const promoted_summary = summarizeWebEvidence(promoted);
+    try std.testing.expect(promoted_summary.has_deterministic_excerpt);
+    try std.testing.expect(!promoted_summary.has_source_excerpt);
+    try std.testing.expect(webEvidenceCanCloseToolPhase(true, promoted_summary));
+
+    const unrelated =
+        \\[WEB_EVIDENCE]
+        \\source=http_get raw_context_persisted=false distill=source_excerpt target=https://example.test/r36s
+        \\status=200
+        \\query=R36S RK3326 RAM
+        \\source_url=https://example.test/r36s
+        \\excerpt=Mercado Livre login e cookies.
+    ;
+    const weak = try normalizeDeterministicWebEvidenceForContext(std.testing.allocator, unrelated, "R36S RK3326 RAM");
+    defer std.testing.allocator.free(weak);
+    const weak_summary = summarizeWebEvidence(weak);
+    try std.testing.expect(weak_summary.has_source_excerpt);
+    try std.testing.expect(!weak_summary.has_deterministic_excerpt);
+    try std.testing.expect(!webEvidenceCanCloseToolPhase(true, weak_summary));
 }
 
 test "web distillation rejects ungrounded model additions" {
