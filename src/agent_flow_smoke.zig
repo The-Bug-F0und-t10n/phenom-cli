@@ -16,6 +16,7 @@ const Scenario = enum {
     web_query_intent_optimization,
     web_source_followup,
     web_cache_reuse,
+    web_cache_expiry,
     web_language,
     web_language_empty,
 };
@@ -66,6 +67,7 @@ pub fn main(init: std.process.Init) !void {
     try runScenario(allocator, init.io, bin, .web_query_intent_optimization);
     try runScenario(allocator, init.io, bin, .web_source_followup);
     try runCacheReuseScenario(allocator, init.io, bin);
+    try runCacheExpiryScenario(allocator, init.io, bin);
     try runScenario(allocator, init.io, bin, .web_language);
     try runScenario(allocator, init.io, bin, .web_language_empty);
     writeFd(1, "agent-flow-smoke: ok\n");
@@ -235,6 +237,49 @@ fn runCacheReuseScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const 
     thread.join();
 }
 
+fn runCacheExpiryScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8) !void {
+    writeFd(1, "agent-flow-smoke: web_cache_expiry\n");
+
+    var state = try startServer(.web_cache_expiry);
+    var thread = try std.Thread.spawn(.{}, serverMain, .{&state});
+    errdefer {
+        _ = c.shutdown(state.fd, c.SHUT_RDWR);
+        _ = c.close(state.fd);
+        thread.join();
+    }
+
+    const work = "/tmp/phenom-zig-agent-flow-smoke-web_cache_expiry";
+    std.Io.Dir.cwd().deleteTree(io, work) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, work);
+
+    const config = try std.fmt.allocPrint(allocator, "web_search_url = \"http://127.0.0.1:{}/search?q={{query}}\"\n", .{state.port});
+    defer allocator.free(config);
+    var work_dir = try std.Io.Dir.cwd().openDir(io, work, .{});
+    defer work_dir.close(io);
+    try work_dir.writeFile(io, .{ .sub_path = "config.toml", .data = config });
+
+    const host = try std.fmt.allocPrint(allocator, "127.0.0.1:{}", .{state.port});
+    defer allocator.free(host);
+    const prompt = scenarioPrompt(.web_cache_expiry);
+    const expect = scenarioExpect(.web_cache_expiry);
+
+    try runChatOnce(allocator, io, bin, work, host, "web_cache_expiry_a", prompt, expect);
+    const db_path = try std.fmt.allocPrint(allocator, "{s}/.phenom-zig/phenom.db", .{work});
+    defer allocator.free(db_path);
+    try execSql(allocator, db_path, "update web_cache set created_at=datetime('now','-8 hours')");
+    try runChatOnce(allocator, io, bin, work, host, "web_cache_expiry_b", prompt, expect);
+
+    try expectCount(allocator, db_path, "select count(*) from events where kind='web_cache_store'", 2);
+    try expectCount(allocator, db_path, "select count(*) from events where kind='web_cache_hit'", 0);
+    try expectCount(allocator, db_path, "select count(*) from events where kind='web_cache_stale'", 1);
+    try expectCount(allocator, db_path, "select count(*) from events where kind='turn_error'", 0);
+    if (state.search_get_count != 2) return SmokeError.UnexpectedAudit;
+
+    _ = c.shutdown(state.fd, c.SHUT_RDWR);
+    _ = c.close(state.fd);
+    thread.join();
+}
+
 fn runChatOnce(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, work: []const u8, host: []const u8, session: []const u8, prompt: []const u8, expect: []const u8) !void {
     const argv = [_][]const u8{
         bin,
@@ -315,6 +360,7 @@ fn serverMain(state: *ServerState) void {
         .web_query_intent_optimization => 4,
         .web_source_followup => 9,
         .web_cache_reuse => 7,
+        .web_cache_expiry => 7,
         .web_language => 4,
         .web_language_empty => 7,
     };
@@ -379,7 +425,7 @@ fn completionText(state: *ServerState, prompt: []const u8) []const u8 {
         .duplicate_web_json => duplicateWebCompletion(prompt),
         .web_query_intent_optimization => queryIntentOptimizationCompletion(prompt),
         .web_source_followup => sourceFollowupCompletion(state, prompt),
-        .web_cache_reuse => cacheReuseCompletion(prompt),
+        .web_cache_reuse, .web_cache_expiry => cacheReuseCompletion(prompt),
         .web_language => languageCompletion(prompt, false, state.completion_count),
         .web_language_empty => languageCompletion(prompt, true, state.completion_count),
     };
@@ -463,7 +509,7 @@ fn searchHtml(state: *ServerState, request_line: []const u8) []const u8 {
         .initial_json_web => "<html><head><title>Londrina Location</title></head><body><p>Londrina fica no norte do Paraná, na região Sul do Brasil.</p></body></html>",
         .duplicate_web_json => "<html><head><title>Londrina Solar</title></head><body><p>Irradiacao solar em Londrina: 4,8 kWh/m2/dia.</p></body></html>",
         .web_query_intent_optimization => "<html><head><title>R36S Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
-        .web_cache_reuse => "<html><head><title>R36S Cached Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
+        .web_cache_reuse, .web_cache_expiry => "<html><head><title>R36S Cached Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
         .web_source_followup => std.fmt.bufPrint(
             &state.completion_buf,
             "<html><head><title>R36S results</title></head><body><article><a href=\"http://127.0.0.1:{}/source-empty\">R36S Specs empty</a><p>Dados tecnicos do console R36S.</p></article><article><a href=\"http://127.0.0.1:{}/source\">R36S Specs source</a><p>Ficha tecnica do console R36S.</p></article></body></html>",
@@ -505,7 +551,7 @@ fn scenarioPrompt(scenario: Scenario) []const u8 {
         .duplicate_web_json => "como media a irradiacao solar em Londrina - PR, pesquise na internet. Responda contendo PHENOM_WEB_JSON_NORMALIZED.",
         .web_query_intent_optimization => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_QUERY_INTENT_OPTIMIZED.",
         .web_source_followup => "busque as informacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_SOURCE_FOLLOWED.",
-        .web_cache_reuse => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_CACHE_REUSED.",
+        .web_cache_reuse, .web_cache_expiry => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_CACHE_REUSED.",
         .web_language, .web_language_empty => "Usuario esta usando o idioma operacional 'user-lang-a'. Pesquise e explique nesse idioma operacional o que entra no custo de uma casa off-grid solar. Responda contendo PHENOM_WEB_LANG_USER.",
     };
 }
@@ -516,7 +562,7 @@ fn scenarioExpect(scenario: Scenario) []const u8 {
         .duplicate_web_json => "PHENOM_WEB_JSON_NORMALIZED",
         .web_query_intent_optimization => "PHENOM_WEB_QUERY_INTENT_OPTIMIZED",
         .web_source_followup => "PHENOM_WEB_SOURCE_FOLLOWED",
-        .web_cache_reuse => "PHENOM_WEB_CACHE_REUSED",
+        .web_cache_reuse, .web_cache_expiry => "PHENOM_WEB_CACHE_REUSED",
         .web_language, .web_language_empty => "PHENOM_WEB_LANG_USER",
     };
 }
@@ -604,4 +650,20 @@ fn sqlScalar(allocator: std.mem.Allocator, db_path: []const u8, sql: []const u8)
     defer _ = c.sqlite3_finalize(stmt);
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return SmokeError.SqliteStepFailed;
     return @intCast(c.sqlite3_column_int64(stmt, 0));
+}
+
+fn execSql(allocator: std.mem.Allocator, db_path: []const u8, sql: []const u8) !void {
+    const z_path = try allocator.dupeZ(u8, db_path);
+    defer allocator.free(z_path);
+    var db: ?*c.sqlite3 = null;
+    if (c.sqlite3_open(z_path.ptr, &db) != c.SQLITE_OK) return SmokeError.SqliteOpenFailed;
+    defer _ = c.sqlite3_close(db);
+
+    const z_sql = try allocator.dupeZ(u8, sql);
+    defer allocator.free(z_sql);
+    var err_msg: [*c]u8 = null;
+    if (c.sqlite3_exec(db, z_sql.ptr, null, null, &err_msg) != c.SQLITE_OK) {
+        if (err_msg != null) c.sqlite3_free(err_msg);
+        return SmokeError.SqliteStepFailed;
+    }
 }

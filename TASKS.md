@@ -12098,3 +12098,68 @@ Invariantes afetadas:
 Risco residual:
 
 - Ainda nao ha fan-out paralelo real entre motores nem politica de confiabilidade/TTL por dominio. A etapa fecha a falha estrutural de extracao direta; ranking multi-motor e freshness ficam para a proxima etapa.
+
+## T332 - RAG Web etapa 5: frescor de cache e qualidade de fonte
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: T330 criou cache operacional, mas sem TTL ele poderia reutilizar evidencia velha indefinidamente. T331 melhorou extracao direta, mas o modelo ainda nao recebia metadado explicito de confiabilidade da fonte. O agente deve anotar frescor e qualidade de forma auditavel, sem bloquear ou reescrever a resposta final do modelo.
+
+Comparacao consultada:
+
+- `../../phenom-cli-ts/src/tools/registrars/search-tools.ts`: cada hit carrega `Source` e `Engine`; o contexto entregue ao modelo preserva origem normalizada.
+- `../../../ollama_cli/client_v1/cli-agent-v2/rag_web.py`: `PageData` e `RawWebData` carregam metadados de pagina/fonte antes do formatter.
+- `../../../ollama_cli/client_v1/cli-agent-v2/knowledge_chunks_db.py`: cache de conhecimento tem `expires_at`; frescor e validade sao propriedades do storage operacional.
+
+Passos de implementacao:
+
+1. Adicionar `age_seconds` ao retorno de `web_cache`.
+2. Criar `loadFreshWebCache(..., ttl_seconds)` em `src/audit.zig`.
+3. Usar TTL operacional de 6 horas no hot path de `web_search`.
+4. Auditar `web_cache_hit` com idade e `web_cache_stale` quando a evidencia expirar.
+5. Adicionar `source_domain`, `source_quality_score` e `source_quality_reason` ao bloco `[WEB_EVIDENCE]`.
+6. Calcular qualidade de fonte por propriedades estruturais, sem allowlist de sites: HTTPS, dominio governamental/educacional/organizacional, IP/localhost e pagina de busca.
+7. Combinar qualidade de conteudo e fonte em `quality_score` operacional.
+8. Adicionar smoke real de expiração de cache.
+
+Implementacao:
+
+- `phenom-zig/src/audit.zig`: `WebCacheEntry.age_seconds`, `loadFreshWebCache` e teste de cache expirado.
+- `phenom-zig/src/main.zig`: `web_cache_ttl_seconds = 21600`, uso de cache fresco e auditoria `web_cache_stale`.
+- `phenom-zig/src/web_rag.zig`: `sourceQualityForEvidence`, `urlDomain`, classificacao estrutural de fonte e qualidade combinada.
+- `phenom-zig/src/agent_flow_smoke.zig`: cenario `web_cache_expiry` prova que cache velho nao e reutilizado.
+
+Criterio de aceite:
+
+- Cache fresco ainda evita HTTP repetido.
+- Cache expirado registra `web_cache_stale` e refaz HTTP.
+- `[WEB_EVIDENCE]` inclui dominio e qualidade da fonte.
+- `assistant_delta` continua sendo texto final do modelo, sem JSON/tool leak.
+- Nenhum HTML bruto entra no `ModelTurnContext` ou no cache.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-audit-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/audit.zig -lc -lsqlite3 --cache-dir /tmp/phenom-audit-test` -> passou; 32 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-web-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/web_rag.zig -lc -lsqlite3 --cache-dir /tmp/phenom-web-rag-test` -> passou; 87 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-main-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; 462 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-smoke-local-cache bin/zig-x86_64-linux-0.16.0/zig build agent-flow-smoke` -> passou; inclui `web_cache_expiry`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-build-local-cache bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+
+Evidencia real do smoke:
+
+- `web_cache_store|http://127.0.0.1:41389/search?q=R36S%20especificacoes%20tecnicas%20console%20cache`
+- `web_cache_stale|http://127.0.0.1:41389/search?q=R36S%20especificacoes%20tecnicas%20console%20cache age_seconds=28800 ttl_seconds=21600`
+- `web_cache_store|http://127.0.0.1:41389/search?q=R36S%20especificacoes%20tecnicas%20console%20cache`
+- `assistant_delta|Specs verificadas via evidencia: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320. PHENOM_WEB_CACHE_REUSED`
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; cache continua guardando evidencia destilada.
+- 6. Falha de modelo nao parece falha de infraestrutura: ampliada; cache velho nao mascara coleta atual.
+- 7. Cada turno consegue ser auditado e reproduzido: ampliada; hit/stale/store carregam idade e TTL.
+
+Risco residual:
+
+- Ainda nao ha fan-out paralelo real entre motores/fonte direta. A proxima etapa deve agregar variantes de query e provedores sem aumentar a surface de tools nem chamar o modelo para redestilar no hot path.

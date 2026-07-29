@@ -70,6 +70,7 @@ pub const SessionFocus = struct {
 pub const WebCacheEntry = struct {
     evidence_text: []u8,
     quality_score: i32,
+    age_seconds: i64 = 0,
 
     pub fn deinit(self: *WebCacheEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.evidence_text);
@@ -243,7 +244,7 @@ pub const AuditDb = struct {
     }
 
     pub fn loadWebCache(self: *AuditDb, allocator: std.mem.Allocator, target: []const u8, query: ?[]const u8, budget_bytes: usize) !?WebCacheEntry {
-        const sql = "select evidence_text, quality_score from web_cache where target=?1 and query=?2 and budget_bytes=?3 limit 1";
+        const sql = "select evidence_text, quality_score, cast(strftime('%s','now') - strftime('%s',created_at) as integer) from web_cache where target=?1 and query=?2 and budget_bytes=?3 limit 1";
         const z_sql = try self.allocator.dupeZ(u8, sql);
         defer self.allocator.free(z_sql);
         var stmt: ?*c.sqlite3_stmt = null;
@@ -260,7 +261,16 @@ pub const AuditDb = struct {
         return .{
             .evidence_text = try dupeColumnText(allocator, stmt, 0),
             .quality_score = c.sqlite3_column_int(stmt, 1),
+            .age_seconds = c.sqlite3_column_int64(stmt, 2),
         };
+    }
+
+    pub fn loadFreshWebCache(self: *AuditDb, allocator: std.mem.Allocator, target: []const u8, query: ?[]const u8, budget_bytes: usize, ttl_seconds: i64) !?WebCacheEntry {
+        var entry = (try self.loadWebCache(allocator, target, query, budget_bytes)) orelse return null;
+        errdefer entry.deinit(allocator);
+        if (entry.age_seconds <= ttl_seconds) return entry;
+        entry.deinit(allocator);
+        return null;
     }
 
     fn ensureSessionFts(self: *AuditDb) !void {
@@ -1194,8 +1204,24 @@ test "web cache stores distilled evidence by target query and budget" {
     var hit = (try db.loadWebCache(std.testing.allocator, target, query, 8192)).?;
     defer hit.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(i32, 82), hit.quality_score);
+    try std.testing.expect(hit.age_seconds >= 0);
     try std.testing.expectEqualStrings(evidence_text, hit.evidence_text);
     try std.testing.expect((try db.loadWebCache(std.testing.allocator, target, query, 4096)) == null);
+}
+
+test "web cache fresh lookup rejects expired evidence" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    const target = "https://example.test/search?q=zig";
+    const query = "zig release";
+    try db.storeWebCache(target, query, 8192, "[WEB_EVIDENCE]\nstatus=200\nexcerpt=Zig release.\n", 82);
+    try db.exec("update web_cache set created_at=datetime('now','-8 hours')");
+
+    try std.testing.expect((try db.loadFreshWebCache(std.testing.allocator, target, query, 8192, 60)) == null);
+    var stale = (try db.loadWebCache(std.testing.allocator, target, query, 8192)).?;
+    defer stale.deinit(std.testing.allocator);
+    try std.testing.expect(stale.age_seconds >= 8 * 60 * 60 - 5);
 }
 
 test "recent session events keep newest events in chronological order" {

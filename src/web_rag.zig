@@ -56,7 +56,8 @@ pub fn fetch(allocator: std.mem.Allocator, io: std.Io, target: []const u8, query
     defer selected_excerpt.deinit(allocator);
     const source_urls = try sourceUrlsForEvidence(allocator, inspected.target, inspected.body_snippet, searchable_text, selected_excerpt.text);
     defer allocator.free(source_urls);
-    const web_block = try renderWebEvidenceBlock(allocator, inspected, title, source_urls, selected_excerpt.text, selected_excerpt.distill, query, budget_bytes);
+    const source_quality = sourceQualityForEvidence(inspected.target, source_urls);
+    const web_block = try renderWebEvidenceBlock(allocator, inspected, title, source_urls, source_quality, selected_excerpt.text, selected_excerpt.distill, query, budget_bytes);
     defer allocator.free(web_block);
     const status_text = try renderStatusText(allocator, inspected.status);
     defer allocator.free(status_text);
@@ -102,8 +103,14 @@ pub fn fetch(allocator: std.mem.Allocator, io: std.Io, target: []const u8, query
         .has_direct_excerpt = distilled.len > 0,
         .raw_bytes_read = inspected.body_snippet.len,
         .model_bytes = evidence_text.len,
-        .quality_score = if (http_ok and distilled.len > 0) 82 else if (http_ok and selected_excerpt.text.len > 0) 45 else 30,
+        .quality_score = webEvidenceQualityScore(http_ok, distilled.len > 0, selected_excerpt.text.len > 0, source_quality.score),
     };
+}
+
+fn webEvidenceQualityScore(http_ok: bool, has_direct_excerpt: bool, has_any_excerpt: bool, source_score: u8) i32 {
+    if (!http_ok) return 30;
+    const content_score: i32 = if (has_direct_excerpt) 82 else if (has_any_excerpt) 45 else 30;
+    return @divTrunc(content_score * 3 + @as(i32, source_score), 4);
 }
 
 fn inspectHttpsGetLimit(allocator: std.mem.Allocator, io: std.Io, target: []const u8, body_limit: usize) http.RuntimeHttpResult {
@@ -222,6 +229,7 @@ fn renderWebEvidenceBlock(
     inspected: http.RuntimeHttpResult,
     title: []const u8,
     source_urls: []const u8,
+    source_quality: SourceQuality,
     excerpt: []const u8,
     distill: []const u8,
     query: ?[]const u8,
@@ -233,7 +241,7 @@ fn renderWebEvidenceBlock(
     const retrieved_at = temporal.currentUtcDateText(&retrieved_buf);
     return std.fmt.allocPrint(
         allocator,
-        "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill={s} target={s}\nretrieved_at={s}\ntimezone=UTC\nstatus={s}\nserver={s}\nerror={s}\nquery={s}\ntitle={s}\n{s}excerpt_budget_bytes={}\nexcerpt={s}\n",
+        "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill={s} target={s}\nretrieved_at={s}\ntimezone=UTC\nstatus={s}\nserver={s}\nerror={s}\nquery={s}\ntitle={s}\nsource_domain={s}\nsource_quality_score={}\nsource_quality_reason={s}\n{s}excerpt_budget_bytes={}\nexcerpt={s}\n",
         .{
             distill,
             inspected.target,
@@ -243,11 +251,75 @@ fn renderWebEvidenceBlock(
             inspected.error_name orelse "",
             query orelse "",
             title,
+            source_quality.domain,
+            source_quality.score,
+            source_quality.reason,
             source_urls,
             budget_bytes,
             excerpt,
         },
     );
+}
+
+const SourceQuality = struct {
+    domain: []const u8,
+    score: u8,
+    reason: []const u8,
+};
+
+fn sourceQualityForEvidence(target: []const u8, source_urls: []const u8) SourceQuality {
+    const url = firstSourceUrl(source_urls) orelse target;
+    const domain = urlDomain(url);
+    if (domain.len == 0) return .{ .domain = "", .score = 25, .reason = "missing_domain" };
+    if (isLocalHost(domain) or isIpHost(domain)) return .{ .domain = domain, .score = 55, .reason = "local_or_ip_host" };
+    if (std.mem.endsWith(u8, domain, ".gov") or containsIgnoreCase(domain, ".gov.")) return .{ .domain = domain, .score = 92, .reason = "government_domain" };
+    if (std.mem.endsWith(u8, domain, ".edu") or containsIgnoreCase(domain, ".edu.")) return .{ .domain = domain, .score = 88, .reason = "education_domain" };
+    if (std.mem.endsWith(u8, domain, ".org") or containsIgnoreCase(domain, ".org.")) return .{ .domain = domain, .score = 76, .reason = "organization_domain" };
+    if (targetLooksSearchPage(url)) return .{ .domain = domain, .score = 45, .reason = "search_result_page" };
+    if (std.mem.startsWith(u8, url, "https://")) return .{ .domain = domain, .score = 70, .reason = "https_domain" };
+    return .{ .domain = domain, .score = 60, .reason = "http_domain" };
+}
+
+fn firstSourceUrl(source_urls: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, source_urls, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (!std.mem.startsWith(u8, trimmed, "source_url=")) continue;
+        const url = std.mem.trim(u8, trimmed["source_url=".len..], " \t\r\n");
+        if (url.len > 0) return url;
+    }
+    return null;
+}
+
+fn urlDomain(url: []const u8) []const u8 {
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return "";
+    var start = scheme_end + "://".len;
+    if (start >= url.len) return "";
+    const end = std.mem.indexOfAnyPos(u8, url, start, "/?#") orelse url.len;
+    var host = url[start..end];
+    if (std.mem.indexOfScalar(u8, host, '@')) |at| {
+        start += at + 1;
+        host = url[start..end];
+    }
+    if (std.mem.indexOfScalar(u8, host, ':')) |colon| host = host[0..colon];
+    return std.mem.trim(u8, host, " \t\r\n.");
+}
+
+fn isLocalHost(host: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(host, "localhost") or std.mem.eql(u8, host, "127.0.0.1") or std.mem.eql(u8, host, "::1");
+}
+
+fn isIpHost(host: []const u8) bool {
+    var saw_digit = false;
+    for (host) |ch| {
+        if (std.ascii.isDigit(ch)) {
+            saw_digit = true;
+            continue;
+        }
+        if (ch == '.') continue;
+        return false;
+    }
+    return saw_digit;
 }
 
 pub fn distillText(allocator: std.mem.Allocator, input: []const u8, budget_bytes: usize) ![]u8 {
@@ -1248,6 +1320,24 @@ test "direct html structured metadata and tables become query evidence" {
     try std.testing.expect(std.mem.indexOf(u8, text, "table_row=page_title") != null);
     try std.testing.expect(std.mem.indexOf(u8, excerpt, "RK3326") != null);
     try std.testing.expect(std.mem.indexOf(u8, excerpt, "1GB RAM") != null);
+}
+
+test "web evidence annotates source quality without site allowlist" {
+    const quality = sourceQualityForEvidence("https://search.example/?q=solar", "source_url=https://dados.gov.br/dataset/atlas-solar\n");
+    try std.testing.expectEqualStrings("dados.gov.br", quality.domain);
+    try std.testing.expectEqual(@as(u8, 92), quality.score);
+    try std.testing.expectEqualStrings("government_domain", quality.reason);
+
+    const local = sourceQualityForEvidence("http://127.0.0.1:8080/source", "");
+    try std.testing.expectEqualStrings("127.0.0.1", local.domain);
+    try std.testing.expectEqual(@as(u8, 55), local.score);
+    try std.testing.expectEqualStrings("local_or_ip_host", local.reason);
+}
+
+test "web evidence quality combines content and source score" {
+    try std.testing.expectEqual(@as(i32, 84), webEvidenceQualityScore(true, true, true, 92));
+    try std.testing.expectEqual(@as(i32, 75), webEvidenceQualityScore(true, true, true, 55));
+    try std.testing.expectEqual(@as(i32, 30), webEvidenceQualityScore(false, true, true, 92));
 }
 
 test "duckduckgo result urls become web evidence source urls" {

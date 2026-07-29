@@ -1244,6 +1244,7 @@ const max_duplicate_tool_repairs = 1;
 const max_required_tool_protocol_repairs = 2;
 const max_pathless_collect_budget: usize = 6 * 1024;
 const max_web_evidence_budget: usize = 8192;
+const web_cache_ttl_seconds: i64 = 6 * 60 * 60;
 const max_model_context_send_bytes: usize = 24 * 1024;
 const weak_evidence_quality_score: i32 = 64;
 const required_tool_missing_answer = "[MODEL_FINALIZATION_BLOCKED] operational work was not completed; no final answer accepted.";
@@ -4153,10 +4154,12 @@ fn runWebSearchStep(
     try events.emit(.{ .tool_start = .{ .name = "web_search", .detail = target } });
 
     var continuation = blk: {
-        if (try db.loadWebCache(allocator, target, query, budget)) |cached_hit| {
+        if (try db.loadFreshWebCache(allocator, target, query, budget, web_cache_ttl_seconds)) |cached_hit| {
             var cached = cached_hit;
             defer cached.deinit(allocator);
-            try db.recordEvent(config.session, "web_cache_hit", target);
+            const hit_body = try std.fmt.allocPrint(allocator, "{s} age_seconds={}", .{ target, cached.age_seconds });
+            defer allocator.free(hit_body);
+            try db.recordEvent(config.session, "web_cache_hit", hit_body);
             break :blk try prepareWebSearchContinuation(
                 allocator,
                 config,
@@ -4172,6 +4175,13 @@ fn runWebSearchStep(
                 db,
                 state,
             );
+        }
+        if (try db.loadWebCache(allocator, target, query, budget)) |stale_hit| {
+            var stale = stale_hit;
+            defer stale.deinit(allocator);
+            const stale_body = try std.fmt.allocPrint(allocator, "{s} age_seconds={} ttl_seconds={}", .{ target, stale.age_seconds, web_cache_ttl_seconds });
+            defer allocator.free(stale_body);
+            try db.recordEvent(config.session, "web_cache_stale", stale_body);
         }
         try db.recordEvent(config.session, "web_cache_miss", target);
         const result = web_rag.fetch(allocator, io, target, query, budget) catch |err| {
