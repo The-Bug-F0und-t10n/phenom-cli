@@ -12604,3 +12604,51 @@ Invariantes afetadas:
 Risco residual:
 
 - O budget ainda e aplicado principalmente por bytes acumulados/limite global antes do envio. A proxima etapa aplica token governor por bucket em `model_context_budget`.
+
+## T341 - Context economy etapa 5: token governor por bucket no ModelTurnContext
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: `model_context_budget` auditava buckets antes do envio, mas o renderizador ainda podia montar buckets grandes demais e so bloquear depois. Isso nao entrega economia percebida: o modelo recebe contexto inchado ate o limite global.
+
+Referencia TS consultada:
+
+- `../phenom-cli-ts/src/use-cases/build-inference-messages.ts`: contexto e montado por partes antes da chamada do modelo.
+- `alinhamento.md` A3/A5: contexto deve ser compacto, separado por fonte e auditavel; baixo consumo e estrategia operacional, nao prompt improvisado.
+
+Passos de implementacao:
+
+1. Aplicar limites por bucket no renderizador central `ModelTurnContext`.
+2. Preservar header, temporal e estrutura de secoes.
+3. Truncar somente conteudo de buckets expansivos: contracts, skills, memory, candidates, evidence, focus, dialogue, session, obligations, grounding e next_action.
+4. Marcar truncamento com `[CONTEXT_BUCKET_TRUNCATED bucket=...]` para auditoria e raciocinio do modelo.
+5. Manter `model_context_budget` medindo o contexto ja renderizado/governado antes do envio.
+
+Implementacao:
+
+- `phenom-zig/src/model_context.zig`: constantes de budget por bucket e appenders budgetados.
+- `phenom-zig/src/model_context.zig`: teste `model context applies bucket governor before send rendering`.
+
+Criterio de aceite:
+
+- Contexto grande e reduzido no render central antes do envio.
+- Truncamento e visivel no proprio `model_context`.
+- Buckets nao afetados continuam renderizados.
+- Nao ha heuristica por keyword de prompt.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-build-test4 bin/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-buildonly3 bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+- `.zig-cache/o/41449f8774b7a1698e6685004ef0d677/agent-flow-smoke zig-out/bin/phenom` -> passou fora do sandbox por requerer socket loopback.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; truncamento atua depois da destilacao.
+- 7. Cada turno consegue ser auditado e reproduzido: reforcada; o `model_context` gravado contem marcadores de truncamento e `model_context_budget` mede o texto final.
+
+Risco residual:
+
+- `WorkingContext.remainingBudget` ainda usava soma historica de `tool_budget_spent`; a proxima etapa muda para bytes renderizados/compactados.

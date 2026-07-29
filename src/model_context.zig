@@ -73,6 +73,18 @@ pub const ModelTurnContext = struct {
     next_action: []const u8 = "",
 };
 
+const bucket_contracts_bytes: usize = 4096;
+const bucket_skills_bytes: usize = 2048;
+const bucket_memory_bytes: usize = 2048;
+const bucket_candidates_bytes: usize = 4096;
+const bucket_evidence_bytes: usize = 10 * 1024;
+const bucket_focus_bytes: usize = 2048;
+const bucket_dialogue_bytes: usize = 3072;
+const bucket_session_bytes: usize = 4096;
+const bucket_obligations_bytes: usize = 2048;
+const bucket_grounding_bytes: usize = 4096;
+const bucket_next_action_bytes: usize = 1536;
+
 pub fn renderSystemPrompt(allocator: std.mem.Allocator, override: ?[]const u8) ![]u8 {
     return allocator.dupe(u8, override orelse default_system_prompt);
 }
@@ -89,94 +101,116 @@ pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContex
 
     if (ctx.contracts.len > 0) {
         try out.appendSlice(allocator, "\n[CONTRACTS]\n");
-        try out.appendSlice(allocator, ctx.contracts);
+        const truncated = try appendBudgetedRaw(&out, allocator, ctx.contracts, bucket_contracts_bytes);
         if (!std.mem.endsWith(u8, ctx.contracts, "\n")) try out.append(allocator, '\n');
+        if (truncated) try out.appendSlice(allocator, "[CONTEXT_BUCKET_TRUNCATED bucket=contracts]\n");
     }
 
     if (ctx.skills.len > 0) {
         try out.appendSlice(allocator, "\n[SKILLS]\n");
-        try appendList(&out, allocator, ctx.skills);
+        try appendListBudgeted(&out, allocator, ctx.skills, bucket_skills_bytes, "skills");
     }
 
     if (ctx.memory.len > 0) {
         try out.appendSlice(allocator, "\n[MEMORY]\n");
-        try appendList(&out, allocator, ctx.memory);
+        try appendListBudgeted(&out, allocator, ctx.memory, bucket_memory_bytes, "memory");
     }
 
     if (ctx.candidates.len > 0) {
         try out.appendSlice(allocator, "\n[CANDIDATES_CONTEXT]\n");
         try out.appendSlice(allocator, "C# candidates are temporary selection handles, not E# evidence. Expand one C# before final answer.\n");
+        var remaining = bucket_candidates_bytes;
+        var truncated = false;
         for (ctx.candidates, 0..) |entry, i| {
             const label = try std.fmt.allocPrint(allocator, "CANDIDATES{}:\n", .{i + 1});
             defer allocator.free(label);
             try out.appendSlice(allocator, label);
-            try appendEvidenceText(&out, allocator, entry.text);
+            truncated = (try appendEvidenceTextBudgeted(&out, allocator, entry.text, &remaining)) or truncated;
         }
+        if (truncated) try out.appendSlice(allocator, "  [CONTEXT_BUCKET_TRUNCATED bucket=candidates]\n");
     }
 
     if (ctx.evidence.len > 0) {
         try out.appendSlice(allocator, "\n[EVIDENCE]\n");
+        var remaining = bucket_evidence_bytes;
+        var truncated = false;
         for (ctx.evidence, 0..) |entry, i| {
             const label = try std.fmt.allocPrint(allocator, "E{}:\n", .{i + 1});
             defer allocator.free(label);
             try out.appendSlice(allocator, label);
-            try appendEvidenceText(&out, allocator, entry.text);
+            truncated = (try appendEvidenceTextBudgeted(&out, allocator, entry.text, &remaining)) or truncated;
         }
+        if (truncated) try out.appendSlice(allocator, "  [CONTEXT_BUCKET_TRUNCATED bucket=evidence]\n");
     }
 
     if (ctx.focus.len > 0) {
         try out.appendSlice(allocator, "\n[SESSION_FOCUS]\n");
+        var remaining = bucket_focus_bytes;
+        var truncated = false;
         for (ctx.focus, 0..) |entry, i| {
             const label = try std.fmt.allocPrint(allocator, "F{}:\n", .{i + 1});
             defer allocator.free(label);
             try out.appendSlice(allocator, label);
-            try appendEvidenceText(&out, allocator, entry.text);
+            truncated = (try appendEvidenceTextBudgeted(&out, allocator, entry.text, &remaining)) or truncated;
         }
+        if (truncated) try out.appendSlice(allocator, "  [CONTEXT_BUCKET_TRUNCATED bucket=focus]\n");
     }
 
     if (ctx.dialogue.len > 0) {
         try out.appendSlice(allocator, "\n[RECENT_DIALOGUE]\n");
+        var remaining = bucket_dialogue_bytes;
+        var truncated = false;
         for (ctx.dialogue, 0..) |entry, i| {
             const label = try std.fmt.allocPrint(allocator, "D{}:\n", .{i + 1});
             defer allocator.free(label);
             try out.appendSlice(allocator, label);
-            try appendEvidenceText(&out, allocator, entry.text);
+            truncated = (try appendEvidenceTextBudgeted(&out, allocator, entry.text, &remaining)) or truncated;
         }
+        if (truncated) try out.appendSlice(allocator, "  [CONTEXT_BUCKET_TRUNCATED bucket=dialogue]\n");
     }
 
     if (ctx.session.len > 0) {
         try out.appendSlice(allocator, "\n[SESSION_CONTEXT]\n");
+        var remaining = bucket_session_bytes;
+        var truncated = false;
         for (ctx.session, 0..) |entry, i| {
             const label = try std.fmt.allocPrint(allocator, "S{}:\n", .{i + 1});
             defer allocator.free(label);
             try out.appendSlice(allocator, label);
-            try appendEvidenceText(&out, allocator, entry.text);
+            truncated = (try appendEvidenceTextBudgeted(&out, allocator, entry.text, &remaining)) or truncated;
         }
+        if (truncated) try out.appendSlice(allocator, "  [CONTEXT_BUCKET_TRUNCATED bucket=session]\n");
     }
 
     if (ctx.obligations.len > 0) {
         try out.appendSlice(allocator, "\n[OBLIGATIONS]\n");
+        var remaining = bucket_obligations_bytes;
+        var truncated = false;
         for (ctx.obligations, 0..) |item, i| {
             const line = try std.fmt.allocPrint(allocator, "O{}: {s}\n", .{ i + 1, item });
             defer allocator.free(line);
-            try out.appendSlice(allocator, line);
+            truncated = (try appendBudgetedRaw(&out, allocator, line, remaining)) or truncated;
+            remaining -|= @min(remaining, line.len);
         }
+        if (truncated) try out.appendSlice(allocator, "[CONTEXT_BUCKET_TRUNCATED bucket=obligations]\n");
     }
 
     if (ctx.grounding.len > 0) {
         try out.appendSlice(allocator, "\n[GROUNDING]\n");
-        try appendList(&out, allocator, ctx.grounding);
+        try appendListBudgeted(&out, allocator, ctx.grounding, bucket_grounding_bytes, "grounding");
     }
 
     if (ctx.next_action_v1) |action| {
         try out.appendSlice(allocator, "\n[NEXT_ACTION]\n");
         const line = try std.fmt.allocPrint(allocator, "kind={s} action={s}\n", .{ @tagName(action.kind), action.text });
         defer allocator.free(line);
-        try out.appendSlice(allocator, line);
+        const truncated = try appendBudgetedRaw(&out, allocator, line, bucket_next_action_bytes);
+        if (truncated) try out.appendSlice(allocator, "\n[CONTEXT_BUCKET_TRUNCATED bucket=next_action]\n");
     } else if (ctx.next_action.len > 0) {
         try out.appendSlice(allocator, "\n[NEXT_ACTION]\n");
-        try out.appendSlice(allocator, ctx.next_action);
+        const truncated = try appendBudgetedRaw(&out, allocator, ctx.next_action, bucket_next_action_bytes);
         if (!std.mem.endsWith(u8, ctx.next_action, "\n")) try out.append(allocator, '\n');
+        if (truncated) try out.appendSlice(allocator, "[CONTEXT_BUCKET_TRUNCATED bucket=next_action]\n");
     }
 
     const rendered = try out.toOwnedSlice(allocator);
@@ -274,6 +308,31 @@ fn appendList(out: *std.ArrayList(u8), allocator: std.mem.Allocator, items: []co
     }
 }
 
+fn appendListBudgeted(out: *std.ArrayList(u8), allocator: std.mem.Allocator, items: []const []const u8, budget: usize, bucket: []const u8) !void {
+    var remaining = budget;
+    var truncated = false;
+    for (items) |item| {
+        if (remaining == 0) {
+            truncated = true;
+            break;
+        }
+        const prefix = "- ";
+        truncated = (try appendBudgetedRaw(out, allocator, prefix, remaining)) or truncated;
+        remaining -|= @min(remaining, prefix.len);
+        truncated = (try appendBudgetedRaw(out, allocator, item, remaining)) or truncated;
+        remaining -|= @min(remaining, item.len);
+        if (!std.mem.endsWith(u8, item, "\n") and remaining > 0) {
+            try out.append(allocator, '\n');
+            remaining -= 1;
+        }
+    }
+    if (truncated) {
+        const line = try std.fmt.allocPrint(allocator, "[CONTEXT_BUCKET_TRUNCATED bucket={s}]\n", .{bucket});
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+    }
+}
+
 fn appendEvidenceText(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |line| {
@@ -283,6 +342,35 @@ fn appendEvidenceText(out: *std.ArrayList(u8), allocator: std.mem.Allocator, tex
         try out.appendSlice(allocator, line);
         try out.append(allocator, '\n');
     }
+}
+
+fn appendEvidenceTextBudgeted(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8, remaining: *usize) !bool {
+    var truncated = false;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.eql(u8, line, "[EVIDENCE]")) continue;
+        if (remaining.* == 0) {
+            truncated = true;
+            break;
+        }
+        const prefix = "  ";
+        truncated = (try appendBudgetedRaw(out, allocator, prefix, remaining.*)) or truncated;
+        remaining.* -|= @min(remaining.*, prefix.len);
+        truncated = (try appendBudgetedRaw(out, allocator, line, remaining.*)) or truncated;
+        remaining.* -|= @min(remaining.*, line.len);
+        if (remaining.* > 0) {
+            try out.append(allocator, '\n');
+            remaining.* -= 1;
+        }
+    }
+    return truncated;
+}
+
+fn appendBudgetedRaw(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8, budget: usize) !bool {
+    const take = @min(text.len, budget);
+    if (take > 0) try out.appendSlice(allocator, text[0..take]);
+    return take < text.len;
 }
 
 test "system prompt stays compact and stable" {
@@ -358,6 +446,22 @@ test "model context renders typed next action and byte buckets" {
     try std.testing.expect(buckets.evidence > 0);
     try std.testing.expect(buckets.next_action > 0);
     try std.testing.expectEqual(rendered.len, buckets.header + buckets.temporal + buckets.contracts + buckets.evidence + buckets.next_action);
+}
+
+test "model context applies bucket governor before send rendering" {
+    const large = "x" ** (bucket_evidence_bytes + 2048);
+    const evidence_blocks = [_]EvidenceBlock{.{ .text = large }};
+    const rendered = try renderModelTurnContext(std.testing.allocator, .{
+        .task = "resumir evidencia grande",
+        .evidence = &evidence_blocks,
+        .grounding = &.{"use evidence"},
+    });
+    defer std.testing.allocator.free(rendered);
+
+    const buckets = measureRenderedContextBytes(rendered);
+    try std.testing.expect(buckets.evidence < large.len);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[CONTEXT_BUCKET_TRUNCATED bucket=evidence]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[GROUNDING]") != null);
 }
 
 test "model context renders candidates outside evidence" {
