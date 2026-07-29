@@ -12748,3 +12748,58 @@ Invariantes afetadas:
 Risco residual:
 
 - Se o backend encerrar por limite sem `finish_reason`, sem `done_reason` e sem usage final, o agente ainda nao tem sinal objetivo de `length_stop`; essa frente exige contrato de backend ou detector estrutural separado.
+
+## T344 - Output final pos-tool renderiza em stream ate conclusao do modelo
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: o fluxo real pos-RAG web ainda dava sensacao de travamento porque `streamDeferredToolLoopTurnInternal` usava o mesmo modo `defer_visible=true` para protocolo/tool call e para resposta final. Com isso, depois de fechar a fase operacional, o modelo gerava deltas SSE, mas o agente acumulava tudo em `raw_visible` e so renderizava no fim. O problema era estrutural: faltava separar `protocol_buffered` de `final_streaming`.
+
+Referencia consultada:
+
+- `alinhamento.md` A2/A6: tool/protocol deve ser oculto, mas a resposta final visivel deve preservar o texto do modelo.
+- `TASKS.md` arquitetura canonica: tool output vira evidencia; resposta final nao deve ser substituida por sintese deterministica do controller.
+- `../phenom-cli-ts` nao esta presente nesta workspace atual; a comparacao disponivel fica documentada em `alinhamento.md`.
+
+Passos de implementacao:
+
+1. Manter `defer_visible=true` durante fase de contrato/tool call para impedir vazamento de protocolo.
+2. Ativar modo final streaming quando `ToolLoopState.closeToolPhase()` troca o contrato ativo para `answer_only`.
+3. Adicionar janela curta de guarda de protocolo no `StreamSink`: deltas finais sao emitidos em stream, mantendo apenas uma cauda pequena para detectar XML/JSON/tool protocol antes de renderizar.
+4. Sincronizar o texto ja emitido pelo sink final com o sink agregado sem reemitir nem duplicar `assistant_delta`.
+5. Aplicar o mesmo caminho de stream na continuacao de `length_stop`, preservando diagnostico auditavel se o backend gerar raw sem visivel.
+6. Criar smoke pos-web com resposta final media em varios eventos SSE e validar granularidade real no SQLite.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: `StreamSink` agora possui `final_stream_guard`, holdback de protocolo e `absorbEmittedVisible`.
+- `phenom-zig/src/main.zig`: `streamDeferredToolLoopTurnInternal` usa `defer_visible=false` somente em `answer_only` com `finalization_state`, mantendo os demais passos buffered.
+- `phenom-zig/src/main.zig`: `repairLengthStoppedVisibleAnswer` usa o mesmo modo streaming e registra detalhes quando uma continuacao nao produz visivel.
+- `phenom-zig/src/agent_flow_smoke.zig`: adiciona `web_final_streaming`, que passa por `set_operational_contract`, `web_search`, `WEB_DOSSIER` e resposta final em chunks SSE.
+
+Criterio de aceite:
+
+- Tool calls e protocolo continuam ocultos.
+- Resposta final pos-tool chega ao usuario como stream, nao como flush unico.
+- `sink.visible` agregado contem o mesmo texto renderizado e satisfaz `--expect-contains`.
+- `assistant_delta` no audit preserva granularidade de stream em mais de um evento.
+- Sem `answer_repair` e sem `turn_error` no caminho feliz.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-final-stream-test bin/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-final-stream-build bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-final-stream-smoke bin/zig-x86_64-linux-0.16.0/zig build agent-flow-smoke` -> passou fora do sandbox por requerer socket loopback.
+- Audit real `web_final_streaming`: `assistant_delta=2`, `answer_repair=0`, `turn_error=0`, `PHENOM_WEB_FINAL_STREAMED` aparece no segundo delta.
+
+Invariantes afetadas:
+
+- 1. Tool nao anunciada nunca executa: preservada; protocolo final bloqueado nao vira execucao.
+- 2. Contexto bruto nao vaza para o modelo: preservada.
+- 7. Cada turno consegue ser auditado e reproduzido: reforcada por prova de chunks no SQLite.
+
+Risco residual:
+
+- A guarda de protocolo protege sintaxe explicita de tool/protocolo com uma janela curta. Ela nao tenta classificar intencao semantica do texto final; isso e deliberado para nao reduzir a capacidade operacional do modelo.

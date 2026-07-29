@@ -1266,6 +1266,7 @@ const max_pathless_collect_budget: usize = 6 * 1024;
 const max_web_evidence_budget: usize = 8192;
 const web_cache_ttl_seconds: i64 = 6 * 60 * 60;
 const max_model_context_send_bytes: usize = 24 * 1024;
+const final_stream_protocol_holdback_bytes: usize = 256;
 const weak_evidence_quality_score: i32 = 64;
 const required_tool_missing_answer = "[MODEL_FINALIZATION_BLOCKED] operational work was not completed; no final answer accepted.";
 const required_work_missing_answer = "[MODEL_FINALIZATION_BLOCKED] required operational work was not completed; no final answer accepted.";
@@ -5234,7 +5235,8 @@ fn repairLengthStoppedVisibleAnswer(
         .visible = std.ArrayList(u8).empty,
         .visible_bytes = 0,
         .thinking_bytes = 0,
-        .defer_visible = true,
+        .defer_visible = false,
+        .final_stream_guard = true,
         .trim_visible_leading_whitespace = false,
     };
     defer repair_sink.deinit();
@@ -5267,12 +5269,18 @@ fn repairLengthStoppedVisibleAnswer(
     repair_sink.promoteTokenLimitStop(config.max_tokens);
 
     aggregate_sink.mergeGenerationStop(repair_sink);
-    if (repair_sink.raw_visible.items.len == 0) {
-        try db.recordEvent(config.session, "answer_repair_failed", "length stop continuation produced no visible answer");
-        try db.recordTurnError(config.session, .model_protocol, "length_stop_continuation", "repair produced no visible answer");
+    if (repair_sink.visible_bytes == 0) {
+        const detail = try std.fmt.allocPrint(
+            allocator,
+            "length stop continuation produced no visible answer raw_model_bytes={} raw_visible_bytes={} holdback_bytes={} blocked={}",
+            .{ repair_sink.raw_model.items.len, repair_sink.raw_visible.items.len, repair_sink.final_stream_holdback.items.len, repair_sink.final_stream_blocked },
+        );
+        defer allocator.free(detail);
+        try db.recordEvent(config.session, "answer_repair_failed", detail);
+        try db.recordTurnError(config.session, .model_protocol, "length_stop_continuation", detail);
         return false;
     }
-    try aggregate_sink.emitVisibleText(repair_sink.raw_visible.items);
+    try aggregate_sink.absorbEmittedVisible(&repair_sink);
     repair_sink.raw_visible.clearRetainingCapacity();
     try db.recordEvent(config.session, "answer_repair_done", "server length continuation emitted visible answer");
     return true;
@@ -5318,6 +5326,7 @@ fn streamDeferredToolLoopTurnInternal(
     const answer_repair_mode = std.mem.indexOf(u8, follow_context, "[EMPTY_WEB_EVIDENCE_ANSWER_REPAIR]") != null;
     const required_tool_mode = required_tool_repair != null;
     const final_answer_mode = active_contract.name == .answer_only and finalization_state != null;
+    const stream_final_visible = final_answer_mode;
     const protocol_hidden_mode = required_tool_mode or answer_repair_mode or final_answer_mode or active_contract.name == .search_web;
     const previous_thinking = client.thinking;
     if (protocol_hidden_mode) client.thinking = .off;
@@ -5332,7 +5341,8 @@ fn streamDeferredToolLoopTurnInternal(
         .visible = std.ArrayList(u8).empty,
         .visible_bytes = 0,
         .thinking_bytes = 0,
-        .defer_visible = true,
+        .defer_visible = !stream_final_visible,
+        .final_stream_guard = stream_final_visible,
         .trim_visible_leading_whitespace = false,
         .suppress_thinking = protocol_hidden_mode,
     };
@@ -5431,6 +5441,12 @@ fn streamDeferredToolLoopTurnInternal(
             );
         }
         if (follow_sink.raw_visible.items.len > 0) {
+            if (stream_final_visible and follow_sink.visible_bytes > 0 and !follow_sink.final_stream_blocked) {
+                aggregate_sink.mergeGenerationStop(follow_sink);
+                try aggregate_sink.absorbEmittedVisible(&follow_sink);
+                follow_sink.raw_visible.clearRetainingCapacity();
+                return .final_answer;
+            }
             if (final_answer_mode and visibleContainsInternalEvidenceProtocol(follow_sink.raw_visible.items)) {
                 follow_sink.discardDeferredVisible();
                 if (finalization_state) |state| {
@@ -5672,7 +5688,11 @@ fn streamDeferredToolLoopTurnInternal(
                 }
             }
             aggregate_sink.mergeGenerationStop(follow_sink);
-            try aggregate_sink.emitVisibleText(follow_sink.raw_visible.items);
+            if (stream_final_visible) {
+                try aggregate_sink.absorbEmittedVisible(&follow_sink);
+            } else {
+                try aggregate_sink.emitVisibleText(follow_sink.raw_visible.items);
+            }
             follow_sink.raw_visible.clearRetainingCapacity();
         }
         return .final_answer;
@@ -7071,6 +7091,9 @@ const StreamSink = struct {
     visible_bytes: usize,
     thinking_bytes: usize,
     defer_visible: bool = false,
+    final_stream_guard: bool = false,
+    final_stream_blocked: bool = false,
+    final_stream_holdback: std.ArrayList(u8) = std.ArrayList(u8).empty,
     trim_visible_leading_whitespace: bool = false,
     suppress_thinking: bool = false,
     completion_stop_reason: http.StopReason = .unknown,
@@ -7081,6 +7104,7 @@ const StreamSink = struct {
         ctx.visible.deinit(ctx.allocator);
         ctx.raw_model.deinit(ctx.allocator);
         ctx.raw_visible.deinit(ctx.allocator);
+        ctx.final_stream_holdback.deinit(ctx.allocator);
     }
 
     pub fn onDelta(ctx: *StreamSink, delta: []const u8) !void {
@@ -7121,6 +7145,7 @@ const StreamSink = struct {
 
     pub fn flush(ctx: *StreamSink) !void {
         try ctx.filter.flush(ctx);
+        try ctx.flushFinalStreamHoldback();
     }
 
     fn hasNoVisibleText(ctx: *const StreamSink) bool {
@@ -7132,6 +7157,7 @@ const StreamSink = struct {
         if (text.len == 0) return;
         try ctx.raw_visible.appendSlice(ctx.allocator, text);
         if (ctx.defer_visible) return;
+        if (ctx.final_stream_guard) return ctx.writeVisibleGuarded(text);
         try ctx.emitVisibleText(text);
     }
 
@@ -7144,6 +7170,40 @@ const StreamSink = struct {
     pub fn discardDeferredVisible(ctx: *StreamSink) void {
         if (!ctx.defer_visible) return;
         ctx.raw_visible.clearRetainingCapacity();
+    }
+
+    fn writeVisibleGuarded(ctx: *StreamSink, text: []const u8) !void {
+        if (ctx.final_stream_blocked) return;
+        try ctx.final_stream_holdback.appendSlice(ctx.allocator, text);
+        if (finalStreamProtocolDetected(ctx.raw_visible.items)) {
+            ctx.final_stream_blocked = true;
+            ctx.final_stream_holdback.clearRetainingCapacity();
+            return;
+        }
+        if (ctx.final_stream_holdback.items.len <= final_stream_protocol_holdback_bytes) return;
+        const emit_len = ctx.final_stream_holdback.items.len - final_stream_protocol_holdback_bytes;
+        try ctx.emitVisibleText(ctx.final_stream_holdback.items[0..emit_len]);
+        const remaining = ctx.final_stream_holdback.items.len - emit_len;
+        std.mem.copyForwards(u8, ctx.final_stream_holdback.items[0..remaining], ctx.final_stream_holdback.items[emit_len..]);
+        ctx.final_stream_holdback.shrinkRetainingCapacity(remaining);
+    }
+
+    fn flushFinalStreamHoldback(ctx: *StreamSink) !void {
+        if (!ctx.final_stream_guard or ctx.defer_visible or ctx.final_stream_blocked) return;
+        if (ctx.final_stream_holdback.items.len == 0) return;
+        if (finalStreamProtocolDetected(ctx.raw_visible.items)) {
+            ctx.final_stream_blocked = true;
+            ctx.final_stream_holdback.clearRetainingCapacity();
+            return;
+        }
+        try ctx.emitVisibleText(ctx.final_stream_holdback.items);
+        ctx.final_stream_holdback.clearRetainingCapacity();
+    }
+
+    fn absorbEmittedVisible(ctx: *StreamSink, other: *const StreamSink) !void {
+        if (other.visible.items.len == 0) return;
+        try ctx.visible.appendSlice(ctx.allocator, other.visible.items);
+        ctx.visible_bytes += other.visible_bytes;
     }
 
     fn emitVisibleText(ctx: *StreamSink, text: []const u8) !void {
@@ -7171,6 +7231,10 @@ const StreamSink = struct {
         ctx.trim_visible_leading_whitespace = true;
     }
 };
+
+fn finalStreamProtocolDetected(visible: []const u8) bool {
+    return rawVisibleContainsToolCall(visible) or visibleContainsInternalEvidenceProtocol(visible);
+}
 
 fn trimLeadingWhitespaceAfterThinking(text: []const u8, active: *bool) []const u8 {
     if (!active.*) return text;
@@ -8157,6 +8221,147 @@ test "deferred follow-up answer emits through aggregate sink" {
     try std.testing.expectEqualStrings("resposta final", aggregate.visible.items);
     try std.testing.expectEqual(@as(usize, 0), follow.visible_bytes);
     try std.testing.expectEqual(http.StopReason.length, aggregate.completion_stop_reason);
+}
+
+test "final stream sink emits visible chunks before completion flush" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var recorder = EventRecorder{};
+    try bus.on(&recorder, EventRecorder.handleOpaque);
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "final-stream",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = false,
+        .final_stream_guard = true,
+    };
+    defer sink.deinit();
+
+    const first = try std.testing.allocator.alloc(u8, 300);
+    defer std.testing.allocator.free(first);
+    @memset(first, 'a');
+    const second = try std.testing.allocator.alloc(u8, 300);
+    defer std.testing.allocator.free(second);
+    @memset(second, 'b');
+
+    try sink.writeVisible(first);
+    try std.testing.expect(recorder.message_chunks >= 1);
+    try sink.writeVisible(second);
+    try sink.flush();
+
+    try std.testing.expect(recorder.message_chunks >= 2);
+    try std.testing.expectEqual(@as(usize, 600), sink.visible_bytes);
+    try std.testing.expectEqualSlices(u8, first, sink.visible.items[0..first.len]);
+    try std.testing.expectEqualSlices(u8, second, sink.visible.items[first.len .. first.len + second.len]);
+}
+
+test "final stream sink flushes short guarded answer" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var recorder = EventRecorder{};
+    try bus.on(&recorder, EventRecorder.handleOpaque);
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "final-stream-short",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = false,
+        .final_stream_guard = true,
+    };
+    defer sink.deinit();
+
+    const text = "continuacao curta PHENOM_SHORT_STREAM";
+    try sink.writeVisible(text);
+    try std.testing.expectEqual(@as(usize, 0), recorder.message_chunks);
+    try sink.flush();
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
+    try std.testing.expectEqualStrings(text, sink.visible.items);
+}
+
+test "final stream sink flushes short guarded delta through reasoning filter" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var recorder = EventRecorder{};
+    try bus.on(&recorder, EventRecorder.handleOpaque);
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "final-stream-short-delta",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = false,
+        .final_stream_guard = true,
+    };
+    defer sink.deinit();
+
+    const text = "continuacao curta PHENOM_SHORT_STREAM";
+    try sink.onDelta(text);
+    try std.testing.expectEqual(@as(usize, 0), recorder.message_chunks);
+    try sink.flush();
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
+    try std.testing.expectEqualStrings(text, sink.visible.items);
+    try std.testing.expectEqualStrings(text, sink.raw_visible.items);
+}
+
+test "final stream protocol guard blocks explicit tool protocol before render" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var recorder = EventRecorder{};
+    try bus.on(&recorder, EventRecorder.handleOpaque);
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "final-stream-protocol",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = false,
+        .final_stream_guard = true,
+    };
+    defer sink.deinit();
+
+    try sink.writeVisible("Vou pesquisar. json { \"tool_call\": { \"name\": \"web_search\" } }");
+    try sink.flush();
+
+    try std.testing.expectEqual(@as(usize, 0), recorder.message_chunks);
+    try std.testing.expectEqual(@as(usize, 0), sink.visible_bytes);
+    try std.testing.expect(sink.final_stream_blocked);
 }
 
 test "deferred stream sink can discard protocol violating prose" {

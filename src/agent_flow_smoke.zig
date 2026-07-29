@@ -20,6 +20,7 @@ const Scenario = enum {
     web_cache_expiry,
     web_query_fanout,
     web_provider_fanout,
+    web_final_streaming,
     length_usage_continuation,
     web_length_continuation,
     web_language,
@@ -75,6 +76,7 @@ pub fn main(init: std.process.Init) !void {
     try runCacheExpiryScenario(allocator, init.io, bin);
     try runScenario(allocator, init.io, bin, .web_query_fanout);
     try runScenario(allocator, init.io, bin, .web_provider_fanout);
+    try runScenario(allocator, init.io, bin, .web_final_streaming);
     try runScenario(allocator, init.io, bin, .length_usage_continuation);
     try runScenario(allocator, init.io, bin, .web_length_continuation);
     try runScenario(allocator, init.io, bin, .web_language);
@@ -217,6 +219,10 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
     if (scenario == .web_query_intent_optimization) {
         try expectAtLeast(allocator, db_path, "select count(*) from events where kind='web_query_optimization' and body like '%success=true%' and body like '%final_query=R36S especificacoes tecnicas console%'", 1);
         try expectAtLeast(allocator, db_path, "select count(*) from events where kind='tool_start' and body like 'web_search%' and body like '%R36S%20especificacoes%20tecnicas%20console%'", 1);
+    }
+    if (scenario == .web_final_streaming) {
+        try expectAtLeast(allocator, db_path, "select count(*) from events where kind='assistant_delta'", 2);
+        try expectCount(allocator, db_path, "select count(*) from events where kind='answer_repair'", 0);
     }
     if (scenario == .length_usage_continuation or scenario == .web_length_continuation) {
         if (contains(result.stdout, "generation limit") or contains(result.stdout, "token limit")) {
@@ -400,6 +406,7 @@ fn serverMain(state: *ServerState) void {
         .web_cache_expiry => 7,
         .web_query_fanout => 5,
         .web_provider_fanout => 5,
+        .web_final_streaming => 5,
         .length_usage_continuation => 2,
         .web_length_continuation => 5,
         .web_language => 4,
@@ -474,6 +481,9 @@ fn handleClient(state: *ServerState, client: c_int) !void {
         if (state.scenario == .web_length_continuation and contains(text, "Resposta web parcial")) {
             return sendSseWithUsage(client, text, 64, 512);
         }
+        if (state.scenario == .web_final_streaming and contains(text, "PHENOM_WEB_FINAL_STREAMED")) {
+            return sendSseChunkedText(client, text, 300);
+        }
         return sendSse(client, text);
     }
     return send(client, "404 Not Found", "text/plain", "not found");
@@ -488,6 +498,7 @@ fn completionText(state: *ServerState, prompt: []const u8) []const u8 {
         .web_cache_reuse, .web_cache_expiry => cacheReuseCompletion(prompt),
         .web_query_fanout => queryFanoutCompletion(prompt),
         .web_provider_fanout => providerFanoutCompletion(prompt),
+        .web_final_streaming => webFinalStreamingCompletion(prompt),
         .length_usage_continuation => lengthUsageContinuationCompletion(prompt),
         .web_length_continuation => webLengthContinuationCompletion(prompt),
         .web_language => languageCompletion(prompt, false, state.completion_count),
@@ -539,8 +550,17 @@ fn providerFanoutCompletion(prompt: []const u8) []const u8 {
     return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S provider specs</parameter><parameter=reason>buscar dados tecnicos externos</parameter></function></tool_call>";
 }
 
+fn webFinalStreamingCompletion(prompt: []const u8) []const u8 {
+    if (contains(prompt, "MODEL_DECLARED_QUERY")) return "R36S streaming specs";
+    if (contains(prompt, "WEB_EVIDENCE_INPUT")) return "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/search\nstatus=200\nquery=R36S streaming specs\ntitle=R36S Streaming Specs\nexcerpt=Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.";
+    if (contains(prompt, "[WEB_DOSSIER v1]") or contains(prompt, "tool phase is closed")) {
+        return "STREAM_A aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa STREAM_B bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nPHENOM_WEB_FINAL_STREAMED";
+    }
+    return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S streaming specs</parameter><parameter=reason>buscar dados tecnicos externos</parameter></function></tool_call>";
+}
+
 fn lengthUsageContinuationCompletion(prompt: []const u8) []const u8 {
-    if (contains(prompt, "Previous visible answer stopped because the server reached the generation length limit")) {
+    if (contains(prompt, "Previous visible answer stopped because the server reached the generation length limit") or contains(prompt, "mode: finalization_repair")) {
         return "a e finalizada pelo proprio modelo.\nPHENOM_LENGTH_USAGE_CONTINUED";
     }
     return "Resposta longa parcial que para no meio da palavr";
@@ -548,7 +568,7 @@ fn lengthUsageContinuationCompletion(prompt: []const u8) []const u8 {
 
 fn webLengthContinuationCompletion(prompt: []const u8) []const u8 {
     if (contains(prompt, "MODEL_DECLARED_QUERY")) return "R36S especificacoes tecnicas console";
-    if (contains(prompt, "Previous visible answer stopped because the server reached the generation length limit")) {
+    if (contains(prompt, "Previous visible answer stopped because the server reached the generation length limit") or contains(prompt, "mode: finalization_repair")) {
         return "a e finalizada pelo proprio modelo.\nPHENOM_WEB_LENGTH_CONTINUED";
     }
     if (contains(prompt, "[WEB_DOSSIER v1]") or contains(prompt, "tool phase is closed")) {
@@ -613,6 +633,7 @@ fn searchHtml(state: *ServerState, request_line: []const u8, search_count: usize
         else
             "<html><head><title>R36S Fanout Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
         .web_provider_fanout => providerFanoutHtml(request_line),
+        .web_final_streaming => "<html><head><title>R36S Streaming Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
         .web_length_continuation => "<html><head><title>R36S Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
         .length_usage_continuation => "<html><head><title>unused</title></head><body></body></html>",
         .web_source_followup => std.fmt.bufPrint(
@@ -667,6 +688,7 @@ fn scenarioPrompt(scenario: Scenario) []const u8 {
         .web_cache_reuse, .web_cache_expiry => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_CACHE_REUSED.",
         .web_query_fanout => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_QUERY_FANOUT.",
         .web_provider_fanout => "busque as especificacoes tecnicas do console R36S em provedores web. pesquise na internet. Responda contendo PHENOM_WEB_PROVIDER_FANOUT.",
+        .web_final_streaming => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda resposta media contendo PHENOM_WEB_FINAL_STREAMED.",
         .length_usage_continuation => "responda uma frase longa e termine contendo PHENOM_LENGTH_USAGE_CONTINUED.",
         .web_length_continuation => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_LENGTH_CONTINUED.",
         .web_language, .web_language_empty => "Usuario esta usando o idioma operacional 'user-lang-a'. Pesquise e explique nesse idioma operacional o que entra no custo de uma casa off-grid solar. Responda contendo PHENOM_WEB_LANG_USER.",
@@ -682,6 +704,7 @@ fn scenarioExpect(scenario: Scenario) []const u8 {
         .web_cache_reuse, .web_cache_expiry => "PHENOM_WEB_CACHE_REUSED",
         .web_query_fanout => "PHENOM_WEB_QUERY_FANOUT",
         .web_provider_fanout => "PHENOM_WEB_PROVIDER_FANOUT",
+        .web_final_streaming => "PHENOM_WEB_FINAL_STREAMED",
         .length_usage_continuation => "PHENOM_LENGTH_USAGE_CONTINUED",
         .web_length_continuation => "PHENOM_WEB_LENGTH_CONTINUED",
         .web_language, .web_language_empty => "PHENOM_WEB_LANG_USER",
@@ -717,6 +740,24 @@ fn sendSseWithUsage(client: c_int, text: []const u8, input_tokens: usize, output
     try stream.print("data: {{\"content\":\"", .{});
     try appendJsonStringBytes(&stream, text);
     try stream.print("\",\"done\":true,\"prompt_eval_count\":{},\"eval_count\":{}}}\n\n", .{ input_tokens, output_tokens });
+    try send(client, "200 OK", "text/event-stream", stream.buffered());
+}
+
+fn sendSseChunkedText(client: c_int, text: []const u8, chunk_bytes: usize) !void {
+    var body_buf: [8192]u8 = undefined;
+    var stream = std.Io.Writer.fixed(&body_buf);
+    var index: usize = 0;
+    while (index < text.len) {
+        const end = @min(index + chunk_bytes, text.len);
+        try stream.print("data: {{\"content\":\"", .{});
+        try appendJsonStringBytes(&stream, text[index..end]);
+        if (end == text.len) {
+            try stream.print("\",\"stop\":true}}\n\n", .{});
+        } else {
+            try stream.print("\"}}\n\n", .{});
+        }
+        index = end;
+    }
     try send(client, "200 OK", "text/event-stream", stream.buffered());
 }
 
