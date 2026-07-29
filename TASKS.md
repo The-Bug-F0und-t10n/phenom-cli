@@ -12220,3 +12220,58 @@ Invariantes afetadas:
 Risco residual:
 
 - Fan-out ainda e sequencial e usa variantes estruturais locais. Proxima lacuna: politica multi-provedor/paralela com ranking por cobertura e qualidade, ainda sem aumentar a surface de tools do modelo.
+
+## T334 - RAG Web etapa 7: fan-out multi-provider por configuracao
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: T333 criou fan-out de variantes, mas ainda dependia de um unico provider/template. Quando o primeiro provider retorna pagina vazia, bloqueio, challenge ou resultado pobre, o agente precisa tentar outro provider sem pedir uma segunda tool call ao modelo e sem alterar a resposta final.
+
+Passos de implementacao:
+
+1. Permitir lista de templates em `web_search_url` ou `PHENOM_WEB_SEARCH_URL`, delimitada por `;` ou newline.
+2. Manter compatibilidade: valor unico continua funcionando.
+3. Usar o primeiro template como `target` primario para auditoria e cache.
+4. Cruzar providers e variantes dentro de `fetchQueryFanout`, com dedupe de URLs resolvidas.
+5. Limitar a lista a 3 templates para preservar latencia e budget.
+6. Parar a coleta quando um provider/variante produz `has_direct_excerpt`.
+7. Adicionar smoke real `web_provider_fanout`: provider 1 vazio, provider 2 com evidencia forte, uma unica tool call visivel.
+
+Implementacao:
+
+- `phenom-zig/src/web_rag.zig`: `buildSearchTemplates`, `appendSearchTemplate`, `searchTemplateSource` e `firstWebSearchTemplate`.
+- `phenom-zig/src/web_rag.zig`: `fetchQueryFanout` agora percorre `templates x variants` e agrega os resultados em um unico pacote.
+- `phenom-zig/src/agent_flow_smoke.zig`: cenario `web_provider_fanout` usa `web_search_url = "provider1;provider2"` e valida duas coletas HTTP internas.
+
+Criterio de aceite:
+
+- Config antiga com um unico `web_search_url` permanece valida.
+- Config multi-template faz fallback para o segundo provider quando o primeiro nao traz evidencia direta.
+- O modelo ainda ve uma unica execucao operacional de `web_search`, com evidencia agregada.
+- `assistant_delta` continua sendo texto final do modelo, sem JSON/tool leak.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-web-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/web_rag.zig -lc -lsqlite3 --cache-dir /tmp/phenom-web-rag-test` -> passou; 89 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-main-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; 464 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-smoke-local-cache bin/zig-x86_64-linux-0.16.0/zig build agent-flow-smoke` -> passou; inclui `web_provider_fanout`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-build-local-cache bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+
+Evidencia real do smoke:
+
+- `tool_start|web_search target=http://127.0.0.1:33777/search-empty?q=R36S%20provider%20specs query_bytes=19 budget_bytes=8192`
+- `web_search_fanout|count=2 primary_target=http://127.0.0.1:33777/search-empty?q=R36S%20provider%20specs`
+- `assistant_delta|Specs verificadas por provider fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320. PHENOM_WEB_PROVIDER_FANOUT`
+- `expectation_passed|PHENOM_WEB_PROVIDER_FANOUT`
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; cada provider entra como evidencia destilada.
+- 6. Falha de modelo nao parece falha de infraestrutura: ampliada; provider fraco nao encerra prematuramente a coleta.
+- 7. Cada turno consegue ser auditado e reproduzido: ampliada; alvo primario, contagem e pacote agregado registram o fallback.
+
+Risco residual:
+
+- Fan-out multi-provider ainda e sequencial. Paralelismo real exige cuidado com allocator/IO em threads e deve entrar como etapa propria, com teste de cancelamento e limite de concorrencia.

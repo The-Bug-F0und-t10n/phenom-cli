@@ -116,6 +116,13 @@ pub fn fetchQueryFanout(allocator: std.mem.Allocator, io: std.Io, query: []const
     }
     if (variants.items.len == 0) return error.MissingWebSearchQuery;
 
+    var templates = try buildSearchTemplates(allocator, configured_template);
+    defer {
+        for (templates.items) |template| allocator.free(template);
+        templates.deinit(allocator);
+    }
+    if (templates.items.len == 0) return error.MissingWebSearchTarget;
+
     var results = std.ArrayList(Result).empty;
     errdefer {
         for (results.items) |result| result.deinit(allocator);
@@ -123,14 +130,16 @@ pub fn fetchQueryFanout(allocator: std.mem.Allocator, io: std.Io, query: []const
     }
 
     const per_fetch_budget = @max(@as(usize, 1024), @min(budget_bytes, @as(usize, 4096)));
-    for (variants.items) |variant| {
-        const target = try resolveSearchTargetWithTemplate(allocator, null, variant, configured_template);
-        defer allocator.free(target);
-        if (hasFetchedTarget(results.items, target)) continue;
-        var result = try fetch(allocator, io, target, variant, per_fetch_budget);
-        result.fanout_count = results.items.len + 1;
-        try results.append(allocator, result);
-        if (result.has_direct_excerpt) break;
+    outer: for (templates.items) |template| {
+        for (variants.items) |variant| {
+            const target = try resolveSearchTargetFromTemplate(allocator, template, variant);
+            defer allocator.free(target);
+            if (hasFetchedTarget(results.items, target)) continue;
+            var result = try fetch(allocator, io, target, variant, per_fetch_budget);
+            result.fanout_count = results.items.len + 1;
+            try results.append(allocator, result);
+            if (result.has_direct_excerpt) break :outer;
+        }
     }
 
     if (results.items.len == 0) return error.MissingWebSearchTarget;
@@ -230,6 +239,31 @@ fn hasFetchedTarget(results: []const Result, target: []const u8) bool {
         if (std.mem.eql(u8, result.target, target)) return true;
     }
     return false;
+}
+
+fn buildSearchTemplates(allocator: std.mem.Allocator, configured_template: ?[]const u8) !std.ArrayList([]u8) {
+    var templates = std.ArrayList([]u8).empty;
+    errdefer {
+        for (templates.items) |template| allocator.free(template);
+        templates.deinit(allocator);
+    }
+    const source = searchTemplateSource(configured_template) orelse return templates;
+    var it = std.mem.tokenizeAny(u8, source, ";\n");
+    while (it.next()) |raw| {
+        const template = std.mem.trim(u8, raw, " \t\r\n");
+        if (template.len == 0) continue;
+        try appendSearchTemplate(allocator, &templates, template);
+        if (templates.items.len >= 3) break;
+    }
+    return templates;
+}
+
+fn appendSearchTemplate(allocator: std.mem.Allocator, templates: *std.ArrayList([]u8), template: []const u8) !void {
+    _ = std.mem.indexOf(u8, template, "{query}") orelse return error.InvalidWebSearchTemplate;
+    for (templates.items) |existing| {
+        if (std.mem.eql(u8, existing, template)) return;
+    }
+    try templates.append(allocator, try allocator.dupe(u8, template));
 }
 
 fn aggregateFanoutResults(allocator: std.mem.Allocator, query: []const u8, budget_bytes: usize, results: std.ArrayList(Result)) !Result {
@@ -370,11 +404,11 @@ pub fn resolveSearchTargetWithTemplate(allocator: std.mem.Allocator, target: ?[]
     }
     const intent = std.mem.trim(u8, query orelse "", " \t\r\n");
     if (intent.len == 0) return error.MissingWebSearchQuery;
-    const template = webSearchTemplate(configured_template) orelse return error.MissingWebSearchTarget;
+    const template = firstWebSearchTemplate(configured_template) orelse return error.MissingWebSearchTarget;
     return resolveSearchTargetFromTemplate(allocator, template, intent);
 }
 
-fn webSearchTemplate(configured_template: ?[]const u8) ?[]const u8 {
+fn searchTemplateSource(configured_template: ?[]const u8) ?[]const u8 {
     if (c.getenv("PHENOM_WEB_SEARCH_URL")) |template_z| {
         const template = std.mem.trim(u8, std.mem.span(template_z), " \t\r\n");
         if (template.len > 0) return template;
@@ -384,6 +418,16 @@ fn webSearchTemplate(configured_template: ?[]const u8) ?[]const u8 {
         if (template.len > 0) return template;
     }
     return default_search_template;
+}
+
+fn firstWebSearchTemplate(configured_template: ?[]const u8) ?[]const u8 {
+    const source = searchTemplateSource(configured_template) orelse return null;
+    var it = std.mem.tokenizeAny(u8, source, ";\n");
+    while (it.next()) |raw| {
+        const template = std.mem.trim(u8, raw, " \t\r\n");
+        if (template.len > 0) return template;
+    }
+    return null;
 }
 
 pub fn resolveSearchTargetFromTemplate(allocator: std.mem.Allocator, template: []const u8, query: []const u8) ![]u8 {
@@ -1557,6 +1601,19 @@ test "query fanout variants are normalized bounded and deduped" {
     try std.testing.expectEqualStrings("R36S especificacoes tecnicas console? preço ficha completa extra palavra longa", variants.items[0]);
     try std.testing.expectEqualStrings("R36S especificacoes tecnicas console preço ficha completa extra palavra longa", variants.items[1]);
     try std.testing.expectEqualStrings("R36S especificacoes tecnicas console preço ficha completa extra palavra", variants.items[2]);
+}
+
+test "web search template list is bounded and deduped" {
+    var templates = try buildSearchTemplates(std.testing.allocator, "https://one.test/search?q={query}; https://one.test/search?q={query}\nhttps://two.test/search?q={query};https://three.test/search?q={query};https://four.test/search?q={query}");
+    defer {
+        for (templates.items) |template| std.testing.allocator.free(template);
+        templates.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), templates.items.len);
+    try std.testing.expectEqualStrings("https://one.test/search?q={query}", templates.items[0]);
+    try std.testing.expectEqualStrings("https://two.test/search?q={query}", templates.items[1]);
+    try std.testing.expectEqualStrings("https://three.test/search?q={query}", templates.items[2]);
 }
 
 test "duckduckgo result urls become web evidence source urls" {

@@ -18,6 +18,7 @@ const Scenario = enum {
     web_cache_reuse,
     web_cache_expiry,
     web_query_fanout,
+    web_provider_fanout,
     web_language,
     web_language_empty,
 };
@@ -70,6 +71,7 @@ pub fn main(init: std.process.Init) !void {
     try runCacheReuseScenario(allocator, init.io, bin);
     try runCacheExpiryScenario(allocator, init.io, bin);
     try runScenario(allocator, init.io, bin, .web_query_fanout);
+    try runScenario(allocator, init.io, bin, .web_provider_fanout);
     try runScenario(allocator, init.io, bin, .web_language);
     try runScenario(allocator, init.io, bin, .web_language_empty);
     writeFd(1, "agent-flow-smoke: ok\n");
@@ -113,7 +115,10 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
     std.Io.Dir.cwd().deleteTree(io, work) catch {};
     try std.Io.Dir.cwd().createDirPath(io, work);
 
-    const config = try std.fmt.allocPrint(allocator, "web_search_url = \"http://127.0.0.1:{}/search?q={{query}}\"\n", .{state.port});
+    const config = if (scenario == .web_provider_fanout)
+        try std.fmt.allocPrint(allocator, "web_search_url = \"http://127.0.0.1:{}/search-empty?q={{query}};http://127.0.0.1:{}/search?q={{query}}\"\n", .{ state.port, state.port })
+    else
+        try std.fmt.allocPrint(allocator, "web_search_url = \"http://127.0.0.1:{}/search?q={{query}}\"\n", .{state.port});
     defer allocator.free(config);
     var work_dir = try std.Io.Dir.cwd().openDir(io, work, .{});
     defer work_dir.close(io);
@@ -186,6 +191,10 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
     try expectCount(allocator, db_path, "select count(*) from events where kind='turn_error'", 0);
     try expectAtLeast(allocator, db_path, "select count(*) from events where kind='turn_done' and body like '%used_evidence=true%'", 1);
     if (scenario == .web_query_fanout) {
+        try expectCount(allocator, db_path, "select count(*) from events where kind='web_search_fanout'", 1);
+        if (state.search_get_count != 2) return SmokeError.UnexpectedAudit;
+    }
+    if (scenario == .web_provider_fanout) {
         try expectCount(allocator, db_path, "select count(*) from events where kind='web_search_fanout'", 1);
         if (state.search_get_count != 2) return SmokeError.UnexpectedAudit;
     }
@@ -368,6 +377,7 @@ fn serverMain(state: *ServerState) void {
         .web_cache_reuse => 7,
         .web_cache_expiry => 7,
         .web_query_fanout => 5,
+        .web_provider_fanout => 5,
         .web_language => 4,
         .web_language_empty => 7,
     };
@@ -434,6 +444,7 @@ fn completionText(state: *ServerState, prompt: []const u8) []const u8 {
         .web_source_followup => sourceFollowupCompletion(state, prompt),
         .web_cache_reuse, .web_cache_expiry => cacheReuseCompletion(prompt),
         .web_query_fanout => queryFanoutCompletion(prompt),
+        .web_provider_fanout => providerFanoutCompletion(prompt),
         .web_language => languageCompletion(prompt, false, state.completion_count),
         .web_language_empty => languageCompletion(prompt, true, state.completion_count),
     };
@@ -473,6 +484,14 @@ fn queryFanoutCompletion(prompt: []const u8) []const u8 {
     if (contains(prompt, "R36S Fanout Specs")) return "Specs verificadas por fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_QUERY_FANOUT";
     if (contains(prompt, "tool phase is closed")) return "Specs verificadas por fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_QUERY_FANOUT";
     return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S especificacoes tecnicas console processador memoria tela resolucao sistema bateria armazenamento</parameter><parameter=reason>buscar dados tecnicos externos</parameter></function></tool_call>";
+}
+
+fn providerFanoutCompletion(prompt: []const u8) []const u8 {
+    if (contains(prompt, "MODEL_DECLARED_QUERY")) return "R36S provider specs";
+    if (contains(prompt, "WEB_EVIDENCE_INPUT")) return "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/search\nstatus=200\nquery=R36S provider specs\ntitle=R36S Provider Specs\nexcerpt=Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.";
+    if (contains(prompt, "R36S Provider Specs")) return "Specs verificadas por provider fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_PROVIDER_FANOUT";
+    if (contains(prompt, "tool phase is closed")) return "Specs verificadas por provider fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_PROVIDER_FANOUT";
+    return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S provider specs</parameter><parameter=reason>buscar dados tecnicos externos</parameter></function></tool_call>";
 }
 
 fn sourceFollowupCompletion(state: *ServerState, prompt: []const u8) []const u8 {
@@ -530,6 +549,10 @@ fn searchHtml(state: *ServerState, request_line: []const u8) []const u8 {
             "<html><head><title>No Direct Support</title></head><body><p>Pagina sem dados relacionados.</p></body></html>"
         else
             "<html><head><title>R36S Fanout Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
+        .web_provider_fanout => if (contains(request_line, "/search-empty"))
+            "<html><head><title>No Provider Support</title></head><body><p>Pagina sem dados relacionados.</p></body></html>"
+        else
+            "<html><head><title>R36S Provider Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
         .web_source_followup => std.fmt.bufPrint(
             &state.completion_buf,
             "<html><head><title>R36S results</title></head><body><article><a href=\"http://127.0.0.1:{}/source-empty\">R36S Specs empty</a><p>Dados tecnicos do console R36S.</p></article><article><a href=\"http://127.0.0.1:{}/source\">R36S Specs source</a><p>Ficha tecnica do console R36S.</p></article></body></html>",
@@ -573,6 +596,7 @@ fn scenarioPrompt(scenario: Scenario) []const u8 {
         .web_source_followup => "busque as informacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_SOURCE_FOLLOWED.",
         .web_cache_reuse, .web_cache_expiry => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_CACHE_REUSED.",
         .web_query_fanout => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_QUERY_FANOUT.",
+        .web_provider_fanout => "busque as especificacoes tecnicas do console R36S em provedores web. pesquise na internet. Responda contendo PHENOM_WEB_PROVIDER_FANOUT.",
         .web_language, .web_language_empty => "Usuario esta usando o idioma operacional 'user-lang-a'. Pesquise e explique nesse idioma operacional o que entra no custo de uma casa off-grid solar. Responda contendo PHENOM_WEB_LANG_USER.",
     };
 }
@@ -585,6 +609,7 @@ fn scenarioExpect(scenario: Scenario) []const u8 {
         .web_source_followup => "PHENOM_WEB_SOURCE_FOLLOWED",
         .web_cache_reuse, .web_cache_expiry => "PHENOM_WEB_CACHE_REUSED",
         .web_query_fanout => "PHENOM_WEB_QUERY_FANOUT",
+        .web_provider_fanout => "PHENOM_WEB_PROVIDER_FANOUT",
         .web_language, .web_language_empty => "PHENOM_WEB_LANG_USER",
     };
 }
