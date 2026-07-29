@@ -381,7 +381,7 @@ const interactive_help_text =
     \\  --model MODEL              model sent to backend
     \\  --thinking auto/on/off     reasoning/template control
     \\  --system-prompt-profile stock/strict  stock profile when Phenom.md is absent
-    \\  --max-tokens N             generation limit sent to backend
+    \\  --max-tokens N             generation limit sent to backend; 0 = backend unlimited
     \\  --no-color                 disable ANSI
     \\  --fail-on-model-error      exit non-zero on model/backend error
     \\  --expect-contains TEXT     require text in visible answer
@@ -878,7 +878,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             try sink.flushDeferredVisible();
         }
         if (sink.completion_stop_reason == .length and sink.visible_bytes > 0) {
-            _ = try repairLengthStoppedVisibleAnswer(allocator, effective_config, prompt, &client, &events, &db, ui_ptr, &sink);
+            try repairLengthStoppedVisibleAnswerUntilStop(allocator, effective_config, prompt, &client, &events, &db, ui_ptr, &sink);
         }
         if (sink.visible_bytes == 0 and rawVisibleContainsToolCall(sink.raw_visible.items)) {
             sink.discardDeferredVisible();
@@ -1331,6 +1331,7 @@ fn renderEmptyVisibleAnswerMessage(allocator: std.mem.Allocator, sink: *const St
 
 fn tokenLimitStopReason(reason: http.StopReason, final_output_tokens: ?usize, max_tokens: u16) http.StopReason {
     if (reason != .unknown) return reason;
+    if (max_tokens == 0) return reason;
     const output = final_output_tokens orelse return reason;
     if (output >= @as(usize, max_tokens)) return .length;
     return reason;
@@ -5268,6 +5269,7 @@ fn repairLengthStoppedVisibleAnswer(
     try repair_sink.flush();
     repair_sink.promoteTokenLimitStop(config.max_tokens);
 
+    const repair_stop_reason = repair_sink.completion_stop_reason;
     aggregate_sink.mergeGenerationStop(repair_sink);
     if (repair_sink.visible_bytes == 0) {
         const detail = try std.fmt.allocPrint(
@@ -5281,9 +5283,34 @@ fn repairLengthStoppedVisibleAnswer(
         return false;
     }
     try aggregate_sink.absorbEmittedVisible(&repair_sink);
+    if (repair_stop_reason != .length) aggregate_sink.completion_stop_reason = repair_stop_reason;
     repair_sink.raw_visible.clearRetainingCapacity();
     try db.recordEvent(config.session, "answer_repair_done", "server length continuation emitted visible answer");
     return true;
+}
+
+fn repairLengthStoppedVisibleAnswerUntilStop(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+) !void {
+    var iterations: usize = 0;
+    while (aggregate_sink.completion_stop_reason == .length and aggregate_sink.visible_bytes > 0) {
+        if (iterations >= max_tool_emergency_iterations) {
+            try db.recordEvent(config.session, "answer_repair_blocked", "length continuation emergency limit reached");
+            try db.recordTurnError(config.session, .model_protocol, "length_stop_continuation", "length continuation emergency limit reached");
+            return;
+        }
+        const before = aggregate_sink.visible_bytes;
+        iterations += 1;
+        const repaired = try repairLengthStoppedVisibleAnswer(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink);
+        if (!repaired or aggregate_sink.visible_bytes <= before) return;
+    }
 }
 
 fn parseSearchPlanTerms(allocator: std.mem.Allocator, visible: []const u8) !?[]u8 {
@@ -8506,6 +8533,7 @@ test "final token usage at max tokens promotes unknown stop to length" {
     try std.testing.expectEqual(http.StopReason.length, tokenLimitStopReason(.unknown, 512, 512));
     try std.testing.expectEqual(http.StopReason.unknown, tokenLimitStopReason(.unknown, 511, 512));
     try std.testing.expectEqual(http.StopReason.stop, tokenLimitStopReason(.stop, 512, 512));
+    try std.testing.expectEqual(http.StopReason.unknown, tokenLimitStopReason(.unknown, 512, 0));
 }
 
 test "initial context no longer forces protocol repair" {

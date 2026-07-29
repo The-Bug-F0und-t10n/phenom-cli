@@ -12803,3 +12803,67 @@ Invariantes afetadas:
 Risco residual:
 
 - A guarda de protocolo protege sintaxe explicita de tool/protocolo com uma janela curta. Ela nao tenta classificar intencao semantica do texto final; isso e deliberado para nao reduzir a capacidade operacional do modelo.
+
+## T345 - Output medio/longo nao corta quando a continuacao tambem para por length
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: o log real mostrou resposta visivel cortada no meio de frase (`dependendo do brilho da`). O audit local confirmou que nao era mais o bug de buffer do T343/T344. A causa raiz era dupla:
+
+- A primeira geracao final parava por `length` e o agente chamava uma continuacao.
+- Se a continuacao tambem parava por `length`, o agente fazia apenas um reparo e podia finalizar como `ok` com texto ainda incompleto.
+- Quando uma continuacao terminava com `stop=true` sem motivo textual explicito, `mergeGenerationStop` preservava o `length` anterior, fazendo o loop pedir nova continuacao sem novo sinal objetivo.
+- O default do CLI ainda enviava teto de geracao ao backend; isso contrariava a regra de que o agente nao deve reduzir a capacidade operacional do modelo por padrao.
+
+Referencia consultada:
+
+- `alinhamento.md` A2: tool/protocolo deve ser oculto, mas o texto final do modelo precisa ser preservado.
+- `alinhamento.md` A3: contexto/evidencia devem potencializar o modelo; o controller valida estado e parada, nao reescreve conteudo.
+- `TASKS.md` regra canonica: resposta final nao deve ser substituida por sintese deterministica do controller.
+
+Passos de implementacao:
+
+1. Manter o texto do modelo em stream e chamar continuacoes sucessivas enquanto houver sinal objetivo `length`.
+2. Encerrar o loop quando a continuacao atual nao provar novo `length`; nao carregar o `length` antigo para sempre.
+3. Alterar `max_tokens=0` para significar geracao ilimitada do ponto de vista do agente.
+4. Traduzir `max_tokens=0` para `n_predict=-1` em llama.cpp e `num_predict=-1` em Ollama.
+5. Nao promover `eval_count >= max_tokens` para `length` quando `max_tokens=0`.
+6. Criar smoke que reproduz resposta web inicial cortada, primeira continuacao cortada e segunda continuacao final.
+
+Implementacao:
+
+- `phenom-zig/src/cli.zig`: default `max_tokens=0`; help documenta `0 = backend unlimited`.
+- `phenom-zig/src/http.zig`: `generationTokenLimit()` converte `0` em `-1` para backends suportados; teste cobre llama.cpp e Ollama.
+- `phenom-zig/src/main.zig`: `repairLengthStoppedVisibleAnswerUntilStop()` encadeia continuacoes ate a parada deixar de ser `length`, com fusivel operacional existente.
+- `phenom-zig/src/main.zig`: `repairLengthStoppedVisibleAnswer()` atualiza o estado agregado com a parada da continuacao atual; `length` anterior nao fica preso depois de uma continuacao normal.
+- `phenom-zig/src/main.zig`: `tokenLimitStopReason()` ignora promocao local quando `max_tokens=0`.
+- `phenom-zig/src/agent_flow_smoke.zig`: adiciona `web_multi_length_continuation`.
+
+Criterio de aceite:
+
+- Output medio/longo continua em stream e nao finaliza no primeiro corte.
+- Se a continuacao tambem bate `length`, o agente chama nova continuacao.
+- O agente nao imprime mensagem operacional de limite para o usuario.
+- O agente nao reescreve a resposta final; apenas pede continuacao ao modelo.
+- Default do produto nao envia teto curto ao backend.
+- `turn_done` final fica `status=ok` somente depois do marcador final visivel no smoke.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-multi-length-test3 bin/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-multi-length-build3 bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-multi-length-smoke bin/zig-x86_64-linux-0.16.0/zig build agent-flow-smoke` -> passou fora do sandbox por requerer socket loopback; inclui `web_multi_length_continuation`.
+- Audit real do smoke `web_multi_length_continuation`: `assistant_delta=3`, `answer_repair=2`, `answer_repair_done=2`, `answer_repair_blocked=0`, `turn_error=0`, `PHENOM_WEB_MULTI_LENGTH_CONTINUED` aparece no delta final.
+
+Invariantes afetadas:
+
+- 1. Tool nao anunciada nunca executa: preservada; continuacao roda sem schema de tool ativo.
+- 2. Contexto bruto nao vaza para o modelo: preservada; continuacao recebe apenas a resposta parcial compactada como contexto operacional.
+- 6. Falha de modelo nao parece falha de infraestrutura: reforcada; `length` vira reparo operacional auditado.
+- 7. Cada turno consegue ser auditado e reproduzido: reforcada; audit mostra deltas, reparos, uso de tokens e fechamento do turno.
+
+Risco residual:
+
+- `max_tokens=0` delega o limite efetivo ao backend/contexto. Em uso interativo, cancelamento por `Esc` continua sendo o mecanismo de controle humano para respostas longas demais.

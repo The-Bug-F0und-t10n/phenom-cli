@@ -23,6 +23,7 @@ const Scenario = enum {
     web_final_streaming,
     length_usage_continuation,
     web_length_continuation,
+    web_multi_length_continuation,
     web_language,
     web_language_empty,
 };
@@ -79,6 +80,7 @@ pub fn main(init: std.process.Init) !void {
     try runScenario(allocator, init.io, bin, .web_final_streaming);
     try runScenario(allocator, init.io, bin, .length_usage_continuation);
     try runScenario(allocator, init.io, bin, .web_length_continuation);
+    try runScenario(allocator, init.io, bin, .web_multi_length_continuation);
     try runScenario(allocator, init.io, bin, .web_language);
     try runScenario(allocator, init.io, bin, .web_language_empty);
     writeFd(1, "agent-flow-smoke: ok\n");
@@ -232,6 +234,16 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
         try expectCount(allocator, db_path, "select count(*) from events where kind='answer_repair' and body='server length stop with partial visible answer'", 1);
         try expectCount(allocator, db_path, "select count(*) from events where kind='answer_repair_done' and body='server length continuation emitted visible answer'", 1);
         try expectAtLeast(allocator, db_path, "select count(*) from events where kind='assistant_delta' and body like '%CONTINUED%'", 1);
+    }
+    if (scenario == .web_multi_length_continuation) {
+        if (contains(result.stdout, "generation limit") or contains(result.stdout, "token limit")) {
+            dumpChildOutput(result.stdout, result.stderr);
+            return SmokeError.ProtocolLeak;
+        }
+        try expectCount(allocator, db_path, "select count(*) from events where kind='answer_repair' and body='server length stop with partial visible answer'", 2);
+        try expectCount(allocator, db_path, "select count(*) from events where kind='answer_repair_done' and body='server length continuation emitted visible answer'", 2);
+        try expectAtLeast(allocator, db_path, "select count(*) from events where kind='assistant_delta' and body like '%PHENOM_WEB_MULTI_LENGTH_CONTINUED%'", 1);
+        try expectCount(allocator, db_path, "select count(*) from events where kind='answer_repair_blocked'", 0);
     }
 
     _ = c.shutdown(state.fd, c.SHUT_RDWR);
@@ -409,6 +421,7 @@ fn serverMain(state: *ServerState) void {
         .web_final_streaming => 5,
         .length_usage_continuation => 2,
         .web_length_continuation => 5,
+        .web_multi_length_continuation => 5,
         .web_language => 4,
         .web_language_empty => 7,
     };
@@ -481,6 +494,9 @@ fn handleClient(state: *ServerState, client: c_int) !void {
         if (state.scenario == .web_length_continuation and contains(text, "Resposta web parcial")) {
             return sendSseWithUsage(client, text, 64, 512);
         }
+        if (state.scenario == .web_multi_length_continuation and contains(text, "MULTI_LENGTH_PARTIAL")) {
+            return sendSseWithUsage(client, text, 64, 512);
+        }
         if (state.scenario == .web_final_streaming and contains(text, "PHENOM_WEB_FINAL_STREAMED")) {
             return sendSseChunkedText(client, text, 300);
         }
@@ -501,6 +517,7 @@ fn completionText(state: *ServerState, prompt: []const u8) []const u8 {
         .web_final_streaming => webFinalStreamingCompletion(prompt),
         .length_usage_continuation => lengthUsageContinuationCompletion(prompt),
         .web_length_continuation => webLengthContinuationCompletion(prompt),
+        .web_multi_length_continuation => webMultiLengthContinuationCompletion(state, prompt),
         .web_language => languageCompletion(prompt, false, state.completion_count),
         .web_language_empty => languageCompletion(prompt, true, state.completion_count),
     };
@@ -577,6 +594,21 @@ fn webLengthContinuationCompletion(prompt: []const u8) []const u8 {
     return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S especificacoes tecnicas console</parameter><parameter=reason>buscar dados tecnicos externos</parameter></function></tool_call>";
 }
 
+fn webMultiLengthContinuationCompletion(state: *ServerState, prompt: []const u8) []const u8 {
+    if (contains(prompt, "MODEL_DECLARED_QUERY")) return "R36S especificacoes tecnicas console multi length";
+    if (contains(prompt, "WEB_EVIDENCE_INPUT")) return "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/search\nstatus=200\nquery=R36S especificacoes tecnicas console multi length\ntitle=R36S Specs\nexcerpt=Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.";
+    if (contains(prompt, "mode: finalization_repair") and state.completion_count <= 3) {
+        return "MULTI_LENGTH_PARTIAL continuacao ainda incompleta no meio da frase ";
+    }
+    if (contains(prompt, "mode: finalization_repair")) {
+        return "finalizada pelo modelo.\nPHENOM_WEB_MULTI_LENGTH_CONTINUED";
+    }
+    if (contains(prompt, "[WEB_DOSSIER v1]") or contains(prompt, "tool phase is closed")) {
+        return "MULTI_LENGTH_PARTIAL resposta web inicial cortada no meio da frase ";
+    }
+    return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S especificacoes tecnicas console multi length</parameter><parameter=reason>buscar dados tecnicos externos</parameter></function></tool_call>";
+}
+
 fn sourceFollowupCompletion(state: *ServerState, prompt: []const u8) []const u8 {
     if (contains(prompt, "MODEL_DECLARED_QUERY")) return "R36S especificacoes tecnicas RK3326 RAM tela";
     if (contains(prompt, "WEB_EVIDENCE_INPUT") and modelWebTargetContains(prompt, "/source-empty")) {
@@ -635,6 +667,7 @@ fn searchHtml(state: *ServerState, request_line: []const u8, search_count: usize
         .web_provider_fanout => providerFanoutHtml(request_line),
         .web_final_streaming => "<html><head><title>R36S Streaming Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
         .web_length_continuation => "<html><head><title>R36S Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
+        .web_multi_length_continuation => "<html><head><title>R36S Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
         .length_usage_continuation => "<html><head><title>unused</title></head><body></body></html>",
         .web_source_followup => std.fmt.bufPrint(
             &state.completion_buf,
@@ -691,6 +724,7 @@ fn scenarioPrompt(scenario: Scenario) []const u8 {
         .web_final_streaming => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda resposta media contendo PHENOM_WEB_FINAL_STREAMED.",
         .length_usage_continuation => "responda uma frase longa e termine contendo PHENOM_LENGTH_USAGE_CONTINUED.",
         .web_length_continuation => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_LENGTH_CONTINUED.",
+        .web_multi_length_continuation => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_MULTI_LENGTH_CONTINUED.",
         .web_language, .web_language_empty => "Usuario esta usando o idioma operacional 'user-lang-a'. Pesquise e explique nesse idioma operacional o que entra no custo de uma casa off-grid solar. Responda contendo PHENOM_WEB_LANG_USER.",
     };
 }
@@ -707,6 +741,7 @@ fn scenarioExpect(scenario: Scenario) []const u8 {
         .web_final_streaming => "PHENOM_WEB_FINAL_STREAMED",
         .length_usage_continuation => "PHENOM_LENGTH_USAGE_CONTINUED",
         .web_length_continuation => "PHENOM_WEB_LENGTH_CONTINUED",
+        .web_multi_length_continuation => "PHENOM_WEB_MULTI_LENGTH_CONTINUED",
         .web_language, .web_language_empty => "PHENOM_WEB_LANG_USER",
     };
 }
@@ -721,6 +756,7 @@ fn expectedWebSearchStarts(scenario: Scenario) i64 {
         .web_source_followup => 3,
         .length_usage_continuation => 0,
         .web_length_continuation => 1,
+        .web_multi_length_continuation => 1,
         else => 1,
     };
 }

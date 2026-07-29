@@ -221,7 +221,7 @@ pub const LocalModelClient = struct {
                 break :blk try std.fmt.allocPrint(
                     self.allocator,
                     "{{\"stream\":true,\"prompt\":\"{s}\",\"temperature\":0.2,\"cache_prompt\":true,\"n_predict\":{},\"stop\":[\"<|im_end|>\"]}}",
-                    .{ escaped_chat_prompt, input.max_tokens },
+                    .{ escaped_chat_prompt, generationTokenLimit(input.max_tokens) },
                 );
             },
         };
@@ -252,8 +252,12 @@ pub const LocalModelClient = struct {
         return std.fmt.allocPrint(
             self.allocator,
             "{{\"model\":\"{s}\",\"stream\":true,\"messages\":[{s}],\"options\":{{\"temperature\":0.2,\"num_predict\":{}}}}}",
-            .{ escaped_model, messages.items, max_tokens },
+            .{ escaped_model, messages.items, generationTokenLimit(max_tokens) },
         );
+    }
+
+    fn generationTokenLimit(max_tokens: u16) i32 {
+        return if (max_tokens == 0) -1 else @intCast(max_tokens);
     }
 
     fn buildLlamaCppPrompt(self: *LocalModelClient, input: InferenceInput, generation_prefix: []const u8) ![]u8 {
@@ -1797,6 +1801,30 @@ test "request body sets generation token limit for supported backends" {
     const ollama_body = try ollama_client.buildBodyForInput(.{ .user_prompt = "explique com detalhes", .max_tokens = 96 });
     defer std.testing.allocator.free(ollama_body);
     try std.testing.expect(std.mem.indexOf(u8, ollama_body, "\"num_predict\":96") != null);
+}
+
+test "zero generation token limit asks supported backends for unlimited generation" {
+    var llama_client = LocalModelClient{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1:11434",
+        .backend = .llamacpp,
+        .model = "phenom:latest",
+        .thinking = .off,
+    };
+    const llama_body = try llama_client.buildBodyForInput(.{ .user_prompt = "explique com detalhes", .max_tokens = 0 });
+    defer std.testing.allocator.free(llama_body);
+    try std.testing.expect(std.mem.indexOf(u8, llama_body, "\"n_predict\":-1") != null);
+
+    var ollama_client = LocalModelClient{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1:11434",
+        .backend = .ollama,
+        .model = "phenom:latest",
+        .thinking = .off,
+    };
+    const ollama_body = try ollama_client.buildBodyForInput(.{ .user_prompt = "explique com detalhes", .max_tokens = 0 });
+    defer std.testing.allocator.free(ollama_body);
+    try std.testing.expect(std.mem.indexOf(u8, ollama_body, "\"num_predict\":-1") != null);
 }
 
 test "llamacpp thinking on opens reasoning block" {

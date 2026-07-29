@@ -31,7 +31,7 @@ pub const Config = struct {
     host: []const u8 = "127.0.0.1:11434",
     model: []const u8 = "llama3.2",
     backend: Backend = .ollama,
-    max_tokens: u16 = 4096,
+    max_tokens: u16 = 0,
     thinking: ThinkingMode = .auto,
     no_color: bool = false,
     offline: bool = false,
@@ -160,7 +160,7 @@ pub fn printUsage(writer: anytype) !void {
         \\
         \\options:
         \\  --no-color
-        \\  --max-tokens N (generation token limit sent to supported backends)
+        \\  --max-tokens N (generation token limit sent to supported backends; 0 = backend unlimited)
         \\  --thinking auto|on|off
         \\  --system-prompt-profile stock|strict
         \\  --fail-on-model-error
