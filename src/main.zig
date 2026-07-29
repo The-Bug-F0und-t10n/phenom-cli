@@ -479,11 +479,12 @@ fn runCreateCustomPromptCommand(
         .thinking = std.ArrayList(u8).empty,
     };
     defer sink.deinit();
-    client.streamInference(.{
+    streamInferenceWithUiCancel(&client, .{
         .user_prompt = generator_prompt,
         .system_prompt = effectiveSystemPrompt(config),
         .max_tokens = @min(config.max_tokens, 1800),
-    }, &sink) catch |err| {
+    }, ui_ptr, &sink) catch |err| {
+        if (err == error.Cancelled) return err;
         try db.recordTurnError(config.session, .infrastructure, "create_custom_prompt", @errorName(err));
         return std.fmt.allocPrint(allocator, "Nao foi possivel criar Phenom.md: modelo falhou com {s}.", .{@errorName(err)});
     };
@@ -2767,7 +2768,7 @@ fn runOneToolLoopStep(
     defer result.deinit(allocator);
 
     const model_evidence = if (call.http_search == true)
-        try distillWebEvidenceForContext(allocator, config, prompt, explicitHttpTargetFromCall(call) orelse path orelse "<web>", call.terms orelse call.intent, result.evidence_text, client, db, &state.context)
+        try distillWebEvidenceForContext(allocator, config, prompt, explicitHttpTargetFromCall(call) orelse path orelse "<web>", call.terms orelse call.intent, result.evidence_text, client, db, &state.context, ui_ptr)
     else
         try renderEvidenceAndMicroContext(allocator, result.evidence_text, result.micro_context_text);
     defer allocator.free(model_evidence);
@@ -3914,6 +3915,7 @@ fn optimizeWebSearchQueryForFetch(
     declared_query: ?[]const u8,
     client: *http.LocalModelClient,
     db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
 ) !?[]u8 {
     const query = std.mem.trim(u8, declared_query orelse "", " \t\r\n");
     if (query.len == 0) return null;
@@ -3928,10 +3930,11 @@ fn optimizeWebSearchQueryForFetch(
     };
     defer sink.deinit();
 
-    client.streamInference(.{
+    streamInferenceWithUiCancel(client, .{
         .user_prompt = optimize_prompt,
         .max_tokens = 384,
-    }, &sink) catch |err| {
+    }, ui_ptr, &sink) catch |err| {
+        if (err == error.Cancelled) return err;
         try recordWebQueryOptimizationAudit(allocator, db, config.session, query, query, false, @errorName(err));
         return null;
     };
@@ -4101,7 +4104,7 @@ fn runWebSearchStep(
         null;
     defer if (stripped_query) |value| allocator.free(value);
     const fetch_query_input = if (stripped_query) |value| if (std.mem.trim(u8, value, " \t\r\n").len > 0) value else declared_query else declared_query;
-    const optimized_query = try optimizeWebSearchQueryForFetch(allocator, config, prompt, fetch_query_input, client, db);
+    const optimized_query = try optimizeWebSearchQueryForFetch(allocator, config, prompt, fetch_query_input, client, db, ui_ptr);
     defer if (optimized_query) |value| allocator.free(value);
     const query = optimized_query orelse fetch_query_input;
     const target = web_rag.resolveSearchTargetWithTemplate(allocator, explicit_target, query, config.web_search_url) catch |err| {
@@ -4164,7 +4167,7 @@ fn runWebSearchStep(
     };
     defer result.deinit(allocator);
 
-    const distilled_web = try distillWebEvidenceForContextTyped(allocator, config, prompt, target, query, result.evidence_text, client, db, &state.context);
+    const distilled_web = try distillWebEvidenceForContextTyped(allocator, config, prompt, target, query, result.evidence_text, client, db, &state.context, ui_ptr);
     defer distilled_web.deinit(allocator);
     const model_evidence = distilled_web.text;
     const model_context_id = try webEvidenceContextId(allocator, model_evidence);
@@ -6330,8 +6333,9 @@ fn distillWebEvidenceForContext(
     client: *http.LocalModelClient,
     db: *audit.AuditDb,
     context: *const working_context.WorkingContext,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
 ) ![]u8 {
-    const distilled = try distillWebEvidenceForContextTyped(allocator, config, prompt, target, query, local_evidence, client, db, context);
+    const distilled = try distillWebEvidenceForContextTyped(allocator, config, prompt, target, query, local_evidence, client, db, context, ui_ptr);
     return distilled.text;
 }
 
@@ -6345,6 +6349,7 @@ fn distillWebEvidenceForContextTyped(
     client: *http.LocalModelClient,
     db: *audit.AuditDb,
     context: *const working_context.WorkingContext,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
 ) !DistilledWebEvidence {
     const active_summary = try renderWebDistillationContextSummary(allocator, context);
     defer allocator.free(active_summary);
@@ -6363,10 +6368,11 @@ fn distillWebEvidenceForContextTyped(
     client.thinking = .off;
     defer client.thinking = old_thinking;
 
-    client.streamInference(.{
+    streamInferenceWithUiCancel(client, .{
         .user_prompt = distill_prompt,
         .max_tokens = 512,
-    }, &sink) catch |err| {
+    }, ui_ptr, &sink) catch |err| {
+        if (err == error.Cancelled) return err;
         try recordWebDistillationAudit(allocator, db, config.session, target, query, false, @errorName(err), local_evidence.len, local_evidence.len);
         const fallback = try allocator.dupe(u8, local_evidence);
         return .{ .text = fallback, .summary = summarizeWebEvidence(fallback) };
