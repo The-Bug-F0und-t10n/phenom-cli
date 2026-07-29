@@ -197,8 +197,9 @@ pub const WorkingContext = struct {
     }
 
     pub fn remainingBudget(self: WorkingContext) usize {
-        if (self.tool_budget_spent >= self.model_budget_limit) return 0;
-        return self.model_budget_limit - self.tool_budget_spent;
+        const rendered = self.renderedBytes();
+        if (rendered >= self.model_budget_limit) return 0;
+        return self.model_budget_limit - rendered;
     }
 
     pub fn hasBudgetForMoreEvidence(self: WorkingContext) bool {
@@ -532,6 +533,30 @@ test "working context caps oversized active evidence before model rendering" {
     defer WorkingContext.freeRenderedEvidenceBlocks(std.testing.allocator, blocks);
     try std.testing.expect(blocks[0].text.len < max_active_evidence_bytes + 64);
     try std.testing.expect(std.mem.indexOf(u8, blocks[0].text, "[EVIDENCE_TRUNCATED]") != null);
+}
+
+test "working context remaining budget uses rendered compacted bytes" {
+    var ctx = WorkingContext.init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.model_budget_limit = 5000;
+
+    try ctx.remember(.{
+        .path = "large.zig",
+        .terms = "large",
+        .strategy = .path,
+        .start_line = 1,
+        .max_lines = 1,
+        .context_id = "ctx_large",
+        .evidence_text = "x" ** 10000,
+        .model_bytes = 10000,
+        .quality_score = 20,
+    });
+    ctx.compactAll();
+
+    try std.testing.expect(ctx.tool_budget_spent > ctx.model_budget_limit);
+    try std.testing.expect(ctx.renderedBytes() < ctx.model_budget_limit);
+    try std.testing.expect(ctx.remainingBudget() > 0);
+    try std.testing.expect(ctx.shouldAllowMoreEvidence());
 }
 
 test "working context rejects raw model leak markers" {

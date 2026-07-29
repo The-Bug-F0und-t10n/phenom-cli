@@ -12652,3 +12652,51 @@ Invariantes afetadas:
 Risco residual:
 
 - `WorkingContext.remainingBudget` ainda usava soma historica de `tool_budget_spent`; a proxima etapa muda para bytes renderizados/compactados.
+
+## T342 - Context economy etapa 6: WorkingContext budget por contexto renderizado
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: `WorkingContext.remainingBudget` descontava `tool_budget_spent`, acumulado antes da compactacao. Quando evidencias antigas eram transformadas em ancora curta, o agente continuava achando que o budget estava cheio. Isso quebrava contexto dinamico e fazia RAG/cache/graph melhorarem confiabilidade sem entregar economia operacional.
+
+Referencia TS consultada:
+
+- `../phenom-cli-ts/src/use-cases/run-tool-loop.ts`: o loop trabalha com contexto operacional corrente, nao com custo historico bruto como limite de continuidade.
+- `alinhamento.md` A3: raw tool output fica no agente/audit; modelo recebe evidencia destilada selecionada por budget.
+
+Passos de implementacao:
+
+1. Trocar `WorkingContext.remainingBudget` para calcular sobre `renderedBytes()`.
+2. Manter `tool_budget_spent` como metrica historica, sem usa-la como budget visivel.
+3. Preservar compactacao existente.
+4. Testar que evidencia bruta grande compactada libera budget renderizado.
+
+Implementacao:
+
+- `phenom-zig/src/working_context.zig`: `remainingBudget` usa bytes renderizados.
+- `phenom-zig/src/working_context.zig`: teste `working context remaining budget uses rendered compacted bytes`.
+
+Criterio de aceite:
+
+- Budget restante reflete o que sera renderizado para o modelo.
+- Evidencia compactada deixa de bloquear novas coletas so por custo bruto historico.
+- `tool_budget_spent` continua disponivel para auditoria interna.
+- Nao ha heuristica por keyword de prompt.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-working-fail3 bin/zig-x86_64-linux-0.16.0/zig test src/working_context.zig -lc -lsqlite3 --test-filter "remaining budget"` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-build-test4 bin/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-buildonly3 bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+- `.zig-cache/o/41449f8774b7a1698e6685004ef0d677/agent-flow-smoke zig-out/bin/phenom` -> passou fora do sandbox por requerer socket loopback.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; budget considera apenas renderizado/destilado.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; bruto historico continua auditavel, contexto enviado continua medido.
+
+Risco residual:
+
+- Nenhum risco residual conhecido para as seis etapas solicitadas; smokes e unit tests passaram no fluxo implementado.
