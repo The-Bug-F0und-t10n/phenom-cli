@@ -13,6 +13,7 @@ const c = @cImport({
 const Scenario = enum {
     initial_json_web,
     duplicate_web_json,
+    web_query_intent_optimization,
     web_source_followup,
     web_language,
     web_language_empty,
@@ -60,6 +61,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(bin);
     try runScenario(allocator, init.io, bin, .initial_json_web);
     try runScenario(allocator, init.io, bin, .duplicate_web_json);
+    try runScenario(allocator, init.io, bin, .web_query_intent_optimization);
     try runScenario(allocator, init.io, bin, .web_source_followup);
     try runScenario(allocator, init.io, bin, .web_language);
     try runScenario(allocator, init.io, bin, .web_language_empty);
@@ -179,6 +181,10 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
     if (scenario == .duplicate_web_json) {
         try expectAtLeast(allocator, db_path, "select count(*) from events where kind='answer_repair' and body='tool call emitted after tool phase closed'", 1);
     }
+    if (scenario == .web_query_intent_optimization) {
+        try expectAtLeast(allocator, db_path, "select count(*) from events where kind='web_query_optimization' and body like '%success=true%' and body like '%final_query=R36S especificacoes tecnicas console%'", 1);
+        try expectAtLeast(allocator, db_path, "select count(*) from events where kind='tool_start' and body like 'web_search%' and body like '%R36S%20especificacoes%20tecnicas%20console%'", 1);
+    }
 
     _ = c.shutdown(state.fd, c.SHUT_RDWR);
     _ = c.close(state.fd);
@@ -210,6 +216,7 @@ fn serverMain(state: *ServerState) void {
     const max: usize = switch (state.scenario) {
         .initial_json_web => 4,
         .duplicate_web_json => 5,
+        .web_query_intent_optimization => 4,
         .web_source_followup => 9,
         .web_language => 4,
         .web_language_empty => 7,
@@ -272,6 +279,7 @@ fn completionText(state: *ServerState, prompt: []const u8) []const u8 {
     return switch (state.scenario) {
         .initial_json_web => initialJsonCompletion(prompt),
         .duplicate_web_json => duplicateWebCompletion(prompt),
+        .web_query_intent_optimization => queryIntentOptimizationCompletion(prompt),
         .web_source_followup => sourceFollowupCompletion(state, prompt),
         .web_language => languageCompletion(prompt, false, state.completion_count),
         .web_language_empty => languageCompletion(prompt, true, state.completion_count),
@@ -291,6 +299,13 @@ fn duplicateWebCompletion(prompt: []const u8) []const u8 {
     if (contains(prompt, "tool call after the tool phase was closed")) return "A evidencia coletada informa irradiacao solar em Londrina de 4,8 kWh/m2/dia.\nPHENOM_WEB_JSON_NORMALIZED";
     if (contains(prompt, "tool phase is closed")) return "Vou pesquisar de novo. json { \"tool_call\": { \"name\": \"search_web\", \"arguments\": { \"query\": \"irradiacao solar media Londrina PR Atlas Solarimetrico INPE\" } } }";
     return "preciso pesquisar\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>irradiacao solar media Londrina PR kWh m2 dia</parameter><parameter=reason>buscar dado externo solicitado</parameter></function></tool_call>";
+}
+
+fn queryIntentOptimizationCompletion(prompt: []const u8) []const u8 {
+    if (contains(prompt, "MODEL_DECLARED_QUERY")) return "R36S especificacoes tecnicas console";
+    if (contains(prompt, "WEB_EVIDENCE_INPUT")) return "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/search\nstatus=200\nquery=R36S especificacoes tecnicas console\ntitle=R36S Specs\nexcerpt=Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.";
+    if (contains(prompt, "tool phase is closed")) return "Specs verificadas: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_QUERY_INTENT_OPTIMIZED";
+    return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S</parameter><parameter=reason>buscar dados tecnicos externos</parameter></function></tool_call>";
 }
 
 fn sourceFollowupCompletion(state: *ServerState, prompt: []const u8) []const u8 {
@@ -342,6 +357,7 @@ fn searchHtml(scenario: Scenario) []const u8 {
     return switch (scenario) {
         .initial_json_web => "<html><head><title>Londrina Location</title></head><body><p>Londrina fica no norte do Paraná, na região Sul do Brasil.</p></body></html>",
         .duplicate_web_json => "<html><head><title>Londrina Solar</title></head><body><p>Irradiacao solar em Londrina: 4,8 kWh/m2/dia.</p></body></html>",
+        .web_query_intent_optimization => "<html><head><title>R36S Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
         .web_source_followup => "<html><head><title>R36S results</title></head><body><p>result=1 title=R36S Specs url=http://127.0.0.1/source-empty snippet=Dados tecnicos do console R36S</p><p>result=2 title=R36S Specs url=http://127.0.0.1/source snippet=Ficha tecnica do console R36S</p></body></html>",
         .web_language, .web_language_empty => "<html><head><title>Solar Cost</title></head><body><p>Solar off-grid systems require batteries, inverter, panels, and charge controllers.</p></body></html>",
     };
@@ -365,6 +381,7 @@ fn scenarioPrompt(scenario: Scenario) []const u8 {
     return switch (scenario) {
         .initial_json_web => "onde fica localizado Londrina no Brasil , pesquise na internet",
         .duplicate_web_json => "como media a irradiacao solar em Londrina - PR, pesquise na internet. Responda contendo PHENOM_WEB_JSON_NORMALIZED.",
+        .web_query_intent_optimization => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_QUERY_INTENT_OPTIMIZED.",
         .web_source_followup => "busque as informacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_SOURCE_FOLLOWED.",
         .web_language, .web_language_empty => "Usuario esta usando o idioma operacional 'user-lang-a'. Pesquise e explique nesse idioma operacional o que entra no custo de uma casa off-grid solar. Responda contendo PHENOM_WEB_LANG_USER.",
     };
@@ -374,6 +391,7 @@ fn scenarioExpect(scenario: Scenario) []const u8 {
     return switch (scenario) {
         .initial_json_web => "PHENOM_INITIAL_JSON_WEB_OK",
         .duplicate_web_json => "PHENOM_WEB_JSON_NORMALIZED",
+        .web_query_intent_optimization => "PHENOM_WEB_QUERY_INTENT_OPTIMIZED",
         .web_source_followup => "PHENOM_WEB_SOURCE_FOLLOWED",
         .web_language, .web_language_empty => "PHENOM_WEB_LANG_USER",
     };

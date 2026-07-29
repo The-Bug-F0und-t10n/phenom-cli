@@ -3945,9 +3945,9 @@ fn optimizeWebSearchQueryForFetch(
             try recordWebQueryOptimizationAudit(allocator, db, config.session, query, query, false, "lossy_query");
             return null;
         }
-        if (!optimizedQueryKeepsDeclaredTerms(query, value)) {
+        if (!optimizedQueryTermsAreGrounded(prompt, query, value)) {
             allocator.free(value);
-            try recordWebQueryOptimizationAudit(allocator, db, config.session, query, query, false, "enriched_query");
+            try recordWebQueryOptimizationAudit(allocator, db, config.session, query, query, false, "ungrounded_query_term");
             return null;
         }
     }
@@ -3960,7 +3960,7 @@ fn renderWebQueryOptimizationPrompt(allocator: std.mem.Allocator, prompt: []cons
         \\[WEB_QUERY_OPTIMIZATION]
         \\Return exactly one web search query. No prose, no XML, no markdown.
         \\Use USER_TASK and MODEL_DECLARED_QUERY to produce a narrow operational query.
-        \\Preserve MODEL_DECLARED_QUERY coverage. Do not enrich it with facts, entities, roles, categories, locations, nationality, platform, biography, or accusations absent from USER_TASK or MODEL_DECLARED_QUERY.
+        \\Preserve MODEL_DECLARED_QUERY coverage. You may add USER_TASK terms that sharpen the search intent. Do not enrich it with facts, entities, roles, categories, locations, nationality, platform, biography, or accusations absent from USER_TASK or MODEL_DECLARED_QUERY.
         \\Do not invent URLs. Maximum 12 words.
         \\
         \\[USER_TASK]
@@ -4018,12 +4018,12 @@ fn optimizedQueryKeepsDeclaredCoverage(original_query: []const u8, optimized_que
     return covered_terms * 2 >= original_terms;
 }
 
-fn optimizedQueryKeepsDeclaredTerms(original_query: []const u8, optimized_query: []const u8) bool {
+fn optimizedQueryTermsAreGrounded(user_task: []const u8, original_query: []const u8, optimized_query: []const u8) bool {
     var it = std.mem.tokenizeAny(u8, optimized_query, " \t\r\n\"'`()[]{}<>:;,./\\|+-_*=");
     while (it.next()) |raw| {
         const term = std.mem.trim(u8, raw, " \t\r\n");
         if (!significantQueryToken(term)) continue;
-        if (!containsIgnoreCaseAscii(original_query, term)) return false;
+        if (!containsIgnoreCaseAscii(original_query, term) and !containsIgnoreCaseAscii(user_task, term)) return false;
     }
     return true;
 }
@@ -9324,8 +9324,9 @@ test "web query optimization output is one bounded query and rejects tool calls"
 
     try std.testing.expect(!optimizedQueryKeepsDeclaredCoverage("quem criou o kernel Linux", "quem"));
     try std.testing.expect(optimizedQueryKeepsDeclaredCoverage("quem criou o kernel Linux", "criador kernel Linux"));
-    try std.testing.expect(optimizedQueryKeepsDeclaredTerms("console R36S especificacoes tecnicas", "R36S especificacoes tecnicas"));
-    try std.testing.expect(!optimizedQueryKeepsDeclaredTerms("console R36S especificacoes tecnicas", "console R36S especificacoes tecnicas termoExtra"));
+    try std.testing.expect(optimizedQueryTermsAreGrounded("busque especificacoes tecnicas do console R36S", "R36S", "R36S especificacoes tecnicas console"));
+    try std.testing.expect(optimizedQueryTermsAreGrounded("busque specs Wi-Fi Bluetooth do R36S", "R36S", "R36S Wi-Fi Bluetooth specs"));
+    try std.testing.expect(!optimizedQueryTermsAreGrounded("busque especificacoes tecnicas do console R36S", "R36S", "R36S Wi-Fi Bluetooth"));
     try std.testing.expect((try normalizeWebQueryOptimizationOutput(std.testing.allocator, "<tool_call><function=web_search></function></tool_call>")) == null);
 }
 
