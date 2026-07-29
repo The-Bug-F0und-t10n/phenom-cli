@@ -843,6 +843,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             return;
         };
         try sink.flush();
+        sink.promoteTokenLimitStop(config.max_tokens);
         var repaired_think_only_before_tool_loop = false;
         if (enable_tool_loop and sink.hasNoVisibleText() and sink.thinking_bytes > 0 and !rawModelContainsToolEnvelope(sink.raw_model.items)) {
             sink.raw_visible.clearRetainingCapacity();
@@ -1328,6 +1329,13 @@ fn renderEmptyVisibleAnswerMessage(allocator: std.mem.Allocator, sink: *const St
         "[MODEL_EMPTY_ANSWER] no visible final answer; raw_model_bytes={} stop_reason={s}",
         .{ sink.raw_model.items.len, @tagName(sink.completion_stop_reason) },
     );
+}
+
+fn tokenLimitStopReason(reason: http.StopReason, final_output_tokens: ?usize, max_tokens: u16) http.StopReason {
+    if (reason != .unknown) return reason;
+    const output = final_output_tokens orelse return reason;
+    if (output >= @as(usize, max_tokens)) return .length;
+    return reason;
 }
 
 const ToolLoopNext = union(enum) {
@@ -5193,6 +5201,7 @@ fn repairThinkOnlyFinalAnswer(
         return err;
     };
     try repair_sink.flush();
+    repair_sink.promoteTokenLimitStop(config.max_tokens);
 
     aggregate_sink.mergeGenerationStop(repair_sink);
     if (repair_sink.raw_visible.items.len == 0) {
@@ -5284,6 +5293,7 @@ fn repairLengthStoppedVisibleAnswer(
         return err;
     };
     try repair_sink.flush();
+    repair_sink.promoteTokenLimitStop(config.max_tokens);
 
     aggregate_sink.mergeGenerationStop(repair_sink);
     if (repair_sink.raw_visible.items.len == 0) {
@@ -5377,6 +5387,7 @@ fn streamDeferredToolLoopTurnInternal(
         return err;
     };
     try follow_sink.flush();
+    follow_sink.promoteTokenLimitStop(config.max_tokens);
 
     var envelope = (parseToolEnvelopeFromVisibleOrRaw(allocator, follow_sink.raw_visible.items, follow_sink.raw_model.items, active_contract) catch |err| {
         try db.recordEvent(config.session, "tool_envelope_error", @errorName(err));
@@ -7117,6 +7128,7 @@ const StreamSink = struct {
     trim_visible_leading_whitespace: bool = false,
     suppress_thinking: bool = false,
     completion_stop_reason: http.StopReason = .unknown,
+    final_output_tokens: ?usize = null,
 
     pub fn deinit(ctx: *StreamSink) void {
         ctx.filter.deinit();
@@ -7139,6 +7151,7 @@ const StreamSink = struct {
         } });
         if (ctx.ui) |ui| try ui.showTokenUsage(usage.input, usage.output, usage.total, usage.tokens_per_second);
         if (!usage.final) return;
+        ctx.final_output_tokens = usage.output;
         const body = if (usage.tokens_per_second) |tps|
             try std.fmt.allocPrint(ctx.allocator, "input={} output={} total={} tokens_per_second={d:.2} exact=true final=true", .{ usage.input, usage.output, usage.total, tps })
         else
@@ -7153,6 +7166,11 @@ const StreamSink = struct {
 
     fn mergeGenerationStop(ctx: *StreamSink, other: StreamSink) void {
         if (other.completion_stop_reason != .unknown) ctx.completion_stop_reason = other.completion_stop_reason;
+        if (other.final_output_tokens) |tokens| ctx.final_output_tokens = tokens;
+    }
+
+    fn promoteTokenLimitStop(ctx: *StreamSink, max_tokens: u16) void {
+        ctx.completion_stop_reason = tokenLimitStopReason(ctx.completion_stop_reason, ctx.final_output_tokens, max_tokens);
     }
 
     pub fn flush(ctx: *StreamSink) !void {
@@ -8308,6 +8326,12 @@ test "server length stop reports server stop not protocol error" {
     try std.testing.expect(std.mem.indexOf(u8, message, "[MODEL_STOP]") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "server_stop=length") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "[MODEL_PROTOCOL_ERROR]") == null);
+}
+
+test "final token usage at max tokens promotes unknown stop to length" {
+    try std.testing.expectEqual(http.StopReason.length, tokenLimitStopReason(.unknown, 512, 512));
+    try std.testing.expectEqual(http.StopReason.unknown, tokenLimitStopReason(.unknown, 511, 512));
+    try std.testing.expectEqual(http.StopReason.stop, tokenLimitStopReason(.stop, 512, 512));
 }
 
 test "initial context no longer forces protocol repair" {

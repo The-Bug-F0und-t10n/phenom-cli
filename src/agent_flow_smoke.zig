@@ -20,6 +20,7 @@ const Scenario = enum {
     web_cache_expiry,
     web_query_fanout,
     web_provider_fanout,
+    length_usage_continuation,
     web_language,
     web_language_empty,
 };
@@ -73,6 +74,7 @@ pub fn main(init: std.process.Init) !void {
     try runCacheExpiryScenario(allocator, init.io, bin);
     try runScenario(allocator, init.io, bin, .web_query_fanout);
     try runScenario(allocator, init.io, bin, .web_provider_fanout);
+    try runScenario(allocator, init.io, bin, .length_usage_continuation);
     try runScenario(allocator, init.io, bin, .web_language);
     try runScenario(allocator, init.io, bin, .web_language_empty);
     writeFd(1, "agent-flow-smoke: ok\n");
@@ -136,6 +138,7 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
     const session = @tagName(scenario);
     const prompt = scenarioPrompt(scenario);
     const expect = scenarioExpect(scenario);
+    const thinking = if (scenario == .length_usage_continuation) "off" else "on";
 
     const argv = [_][]const u8{
         bin,
@@ -153,7 +156,7 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
         "--max-tokens",
         "512",
         "--thinking",
-        "on",
+        thinking,
         "--expect-contains",
         expect,
         "--fail-on-model-error",
@@ -191,14 +194,12 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
 
     const db_path = try std.fmt.allocPrint(allocator, "{s}/.phenom-zig/phenom.db", .{work});
     defer allocator.free(db_path);
-    try expectCount(allocator, db_path, "select count(*) from events where kind='tool_start' and body like 'web_search%'", switch (scenario) {
-        .web_language_empty => 2,
-        .web_source_followup => 3,
-        else => 1,
-    });
+    try expectCount(allocator, db_path, "select count(*) from events where kind='tool_start' and body like 'web_search%'", expectedWebSearchStarts(scenario));
     try expectCount(allocator, db_path, "select count(*) from events where kind='assistant_delta' and (body like '%tool_call%' or body like '%WEB_EVIDENCE%' or body like '%```json%' or body like '%PHENOM_WEB_LANG_EN%')", 0);
     try expectCount(allocator, db_path, "select count(*) from events where kind='turn_error'", 0);
-    try expectAtLeast(allocator, db_path, "select count(*) from events where kind='turn_done' and body like '%used_evidence=true%'", 1);
+    if (isWebScenario(scenario)) {
+        try expectAtLeast(allocator, db_path, "select count(*) from events where kind='turn_done' and body like '%used_evidence=true%'", 1);
+    }
     if (scenario == .web_query_fanout) {
         try expectCount(allocator, db_path, "select count(*) from events where kind='web_search_fanout'", 1);
         if (state.search_get_count != 2) return SmokeError.UnexpectedAudit;
@@ -214,6 +215,14 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
     if (scenario == .web_query_intent_optimization) {
         try expectAtLeast(allocator, db_path, "select count(*) from events where kind='web_query_optimization' and body like '%success=true%' and body like '%final_query=R36S especificacoes tecnicas console%'", 1);
         try expectAtLeast(allocator, db_path, "select count(*) from events where kind='tool_start' and body like 'web_search%' and body like '%R36S%20especificacoes%20tecnicas%20console%'", 1);
+    }
+    if (scenario == .length_usage_continuation) {
+        if (contains(result.stdout, "generation limit") or contains(result.stdout, "token limit")) {
+            dumpChildOutput(result.stdout, result.stderr);
+            return SmokeError.ProtocolLeak;
+        }
+        try expectCount(allocator, db_path, "select count(*) from events where kind='answer_repair' and body='server length stop with partial visible answer'", 1);
+        try expectCount(allocator, db_path, "select count(*) from events where kind='answer_repair_done' and body='server length continuation emitted visible answer'", 1);
     }
 
     _ = c.shutdown(state.fd, c.SHUT_RDWR);
@@ -388,6 +397,7 @@ fn serverMain(state: *ServerState) void {
         .web_cache_expiry => 7,
         .web_query_fanout => 5,
         .web_provider_fanout => 5,
+        .length_usage_continuation => 2,
         .web_language => 4,
         .web_language_empty => 7,
     };
@@ -453,7 +463,10 @@ fn handleClient(state: *ServerState, client: c_int) !void {
     if (std.mem.startsWith(u8, first_line, "POST /completion ")) {
         const prompt = request[header_end .. header_end + body_len];
         const text = completionText(state, prompt);
-        _ = @atomicRmw(usize, &state.completion_count, .Add, 1, .seq_cst);
+        const completion_count = @atomicRmw(usize, &state.completion_count, .Add, 1, .seq_cst);
+        if (state.scenario == .length_usage_continuation and completion_count == 0) {
+            return sendSseWithUsage(client, text, 64, 512);
+        }
         return sendSse(client, text);
     }
     return send(client, "404 Not Found", "text/plain", "not found");
@@ -468,6 +481,7 @@ fn completionText(state: *ServerState, prompt: []const u8) []const u8 {
         .web_cache_reuse, .web_cache_expiry => cacheReuseCompletion(prompt),
         .web_query_fanout => queryFanoutCompletion(prompt),
         .web_provider_fanout => providerFanoutCompletion(prompt),
+        .length_usage_continuation => lengthUsageContinuationCompletion(prompt),
         .web_language => languageCompletion(prompt, false, state.completion_count),
         .web_language_empty => languageCompletion(prompt, true, state.completion_count),
     };
@@ -515,6 +529,13 @@ fn providerFanoutCompletion(prompt: []const u8) []const u8 {
     if (contains(prompt, "R36S Provider Specs")) return "Specs verificadas por provider fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_PROVIDER_FANOUT";
     if (contains(prompt, "tool phase is closed")) return "Specs verificadas por provider fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_PROVIDER_FANOUT";
     return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S provider specs</parameter><parameter=reason>buscar dados tecnicos externos</parameter></function></tool_call>";
+}
+
+fn lengthUsageContinuationCompletion(prompt: []const u8) []const u8 {
+    if (contains(prompt, "Previous visible answer stopped because the server reached the generation length limit")) {
+        return "a e finalizada pelo proprio modelo.\nPHENOM_LENGTH_USAGE_CONTINUED";
+    }
+    return "Resposta longa parcial que para no meio da palavr";
 }
 
 fn sourceFollowupCompletion(state: *ServerState, prompt: []const u8) []const u8 {
@@ -573,6 +594,7 @@ fn searchHtml(state: *ServerState, request_line: []const u8, search_count: usize
         else
             "<html><head><title>R36S Fanout Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
         .web_provider_fanout => providerFanoutHtml(request_line),
+        .length_usage_continuation => "<html><head><title>unused</title></head><body></body></html>",
         .web_source_followup => std.fmt.bufPrint(
             &state.completion_buf,
             "<html><head><title>R36S results</title></head><body><article><a href=\"http://127.0.0.1:{}/source-empty\">R36S Specs empty</a><p>Dados tecnicos do console R36S.</p></article><article><a href=\"http://127.0.0.1:{}/source\">R36S Specs source</a><p>Ficha tecnica do console R36S.</p></article></body></html>",
@@ -625,6 +647,7 @@ fn scenarioPrompt(scenario: Scenario) []const u8 {
         .web_cache_reuse, .web_cache_expiry => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_CACHE_REUSED.",
         .web_query_fanout => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_QUERY_FANOUT.",
         .web_provider_fanout => "busque as especificacoes tecnicas do console R36S em provedores web. pesquise na internet. Responda contendo PHENOM_WEB_PROVIDER_FANOUT.",
+        .length_usage_continuation => "responda uma frase longa e termine contendo PHENOM_LENGTH_USAGE_CONTINUED.",
         .web_language, .web_language_empty => "Usuario esta usando o idioma operacional 'user-lang-a'. Pesquise e explique nesse idioma operacional o que entra no custo de uma casa off-grid solar. Responda contendo PHENOM_WEB_LANG_USER.",
     };
 }
@@ -638,7 +661,21 @@ fn scenarioExpect(scenario: Scenario) []const u8 {
         .web_cache_reuse, .web_cache_expiry => "PHENOM_WEB_CACHE_REUSED",
         .web_query_fanout => "PHENOM_WEB_QUERY_FANOUT",
         .web_provider_fanout => "PHENOM_WEB_PROVIDER_FANOUT",
+        .length_usage_continuation => "PHENOM_LENGTH_USAGE_CONTINUED",
         .web_language, .web_language_empty => "PHENOM_WEB_LANG_USER",
+    };
+}
+
+fn isWebScenario(scenario: Scenario) bool {
+    return expectedWebSearchStarts(scenario) > 0;
+}
+
+fn expectedWebSearchStarts(scenario: Scenario) i64 {
+    return switch (scenario) {
+        .web_language_empty => 2,
+        .web_source_followup => 3,
+        .length_usage_continuation => 0,
+        else => 1,
     };
 }
 
@@ -648,6 +685,15 @@ fn sendSse(client: c_int, text: []const u8) !void {
     try stream.print("data: {{\"content\":\"", .{});
     try appendJsonStringBytes(&stream, text);
     try stream.print("\",\"stop\":true}}\n\n", .{});
+    try send(client, "200 OK", "text/event-stream", stream.buffered());
+}
+
+fn sendSseWithUsage(client: c_int, text: []const u8, input_tokens: usize, output_tokens: usize) !void {
+    var body_buf: [4096]u8 = undefined;
+    var stream = std.Io.Writer.fixed(&body_buf);
+    try stream.print("data: {{\"content\":\"", .{});
+    try appendJsonStringBytes(&stream, text);
+    try stream.print("\",\"done\":true,\"prompt_eval_count\":{},\"eval_count\":{}}}\n\n", .{ input_tokens, output_tokens });
     try send(client, "200 OK", "text/event-stream", stream.buffered());
 }
 

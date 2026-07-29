@@ -12341,3 +12341,59 @@ Invariantes afetadas:
 Risco residual:
 
 - Cancelamento em HTTPS ainda depende do caminho `std.http.Client`, que nao recebeu token nesta etapa. O caminho HTTP usado por provedores configurados e smokes reais ja cancela por `poll`.
+
+## T336 - Runtime: detectar parada por max_tokens via uso final real
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: o log real mostrou resposta visivel quebrada no meio da palavra e encerramento `done`, sem o aviso anterior de `generation limit`. O backend pode retornar `done=true` sem `finish_reason=length` ou `done_reason=length`, mesmo quando a geracao bateu `--max-tokens`. Nesse caso o agente tratava a parada como sucesso normal e nao acionava continuacao.
+
+Causa raiz:
+
+- `src/http.zig` ja emitia `TokenUsage` final quando o backend informava contadores reais.
+- `StreamSink` registrava `completion_stop_reason`, mas nao preservava o `output` final para reconciliar parada desconhecida.
+- Quando o servidor retornava `done=true` sem motivo explicito, `completion_stop_reason` ficava `.unknown`.
+- Com `.unknown`, o fluxo principal nao chamava `repairLengthStoppedVisibleAnswer`, mesmo se `eval_count == --max-tokens`.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: `StreamSink` agora preserva `final_output_tokens` em `onTokenUsage`.
+- `phenom-zig/src/main.zig`: `tokenLimitStopReason` promove somente `.unknown` para `.length` quando `final_output_tokens >= max_tokens`.
+- `phenom-zig/src/main.zig`: a promocao roda depois de `flush()` no turno principal, reparo think-only, reparo de length e follow-up pos-tool.
+- `phenom-zig/src/agent_flow_smoke.zig`: cenario `length_usage_continuation` simula backend llama.cpp com `done=true`, `prompt_eval_count=64`, `eval_count=512`, sem motivo explicito de length.
+
+Criterio de aceite:
+
+- Se o backend informa motivo explicito (`stop`, `length`, etc.), o motivo do servidor continua prevalecendo.
+- Se o backend nao informa motivo e o uso final de output bate `--max-tokens`, o agente trata como `.length`.
+- A continuacao e solicitada ao modelo, sem resposta deterministica criada pelo agente.
+- O transcript nao mostra `generation limit` nem `token limit` como resposta final.
+- O `assistant_delta` continua sendo texto do modelo: parcial original mais continuacao gerada pelo modelo.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-main-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test-cache` -> passou; 465 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-agent-local-cache bin/zig-x86_64-linux-0.16.0/zig build agent-flow-smoke --cache-dir /tmp/phenom-agent-flow-build-cache` -> passou; inclui `length_usage_continuation`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-build-local-cache bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-build-cache` -> passou.
+
+Evidencia real do smoke:
+
+- `token_usage|input=64 output=512 total=576 tokens_per_second=null exact=true final=true`
+- `assistant_delta|Resposta longa parcial que para no meio da palavr`
+- `answer_repair|server length stop with partial visible answer`
+- `assistant_delta|a e finalizada pelo proprio modelo. PHENOM_LENGTH_USAGE_CONTINUED`
+- `answer_repair_done|server length continuation emitted visible answer`
+- `model_stop|server_stop reason=length`
+- `turn_done|status=ok ... low_confidence=false`
+
+Invariantes afetadas:
+
+- 1. Output final do modelo: preservado; o agente nao reescreve conteudo.
+- 6. Falha/parada do modelo nao parece sucesso silencioso: ampliada; parada por teto de saida sem motivo explicito vira reparo de continuacao.
+- 7. Cada turno consegue ser auditado e reproduzido: ampliada; `token_usage`, `answer_repair` e `model_stop` explicam a decisao.
+
+Risco residual:
+
+- Se o backend nao fornecer motivo de parada nem contadores reais finais, nao existe sinal estrutural para diferenciar parada normal de corte por teto. Nesse caso o agente deve preservar a resposta do modelo e auditar `.unknown`, sem heuristica de texto.
