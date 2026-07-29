@@ -12867,3 +12867,56 @@ Invariantes afetadas:
 Risco residual:
 
 - `max_tokens=0` delega o limite efetivo ao backend/contexto. Em uso interativo, cancelamento por `Esc` continua sendo o mecanismo de controle humano para respostas longas demais.
+
+## T346 - Continuacao de length nao duplica resposta e preserva fontes web
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: log real mostrou resposta tecnica media/longa duplicada: o modelo repetiu o inicio da resposta durante a continuacao de `length`, e o agente anexou tudo literalmente. O mesmo fluxo tambem podia perder fontes na continuacao porque o reparo recebia apenas `SESSION_CONTEXT` com a resposta parcial, nao o `WEB_DOSSIER` usado na resposta final original.
+
+Referencia consultada:
+
+- `TASKS.md` arquitetura canonica: ferramenta coleta, evidencia vira dossie, modelo responde; controller nao deve sintetizar resposta final.
+- `alinhamento.md` A2/A3: protocolo oculto, resposta final preservada, evidencia compacta deve potencializar o modelo.
+
+Passos de implementacao:
+
+1. Guardar no `StreamSink` o ultimo contexto de finalizacao com ownership seguro.
+2. Preservar esse contexto no reparo de `length` como evidencia, para manter `WEB_DOSSIER` e `source_url`.
+3. Capturar a continuacao antes de emitir quando ela vem de reparo de `length`.
+4. Remover apenas sobreposicao textual literal longa entre resposta ja renderizada e continuacao.
+5. Emitir somente o sufixo novo do modelo; sem reescrever conteudo, sem filtro por entidade ou regra de negocio.
+6. Estender smoke real fake-server para reproduzir prefixo repetido e validar fonte no reparo.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: `StreamSink.length_repair_context` guarda contexto final para reparo posterior.
+- `phenom-zig/src/main.zig`: `repairLengthStoppedVisibleAnswer()` injeta o contexto guardado como `EVIDENCE` no reparo.
+- `phenom-zig/src/main.zig`: `continuationVisibleSuffix()` remove sobreposicao exata/sufixo-prefixo e repeticao longa de prefixo ja emitido.
+- `phenom-zig/src/agent_flow_smoke.zig`: `web_multi_length_continuation` agora simula repeticao do prefixo e exige `source_url` no contexto de reparo.
+
+Criterio de aceite:
+
+- Prefixo repetido pelo modelo em continuacao de `length` aparece uma vez no audit/output.
+- Continuação ainda aparece como `assistant_delta` e completa o marcador final.
+- `WEB_DOSSIER/source_url` continua disponivel no contexto de `finalization_repair`.
+- Sem `answer_repair_blocked` e sem `turn_error`.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-dedupe-length-test2 bin/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-dedupe-length-build2 bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-dedupe-length-smoke bin/zig-x86_64-linux-0.16.0/zig build agent-flow-smoke` -> passou fora do sandbox por requerer socket loopback.
+- Audit real `web_multi_length_continuation`: `assistant_delta=3`, prefixo `MULTI_LENGTH_PARTIAL resposta web inicial` em `assistant_delta` = 1, `answer_repair=2`, `answer_repair_done=2`, contexto `mode: finalization_repair` contem `source_url=http://127.0.0.1...`, `turn_error=0`.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; contexto guardado ja e renderizado/destilado.
+- 6. Falha de modelo nao parece falha de infraestrutura: preservada; repeticao de continuacao vira reparo de composicao auditado.
+- 7. Cada turno consegue ser auditado e reproduzido: reforcada; smoke consulta SQLite para deltas, reparos e fonte.
+
+Risco residual:
+
+- A reconciliação remove apenas sobreposição textual longa e literal no fluxo de reparo de `length`. Repetições semânticas não literais continuam sendo responsabilidade do modelo.

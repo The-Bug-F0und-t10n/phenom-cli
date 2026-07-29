@@ -5203,6 +5203,17 @@ fn repairLengthStoppedVisibleAnswer(
     const partial = try compactOperationalText(allocator, aggregate_sink.visible.items, 4096);
     defer allocator.free(partial);
     const session_blocks = [_]model_context.SessionBlock{.{ .text = partial }};
+    const repair_evidence_text = if (aggregate_sink.length_repair_context) |context|
+        try compactOperationalText(allocator, context, 8192)
+    else
+        null;
+    defer if (repair_evidence_text) |text| allocator.free(text);
+    var evidence_block_storage: [1]model_context.EvidenceBlock = undefined;
+    var evidence_blocks: []const model_context.EvidenceBlock = &.{};
+    if (repair_evidence_text) |text| {
+        evidence_block_storage[0] = .{ .text = text };
+        evidence_blocks = evidence_block_storage[0..1];
+    }
     const repair_context = try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
         .mode = "finalization_repair",
@@ -5210,10 +5221,12 @@ fn repairLengthStoppedVisibleAnswer(
         \\[TOOLS v1]
         \\No tool schema is active for this repair.
         ,
+        .evidence = evidence_blocks,
         .session = &session_blocks,
         .obligations = &.{
             "Previous visible answer stopped because the server reached the generation length limit.",
             "SESSION_CONTEXT is the partial visible answer already shown to the user.",
+            "If EVIDENCE is present, keep using it for sources and grounding while continuing.",
             "Continue from the exact stopping point; do not repeat earlier paragraphs, headings, or calculations.",
             "Do not mention truncation, token limits, tool calls, or protocol details.",
         },
@@ -5236,8 +5249,8 @@ fn repairLengthStoppedVisibleAnswer(
         .visible = std.ArrayList(u8).empty,
         .visible_bytes = 0,
         .thinking_bytes = 0,
-        .defer_visible = false,
-        .final_stream_guard = true,
+        .defer_visible = true,
+        .final_stream_guard = false,
         .trim_visible_leading_whitespace = false,
     };
     defer repair_sink.deinit();
@@ -5271,7 +5284,8 @@ fn repairLengthStoppedVisibleAnswer(
 
     const repair_stop_reason = repair_sink.completion_stop_reason;
     aggregate_sink.mergeGenerationStop(repair_sink);
-    if (repair_sink.visible_bytes == 0) {
+    const repair_visible = std.mem.trim(u8, repair_sink.raw_visible.items, " \t\r\n");
+    if (repair_visible.len == 0) {
         const detail = try std.fmt.allocPrint(
             allocator,
             "length stop continuation produced no visible answer raw_model_bytes={} raw_visible_bytes={} holdback_bytes={} blocked={}",
@@ -5282,11 +5296,58 @@ fn repairLengthStoppedVisibleAnswer(
         try db.recordTurnError(config.session, .model_protocol, "length_stop_continuation", detail);
         return false;
     }
-    try aggregate_sink.absorbEmittedVisible(&repair_sink);
+    const reconciled = continuationVisibleSuffix(aggregate_sink.visible.items, repair_visible);
+    if (reconciled.len == 0) {
+        try db.recordEvent(config.session, "answer_repair_failed", "length stop continuation repeated already visible answer");
+        return false;
+    }
+    try aggregate_sink.emitVisibleText(reconciled);
     if (repair_stop_reason != .length) aggregate_sink.completion_stop_reason = repair_stop_reason;
     repair_sink.raw_visible.clearRetainingCapacity();
     try db.recordEvent(config.session, "answer_repair_done", "server length continuation emitted visible answer");
     return true;
+}
+
+fn continuationVisibleSuffix(previous: []const u8, continuation: []const u8) []const u8 {
+    if (previous.len == 0 or continuation.len == 0) return continuation;
+    if (longestSuffixPrefixOverlap(previous, continuation)) |overlap| return continuation[overlap..];
+
+    const previous_start = skipAsciiWhitespace(previous);
+    const continuation_start = skipLeadingContinuationDecoration(continuation);
+    const common = commonPrefixUtf8Bytes(previous[previous_start..], continuation[continuation_start..]);
+    const shorter = @min(previous.len - previous_start, continuation.len - continuation_start);
+    if (common >= 128 and common * 2 >= shorter) return continuation[continuation_start + common ..];
+    return continuation;
+}
+
+fn longestSuffixPrefixOverlap(previous: []const u8, continuation: []const u8) ?usize {
+    const max = @min(previous.len, continuation.len);
+    if (max < 64) return null;
+    var overlap = max;
+    while (overlap >= 64) : (overlap -= 1) {
+        if (std.mem.eql(u8, previous[previous.len - overlap ..], continuation[0..overlap])) return overlap;
+    }
+    return null;
+}
+
+fn skipAsciiWhitespace(text: []const u8) usize {
+    var i: usize = 0;
+    while (i < text.len and std.ascii.isWhitespace(text[i])) : (i += 1) {}
+    return i;
+}
+
+fn skipLeadingContinuationDecoration(text: []const u8) usize {
+    var i = skipAsciiWhitespace(text);
+    while (i < text.len and (text[i] == '*' or text[i] == '_' or text[i] == '`' or text[i] == '>' or text[i] == '#')) : (i += 1) {}
+    while (i < text.len and std.ascii.isWhitespace(text[i])) : (i += 1) {}
+    return i;
+}
+
+fn commonPrefixUtf8Bytes(a: []const u8, b: []const u8) usize {
+    const max = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < max and a[i] == b[i]) : (i += 1) {}
+    return i;
 }
 
 fn repairLengthStoppedVisibleAnswerUntilStop(
@@ -5355,6 +5416,7 @@ fn streamDeferredToolLoopTurnInternal(
     const final_answer_mode = active_contract.name == .answer_only and finalization_state != null;
     const stream_final_visible = final_answer_mode;
     const protocol_hidden_mode = required_tool_mode or answer_repair_mode or final_answer_mode or active_contract.name == .search_web;
+    if (finalization_state != null and !required_tool_mode) try aggregate_sink.rememberLengthRepairContext(follow_context);
     const previous_thinking = client.thinking;
     if (protocol_hidden_mode) client.thinking = .off;
     defer client.thinking = previous_thinking;
@@ -7125,6 +7187,7 @@ const StreamSink = struct {
     suppress_thinking: bool = false,
     completion_stop_reason: http.StopReason = .unknown,
     final_output_tokens: ?usize = null,
+    length_repair_context: ?[]u8 = null,
 
     pub fn deinit(ctx: *StreamSink) void {
         ctx.filter.deinit();
@@ -7132,6 +7195,7 @@ const StreamSink = struct {
         ctx.raw_model.deinit(ctx.allocator);
         ctx.raw_visible.deinit(ctx.allocator);
         ctx.final_stream_holdback.deinit(ctx.allocator);
+        if (ctx.length_repair_context) |text| ctx.allocator.free(text);
     }
 
     pub fn onDelta(ctx: *StreamSink, delta: []const u8) !void {
@@ -7231,6 +7295,12 @@ const StreamSink = struct {
         if (other.visible.items.len == 0) return;
         try ctx.visible.appendSlice(ctx.allocator, other.visible.items);
         ctx.visible_bytes += other.visible_bytes;
+    }
+
+    fn rememberLengthRepairContext(ctx: *StreamSink, context: []const u8) !void {
+        const copy = try ctx.allocator.dupe(u8, context);
+        if (ctx.length_repair_context) |old| ctx.allocator.free(old);
+        ctx.length_repair_context = copy;
     }
 
     fn emitVisibleText(ctx: *StreamSink, text: []const u8) !void {
@@ -8534,6 +8604,18 @@ test "final token usage at max tokens promotes unknown stop to length" {
     try std.testing.expectEqual(http.StopReason.unknown, tokenLimitStopReason(.unknown, 511, 512));
     try std.testing.expectEqual(http.StopReason.stop, tokenLimitStopReason(.stop, 512, 512));
     try std.testing.expectEqual(http.StopReason.unknown, tokenLimitStopReason(.unknown, 512, 0));
+}
+
+test "length continuation suffix removes exact overlap" {
+    const previous = "abc resposta parcial no meio da frase longa com contexto suficiente para passar do limite minimo de sobreposicao";
+    const continuation = "frase longa com contexto suficiente para passar do limite minimo de sobreposicao e termina corretamente";
+    try std.testing.expectEqualStrings(" e termina corretamente", continuationVisibleSuffix(previous, continuation));
+}
+
+test "length continuation suffix removes repeated rendered prefix" {
+    const previous = "Com base nas especificacoes tecnicas oficiais, aqui esta a lista consolidada com processador memoria armazenamento tela conectividade bateria e fontes.";
+    const continuation = "*Com base nas especificacoes tecnicas oficiais, aqui esta a lista consolidada com processador memoria armazenamento tela conectividade bateria e fontes. Continua apenas com a parte restante.";
+    try std.testing.expectEqualStrings(" Continua apenas com a parte restante.", continuationVisibleSuffix(previous, continuation));
 }
 
 test "initial context no longer forces protocol repair" {

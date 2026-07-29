@@ -243,6 +243,8 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
         try expectCount(allocator, db_path, "select count(*) from events where kind='answer_repair' and body='server length stop with partial visible answer'", 2);
         try expectCount(allocator, db_path, "select count(*) from events where kind='answer_repair_done' and body='server length continuation emitted visible answer'", 2);
         try expectAtLeast(allocator, db_path, "select count(*) from events where kind='assistant_delta' and body like '%PHENOM_WEB_MULTI_LENGTH_CONTINUED%'", 1);
+        try expectCount(allocator, db_path, "select count(*) from events where kind='assistant_delta' and body like '%MULTI_LENGTH_PARTIAL resposta web inicial%'", 1);
+        try expectAtLeast(allocator, db_path, "select count(*) from events where kind='model_context' and body like '%mode: finalization_repair%' and body like '%source_url=http://127.0.0.1%'", 1);
         try expectCount(allocator, db_path, "select count(*) from events where kind='answer_repair_blocked'", 0);
     }
 
@@ -596,15 +598,15 @@ fn webLengthContinuationCompletion(prompt: []const u8) []const u8 {
 
 fn webMultiLengthContinuationCompletion(state: *ServerState, prompt: []const u8) []const u8 {
     if (contains(prompt, "MODEL_DECLARED_QUERY")) return "R36S especificacoes tecnicas console multi length";
-    if (contains(prompt, "WEB_EVIDENCE_INPUT")) return "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/search\nstatus=200\nquery=R36S especificacoes tecnicas console multi length\ntitle=R36S Specs\nexcerpt=Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.";
+    if (contains(prompt, "WEB_EVIDENCE_INPUT")) return "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/search\nstatus=200\nquery=R36S especificacoes tecnicas console multi length\ntitle=R36S Specs\nsource_url=http://127.0.0.1/search\nexcerpt=Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.";
     if (contains(prompt, "mode: finalization_repair") and state.completion_count <= 3) {
-        return "MULTI_LENGTH_PARTIAL continuacao ainda incompleta no meio da frase ";
+        return "MULTI_LENGTH_PARTIAL resposta web inicial cortada no meio da frase com um prefixo suficientemente longo para reproduzir repeticao de continuacao em respostas medias e longas. continuacao ainda incompleta no meio da frase ";
     }
     if (contains(prompt, "mode: finalization_repair")) {
         return "finalizada pelo modelo.\nPHENOM_WEB_MULTI_LENGTH_CONTINUED";
     }
     if (contains(prompt, "[WEB_DOSSIER v1]") or contains(prompt, "tool phase is closed")) {
-        return "MULTI_LENGTH_PARTIAL resposta web inicial cortada no meio da frase ";
+        return "MULTI_LENGTH_PARTIAL resposta web inicial cortada no meio da frase com um prefixo suficientemente longo para reproduzir repeticao de continuacao em respostas medias e longas. ";
     }
     return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S especificacoes tecnicas console multi length</parameter><parameter=reason>buscar dados tecnicos externos</parameter></function></tool_call>";
 }
