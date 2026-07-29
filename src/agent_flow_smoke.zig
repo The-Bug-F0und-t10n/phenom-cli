@@ -479,7 +479,15 @@ fn searchHtml(state: *ServerState, request_line: []const u8) []const u8 {
 
 fn sourceHtml(scenario: Scenario) []const u8 {
     return switch (scenario) {
-        .web_source_followup => "<html><head><title>R36S Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
+        .web_source_followup =>
+        \\<html><head>
+        \\<title>Ficha tecnica completa do Console Portatil R36S</title>
+        \\<meta name="description" content="Console R36S com Linux, processador RK3326, 1GB RAM e tela IPS.">
+        \\<script type="application/ld+json">{"name":"Console Portatil R36S","processor":"RK3326","memory":"1GB RAM","display":"IPS 3.5 polegadas 480x320"}</script>
+        \\</head><body>
+        \\<table><tr><td>CPU</td><td>RK3326 quad-core</td></tr><tr><td>Memoria</td><td>1GB RAM</td></tr><tr><td>Tela</td><td>IPS 3.5 polegadas 480x320</td></tr></table>
+        \\</body></html>
+        ,
         else => "not found",
     };
 }

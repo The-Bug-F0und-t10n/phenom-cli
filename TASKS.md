@@ -12035,3 +12035,66 @@ Invariantes afetadas:
 Risco residual:
 
 - Cache ainda nao tem TTL, invalidacao por header HTTP, nem politica por dominio. A chave conservadora por target/query/budget evita mistura de contextos, mas nao resolve frescor temporal para noticias/precos.
+
+## T331 - RAG Web etapa 4: extracao estruturada de paginas diretas
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: o log real mostrou paginas HTTP 200 com `title`/`source_url`, mas `excerpt=` vazio. Isso nao e falha do modelo final; e falha do coletor em transformar HTML moderno em evidencia consultavel. O agente deve potencializar o modelo com dados estruturados e anotados, sem redestilar obrigatoriamente com outro turno de modelo e sem substituir a resposta final.
+
+Comparacao consultada:
+
+- `../../phenom-cli-ts/src/tools/registrars/search-tools.ts`: busca gera variantes curtas, consulta SearxNG/DDG em paralelo, deduplica hits e entrega `title`, `summary`, `Source`, `Engine` como contexto normalizado. Nao ha sintese final deterministica pelo agente.
+- `../../../ollama_cli/client_v1/cli-agent-v2/rag_web.py`: pipeline textual analisa query, executa multi-query DDG, acessa paginas, filtra relevancia e retorna `RawWebData` com `PageData`. O ponto aproveitado no Zig e a fronteira: coleta/processamento antes do modelo, resposta final depois.
+- `../../../ollama_cli/client_v1/cli-agent-v2/worker_v2.py`: compressao deliberativa por chunks, clustering, resumo e coverage. O ponto aproveitado no Zig e tratar dados coletados como produto processado/auditavel, nao como bruto despejado no prompt.
+- `TASKS.md`: regra canonica preservada: `tool raw result -> ToolEvent -> EvidenceEntry -> EvidencePacket -> ModelTurnContext`.
+
+Passos de implementacao:
+
+1. Extrair conteudo estruturado de pagina direta em `src/web_rag.zig` antes do fallback textual.
+2. Capturar `meta content`, JSON-LD `application/ld+json`, linhas de tabela e itens de lista.
+3. Repetir `page_title` como ancora em cada linha estruturada para que dados tecnicos adjacentes nao sejam descartados por cobertura lexical parcial.
+4. Alinhar `queryCoverageSufficient` ao criterio de evidencia final: termos entidade alfanumerica exigem ancora casada e cobertura por contagem de termos, nao metade dos bytes da query.
+5. Ajustar o smoke `web_source_followup` para provar fonte tecnica em JSON-LD/tabela.
+6. Rodar unitarios, build e smoke real do agente.
+
+Implementacao:
+
+- `phenom-zig/src/web_rag.zig`: `directHtmlStructuredText`, `appendDirectMetaText`, `appendDirectJsonLdText`, `appendDirectTagText` e `appendDirectPageLine`.
+- `phenom-zig/src/web_rag.zig`: paginas diretas agora geram linhas `page_title=`, `meta=`, `structured_data=`, `table_row=`, `list_item=` e `page_text=` sem vazar HTML bruto.
+- `phenom-zig/src/web_rag.zig`: cobertura de query passou a usar termos e ancoras entidade, evitando rejeitar evidencias tecnicas por termos abstratos como "especificacoes".
+- `phenom-zig/src/agent_flow_smoke.zig`: `web_source_followup` usa fonte R36S com JSON-LD e tabela HTML, nao apenas paragrafo simples.
+
+Criterio de aceite:
+
+- Pagina direta com JSON-LD/tabela gera `excerpt` contendo specs verificaveis.
+- SERP continua seguindo fonte quando a primeira fonte e fraca/vazia.
+- `assistant_delta` continua sendo exatamente o texto final do modelo.
+- JSON/tool call e `[WEB_EVIDENCE]` nao aparecem no output final.
+- Raw HTML fica fora do `ModelTurnContext`; so evidencia destilada entra no prompt.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-web-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/web_rag.zig -lc -lsqlite3 --cache-dir /tmp/phenom-web-rag-test` -> passou; 85 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-main-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; 459 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-smoke-local-cache bin/zig-x86_64-linux-0.16.0/zig build agent-flow-smoke` -> passou; `web_source_followup` valida SERP -> fonte vazia -> fonte estruturada -> final do modelo.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-build-local-cache bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+
+Evidencia real do smoke:
+
+- `tool_start|web_search target=http://127.0.0.1:35041/search?q=R36S%20especificacoes%20tecnicas%20RK3326%20RAM%20tela`
+- `tool_start|web_search target=http://127.0.0.1:35041/source-empty`
+- `tool_start|web_search target=http://127.0.0.1:35041/source`
+- `assistant_delta|Specs verificadas: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320. PHENOM_WEB_SOURCE_FOLLOWED`
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; HTML vira evidencia estruturada budgetada.
+- 6. Falha de modelo nao parece falha de infraestrutura: ampliada; pagina 200 com dados em JSON-LD/tabela nao vira `excerpt=` vazio por extracao pobre.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; tool starts, evidence e final do modelo aparecem no SQLite.
+
+Risco residual:
+
+- Ainda nao ha fan-out paralelo real entre motores nem politica de confiabilidade/TTL por dominio. A etapa fecha a falha estrutural de extracao direta; ranking multi-motor e freshness ficam para a proxima etapa.

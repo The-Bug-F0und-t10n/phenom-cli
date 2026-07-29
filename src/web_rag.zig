@@ -437,7 +437,110 @@ fn structuredTextForDistillation(allocator: std.mem.Allocator, target: []const u
     const releases = try htmlReleaseEntriesText(allocator, trimmed);
     if (std.mem.trim(u8, releases, " \t\r\n").len > 0) return releases;
     allocator.free(releases);
+    if (!targetLooksSearchPage(target)) {
+        const direct = try directHtmlStructuredText(allocator, trimmed, plain_fallback);
+        if (std.mem.trim(u8, direct, " \t\r\n").len > 0) return direct;
+        allocator.free(direct);
+    }
     return allocator.dupe(u8, plain_fallback);
+}
+
+fn directHtmlStructuredText(allocator: std.mem.Allocator, raw: []const u8, plain_fallback: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    const title = try extractTitle(allocator, raw);
+    defer allocator.free(title);
+    const title_text = std.mem.trim(u8, title, " \t\r\n");
+    if (title_text.len > 0) try appendDirectPageLine(allocator, &out, title_text, "page_title", title_text);
+    try appendDirectMetaText(allocator, &out, raw, title_text);
+    try appendDirectJsonLdText(allocator, &out, raw, title_text);
+    try appendDirectTagText(allocator, &out, raw, title_text, "tr", "table_row", 24, 900);
+    try appendDirectTagText(allocator, &out, raw, title_text, "li", "list_item", 24, 700);
+    try appendDirectPageLine(allocator, &out, title_text, "page_text", plain_fallback);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendDirectMetaText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), raw: []const u8, title: []const u8) !void {
+    var cursor: usize = 0;
+    var count: usize = 0;
+    while (count < 16) {
+        const rel = indexOfIgnoreCase(raw[cursor..], "<meta") orelse break;
+        const start = cursor + rel;
+        const end_rel = std.mem.indexOfScalar(u8, raw[start..], '>') orelse break;
+        const tag = raw[start .. start + end_rel + 1];
+        cursor = start + end_rel + 1;
+        const content = try extractHtmlAttribute(allocator, tag, "content");
+        defer allocator.free(content);
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        if (trimmed.len < 8) continue;
+        try appendDirectPageLine(allocator, out, title, "meta", trimmed);
+        count += 1;
+    }
+}
+
+fn appendDirectJsonLdText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), raw: []const u8, title: []const u8) !void {
+    var cursor: usize = 0;
+    var count: usize = 0;
+    while (count < 8) {
+        const rel = indexOfIgnoreCase(raw[cursor..], "application/ld+json") orelse break;
+        const marker = cursor + rel;
+        const tag_end_rel = std.mem.indexOfScalar(u8, raw[marker..], '>') orelse break;
+        const content_start = marker + tag_end_rel + 1;
+        const close_rel = indexOfIgnoreCase(raw[content_start..], "</script>") orelse break;
+        const json_text = try jsonStringValuesToText(allocator, raw[content_start .. content_start + close_rel], 1600);
+        defer allocator.free(json_text);
+        try appendDirectPageLine(allocator, out, title, "structured_data", json_text);
+        cursor = content_start + close_rel + "</script>".len;
+        count += 1;
+    }
+}
+
+fn appendDirectTagText(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    raw: []const u8,
+    title: []const u8,
+    tag_name: []const u8,
+    label: []const u8,
+    max_items: usize,
+    max_chars: usize,
+) !void {
+    const open = try std.fmt.allocPrint(allocator, "<{s}", .{tag_name});
+    defer allocator.free(open);
+    const close = try std.fmt.allocPrint(allocator, "</{s}>", .{tag_name});
+    defer allocator.free(close);
+
+    var cursor: usize = 0;
+    var count: usize = 0;
+    while (count < max_items) {
+        const rel = indexOfIgnoreCase(raw[cursor..], open) orelse break;
+        const start = cursor + rel;
+        const tag_end_rel = std.mem.indexOfScalar(u8, raw[start..], '>') orelse break;
+        const body_start = start + tag_end_rel + 1;
+        const close_rel = indexOfIgnoreCase(raw[body_start..], close) orelse break;
+        const text = try distillText(allocator, raw[body_start .. body_start + close_rel], max_chars);
+        defer allocator.free(text);
+        try appendDirectPageLine(allocator, out, title, label, text);
+        cursor = body_start + close_rel + close.len;
+        count += 1;
+    }
+}
+
+fn appendDirectPageLine(allocator: std.mem.Allocator, out: *std.ArrayList(u8), title: []const u8, label: []const u8, value: []const u8) !void {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len < 4 or isStyleLikeText(trimmed)) return;
+    if (std.mem.indexOf(u8, out.items, trimmed) != null) return;
+    const capped = trimmed[0..@min(trimmed.len, 1600)];
+    if (title.len > 0 and !std.mem.eql(u8, label, "page_title")) {
+        const line = try std.fmt.allocPrint(allocator, "{s}=page_title: {s}. {s}\n", .{ label, title, capped });
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+    } else {
+        const line = try std.fmt.allocPrint(allocator, "{s}={s}\n", .{ label, capped });
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+    }
 }
 
 fn isDirectStructuredSummary(text: []const u8) bool {
@@ -896,25 +999,36 @@ fn queryCoverageScore(chunk: []const u8, query: []const u8) usize {
     return score;
 }
 
-fn queryCoverageTotal(query: []const u8) struct { bytes: usize, terms: usize } {
-    var bytes: usize = 0;
-    var terms: usize = 0;
+fn queryCoverageSufficient(chunk: []const u8, query: []const u8) bool {
+    var total_terms: usize = 0;
+    var matched_terms: usize = 0;
+    var anchor_terms: usize = 0;
+    var matched_anchors: usize = 0;
     var it = std.mem.tokenizeAny(u8, query, " \t\r\n\"'`()[]{}<>:;,./\\|+-_*=");
     while (it.next()) |raw| {
         const term = std.mem.trim(u8, raw, " \t\r\n");
         if (term.len < 3) continue;
-        bytes += term.len;
-        terms += 1;
+        total_terms += 1;
+        const is_anchor = queryTermLooksEntity(term);
+        if (is_anchor) anchor_terms += 1;
+        if (!containsIgnoreCase(chunk, term)) continue;
+        matched_terms += 1;
+        if (is_anchor) matched_anchors += 1;
     }
-    return .{ .bytes = bytes, .terms = terms };
+    if (total_terms == 0) return true;
+    if (total_terms == 1) return matched_terms == 1;
+    if (anchor_terms > 0) return matched_anchors > 0 and matched_terms * 2 >= @max(total_terms, 2);
+    return matched_terms * 2 >= total_terms;
 }
 
-fn queryCoverageSufficient(chunk: []const u8, query: []const u8) bool {
-    const total = queryCoverageTotal(query);
-    if (total.terms == 0) return true;
-    const score = queryCoverageScore(chunk, query);
-    if (total.terms == 1) return score > 0;
-    return score * 2 >= total.bytes;
+fn queryTermLooksEntity(term: []const u8) bool {
+    var has_digit = false;
+    var has_letter = false;
+    for (term) |ch| {
+        if (std.ascii.isDigit(ch)) has_digit = true;
+        if (std.ascii.isAlphabetic(ch)) has_letter = true;
+    }
+    return has_digit and has_letter;
 }
 
 fn appendBudgetedSlice(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8, budget_bytes: usize) !void {
@@ -1025,17 +1139,16 @@ test "query distillation does not fall back to similar unrelated text" {
     try std.testing.expectEqualStrings("", out);
 }
 
-test "direct page excerpt falls back to real page text when strict coverage is empty" {
+test "direct page query distillation keeps entity anchored page text" {
     const page = "Ficha técnica completa do Console Portátil R36S. Tela IPS 3.5 polegadas 480x320. Sistema Linux e armazenamento 64GB.";
     const strict = try distillTextForQuery(std.testing.allocator, page, "especificações técnicas R36S console portátil", 512);
     defer std.testing.allocator.free(strict);
-    try std.testing.expectEqualStrings("", strict);
+    try std.testing.expect(std.mem.indexOf(u8, strict, "R36S") != null);
 
     const excerpt = try selectWebExcerpt(std.testing.allocator, "https://example.test/r36s", page, strict, "especificações técnicas R36S console portátil", 512);
     defer excerpt.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("source_excerpt", excerpt.distill);
+    try std.testing.expectEqualStrings("query_chunks", excerpt.distill);
     try std.testing.expect(std.mem.indexOf(u8, excerpt.text, "R36S") != null);
-    try std.testing.expect(std.mem.indexOf(u8, excerpt.text, "480x320") != null);
 }
 
 test "json search payload is converted to readable evidence before query ranking" {
@@ -1112,6 +1225,29 @@ test "generic html result parsing stays scoped to search targets" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "result=1") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Direct page content") != null);
+}
+
+test "direct html structured metadata and tables become query evidence" {
+    const raw =
+        \\<html><head>
+        \\<title>Ficha tecnica completa do Console Portatil R36S</title>
+        \\<meta name="description" content="Console portatil com Linux e tela IPS.">
+        \\<script type="application/ld+json">{"name":"Console Portatil R36S","processor":"RK3326","memory":"1GB RAM","display":"IPS 3.5 polegadas 480x320"}</script>
+        \\</head><body>
+        \\<table><tr><td>CPU</td><td>RK3326 quad-core</td></tr><tr><td>Memoria</td><td>1GB RAM</td></tr></table>
+        \\</body></html>
+    ;
+    const fallback = try distillText(std.testing.allocator, raw, raw.len);
+    defer std.testing.allocator.free(fallback);
+    const text = try structuredTextForDistillation(std.testing.allocator, "https://example.test/r36s", raw, fallback);
+    defer std.testing.allocator.free(text);
+    const excerpt = try distillTextForQuery(std.testing.allocator, text, "R36S especificacoes tecnicas RK3326 RAM tela", 900);
+    defer std.testing.allocator.free(excerpt);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "structured_data=page_title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "table_row=page_title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, excerpt, "RK3326") != null);
+    try std.testing.expect(std.mem.indexOf(u8, excerpt, "1GB RAM") != null);
 }
 
 test "duckduckgo result urls become web evidence source urls" {
