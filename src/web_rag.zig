@@ -429,6 +429,11 @@ fn structuredTextForDistillation(allocator: std.mem.Allocator, target: []const u
         allocator.free(results);
         return allocator.dupe(u8, "");
     }
+    if (targetLooksSearchPage(target)) {
+        const results = try genericHtmlSearchResultsText(allocator, trimmed);
+        if (std.mem.trim(u8, results, " \t\r\n").len > 0) return results;
+        allocator.free(results);
+    }
     const releases = try htmlReleaseEntriesText(allocator, trimmed);
     if (std.mem.trim(u8, releases, " \t\r\n").len > 0) return releases;
     allocator.free(releases);
@@ -462,6 +467,12 @@ fn selectWebExcerpt(allocator: std.mem.Allocator, target: []const u8, searchable
 
 fn isDuckDuckGoSearchTarget(target: []const u8) bool {
     return containsIgnoreCase(target, "://html.duckduckgo.com/html/");
+}
+
+fn targetLooksSearchPage(target: []const u8) bool {
+    return containsIgnoreCase(target, "/search") or
+        containsIgnoreCase(target, "?q=") or
+        containsIgnoreCase(target, "&q=");
 }
 
 fn duckDuckGoResultsText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -501,6 +512,54 @@ fn duckDuckGoResultsText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
         cursor = result_start;
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn genericHtmlSearchResultsText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    var cursor: usize = 0;
+    var result_index: usize = 0;
+    while (result_index < 8) {
+        const tag_start = nextAnchorTag(raw, cursor) orelse break;
+        const tag_end_rel = std.mem.indexOfScalar(u8, raw[tag_start..], '>') orelse break;
+        const content_start = tag_start + tag_end_rel + 1;
+        const title_end_rel = indexOfIgnoreCase(raw[content_start..], "</a>") orelse break;
+        const title_html = raw[content_start .. content_start + title_end_rel];
+        const title = try distillText(allocator, title_html, 240);
+        defer allocator.free(title);
+        const trimmed_title = std.mem.trim(u8, title, " \t\r\n");
+        const href = try extractHtmlAttribute(allocator, raw[tag_start..content_start], "href");
+        defer allocator.free(href);
+        const url = try normalizeSearchResultUrl(allocator, std.mem.trim(u8, href, " \t\r\n"));
+        defer allocator.free(url);
+
+        const after_anchor = content_start + title_end_rel + "</a>".len;
+        cursor = after_anchor;
+        if (trimmed_title.len == 0 or !isHttpTarget(url) or !sourceUrlLooksComplete(url)) continue;
+
+        const next_anchor = nextAnchorTag(raw, after_anchor) orelse @min(raw.len, after_anchor + 1024);
+        const snippet = try distillText(allocator, raw[after_anchor..next_anchor], 360);
+        defer allocator.free(snippet);
+        const trimmed_snippet = std.mem.trim(u8, snippet, " \t\r\n");
+
+        result_index += 1;
+        try appendResultField(allocator, &out, result_index, "title", trimmed_title);
+        try appendResultField(allocator, &out, result_index, "url", url);
+        if (trimmed_snippet.len > 0) try appendResultField(allocator, &out, result_index, "snippet", trimmed_snippet);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn nextAnchorTag(raw: []const u8, start: usize) ?usize {
+    var cursor = start;
+    while (indexOfIgnoreCase(raw[cursor..], "<a")) |rel| {
+        const idx = cursor + rel;
+        const after = idx + 2;
+        if (after >= raw.len or raw[after] == '>' or std.ascii.isWhitespace(raw[after])) return idx;
+        cursor = after;
+    }
+    return null;
 }
 
 fn tagStartBefore(raw: []const u8, pos: usize) ?usize {
@@ -1012,6 +1071,47 @@ test "duckduckgo html search results become structured snippets" {
     try std.testing.expect(std.mem.indexOf(u8, text, "result=1 url=https://ziglang.org/download/") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "result=1 snippet=Download the latest release") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "<a") == null);
+}
+
+test "generic html search results become structured snippets" {
+    const raw =
+        \\<html><body>
+        \\<article class="result">
+        \\<a href="https://example.test/r36s-specs">R36S technical specifications</a>
+        \\<p>Console R36S uses RK3326, 1GB RAM, and IPS 3.5 inch display.</p>
+        \\</article>
+        \\<article class="result">
+        \\<a href="https://example.test/other">Other topic</a>
+        \\<p>Adjacent topic.</p>
+        \\</article>
+        \\</body></html>
+    ;
+    const text = try structuredTextForDistillation(std.testing.allocator, "http://127.0.0.1:8080/search?q=R36S", raw, "");
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "result=1 title=R36S technical specifications") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "result=1 url=https://example.test/r36s-specs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "result=1 snippet=Console R36S uses RK3326") != null);
+
+    const urls = try sourceUrlsForEvidence(std.testing.allocator, "http://127.0.0.1:8080/search?q=R36S", raw, text, text);
+    defer std.testing.allocator.free(urls);
+    try std.testing.expect(std.mem.indexOf(u8, urls, "source_url=https://example.test/r36s-specs\n") != null);
+}
+
+test "generic html result parsing stays scoped to search targets" {
+    const raw =
+        \\<html><body>
+        \\<a href="https://example.test/nav">Navigation</a>
+        \\<p>Direct page content about Console R36S RK3326.</p>
+        \\</body></html>
+    ;
+    const fallback = try distillText(std.testing.allocator, raw, raw.len);
+    defer std.testing.allocator.free(fallback);
+    const text = try structuredTextForDistillation(std.testing.allocator, "https://example.test/r36s", raw, fallback);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "result=1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Direct page content") != null);
 }
 
 test "duckduckgo result urls become web evidence source urls" {

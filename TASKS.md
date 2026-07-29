@@ -11924,3 +11924,53 @@ Invariantes afetadas:
 Risco residual:
 
 - Esta etapa nao implementa ainda fan-out multi-fonte, cache persistente, score de confiabilidade por dominio ou ranking amplo de citacoes. Esses itens ficam para as proximas etapas do RAG web.
+
+## T329 - RAG Web etapa 2: SERP HTML generica como evidencia estruturada
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: o RAG web em Zig estruturava DuckDuckGo HTML e alguns formatos diretos, mas uma pagina de busca HTML generica podia cair como texto plano. Isso reduzia confiabilidade porque `source_url` ficava dependente de texto ja formatado ou de redestilacao antiga pelo modelo. O coletor precisa transformar SERP generica em resultados com `title`, `url` e `snippet` antes de qualquer contexto ir ao modelo.
+
+Referencia TS consultada:
+
+- `../../phenom-cli-ts/src/tools/registrars/search-tools.ts`: `web_search` agrega SearxNG e DuckDuckGo em hits normalizados `{ title, summary, source, engine }` e deduplica por fonte/titulo.
+
+Passos de implementacao:
+
+1. Adicionar parser de anchors HTML genericos em `src/web_rag.zig`.
+2. Ativar o parser somente para alvos com formato de busca (`/search`, `?q=`, `&q=`), evitando transformar pagina comum com menu em SERP.
+3. Reutilizar `extractHtmlAttribute`, `distillText`, `normalizeSearchResultUrl`, `sourceUrlLooksComplete` e `appendResultField`.
+4. Adicionar testes unitarios para SERP generica e para nao ativar o parser em pagina direta.
+5. Alterar o smoke `web_source_followup` para usar SERP HTML generica com anchors reais.
+6. Rodar unitarios do RAG, build e smoke real do agente.
+
+Implementacao:
+
+- `phenom-zig/src/web_rag.zig`: `genericHtmlSearchResultsText` cria linhas `result=N title/url/snippet` a partir de anchors HTTP.
+- `phenom-zig/src/web_rag.zig`: `nextAnchorTag` evita falso positivo em tags como `<article>`.
+- `phenom-zig/src/web_rag.zig`: `targetLooksSearchPage` limita o parser a endpoints de busca.
+- `phenom-zig/src/agent_flow_smoke.zig`: `web_source_followup` agora usa HTML generico com `<a href=...>` e continua exigindo follow-up de fonte e resposta final do modelo.
+
+Criterio de aceite:
+
+- SERP HTML generica vira evidencia estruturada com fonte antes do modelo.
+- Pagina direta com anchors de navegacao nao vira SERP.
+- `web_source_followup` prova busca inicial, fonte vazia, segunda fonte util e final visivel do modelo.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-web-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/web_rag.zig -lc -lsqlite3 --cache-dir /tmp/phenom-web-rag-test` -> passou; 84 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-smoke-local-cache bin/zig-x86_64-linux-0.16.0/zig build agent-flow-smoke` -> passou; `web_source_followup` usa SERP generica.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-build-local-cache bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; HTML vira resultado estruturado budgetado.
+- 6. Falha de modelo nao parece falha de infraestrutura: ampliada; ausencia de snippet/fonte fica estruturalmente detectavel.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; o smoke registra `tool_start`, `evidence`, `web_search_follow_source` e `assistant_delta`.
+
+Risco residual:
+
+- Ainda nao ha fan-out paralelo nem cache persistente. O parser generico e deliberadamente simples: anchors HTTP com texto e snippet proximo. Suporte a formatos especificos de motores adicionais deve entrar por testes de fixture reais.

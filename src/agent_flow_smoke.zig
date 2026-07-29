@@ -360,7 +360,7 @@ fn searchHtml(state: *ServerState, request_line: []const u8) []const u8 {
         .web_query_intent_optimization => "<html><head><title>R36S Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
         .web_source_followup => std.fmt.bufPrint(
             &state.completion_buf,
-            "<html><head><title>R36S results</title></head><body><p>result=1 title=R36S Specs url=http://127.0.0.1:{}/source-empty snippet=Dados tecnicos do console R36S</p><p>result=2 title=R36S Specs url=http://127.0.0.1:{}/source snippet=Ficha tecnica do console R36S</p></body></html>",
+            "<html><head><title>R36S results</title></head><body><article><a href=\"http://127.0.0.1:{}/source-empty\">R36S Specs empty</a><p>Dados tecnicos do console R36S.</p></article><article><a href=\"http://127.0.0.1:{}/source\">R36S Specs source</a><p>Ficha tecnica do console R36S.</p></article></body></html>",
             .{ state.port, state.port },
         ) catch unreachable,
         .web_language => "<html><head><title>Solar Cost</title></head><body><p>Solar off-grid systems require batteries, inverter, panels, and charge controllers.</p></body></html>",
