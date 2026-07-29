@@ -12549,3 +12549,58 @@ Invariantes afetadas:
 Risco residual:
 
 - RAG web ainda entra como varios blocos de evidencia quando ha multiplas coletas. A proxima etapa consolida isso em dossie curto.
+
+## T340 - Context economy etapa 4: WEB_DOSSIER consolidado para RAG web
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: o RAG web do Zig ainda podia enviar varios blocos `WEB_EVIDENCE` e, pior, EvidencePacket de fan-out era lido como uma unica evidencia web. Isso fazia o modelo ver so o primeiro resultado util/ruim do pacote e gastar outra inferencia para refinar uma busca que o agente ja tinha executado.
+
+Referencia TS consultada:
+
+- `../phenom-cli-ts/src/use-cases/run-tool-loop.ts`: tool result volta ao loop como contexto operacional filtrado, nao como output bruto.
+- `../phenom-cli-ts/src/use-cases/build-inference-messages.ts`: mensagens de inferencia sao montadas por buckets e nao despejam resultado bruto de tool como resposta final.
+- `alinhamento.md` A3/A4: tool coleta dado bruto; controller normaliza para evidencia destilada; pesquisa web ampla precisa dossie estruturado, fan-out, cache, ranking e citacoes.
+
+Passos de implementacao:
+
+1. Consolidar evidencias web em um unico bloco `[WEB_DOSSIER v1]`.
+2. Renderizar cada `[WEB_EVIDENCE]` interno de um EvidencePacket fan-out como entrada `W#` separada.
+3. Preservar `source_url`, `target`, `query`, `status`, `source_domain`, `title`, `excerpt` e lacunas.
+4. Remover `[WEB_EVIDENCE]` do contexto final enviado ao modelo, mantendo apenas o dossie.
+5. Preservar o raw/audit em SQLite e eventos de tool, sem transformar JSON/tool output em resposta final.
+6. Corrigir reparo de contrato duplicado para preservar evidencia coletada e manter o contrato ativo.
+7. Atualizar smoke real fake-server para exigir refinamento model-driven apenas quando o dossie ainda nao contem suporte direto.
+
+Implementacao:
+
+- `phenom-zig/src/working_context.zig`: `renderEvidenceBlocks` agrega web em `[WEB_DOSSIER v1]`; pacotes fan-out sao explodidos em `W1`, `W2`, etc.
+- `phenom-zig/src/main.zig`: contexto web anotado usa `WEB_DOSSIER`; reparos e duplicate-contract preservam evidencia coletada.
+- `phenom-zig/src/agent_flow_smoke.zig`: smoke reconhece dossie e valida fan-out sem JSON/tool leak.
+
+Criterio de aceite:
+
+- O modelo recebe um dossie web curto, nao varios blocos `WEB_EVIDENCE`.
+- Fan-out com dois fetches aparece como `fetches=2` e `W1/W2` no mesmo `model_context`.
+- Se o fan-out ja contem suporte direto, nao ha segunda chamada `web_search`.
+- Resposta final continua 100% texto visivel do modelo; agente nao sintetiza specs.
+- JSON/tool/protocolo nao vazam para `assistant_delta`.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-build-test2 bin/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-buildonly2 bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+- `.zig-cache/o/41449f8774b7a1698e6685004ef0d677/agent-flow-smoke zig-out/bin/phenom` -> passou fora do sandbox por requerer socket loopback.
+- Audit real `web_query_fanout`: `web_search_fanout count=2`, `model_context` com `[WEB_DOSSIER v1] fetches=2`, `tool_start web_search` = 1, `assistant_delta` contem `PHENOM_WEB_QUERY_FANOUT`, `turn_error` = 0.
+
+Invariantes afetadas:
+
+- 1. Tool nao anunciada nunca executa: preservada; fan-out e interno ao executor `web_search` ja aceito.
+- 2. Contexto bruto nao vaza para o modelo: reforcada; `WEB_EVIDENCE` bruto sai do prompt final e vira dossie.
+- 7. Cada turno consegue ser auditado e reproduzido: reforcada; SQLite guarda tool events, fan-out e `model_context` com dossie.
+
+Risco residual:
+
+- O budget ainda e aplicado principalmente por bytes acumulados/limite global antes do envio. A proxima etapa aplica token governor por bucket em `model_context_budget`.

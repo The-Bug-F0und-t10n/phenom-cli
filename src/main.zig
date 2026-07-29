@@ -1936,9 +1936,9 @@ fn firstSearchResultIndex(excerpt: []const u8) ?usize {
 
 fn webAnswerOnlyNextAction(web_complete: bool) []const u8 {
     return if (web_complete)
-        "HTTP web_search returned status=200 with non-empty WEB_EVIDENCE excerpt and source_url. The tool phase is closed. Answer now in the user's language from USER_TASK, not in the source/WEB_EVIDENCE language. Cite or name the source_url when making the web-supported claim. Do not call tools, emit JSON, or expose protocol text."
+        "HTTP web_search returned status=200 with non-empty WEB_DOSSIER excerpt and source_url. The tool phase is closed. Answer now in the user's language from USER_TASK, not in the source language. Cite or name the source_url when making the web-supported claim. Do not call tools, emit JSON, or expose protocol text."
     else
-        "Answer in the user's language from USER_TASK, not in the source/WEB_EVIDENCE language. Use WEB_EVIDENCE only if it directly and exactly supports the requested entity/fact and includes source_url. If WEB_EVIDENCE excerpt is empty or lacks source_url, emit one refined web_search with the exact requested entity/fact while budget remains; otherwise state the limitation. Similar names, adjacent topics, partial matches, or 'looks related' are insufficient. Do not ask permission for another search inside the active contract. Do not claim browser automation or full-page crawling.";
+        "Answer in the user's language from USER_TASK, not in the source language. Use WEB_DOSSIER only if it directly and exactly supports the requested entity/fact and includes source_url. If WEB_DOSSIER excerpt is empty or lacks source_url, emit one refined web_search with the exact requested entity/fact while budget remains; otherwise state the limitation. Similar names, adjacent topics, partial matches, or 'looks related' are insufficient. Do not ask permission for another search inside the active contract. Do not claim browser automation or full-page crawling.";
 }
 
 fn webEvidenceExcerptOnlyRepeatsTitle(excerpt: []const u8, title: []const u8) bool {
@@ -3511,16 +3511,19 @@ fn runSetOperationalContractStep(
         }
         state.duplicate_contract_repairs += 1;
         try db.recordEvent(config.session, "contract_duplicate", "set_operational_contract");
-        const duplicate_context = try model_context.renderModelTurnContext(allocator, .{
-            .task = prompt,
-            .contracts = activeToolSchema(state),
-            .obligations = &.{
-                "The operational contract was already selected in this turn.",
-                "Use set_operational_contract only to switch to a different contract after evidence changes the operational strategy.",
-            },
-            .grounding = groundingRules(),
-            .next_action = "Continue inside the existing contract. Call an advertised evidence/session/tool if needed, otherwise answer the user now.",
-        });
+        const next_action = if (state.active_contract.name == .search_web)
+            webAnswerOnlyNextAction(false)
+        else
+            "Continue inside the existing contract. Call an advertised evidence/session/tool if needed, otherwise answer the user now.";
+        const duplicate_context = try renderCollectedEvidenceContext(
+            allocator,
+            prompt,
+            &state.context,
+            null,
+            null,
+            activeToolSchema(state),
+            next_action,
+        );
         defer allocator.free(duplicate_context);
         try db.recordEvent(config.session, "model_context", duplicate_context);
         return try streamDeferredToolLoopTurn(allocator, config, prompt, duplicate_context, client, events, db, ui_ptr, aggregate_sink, state);
@@ -5876,7 +5879,7 @@ fn renderFinalizationRepairContext(
 fn renderEmptyWebEvidenceAnswerRepairContext(allocator: std.mem.Allocator, follow_context: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{s}\n[EMPTY_WEB_EVIDENCE_ANSWER_REPAIR]\nPrevious visible answer was blocked because the latest WEB_EVIDENCE excerpt is empty or does not directly support the requested fact.\nAnswer visibly in the user's language from USER_TASK. State that web_search ran but returned no direct supporting evidence for the requested fact. Do not invent numbers, dates, versions, URLs, titles, or claims absent from WEB_EVIDENCE. Do not emit tool calls, <think>, </think>, or protocol tags.\n",
+        "{s}\n[EMPTY_WEB_EVIDENCE_ANSWER_REPAIR]\nPrevious visible answer was blocked because WEB_DOSSIER has no excerpt that directly supports the requested fact.\nAnswer visibly in the user's language from USER_TASK. State that web_search ran but returned no direct supporting evidence for the requested fact. Do not invent numbers, dates, versions, URLs, titles, or claims absent from WEB_DOSSIER. Do not emit tool calls, <think>, </think>, or protocol tags.\n",
         .{follow_context},
     );
 }
@@ -6267,40 +6270,15 @@ fn renderAnnotatedWebEvidenceContext(
     contracts_text: []const u8,
     next_action: []const u8,
 ) ![]u8 {
-    var owned_annotations = std.ArrayList([]u8).empty;
-    defer {
-        for (owned_annotations.items) |text| allocator.free(text);
-        owned_annotations.deinit(allocator);
-    }
-    const evidence_blocks = try allocator.alloc(model_context.EvidenceBlock, context.entries.items.len);
-    defer allocator.free(evidence_blocks);
-    for (context.entries.items, 0..) |entry, i| {
-        const text = entry.evidence_text;
-        if (std.mem.indexOf(u8, text, "[WEB_EVIDENCE]") == null) {
-            evidence_blocks[i] = .{ .text = text };
-            continue;
-        }
-        const summary = summarizeWebEvidence(text);
-        const quality = if (webEvidenceStrongForFinalAnswerFromSummary(summary)) "strong" else "weak";
-        const reason = webEvidenceQualityReason(summary);
-        const annotated = try std.fmt.allocPrint(
-            allocator,
-            "[WEB_EVIDENCE_QUALITY]\nweb_quality={s}\nquality_reason={s}\n{s}",
-            .{ quality, reason, text },
-        );
-        owned_annotations.append(allocator, annotated) catch |err| {
-            allocator.free(annotated);
-            return err;
-        };
-        evidence_blocks[i] = .{ .text = annotated };
-    }
+    const evidence_blocks = try context.renderEvidenceBlocks(allocator);
+    defer working_context.WorkingContext.freeRenderedEvidenceBlocks(allocator, evidence_blocks);
     return model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
         .contracts = contracts_text,
         .evidence = evidence_blocks,
         .obligations = &.{
-            "Every WEB_EVIDENCE block is visible for reasoning and audit.",
-            "Treat web_quality=weak as context about attempts, sources, and gaps; do not promote weak evidence into unsupported facts.",
+            "WEB_DOSSIER entries are consolidated web evidence from this turn; use direct excerpt/source_url lines as support.",
+            "Treat GAPS as context about attempts and insufficiency; do not promote gaps into unsupported facts.",
             "For factual web claims, cite or name the source_url that directly supports the claim. If direct support is missing, state the limitation.",
         },
         .grounding = groundingRules(),
@@ -6382,7 +6360,7 @@ fn renderCollectedEvidenceContextInternal(
     next_action_v1: ?model_context.NextAction,
 ) ![]u8 {
     const evidence_blocks = try context.renderEvidenceBlocks(allocator);
-    defer allocator.free(evidence_blocks);
+    defer working_context.WorkingContext.freeRenderedEvidenceBlocks(allocator, evidence_blocks);
     const session_blocks = try session_context.toSessionBlocks(allocator, session_text);
     defer allocator.free(session_blocks);
     const focus_blocks = try session_context.toFocusBlocks(allocator, focus_text);
@@ -9701,7 +9679,7 @@ test "successful web evidence closes tool phase structurally" {
     try std.testing.expect(state.finalizationBlocker() == null);
 }
 
-test "web final context annotates weak evidence instead of hiding it" {
+test "web final context renders consolidated dossier instead of raw web blocks" {
     var ctx = working_context.WorkingContext.init(std.testing.allocator);
     defer ctx.deinit();
 
@@ -9727,8 +9705,11 @@ test "web final context annotates weak evidence instead of hiding it" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "RK3326") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "64GB") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Linux") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "web_quality=weak") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "web_quality=strong") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[WEB_DOSSIER v1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[WEB_EVIDENCE]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "source_url=https://example.test/weak") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "source_url=https://example.test/strong") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "WEB_DOSSIER entries are consolidated web evidence") != null);
 }
 
 test "search result evidence follows source before closing" {

@@ -518,16 +518,16 @@ fn cacheReuseCompletion(prompt: []const u8) []const u8 {
 fn queryFanoutCompletion(prompt: []const u8) []const u8 {
     if (contains(prompt, "MODEL_DECLARED_QUERY")) return "R36S especificacoes tecnicas console processador memoria tela resolucao sistema bateria armazenamento";
     if (contains(prompt, "WEB_EVIDENCE_INPUT")) return "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/search\nstatus=200\nquery=R36S especificacoes tecnicas console processador memoria tela resolucao sistema bateria armazenamento\ntitle=R36S Fanout Specs\nexcerpt=Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.";
-    if (contains(prompt, "R36S Fanout Specs")) return "Specs verificadas por fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_QUERY_FANOUT";
-    if (contains(prompt, "tool phase is closed")) return "Specs verificadas por fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_QUERY_FANOUT";
+    if (contains(prompt, "R36S Fanout Specs") or (contains(prompt, "[WEB_DOSSIER v1]") and contains(prompt, "RK3326"))) return "Specs verificadas por fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_QUERY_FANOUT";
+    if (contains(prompt, "[WEB_DOSSIER v1]")) return "refinar busca\n</think>\n\n<tool_call><function=web_search><parameter=query>R36S Fanout Specs RK3326 RAM tela 480x320</parameter></function></tool_call>";
     return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S especificacoes tecnicas console processador memoria tela resolucao sistema bateria armazenamento</parameter><parameter=reason>buscar dados tecnicos externos</parameter></function></tool_call>";
 }
 
 fn providerFanoutCompletion(prompt: []const u8) []const u8 {
     if (contains(prompt, "MODEL_DECLARED_QUERY")) return "R36S provider specs";
     if (contains(prompt, "WEB_EVIDENCE_INPUT")) return "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/search\nstatus=200\nquery=R36S provider specs\ntitle=R36S Provider Specs\nexcerpt=Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.";
-    if (contains(prompt, "R36S Provider Specs")) return "Specs verificadas por provider fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_PROVIDER_FANOUT";
-    if (contains(prompt, "tool phase is closed")) return "Specs verificadas por provider fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_PROVIDER_FANOUT";
+    if (contains(prompt, "R36S Provider Specs") or (contains(prompt, "[WEB_DOSSIER v1]") and contains(prompt, "RK3326"))) return "Specs verificadas por provider fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_PROVIDER_FANOUT";
+    if (contains(prompt, "[WEB_DOSSIER v1]")) return "refinar provider\n</think>\n\n<tool_call><function=web_search><parameter=query>R36S provider specs RK3326 RAM tela 480x320</parameter></function></tool_call>";
     return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S provider specs</parameter><parameter=reason>buscar dados tecnicos externos</parameter></function></tool_call>";
 }
 
@@ -579,7 +579,7 @@ fn languageCompletion(prompt: []const u8, empty: bool, completion_count: usize) 
     }
     if (contains(prompt, "tool phase is closed")) return "user-lang-a: soma-bateria soma-inversor soma-painel soma-controlador.\nPHENOM_WEB_LANG_USER";
     if (empty and contains(prompt, "excerpt=")) return "refinar busca vazia\n</think>\n\n<tool_call><function=web_search><parameter=query>solar off-grid house cost components batteries inverter panels</parameter></function></tool_call>";
-    if (contains(prompt, "source/WEB_EVIDENCE language")) return "user-lang-a: soma-bateria soma-inversor soma-painel soma-controlador.\nPHENOM_WEB_LANG_USER";
+    if (contains(prompt, "source language")) return "user-lang-a: soma-bateria soma-inversor soma-painel soma-controlador.\nPHENOM_WEB_LANG_USER";
     return "precisa de evidencia externa\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>solar off-grid house cost batteries inverter panels</parameter><parameter=reason>estimar custo externo com evidencia</parameter></function></tool_call>";
 }
 
