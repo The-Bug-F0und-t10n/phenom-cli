@@ -12397,3 +12397,56 @@ Invariantes afetadas:
 Risco residual:
 
 - Se o backend nao fornecer motivo de parada nem contadores reais finais, nao existe sinal estrutural para diferenciar parada normal de corte por teto. Nesse caso o agente deve preservar a resposta do modelo e auditar `.unknown`, sem heuristica de texto.
+
+## T337 - Context economy etapa 1: bootstrap micro estrutural sem heuristica
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: o primeiro turno iniciava com cerca de 1.8k tokens mesmo para saudacao simples porque `buildInitialModelContext` sempre renderizava router completo, grounding completo e `NEXT_ACTION` longo quando o tool loop estava ativo. A causa raiz nao era a saudacao; era a ausencia de um bootstrap barato por estado estrutural. A correcao tambem removeu reparos que inferiam `web_search`, `apply_patch` e `validate_syntax` por keywords do prompt.
+
+Referencia TS consultada:
+
+- `../phenom-cli-ts/src/agent.ts`: system prompt estavel e contexto volatil fora do system.
+- `../phenom-cli-ts/src/use-cases/build-inference-messages.ts`: compactacao por mensagens/contexto antes do envio.
+- `alinhamento.md` A0/A6: controller nao deve inferir direcao operacional por palavras-chave.
+
+Passos de implementacao:
+
+1. Adicionar decisao estrutural em `buildInitialModelContext`: se nao ha MEMORY, SKILLS, SESSION_FOCUS, RECENT_DIALOGUE ou SESSION_CONTEXT, renderizar apenas `[TURN_CONTEXT v1]`, task, mode, budget e temporal.
+2. Nao usar texto do usuario para decidir micro vs operacional.
+3. Remover `promptExplicitlyRequestsWebSearch` e `syntheticWebSearchQuery`; `web_search` direto emitido pelo modelo continua parseado/normalizado pelo parser de tool call.
+4. Remover `promptExplicitlyRequiresApplyPatch` e `promptExplicitlyRequiresValidateSyntax`; obrigacoes operacionais passam a vir dos campos emitidos pelo modelo.
+5. Atualizar testes antigos que exigiam router cheio no one-shot vazio.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: `initialTurnContextStateIsEmpty` define bootstrap micro por estado renderizado, nao por linguagem natural.
+- `phenom-zig/src/main.zig`: contexto inicial vazio usa `mode: micro_turn` e `budget: micro`, sem `[CONTRACTS]`, `[GROUNDING]` e `[NEXT_ACTION]`.
+- `phenom-zig/src/main.zig`: testes provam que prompts diferentes recebem o mesmo bootstrap enxuto quando o estado estrutural esta vazio.
+- `phenom-zig/src/main.zig`: testes provam que JSON `web_search` emitido pelo modelo continua parseavel sem sintetizar query do prompt.
+
+Criterio de aceite:
+
+- Saudacao ou qualquer primeiro turno sem estado persistente/session nao recebe router completo.
+- Nenhuma keyword do prompt aciona web, mutacao ou validacao.
+- Tool call direta do modelo continua roteavel pelo parser.
+- Estado de sessao/memoria existente continua abrindo contexto completo quando necessario.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-main-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test-cache` -> passou; 466 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-build-local-cache bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-build-cache` -> passou.
+- `sh tools/check_simple_greeting_flow.sh ./zig-out/bin/phenom` -> bloqueado pelo sandbox ao abrir socket local (`PermissionError: Operation not permitted`) e pelo wrapper elevado com exit 127 sem saida. Nao foi usado como prova desta etapa.
+
+Invariantes afetadas:
+
+- 1. Tool nao anunciada nunca executa: preservada; chamadas diretas continuam passando pelo gate de contrato.
+- 2. Contexto bruto nao vaza para o modelo: preservada; bootstrap nao injeta evidencia.
+- 6. Falha de modelo nao parece falha de infraestrutura: preservada; ausencia de tool call do modelo nao vira requisicao sintetica do agente.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; `model_context_budget` mede o contexto renderizado.
+
+Risco residual:
+
+- O bootstrap micro depende do modelo emitir tool call quando precisar operar. Isso e intencional e alinhado a regra model-driven; a etapa seguinte reduz a superficie do router quando houver estado operacional em vez de reintroduzir heuristica de prompt.

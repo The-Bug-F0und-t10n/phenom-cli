@@ -1195,6 +1195,15 @@ fn buildInitialModelContext(
 
     const session_blocks = try session_context.toSessionBlocks(allocator, null);
     defer allocator.free(session_blocks);
+
+    if (enable_tool_loop and initialTurnContextStateIsEmpty(persistent.memory.items, persistent.skills.items, focus_blocks, dialogue_blocks, session_blocks)) {
+        return try model_context.renderModelTurnContext(allocator, .{
+            .task = prompt,
+            .mode = "micro_turn",
+            .budget = "micro",
+        });
+    }
+
     const profile = context_profile.select(.{
         .enable_tool_loop = enable_tool_loop,
     });
@@ -1217,6 +1226,16 @@ fn buildInitialModelContext(
             .text = "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
         },
     });
+}
+
+fn initialTurnContextStateIsEmpty(
+    memory: []const []const u8,
+    skills: []const []const u8,
+    focus: []const model_context.FocusBlock,
+    dialogue: []const model_context.DialogueBlock,
+    session: []const model_context.SessionBlock,
+) bool {
+    return memory.len == 0 and skills.len == 0 and focus.len == 0 and dialogue.len == 0 and session.len == 0;
 }
 
 fn loadMergedSessionFocus(
@@ -1280,28 +1299,6 @@ fn visibleContainsLeakedReasoning(visible: []const u8) bool {
         containsAsciiIgnoreCase(visible, "I will search") or
         containsAsciiIgnoreCase(visible, "Let me search") or
         containsAsciiIgnoreCase(visible, "Let me craft");
-}
-
-fn promptExplicitlyRequestsWebSearch(prompt: []const u8) bool {
-    return containsAsciiIgnoreCase(prompt, "pesquise na internet") or
-        containsAsciiIgnoreCase(prompt, "pesquisar na internet") or
-        containsAsciiIgnoreCase(prompt, "busque na internet") or
-        containsAsciiIgnoreCase(prompt, "procure na internet") or
-        containsAsciiIgnoreCase(prompt, "pesquisa web") or
-        containsAsciiIgnoreCase(prompt, "web_search");
-}
-
-fn syntheticWebSearchQuery(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
-    var slice = std.mem.trim(u8, prompt, " \t\r\n");
-    if (std.mem.indexOfScalar(u8, slice, ':')) |colon| {
-        if (colon + 1 < slice.len) slice = std.mem.trim(u8, slice[colon + 1 ..], " \t\r\n");
-    }
-    if (std.ascii.indexOfIgnoreCase(slice, "responda")) |idx| slice = std.mem.trim(u8, slice[0..idx], " \t\r\n. ");
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendBoundedSearchText(allocator, &out, slice, 240);
-    if (out.items.len == 0) try appendBoundedSearchText(allocator, &out, prompt, 240);
-    return out.toOwnedSlice(allocator);
 }
 
 fn rawModelContainsToolEnvelope(raw: []const u8) bool {
@@ -1368,27 +1365,6 @@ fn runToolLoopIterations(
     const has_visible_output = std.mem.trim(u8, visible_output, " \t\r\n").len > 0;
     var tool_iterations: usize = 0;
     var repairs: usize = 0;
-    if (maybe_envelope == null and has_visible_output and promptExplicitlyRequestsWebSearch(prompt) and !contextHasSection(initial_context, "[WEB_EVIDENCE]")) {
-        first_sink.discardDeferredVisible();
-        const query = try syntheticWebSearchQuery(allocator, prompt);
-        defer allocator.free(query);
-        var contract_call = tool_call.ToolCall{
-            .name = try allocator.dupe(u8, "set_operational_contract"),
-            .contract = .search_web,
-            .terms = try allocator.dupe(u8, query),
-            .reason = try allocator.dupe(u8, "user explicitly requested internet search"),
-        };
-        defer contract_call.deinit(allocator);
-        try db.recordEvent(config.session, "tool_repair", "explicit web search request enforced");
-        const next = try runSetOperationalContractStep(allocator, io, config, prompt, &contract_call, client, events, db, ui_ptr, first_sink, &state, &tool_iterations);
-        switch (next) {
-            .final_answer => return true,
-            .stopped => return true,
-            .tool_call => |next_call| {
-                maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
-            },
-        }
-    }
     if (maybe_envelope == null and has_visible_output and outputCitesMissingSessionEvidence(visible_output, initial_context)) {
         first_sink.discardDeferredVisible();
         try db.recordEvent(config.session, "tool_repair", "answer cited missing evidence");
@@ -3477,14 +3453,6 @@ fn renderOperationalContractNextAction(
     return allocator.dupe(u8, "Proceed inside the active contract. Call only advertised tools, or answer if no more tool-backed context is needed.");
 }
 
-fn promptExplicitlyRequiresApplyPatch(prompt: []const u8) bool {
-    return containsAsciiIgnoreCase(prompt, "apply_patch");
-}
-
-fn promptExplicitlyRequiresValidateSyntax(prompt: []const u8) bool {
-    return containsAsciiIgnoreCase(prompt, "validate_syntax");
-}
-
 fn runSetOperationalContractStep(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3525,8 +3493,8 @@ fn runSetOperationalContractStep(
         return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
     }
 
-    const effective_requires_mutation = (call.requires_mutation orelse false) or promptExplicitlyRequiresApplyPatch(prompt);
-    const effective_requires_runtime_validation = (call.requires_runtime_validation orelse false) or promptExplicitlyRequiresValidateSyntax(prompt);
+    const effective_requires_mutation = call.requires_mutation orelse false;
+    const effective_requires_runtime_validation = call.requires_runtime_validation orelse false;
     const request = contracts.OperationalContractRequest{
         .requested_contract = call.contract,
         .requires_inspection = (call.requires_inspection orelse false) or effective_requires_mutation,
@@ -7534,6 +7502,25 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect((try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test-empty", "analise esse projeto", false, true)) == null);
 }
 
+test "empty initial turn uses structural micro context without prompt heuristics" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    const first = (try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "empty-a", "ola", true, true)) orelse return error.MissingContext;
+    defer std.testing.allocator.free(first);
+    const second = (try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "empty-b", "pesquise na internet sobre Londrina", true, true)) orelse return error.MissingContext;
+    defer std.testing.allocator.free(second);
+
+    for ([_][]const u8{ first, second }) |rendered| {
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "mode: micro_turn") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "budget: micro") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[CONTRACTS]\n") == null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[GROUNDING]\n") == null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[NEXT_ACTION]\n") == null);
+        try std.testing.expect(rendered.len < 512);
+    }
+}
+
 test "search session scope is model selected without linguistic inference" {
     try std.testing.expectEqual(SessionSearchScope.current, try resolveSessionSearchScope(null, null));
     try std.testing.expectEqual(SessionSearchScope.current, try resolveSessionSearchScope("current", null));
@@ -7794,7 +7781,9 @@ test "initial model context for one-shot prompt omits implicit session context" 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[SESSION_FOCUS]\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[RECENT_DIALOGUE]\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "cloneEvidenceEntry") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Think first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "mode: micro_turn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[CONTRACTS]\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[NEXT_ACTION]\n") == null);
 }
 
 test "initial model context includes long session summary without failed or current turns" {
@@ -8229,14 +8218,14 @@ test "raw visible tool call is not safe final prose" {
     try std.testing.expect(!visibleContainsLeakedReasoning("A evidencia coletada nao contem o valor especifico para Londrina."));
 }
 
-test "explicit internet request is recognized and converted to web query" {
-    try std.testing.expect(promptExplicitlyRequestsWebSearch("Pesquise na internet: qual e a capital da Franca?"));
-    try std.testing.expect(promptExplicitlyRequestsWebSearch("use web_search para confirmar"));
-    try std.testing.expect(!promptExplicitlyRequestsWebSearch("resuma esta URL se precisar"));
-
-    const query = try syntheticWebSearchQuery(std.testing.allocator, "Pesquise na internet: quem criou o kernel Linux? Responda em portugues.");
-    defer std.testing.allocator.free(query);
-    try std.testing.expectEqualStrings("quem criou kernel Linux", query);
+test "direct model web_search remains parseable without prompt query synthesis" {
+    const visible =
+        \\I'll search. json { "tool_call": { "name": "search_web", "arguments": { "query": "Londrina PR Brasil localização" } } }
+    ;
+    var parsed = (try parseToolCallFromVisibleOrRaw(std.testing.allocator, visible, "")) orelse return error.NoToolCall;
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("web_search", parsed.name);
+    try std.testing.expectEqualStrings("Londrina PR Brasil localização", declaredWebQuery(&parsed).?);
 }
 
 test "stream sink emits caller-selected final text byte-for-byte" {
@@ -9990,11 +9979,42 @@ test "search web finalization can require and satisfy inspection evidence" {
     try std.testing.expect(state.finalizationBlocker() == null);
 }
 
-test "explicit apply_patch mention preserves mutation obligation" {
-    try std.testing.expect(promptExplicitlyRequiresApplyPatch("corrija usando apply_patch com contextId fresco"));
-    try std.testing.expect(!promptExplicitlyRequiresApplyPatch("explique o contrato de mutacao sem ferramenta nomeada"));
-    try std.testing.expect(promptExplicitlyRequiresValidateSyntax("valide com validate_syntax depois do patch"));
-    try std.testing.expect(!promptExplicitlyRequiresValidateSyntax("valide de forma apropriada"));
+test "operational contract obligations come from model call fields" {
+    var mutation_call = tool_call.ToolCall{
+        .name = try std.testing.allocator.dupe(u8, "set_operational_contract"),
+        .requires_inspection = false,
+        .requires_mutation = true,
+        .requires_runtime_validation = false,
+        .requires_browser_diagnostics = false,
+    };
+    defer mutation_call.deinit(std.testing.allocator);
+    const mutation_request = contracts.OperationalContractRequest{
+        .requested_contract = mutation_call.contract,
+        .requires_inspection = (mutation_call.requires_inspection orelse false) or (mutation_call.requires_mutation orelse false),
+        .requires_mutation = mutation_call.requires_mutation orelse false,
+        .requires_runtime_validation = mutation_call.requires_runtime_validation orelse false,
+        .requires_browser_diagnostics = mutation_call.requires_browser_diagnostics orelse false,
+        .requires_memory_promotion = mutation_call.requires_memory_promotion orelse false,
+    };
+    try std.testing.expectEqual(contracts.ContractName.mutate_file, contracts.selectOperationalContract(mutation_request));
+
+    var direct_call = tool_call.ToolCall{
+        .name = try std.testing.allocator.dupe(u8, "set_operational_contract"),
+        .requires_inspection = false,
+        .requires_mutation = false,
+        .requires_runtime_validation = false,
+        .requires_browser_diagnostics = false,
+    };
+    defer direct_call.deinit(std.testing.allocator);
+    const direct_request = contracts.OperationalContractRequest{
+        .requested_contract = direct_call.contract,
+        .requires_inspection = direct_call.requires_inspection orelse false,
+        .requires_mutation = direct_call.requires_mutation orelse false,
+        .requires_runtime_validation = direct_call.requires_runtime_validation orelse false,
+        .requires_browser_diagnostics = direct_call.requires_browser_diagnostics orelse false,
+        .requires_memory_promotion = direct_call.requires_memory_promotion orelse false,
+    };
+    try std.testing.expectEqual(contracts.ContractName.answer_only, contracts.selectOperationalContract(direct_request));
 }
 
 test "finalization repair context exposes only active contract tools" {
