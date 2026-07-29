@@ -11974,3 +11974,64 @@ Invariantes afetadas:
 Risco residual:
 
 - Ainda nao ha fan-out paralelo nem cache persistente. O parser generico e deliberadamente simples: anchors HTTP com texto e snippet proximo. Suporte a formatos especificos de motores adicionais deve entrar por testes de fixture reais.
+
+## T330 - RAG Web etapa 3: cache operacional de evidencia web
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: depois de estruturar evidencia web, o agente ainda refazia HTTP e destilacao para a mesma URL/query/budget em turnos diferentes do mesmo workspace. Isso desperdicava tempo, aumentava chance de falha transiente e nao aproveitava o SQLite operacional que ja e a fonte de auditoria do agente. O cache correto deve guardar somente evidencia destilada, nunca HTML bruto, e deve continuar entregando a resposta final ao modelo.
+
+Referencia TS consultada:
+
+- `../../phenom-cli-ts/src/tools/registrars/search-tools.ts`: o TS deduplica hits por fonte/titulo dentro da execucao de `web_search`. No Zig, esta etapa adiciona deduplicacao persistida por target/query/budget no SQLite operacional.
+
+Passos de implementacao:
+
+1. Criar tabela `web_cache` em `src/audit.zig`.
+2. Adicionar `storeWebCache` e `loadWebCache` com chave `(target, query, budget_bytes)`.
+3. Guardar apenas `evidence_text` destilado e `quality_score`, sem HTML bruto.
+4. Integrar cache em `runWebSearchStep` antes de `web_rag.fetch`.
+5. Fazer cache hit passar pelo mesmo fluxo de evidencia, follow-up, fechamento de fase e contexto ao modelo.
+6. Adicionar smoke real `web_cache_reuse`: duas execucoes no mesmo workspace, uma busca HTTP real e segunda resposta a partir do cache.
+7. Corrigir vazamento de thread da TUI que impedia `zig test src/main.zig` completo: `TerminalUi.deinit` agora para ticker/cancel input mesmo quando a UI nunca foi attached.
+
+Implementacao:
+
+- `phenom-zig/src/audit.zig`: tabela `web_cache`, tipo `WebCacheEntry`, store/load e teste unitario.
+- `phenom-zig/src/main.zig`: `runWebSearchStep` consulta cache, registra `web_cache_hit`/`web_cache_miss`/`web_cache_store` e reutiliza `prepareWebSearchContinuation`.
+- `phenom-zig/src/agent_flow_smoke.zig`: `web_cache_reuse` valida duas sessoes no mesmo DB com uma unica requisicao HTTP de busca.
+- `phenom-zig/src/tui.zig`: `deinit` para threads internas antes de liberar o editor, corrigindo panic em teste completo.
+
+Criterio de aceite:
+
+- Primeira execucao de uma busca grava `web_cache_store`.
+- Segunda execucao com mesmo target/query/budget grava `web_cache_hit`.
+- O servidor fake recebe somente um GET `/search` nas duas execucoes.
+- `assistant_delta` continua sendo texto final do modelo.
+- Cache nao injeta MEMORY/SKILLS nem HTML bruto no prompt.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-audit-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/audit.zig -lc -lsqlite3 --cache-dir /tmp/phenom-audit-test` -> passou; 31 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-main-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; 458 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-smoke-local-cache bin/zig-x86_64-linux-0.16.0/zig build agent-flow-smoke` -> passou; inclui `web_cache_reuse`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-build-local-cache bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+
+Evidencia real do smoke:
+
+- `web_cache_store|http://127.0.0.1:41421/search?q=R36S%20especificacoes%20tecnicas%20console%20cache`
+- `web_cache_hit|http://127.0.0.1:41421/search?q=R36S%20especificacoes%20tecnicas%20console%20cache`
+- `assistant_delta|Specs verificadas via evidencia: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320. PHENOM_WEB_CACHE_REUSED`
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; cache guarda evidencia destilada, nao HTML.
+- 3. MEMORY/SKILLS nao competem com storage operacional: preservada; cache fica em SQLite operacional e nao vira memoria conversacional.
+- 6. Falha de modelo nao parece falha de infraestrutura: ampliada; falha transiente de HTTP pode ser evitada quando evidencia cacheada existe.
+- 7. Cada turno consegue ser auditado e reproduzido: ampliada; cache hit/store aparecem como eventos auditaveis.
+
+Risco residual:
+
+- Cache ainda nao tem TTL, invalidacao por header HTTP, nem politica por dominio. A chave conservadora por target/query/budget evita mistura de contextos, mas nao resolve frescor temporal para noticias/precos.

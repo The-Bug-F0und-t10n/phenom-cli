@@ -67,6 +67,15 @@ pub const SessionFocus = struct {
     }
 };
 
+pub const WebCacheEntry = struct {
+    evidence_text: []u8,
+    quality_score: i32,
+
+    pub fn deinit(self: *WebCacheEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.evidence_text);
+    }
+};
+
 pub const AuditDb = struct {
     allocator: std.mem.Allocator,
     db: ?*c.sqlite3,
@@ -119,6 +128,18 @@ pub const AuditDb = struct {
             \\  created_at text not null default current_timestamp
             \\);
             \\create index if not exists session_focus_session_id_idx on session_focus(session, id);
+        );
+        try audit.exec(
+            \\create table if not exists web_cache (
+            \\  target text not null,
+            \\  query text not null,
+            \\  budget_bytes integer not null,
+            \\  evidence_text text not null,
+            \\  quality_score integer not null,
+            \\  created_at text not null default current_timestamp,
+            \\  primary key(target, query, budget_bytes)
+            \\);
+            \\create index if not exists web_cache_created_idx on web_cache(created_at);
         );
         try audit.ensureSessionFts();
         return audit;
@@ -196,6 +217,50 @@ pub const AuditDb = struct {
         const body = try std.fmt.allocPrint(self.allocator, "class={s} source={s} detail={s}", .{ @tagName(class), source, detail });
         defer self.allocator.free(body);
         try self.recordEvent(session, "turn_error", body);
+    }
+
+    pub fn storeWebCache(self: *AuditDb, target: []const u8, query: ?[]const u8, budget_bytes: usize, evidence_text: []const u8, quality_score: i32) !void {
+        const sql =
+            \\insert into web_cache(target, query, budget_bytes, evidence_text, quality_score)
+            \\values (?1, ?2, ?3, ?4, ?5)
+            \\on conflict(target, query, budget_bytes) do update set
+            \\  evidence_text=excluded.evidence_text,
+            \\  quality_score=excluded.quality_score,
+            \\  created_at=current_timestamp
+        ;
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        try bindText(stmt, 1, target);
+        try bindText(stmt, 2, std.mem.trim(u8, query orelse "", " \t\r\n"));
+        if (c.sqlite3_bind_int64(stmt, 3, @as(i64, @intCast(budget_bytes))) != c.SQLITE_OK) return error.SqliteBindFailed;
+        try bindText(stmt, 4, evidence_text);
+        if (c.sqlite3_bind_int(stmt, 5, quality_score) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteStepFailed;
+    }
+
+    pub fn loadWebCache(self: *AuditDb, allocator: std.mem.Allocator, target: []const u8, query: ?[]const u8, budget_bytes: usize) !?WebCacheEntry {
+        const sql = "select evidence_text, quality_score from web_cache where target=?1 and query=?2 and budget_bytes=?3 limit 1";
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        try bindText(stmt, 1, target);
+        try bindText(stmt, 2, std.mem.trim(u8, query orelse "", " \t\r\n"));
+        if (c.sqlite3_bind_int64(stmt, 3, @as(i64, @intCast(budget_bytes))) != c.SQLITE_OK) return error.SqliteBindFailed;
+
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return error.SqliteStepFailed;
+        return .{
+            .evidence_text = try dupeColumnText(allocator, stmt, 0),
+            .quality_score = c.sqlite3_column_int(stmt, 1),
+        };
     }
 
     fn ensureSessionFts(self: *AuditDb) !void {
@@ -1107,6 +1172,30 @@ test "tool event audit summary stores metadata without raw output" {
     try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "raw_bytes=") != null);
     try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "raw_hash=") != null);
     try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "SECRET_RAW_TAIL") == null);
+}
+
+test "web cache stores distilled evidence by target query and budget" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    const target = "https://example.test/search?q=zig";
+    const query = "zig release";
+    const evidence_text =
+        \\[EVIDENCE]
+        \\- E1 kind=web_http_get source=https://example.test/search
+        \\[WEB_EVIDENCE]
+        \\status=200
+        \\query=zig release
+        \\source_url=https://ziglang.org/download/
+        \\excerpt=Zig release page.
+    ;
+    try db.storeWebCache(target, query, 8192, evidence_text, 82);
+
+    var hit = (try db.loadWebCache(std.testing.allocator, target, query, 8192)).?;
+    defer hit.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i32, 82), hit.quality_score);
+    try std.testing.expectEqualStrings(evidence_text, hit.evidence_text);
+    try std.testing.expect((try db.loadWebCache(std.testing.allocator, target, query, 4096)) == null);
 }
 
 test "recent session events keep newest events in chronological order" {

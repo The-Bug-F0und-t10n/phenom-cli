@@ -650,6 +650,8 @@ pub fn TerminalUi(comptime Writer: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            self.stopInferenceCancelInput();
+            self.stopStatusTicker();
             self.detach() catch {};
             self.editor.deinit();
         }

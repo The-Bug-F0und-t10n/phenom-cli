@@ -4152,38 +4152,71 @@ fn runWebSearchStep(
     try db.recordEvent(config.session, "tool_start", start);
     try events.emit(.{ .tool_start = .{ .name = "web_search", .detail = target } });
 
-    const result = web_rag.fetch(allocator, io, target, query, budget) catch |err| {
-        try db.recordEvent(config.session, "tool_error", @errorName(err));
-        try db.recordTurnError(config.session, .tool_runtime, "web_search", @errorName(err));
-        try events.emit(.{ .tool_result = .{ .name = "web_search", .output = @errorName(err) } });
-        const follow_context = try renderCollectedEvidenceContext(
-            allocator,
-            prompt,
-            &state.context,
-            null,
-            null,
-            activeToolSchema(state),
-            "web_search failed. If a valid explicit HTTP URL is available, emit one corrected web_search call; otherwise answer with current evidence and state the limitation.",
-        );
-        defer allocator.free(follow_context);
-        try db.recordEvent(config.session, "model_context", follow_context);
-        return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
-    };
-    defer result.deinit(allocator);
+    var continuation = blk: {
+        if (try db.loadWebCache(allocator, target, query, budget)) |cached_hit| {
+            var cached = cached_hit;
+            defer cached.deinit(allocator);
+            try db.recordEvent(config.session, "web_cache_hit", target);
+            break :blk try prepareWebSearchContinuation(
+                allocator,
+                config,
+                prompt,
+                target,
+                declared_query,
+                query,
+                call.budget_bytes,
+                strategy,
+                cached.evidence_text,
+                cached.quality_score,
+                events,
+                db,
+                state,
+            );
+        }
+        try db.recordEvent(config.session, "web_cache_miss", target);
+        const result = web_rag.fetch(allocator, io, target, query, budget) catch |err| {
+            try db.recordEvent(config.session, "tool_error", @errorName(err));
+            try db.recordTurnError(config.session, .tool_runtime, "web_search", @errorName(err));
+            try events.emit(.{ .tool_result = .{ .name = "web_search", .output = @errorName(err) } });
+            const follow_context = try renderCollectedEvidenceContext(
+                allocator,
+                prompt,
+                &state.context,
+                null,
+                null,
+                activeToolSchema(state),
+                "web_search failed. If a valid explicit HTTP URL is available, emit one corrected web_search call; otherwise answer with current evidence and state the limitation.",
+            );
+            defer allocator.free(follow_context);
+            try db.recordEvent(config.session, "model_context", follow_context);
+            return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
+        };
+        defer result.deinit(allocator);
 
-    const distilled_web = try distillWebEvidenceForContextTyped(allocator, config, prompt, target, query, result.evidence_text, client, db, &state.context, ui_ptr);
-    defer distilled_web.deinit(allocator);
-    const model_evidence = distilled_web.text;
-    const model_context_id = try webEvidenceContextId(allocator, model_evidence);
-    defer allocator.free(model_context_id);
-    try db.recordEvent(config.session, "tool_event", result.audit_text);
-    try db.recordEvent(config.session, "evidence", model_evidence);
-    try events.emit(.{ .tool_result = .{ .name = "web_search", .output = model_evidence } });
-    try state.rememberExecutedArgs(target, declared_query, strategy, 1, 1, model_context_id, model_evidence, model_evidence.len, result.quality_score);
-    state.recordObservation();
-    const follow_source = webEvidenceSourceFollowupTarget(distilled_web.summary, target, state, strategy) orelse
-        webEvidenceContextFollowupTarget(distilled_web.summary, target, state, strategy);
-    if (follow_source) |source_url| {
+        const distilled_web = try distillWebEvidenceForContextTyped(allocator, config, prompt, target, query, result.evidence_text, client, db, &state.context, ui_ptr);
+        defer distilled_web.deinit(allocator);
+        const model_evidence = distilled_web.text;
+        try db.storeWebCache(target, query, budget, model_evidence, result.quality_score);
+        try db.recordEvent(config.session, "web_cache_store", target);
+        try db.recordEvent(config.session, "tool_event", result.audit_text);
+        break :blk try prepareWebSearchContinuation(
+            allocator,
+            config,
+            prompt,
+            target,
+            declared_query,
+            query,
+            call.budget_bytes,
+            strategy,
+            model_evidence,
+            result.quality_score,
+            events,
+            db,
+            state,
+        );
+    };
+    defer continuation.deinit(allocator);
+    if (continuation.follow_source) |source_url| {
         try db.recordEvent(config.session, "web_search_follow_source", source_url);
         var follow_call = tool_call.ToolCall{
             .name = "web_search",
@@ -4193,12 +4226,56 @@ fn runWebSearchStep(
         };
         return try runWebSearchStep(allocator, io, config, prompt, &follow_call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
     }
-    const web_complete = webEvidenceCanCloseToolPhase(result.http_success, distilled_web.summary);
+    const follow_context = continuation.follow_context orelse return error.MissingWebContinuation;
+    try db.recordEvent(config.session, "model_context", follow_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
+}
+
+const WebEvidenceContinuation = struct {
+    follow_source: ?[]u8 = null,
+    follow_context: ?[]u8 = null,
+
+    fn deinit(self: *WebEvidenceContinuation, allocator: std.mem.Allocator) void {
+        if (self.follow_source) |text| allocator.free(text);
+        if (self.follow_context) |text| allocator.free(text);
+    }
+};
+
+fn prepareWebSearchContinuation(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    target: []const u8,
+    declared_query: ?[]const u8,
+    query: ?[]const u8,
+    requested_budget_bytes: ?usize,
+    strategy: contracts.StrategyName,
+    model_evidence: []const u8,
+    quality_score: i32,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    state: *ToolLoopState,
+) !WebEvidenceContinuation {
+    const summary = summarizeWebEvidence(model_evidence);
+    const model_context_id = try webEvidenceContextId(allocator, model_evidence);
+    defer allocator.free(model_context_id);
+    try db.recordEvent(config.session, "evidence", model_evidence);
+    try events.emit(.{ .tool_result = .{ .name = "web_search", .output = model_evidence } });
+    try state.rememberExecutedArgs(target, declared_query, strategy, 1, 1, model_context_id, model_evidence, model_evidence.len, quality_score);
+    state.recordObservation();
+    const follow_source = webEvidenceSourceFollowupTarget(summary, target, state, strategy) orelse
+        webEvidenceContextFollowupTarget(summary, target, state, strategy);
+    if (follow_source) |source_url| {
+        _ = query;
+        _ = requested_budget_bytes;
+        return .{ .follow_source = try allocator.dupe(u8, source_url) };
+    }
+    const web_complete = webEvidenceCanCloseToolPhase(summary.status_code != null and summary.status_code.? >= 200 and summary.status_code.? < 300, summary);
     if (web_complete) state.closeToolPhase();
     const working_add = try std.fmt.allocPrint(
         allocator,
         "path={s} terms_bytes={} strategy={s} compact=false model_bytes={} quality={}",
-        .{ target, if (declared_query) |value| value.len else 0, @tagName(strategy), model_evidence.len, result.quality_score },
+        .{ target, if (declared_query) |value| value.len else 0, @tagName(strategy), model_evidence.len, quality_score },
     );
     defer allocator.free(working_add);
     try db.recordEvent(config.session, "working_context_add", working_add);
@@ -4221,9 +4298,7 @@ fn runWebSearchStep(
             if (!state.shouldAllowMoreEvidence()) context_profile.toolSchema(.code_evidence, .after_collect_evidence) else activeToolSchema(state),
             webAnswerOnlyNextAction(false),
         );
-    defer allocator.free(follow_context);
-    try db.recordEvent(config.session, "model_context", follow_context);
-    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
+    return .{ .follow_context = follow_context };
 }
 
 fn webEvidenceSourceFollowupTarget(summary: WebEvidenceSummary, current_target: []const u8, state: *const ToolLoopState, strategy: contracts.StrategyName) ?[]const u8 {

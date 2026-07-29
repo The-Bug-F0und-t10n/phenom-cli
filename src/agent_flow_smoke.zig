@@ -15,6 +15,7 @@ const Scenario = enum {
     duplicate_web_json,
     web_query_intent_optimization,
     web_source_followup,
+    web_cache_reuse,
     web_language,
     web_language_empty,
 };
@@ -42,6 +43,7 @@ const ServerState = struct {
     fd: c_int,
     port: u16,
     completion_count: usize = 0,
+    search_get_count: usize = 0,
     completion_buf: [4096]u8 = undefined,
 };
 
@@ -63,6 +65,7 @@ pub fn main(init: std.process.Init) !void {
     try runScenario(allocator, init.io, bin, .duplicate_web_json);
     try runScenario(allocator, init.io, bin, .web_query_intent_optimization);
     try runScenario(allocator, init.io, bin, .web_source_followup);
+    try runCacheReuseScenario(allocator, init.io, bin);
     try runScenario(allocator, init.io, bin, .web_language);
     try runScenario(allocator, init.io, bin, .web_language_empty);
     writeFd(1, "agent-flow-smoke: ok\n");
@@ -191,6 +194,99 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
     thread.join();
 }
 
+fn runCacheReuseScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8) !void {
+    writeFd(1, "agent-flow-smoke: web_cache_reuse\n");
+
+    var state = try startServer(.web_cache_reuse);
+    var thread = try std.Thread.spawn(.{}, serverMain, .{&state});
+    errdefer {
+        _ = c.shutdown(state.fd, c.SHUT_RDWR);
+        _ = c.close(state.fd);
+        thread.join();
+    }
+
+    const work = "/tmp/phenom-zig-agent-flow-smoke-web_cache_reuse";
+    std.Io.Dir.cwd().deleteTree(io, work) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, work);
+
+    const config = try std.fmt.allocPrint(allocator, "web_search_url = \"http://127.0.0.1:{}/search?q={{query}}\"\n", .{state.port});
+    defer allocator.free(config);
+    var work_dir = try std.Io.Dir.cwd().openDir(io, work, .{});
+    defer work_dir.close(io);
+    try work_dir.writeFile(io, .{ .sub_path = "config.toml", .data = config });
+
+    const host = try std.fmt.allocPrint(allocator, "127.0.0.1:{}", .{state.port});
+    defer allocator.free(host);
+    const prompt = scenarioPrompt(.web_cache_reuse);
+    const expect = scenarioExpect(.web_cache_reuse);
+
+    try runChatOnce(allocator, io, bin, work, host, "web_cache_reuse_a", prompt, expect);
+    try runChatOnce(allocator, io, bin, work, host, "web_cache_reuse_b", prompt, expect);
+
+    const db_path = try std.fmt.allocPrint(allocator, "{s}/.phenom-zig/phenom.db", .{work});
+    defer allocator.free(db_path);
+    try expectCount(allocator, db_path, "select count(*) from events where kind='web_cache_store'", 1);
+    try expectCount(allocator, db_path, "select count(*) from events where kind='web_cache_hit'", 1);
+    try expectCount(allocator, db_path, "select count(*) from events where kind='turn_error'", 0);
+    if (state.search_get_count != 1) return SmokeError.UnexpectedAudit;
+
+    _ = c.shutdown(state.fd, c.SHUT_RDWR);
+    _ = c.close(state.fd);
+    thread.join();
+}
+
+fn runChatOnce(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, work: []const u8, host: []const u8, session: []const u8, prompt: []const u8, expect: []const u8) !void {
+    const argv = [_][]const u8{
+        bin,
+        "chat",
+        "--backend",
+        "llamacpp",
+        "--host",
+        host,
+        "--model",
+        "scripted",
+        "--session",
+        session,
+        "--prompt",
+        prompt,
+        "--max-tokens",
+        "512",
+        "--thinking",
+        "on",
+        "--expect-contains",
+        expect,
+        "--fail-on-model-error",
+        "--no-color",
+    };
+    const result = try std.process.run(allocator, io, .{
+        .argv = &argv,
+        .cwd = .{ .path = work },
+        .stdout_limit = .limited(128 * 1024),
+        .stderr_limit = .limited(128 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            dumpChildOutput(result.stdout, result.stderr);
+            return SmokeError.ChildFailed;
+        },
+        else => {
+            dumpChildOutput(result.stdout, result.stderr);
+            return SmokeError.ChildFailed;
+        },
+    }
+    if (std.mem.indexOf(u8, result.stdout, expect) == null) {
+        dumpChildOutput(result.stdout, result.stderr);
+        return SmokeError.ExpectedOutputMissing;
+    }
+    if (containsAny(result.stdout, &.{ "\"tool_call\"", "```json", "[WEB_EVIDENCE_EMPTY]", "PHENOM_WEB_LANG_EN" })) {
+        dumpChildOutput(result.stdout, result.stderr);
+        return SmokeError.ProtocolLeak;
+    }
+}
+
 fn startServer(scenario: Scenario) !ServerState {
     const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
     if (fd < 0) return SmokeError.SocketFailed;
@@ -218,6 +314,7 @@ fn serverMain(state: *ServerState) void {
         .duplicate_web_json => 5,
         .web_query_intent_optimization => 4,
         .web_source_followup => 9,
+        .web_cache_reuse => 7,
         .web_language => 4,
         .web_language_empty => 7,
     };
@@ -258,6 +355,7 @@ fn handleClient(state: *ServerState, client: c_int) !void {
         return send(client, "200 OK", "application/json", "{\"tokens\":[1,2,3,4,5,6,7,8]}");
     }
     if (std.mem.startsWith(u8, first_line, "GET /search")) {
+        state.search_get_count += 1;
         return send(client, "200 OK", "text/html", searchHtml(state, first_line));
     }
     if (std.mem.startsWith(u8, first_line, "GET /source ")) {
@@ -281,6 +379,7 @@ fn completionText(state: *ServerState, prompt: []const u8) []const u8 {
         .duplicate_web_json => duplicateWebCompletion(prompt),
         .web_query_intent_optimization => queryIntentOptimizationCompletion(prompt),
         .web_source_followup => sourceFollowupCompletion(state, prompt),
+        .web_cache_reuse => cacheReuseCompletion(prompt),
         .web_language => languageCompletion(prompt, false, state.completion_count),
         .web_language_empty => languageCompletion(prompt, true, state.completion_count),
     };
@@ -306,6 +405,12 @@ fn queryIntentOptimizationCompletion(prompt: []const u8) []const u8 {
     if (contains(prompt, "WEB_EVIDENCE_INPUT")) return "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1/search\nstatus=200\nquery=R36S especificacoes tecnicas console\ntitle=R36S Specs\nexcerpt=Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.";
     if (contains(prompt, "tool phase is closed")) return "Specs verificadas: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_QUERY_INTENT_OPTIMIZED";
     return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S</parameter><parameter=reason>buscar dados tecnicos externos</parameter></function></tool_call>";
+}
+
+fn cacheReuseCompletion(prompt: []const u8) []const u8 {
+    if (contains(prompt, "MODEL_DECLARED_QUERY")) return "R36S especificacoes tecnicas console cache";
+    if (contains(prompt, "tool phase is closed")) return "Specs verificadas via evidencia: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.\nPHENOM_WEB_CACHE_REUSED";
+    return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S especificacoes tecnicas console cache</parameter><parameter=reason>buscar e reutilizar evidencia externa</parameter></function></tool_call>";
 }
 
 fn sourceFollowupCompletion(state: *ServerState, prompt: []const u8) []const u8 {
@@ -358,6 +463,7 @@ fn searchHtml(state: *ServerState, request_line: []const u8) []const u8 {
         .initial_json_web => "<html><head><title>Londrina Location</title></head><body><p>Londrina fica no norte do Paraná, na região Sul do Brasil.</p></body></html>",
         .duplicate_web_json => "<html><head><title>Londrina Solar</title></head><body><p>Irradiacao solar em Londrina: 4,8 kWh/m2/dia.</p></body></html>",
         .web_query_intent_optimization => "<html><head><title>R36S Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
+        .web_cache_reuse => "<html><head><title>R36S Cached Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
         .web_source_followup => std.fmt.bufPrint(
             &state.completion_buf,
             "<html><head><title>R36S results</title></head><body><article><a href=\"http://127.0.0.1:{}/source-empty\">R36S Specs empty</a><p>Dados tecnicos do console R36S.</p></article><article><a href=\"http://127.0.0.1:{}/source\">R36S Specs source</a><p>Ficha tecnica do console R36S.</p></article></body></html>",
@@ -391,6 +497,7 @@ fn scenarioPrompt(scenario: Scenario) []const u8 {
         .duplicate_web_json => "como media a irradiacao solar em Londrina - PR, pesquise na internet. Responda contendo PHENOM_WEB_JSON_NORMALIZED.",
         .web_query_intent_optimization => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_QUERY_INTENT_OPTIMIZED.",
         .web_source_followup => "busque as informacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_SOURCE_FOLLOWED.",
+        .web_cache_reuse => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_CACHE_REUSED.",
         .web_language, .web_language_empty => "Usuario esta usando o idioma operacional 'user-lang-a'. Pesquise e explique nesse idioma operacional o que entra no custo de uma casa off-grid solar. Responda contendo PHENOM_WEB_LANG_USER.",
     };
 }
@@ -401,6 +508,7 @@ fn scenarioExpect(scenario: Scenario) []const u8 {
         .duplicate_web_json => "PHENOM_WEB_JSON_NORMALIZED",
         .web_query_intent_optimization => "PHENOM_WEB_QUERY_INTENT_OPTIMIZED",
         .web_source_followup => "PHENOM_WEB_SOURCE_FOLLOWED",
+        .web_cache_reuse => "PHENOM_WEB_CACHE_REUSED",
         .web_language, .web_language_empty => "PHENOM_WEB_LANG_USER",
     };
 }
