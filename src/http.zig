@@ -309,6 +309,10 @@ pub fn inspectHttpGet(allocator: std.mem.Allocator, target: []const u8) RuntimeH
 }
 
 pub fn inspectHttpGetLimit(allocator: std.mem.Allocator, target: []const u8, body_limit: usize) RuntimeHttpResult {
+    return inspectHttpGetLimitCancel(allocator, target, body_limit, null);
+}
+
+pub fn inspectHttpGetLimitCancel(allocator: std.mem.Allocator, target: []const u8, body_limit: usize, cancel: ?*std.atomic.Value(bool)) RuntimeHttpResult {
     const parsed = parseHttpTarget(allocator, target) catch |err| {
         const normalized_target = if (std.mem.startsWith(u8, target, "http://") or std.mem.startsWith(u8, target, "https://"))
             allocator.dupe(u8, target) catch unreachable
@@ -324,7 +328,7 @@ pub fn inspectHttpGetLimit(allocator: std.mem.Allocator, target: []const u8, bod
     };
     defer parsed.deinit(allocator);
     const normalized = parsed.render(allocator) catch unreachable;
-    const response = requestHttp(allocator, parsed.host, parsed.port, "GET", parsed.path, null, body_limit) catch |err| {
+    const response = requestHttpCancel(allocator, parsed.host, parsed.port, "GET", parsed.path, null, body_limit, cancel) catch |err| {
         return .{
             .target = normalized,
             .status = null,
@@ -743,6 +747,20 @@ fn requestHttp(
     body: ?[]const u8,
     body_limit: usize,
 ) !HttpResponse {
+    return requestHttpCancel(allocator, host, port, method, path, body, body_limit, null);
+}
+
+fn requestHttpCancel(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    method: []const u8,
+    path: []const u8,
+    body: ?[]const u8,
+    body_limit: usize,
+    cancel: ?*std.atomic.Value(bool),
+) !HttpResponse {
+    if (isCancelled(cancel)) return error.Cancelled;
     const fd = try tcpConnect(allocator, host, port);
     defer _ = c.close(fd);
     const request = if (body) |payload|
@@ -763,7 +781,9 @@ fn requestHttp(
     var response = std.ArrayList(u8).empty;
     defer response.deinit(allocator);
     var buf: [2048]u8 = undefined;
+    var cancel_input = StreamCancelInput{};
     while (response.items.len < body_limit + 32 * 1024) {
+        try waitReadableOrCancelled(fd, cancel, null, &cancel_input);
         const n_raw = c.read(fd, &buf, buf.len);
         if (n_raw < 0) return error.SocketReadFailed;
         const n: usize = @intCast(n_raw);

@@ -10,6 +10,7 @@ const c = @cImport({
 
 const default_fetch_limit: usize = 64 * 1024;
 pub const default_search_template = "https://html.duckduckgo.com/html/?q={query}";
+const max_fanout_concurrency: usize = 2;
 
 pub const Result = struct {
     target: []u8,
@@ -33,6 +34,10 @@ pub const Result = struct {
 };
 
 pub fn fetch(allocator: std.mem.Allocator, io: std.Io, target: []const u8, query: ?[]const u8, budget_bytes: usize) !Result {
+    return fetchCancel(allocator, io, target, query, budget_bytes, null);
+}
+
+fn fetchCancel(allocator: std.mem.Allocator, io: std.Io, target: []const u8, query: ?[]const u8, budget_bytes: usize, cancel: ?*std.atomic.Value(bool)) !Result {
     if (!isHttpTarget(target)) return error.InvalidWebTarget;
     if (budget_bytes == 0) return error.InvalidEvidenceBudget;
 
@@ -40,7 +45,7 @@ pub fn fetch(allocator: std.mem.Allocator, io: std.Io, target: []const u8, query
     const inspected = if (std.mem.startsWith(u8, std.mem.trim(u8, target, " \t\r\n"), "https://"))
         inspectHttpsGetLimit(allocator, io, target, body_limit)
     else
-        http.inspectHttpGetLimit(allocator, target, body_limit);
+        http.inspectHttpGetLimitCancel(allocator, target, body_limit, cancel);
     defer inspected.deinit(allocator);
 
     const title = try extractTitle(allocator, inspected.body_snippet);
@@ -123,32 +128,104 @@ pub fn fetchQueryFanout(allocator: std.mem.Allocator, io: std.Io, query: []const
     }
     if (templates.items.len == 0) return error.MissingWebSearchTarget;
 
-    var results = std.ArrayList(Result).empty;
-    errdefer {
-        for (results.items) |result| result.deinit(allocator);
-        results.deinit(allocator);
+    var requests = std.ArrayList(FanoutRequest).empty;
+    defer {
+        for (requests.items) |request| request.deinit(allocator);
+        requests.deinit(allocator);
     }
-
     const per_fetch_budget = @max(@as(usize, 1024), @min(budget_bytes, @as(usize, 4096)));
-    outer: for (templates.items) |template| {
+    for (templates.items) |template| {
         for (variants.items) |variant| {
             const target = try resolveSearchTargetFromTemplate(allocator, template, variant);
-            defer allocator.free(target);
-            if (hasFetchedTarget(results.items, target)) continue;
-            var result = try fetch(allocator, io, target, variant, per_fetch_budget);
-            result.fanout_count = results.items.len + 1;
-            try results.append(allocator, result);
-            if (result.has_direct_excerpt) break :outer;
+            errdefer allocator.free(target);
+            if (hasFanoutRequestTarget(requests.items, target)) {
+                allocator.free(target);
+                continue;
+            }
+            try requests.append(allocator, .{
+                .target = target,
+                .query = try allocator.dupe(u8, variant),
+            });
         }
+    }
+    if (requests.items.len == 0) return error.MissingWebSearchTarget;
+
+    var results = try fetchFanoutRequestsParallel(allocator, io, requests.items, per_fetch_budget);
+    errdefer {
+        for (results.items) |result| result.deinit(std.heap.smp_allocator);
+        results.deinit(allocator);
     }
 
     if (results.items.len == 0) return error.MissingWebSearchTarget;
     if (results.items.len == 1) {
-        const only = results.items[0];
+        const only = try cloneResult(allocator, results.items[0]);
+        results.items[0].deinit(std.heap.smp_allocator);
         results.deinit(allocator);
         return only;
     }
     return aggregateFanoutResults(allocator, query, budget_bytes, results);
+}
+
+const FanoutRequest = struct {
+    target: []u8,
+    query: []u8,
+
+    fn deinit(self: FanoutRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.target);
+        allocator.free(self.query);
+    }
+};
+
+const FanoutSlot = struct {
+    result: ?Result = null,
+    err: ?anyerror = null,
+    skipped: bool = false,
+};
+
+fn fetchFanoutRequestsParallel(allocator: std.mem.Allocator, io: std.Io, requests: []const FanoutRequest, per_fetch_budget: usize) !std.ArrayList(Result) {
+    var results = std.ArrayList(Result).empty;
+    errdefer {
+        for (results.items) |result| result.deinit(std.heap.smp_allocator);
+        results.deinit(allocator);
+    }
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var start: usize = 0;
+    while (start < requests.len and !cancel.load(.acquire)) {
+        const batch_len = @min(max_fanout_concurrency, requests.len - start);
+        var slots: [max_fanout_concurrency]FanoutSlot = undefined;
+        var threads: [max_fanout_concurrency]std.Thread = undefined;
+        for (0..batch_len) |idx| {
+            slots[idx] = .{};
+            threads[idx] = try std.Thread.spawn(.{}, fetchFanoutWorker, .{ io, requests[start + idx], per_fetch_budget, &cancel, &slots[idx] });
+        }
+        for (0..batch_len) |idx| threads[idx].join();
+        for (0..batch_len) |idx| {
+            if (slots[idx].result) |result| {
+                var owned = result;
+                owned.fanout_count = results.items.len + 1;
+                try results.append(allocator, owned);
+                if (owned.has_direct_excerpt) cancel.store(true, .release);
+            } else if (slots[idx].err) |err| {
+                if (results.items.len == 0) return err;
+            }
+        }
+        start += batch_len;
+    }
+    return results;
+}
+
+fn fetchFanoutWorker(io: std.Io, request: FanoutRequest, per_fetch_budget: usize, cancel: *std.atomic.Value(bool), slot: *FanoutSlot) void {
+    if (cancel.load(.acquire)) {
+        slot.skipped = true;
+        return;
+    }
+    const result = fetchCancel(std.heap.smp_allocator, io, request.target, request.query, per_fetch_budget, cancel) catch |err| {
+        slot.err = err;
+        return;
+    };
+    if (result.has_direct_excerpt) cancel.store(true, .release);
+    slot.result = result;
 }
 
 fn buildQueryVariants(allocator: std.mem.Allocator, raw: []const u8) !std.ArrayList([]u8) {
@@ -241,6 +318,37 @@ fn hasFetchedTarget(results: []const Result, target: []const u8) bool {
     return false;
 }
 
+fn hasFanoutRequestTarget(requests: []const FanoutRequest, target: []const u8) bool {
+    for (requests) |request| {
+        if (std.mem.eql(u8, request.target, target)) return true;
+    }
+    return false;
+}
+
+fn cloneResult(allocator: std.mem.Allocator, source: Result) !Result {
+    const target = try allocator.dupe(u8, source.target);
+    errdefer allocator.free(target);
+    const evidence_text = try allocator.dupe(u8, source.evidence_text);
+    errdefer allocator.free(evidence_text);
+    const audit_text = try allocator.dupe(u8, source.audit_text);
+    errdefer allocator.free(audit_text);
+    const context_id = try allocator.dupe(u8, source.context_id);
+    errdefer allocator.free(context_id);
+    return .{
+        .target = target,
+        .evidence_text = evidence_text,
+        .audit_text = audit_text,
+        .context_id = context_id,
+        .status_code = source.status_code,
+        .http_success = source.http_success,
+        .has_direct_excerpt = source.has_direct_excerpt,
+        .raw_bytes_read = source.raw_bytes_read,
+        .model_bytes = source.model_bytes,
+        .quality_score = source.quality_score,
+        .fanout_count = source.fanout_count,
+    };
+}
+
 fn buildSearchTemplates(allocator: std.mem.Allocator, configured_template: ?[]const u8) !std.ArrayList([]u8) {
     var templates = std.ArrayList([]u8).empty;
     errdefer {
@@ -269,7 +377,7 @@ fn appendSearchTemplate(allocator: std.mem.Allocator, templates: *std.ArrayList(
 fn aggregateFanoutResults(allocator: std.mem.Allocator, query: []const u8, budget_bytes: usize, results: std.ArrayList(Result)) !Result {
     var owned_results = results;
     defer {
-        for (owned_results.items) |result| result.deinit(allocator);
+        for (owned_results.items) |result| result.deinit(std.heap.smp_allocator);
         owned_results.deinit(allocator);
     }
 

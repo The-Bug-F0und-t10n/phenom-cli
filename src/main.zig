@@ -5217,7 +5217,6 @@ fn repairLengthStoppedVisibleAnswer(
     aggregate_sink: *StreamSink,
 ) !bool {
     try db.recordEvent(config.session, "answer_repair", "server length stop with partial visible answer");
-    try events.emit(.{ .progress_update = "model stopped at generation limit; requesting continuation" });
 
     const partial = try compactOperationalText(allocator, aggregate_sink.visible.items, 4096);
     defer allocator.free(partial);

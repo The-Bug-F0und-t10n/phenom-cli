@@ -12275,3 +12275,69 @@ Invariantes afetadas:
 Risco residual:
 
 - Fan-out multi-provider ainda e sequencial. Paralelismo real exige cuidado com allocator/IO em threads e deve entrar como etapa propria, com teste de cancelamento e limite de concorrencia.
+
+## T335 - RAG Web etapa 8: fan-out paralelo com cancelamento cooperativo
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: T334 adicionou fallback multi-provider, mas a execucao ainda era sequencial. Um provider lento podia atrasar a coleta mesmo quando outro provider ja tinha evidencia direta. O agente tambem emitia `model stopped at generation limit; requesting continuation` como progresso visivel; isso e auditoria operacional de `max_tokens`, nao resposta final do modelo.
+
+Causa raiz do log de `generation limit`:
+
+- O backend retornou `finish_reason=length`/equivalente porque a resposta bateu `max_tokens`.
+- Isso independe de haver contexto livre no modelo: `context_window` controla entrada; `max_tokens` controla saida.
+- O agente chamava `repairLengthStoppedVisibleAnswer`, registrava o reparo e emitia uma mensagem operacional visivel antes da continuacao.
+- Correto: manter auditoria de `answer_repair=server length stop with partial visible answer`, mas nao expor a mensagem operacional no output final.
+
+Passos de implementacao:
+
+1. Criar `fetchCancel` em `src/web_rag.zig`, preservando `fetch` como wrapper publico.
+2. Adicionar `inspectHttpGetLimitCancel` e `requestHttpCancel` em `src/http.zig`.
+3. Usar `poll` com token de cancelamento no loop de leitura HTTP.
+4. Executar fan-out em lotes de `max_fanout_concurrency = 2`.
+5. Usar `std.heap.smp_allocator` nos workers para evitar compartilhar o allocator principal entre threads.
+6. Sinalizar cancelamento quando qualquer worker encontra `has_direct_excerpt`.
+7. Parar novos lotes e cancelar HTTP lento ainda bloqueado em leitura.
+8. Remover `progress_update` visivel do reparo de `length_stop`; preservar auditoria.
+9. Atualizar smoke `web_provider_fanout` com provider lento de 1s e provider forte imediato.
+
+Implementacao:
+
+- `phenom-zig/src/web_rag.zig`: `FanoutRequest`, `FanoutSlot`, `fetchFanoutRequestsParallel`, `fetchFanoutWorker`, `cloneResult` e cancelamento compartilhado.
+- `phenom-zig/src/http.zig`: GET HTTP cancellable por token atomico.
+- `phenom-zig/src/agent_flow_smoke.zig`: servidor fake concorrente para `web_provider_fanout`, latencia medida e limite <900 ms com provider lento de 1s.
+- `phenom-zig/src/main.zig`: reparo de `length_stop` deixa de emitir mensagem operacional visivel.
+
+Criterio de aceite:
+
+- Fan-out query-only continua sendo uma unica tool call visivel.
+- Dois providers podem ser buscados em paralelo com limite de concorrencia.
+- Provider lento e vazio nao atrasa o turno quando provider forte responde primeiro.
+- Cancelamento HTTP interrompe leitura bloqueada em provider lento.
+- `assistant_delta` continua sendo texto final do modelo, sem JSON/tool leak e sem aviso `generation limit`.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-web-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/web_rag.zig -lc -lsqlite3 --cache-dir /tmp/phenom-web-rag-test` -> passou; 89 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-main-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; 464 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-smoke-local-cache bin/zig-x86_64-linux-0.16.0/zig build agent-flow-smoke` -> passou; `web_provider_fanout` usa provider lento de 1s e exige elapsed <900 ms.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-build-local-cache bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+
+Evidencia real do smoke:
+
+- `tool_start|web_search target=http://127.0.0.1:46611/search-empty?q=R36S%20provider%20specs query_bytes=19 budget_bytes=8192`
+- `web_search_fanout|count=2 primary_target=http://127.0.0.1:46611/search-empty?q=R36S%20provider%20specs`
+- `assistant_delta|Specs verificadas por provider fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320. PHENOM_WEB_PROVIDER_FANOUT`
+- `expectation_passed|PHENOM_WEB_PROVIDER_FANOUT`
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada.
+- 6. Falha de modelo nao parece falha de infraestrutura: ampliada; provider lento/fraco nao bloqueia provider forte.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; fan-out registra contagem e alvo primario.
+
+Risco residual:
+
+- Cancelamento em HTTPS ainda depende do caminho `std.http.Client`, que nao recebeu token nesta etapa. O caminho HTTP usado por provedores configurados e smokes reais ja cancela por `poll`.

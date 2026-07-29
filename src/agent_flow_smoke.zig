@@ -7,6 +7,7 @@ const c = @cImport({
     @cInclude("sqlite3.h");
     @cInclude("stdlib.h");
     @cInclude("sys/socket.h");
+    @cInclude("time.h");
     @cInclude("unistd.h");
 });
 
@@ -81,6 +82,12 @@ fn writeFd(fd: c_int, text: []const u8) void {
     _ = c.write(fd, text.ptr, text.len);
 }
 
+fn monotonicMillis() i64 {
+    var ts: c.struct_timespec = undefined;
+    if (c.clock_gettime(c.CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
+}
+
 fn dumpChildOutput(stdout: []const u8, stderr: []const u8) void {
     writeFd(2, "\n[agent-flow-smoke child stdout]\n");
     writeFd(2, stdout);
@@ -152,12 +159,14 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
         "--fail-on-model-error",
         "--no-color",
     };
+    const started_ms = monotonicMillis();
     const result = try std.process.run(allocator, io, .{
         .argv = &argv,
         .cwd = .{ .path = work },
         .stdout_limit = .limited(128 * 1024),
         .stderr_limit = .limited(128 * 1024),
     });
+    const elapsed_ms = monotonicMillis() - started_ms;
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
@@ -197,6 +206,7 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
     if (scenario == .web_provider_fanout) {
         try expectCount(allocator, db_path, "select count(*) from events where kind='web_search_fanout'", 1);
         if (state.search_get_count != 2) return SmokeError.UnexpectedAudit;
+        if (elapsed_ms >= 900) return SmokeError.UnexpectedAudit;
     }
     if (scenario == .duplicate_web_json) {
         try expectAtLeast(allocator, db_path, "select count(*) from events where kind='answer_repair' and body='tool call emitted after tool phase closed'", 1);
@@ -381,14 +391,27 @@ fn serverMain(state: *ServerState) void {
         .web_language => 4,
         .web_language_empty => 7,
     };
-    while (state.completion_count < max) {
+    while (@atomicLoad(usize, &state.completion_count, .seq_cst) < max) {
         var addr: c.sockaddr_in = undefined;
         var addr_len: c.socklen_t = @sizeOf(c.sockaddr_in);
         const client = c.accept(state.fd, @ptrCast(&addr), &addr_len);
         if (client < 0) return;
-        handleClient(state, client) catch {};
-        _ = c.close(client);
+        if (state.scenario == .web_provider_fanout) {
+            const thread = std.Thread.spawn(.{}, handleClientThread, .{ state, client }) catch {
+                _ = c.close(client);
+                return;
+            };
+            thread.detach();
+        } else {
+            handleClient(state, client) catch {};
+            _ = c.close(client);
+        }
     }
+}
+
+fn handleClientThread(state: *ServerState, client: c_int) void {
+    handleClient(state, client) catch {};
+    _ = c.close(client);
 }
 
 fn handleClient(state: *ServerState, client: c_int) !void {
@@ -418,8 +441,8 @@ fn handleClient(state: *ServerState, client: c_int) !void {
         return send(client, "200 OK", "application/json", "{\"tokens\":[1,2,3,4,5,6,7,8]}");
     }
     if (std.mem.startsWith(u8, first_line, "GET /search")) {
-        state.search_get_count += 1;
-        return send(client, "200 OK", "text/html", searchHtml(state, first_line));
+        const search_count = @atomicRmw(usize, &state.search_get_count, .Add, 1, .seq_cst) + 1;
+        return send(client, "200 OK", "text/html", searchHtml(state, first_line, search_count));
     }
     if (std.mem.startsWith(u8, first_line, "GET /source ")) {
         return send(client, "200 OK", "text/html", sourceHtml(state.scenario));
@@ -430,7 +453,7 @@ fn handleClient(state: *ServerState, client: c_int) !void {
     if (std.mem.startsWith(u8, first_line, "POST /completion ")) {
         const prompt = request[header_end .. header_end + body_len];
         const text = completionText(state, prompt);
-        state.completion_count += 1;
+        _ = @atomicRmw(usize, &state.completion_count, .Add, 1, .seq_cst);
         return sendSse(client, text);
     }
     return send(client, "404 Not Found", "text/plain", "not found");
@@ -539,20 +562,17 @@ fn languageCompletion(prompt: []const u8, empty: bool, completion_count: usize) 
     return "precisa de evidencia externa\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>solar off-grid house cost batteries inverter panels</parameter><parameter=reason>estimar custo externo com evidencia</parameter></function></tool_call>";
 }
 
-fn searchHtml(state: *ServerState, request_line: []const u8) []const u8 {
+fn searchHtml(state: *ServerState, request_line: []const u8, search_count: usize) []const u8 {
     return switch (state.scenario) {
         .initial_json_web => "<html><head><title>Londrina Location</title></head><body><p>Londrina fica no norte do Paraná, na região Sul do Brasil.</p></body></html>",
         .duplicate_web_json => "<html><head><title>Londrina Solar</title></head><body><p>Irradiacao solar em Londrina: 4,8 kWh/m2/dia.</p></body></html>",
         .web_query_intent_optimization => "<html><head><title>R36S Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
         .web_cache_reuse, .web_cache_expiry => "<html><head><title>R36S Cached Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
-        .web_query_fanout => if (state.search_get_count == 1)
+        .web_query_fanout => if (search_count == 1)
             "<html><head><title>No Direct Support</title></head><body><p>Pagina sem dados relacionados.</p></body></html>"
         else
             "<html><head><title>R36S Fanout Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
-        .web_provider_fanout => if (contains(request_line, "/search-empty"))
-            "<html><head><title>No Provider Support</title></head><body><p>Pagina sem dados relacionados.</p></body></html>"
-        else
-            "<html><head><title>R36S Provider Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
+        .web_provider_fanout => providerFanoutHtml(request_line),
         .web_source_followup => std.fmt.bufPrint(
             &state.completion_buf,
             "<html><head><title>R36S results</title></head><body><article><a href=\"http://127.0.0.1:{}/source-empty\">R36S Specs empty</a><p>Dados tecnicos do console R36S.</p></article><article><a href=\"http://127.0.0.1:{}/source\">R36S Specs source</a><p>Ficha tecnica do console R36S.</p></article></body></html>",
@@ -564,6 +584,14 @@ fn searchHtml(state: *ServerState, request_line: []const u8) []const u8 {
         else
             "<html><head><title>No Direct Support</title></head><body><p>Pagina sem dados relacionados.</p></body></html>",
     };
+}
+
+fn providerFanoutHtml(request_line: []const u8) []const u8 {
+    if (contains(request_line, "/search-empty")) {
+        _ = c.usleep(1_000_000);
+        return "<html><head><title>No Provider Support</title></head><body><p>Pagina sem dados relacionados.</p></body></html>";
+    }
+    return "<html><head><title>R36S Provider Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>";
 }
 
 fn sourceHtml(scenario: Scenario) []const u8 {
