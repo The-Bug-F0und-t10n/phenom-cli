@@ -5272,7 +5272,7 @@ fn repairLengthStoppedVisibleAnswer(
         try db.recordTurnError(config.session, .model_protocol, "length_stop_continuation", "repair produced no visible answer");
         return false;
     }
-    try aggregate_sink.writeVisible(repair_sink.raw_visible.items);
+    try aggregate_sink.emitVisibleText(repair_sink.raw_visible.items);
     repair_sink.raw_visible.clearRetainingCapacity();
     try db.recordEvent(config.session, "answer_repair_done", "server length continuation emitted visible answer");
     return true;

@@ -21,6 +21,7 @@ const Scenario = enum {
     web_query_fanout,
     web_provider_fanout,
     length_usage_continuation,
+    web_length_continuation,
     web_language,
     web_language_empty,
 };
@@ -75,6 +76,7 @@ pub fn main(init: std.process.Init) !void {
     try runScenario(allocator, init.io, bin, .web_query_fanout);
     try runScenario(allocator, init.io, bin, .web_provider_fanout);
     try runScenario(allocator, init.io, bin, .length_usage_continuation);
+    try runScenario(allocator, init.io, bin, .web_length_continuation);
     try runScenario(allocator, init.io, bin, .web_language);
     try runScenario(allocator, init.io, bin, .web_language_empty);
     writeFd(1, "agent-flow-smoke: ok\n");
@@ -216,13 +218,14 @@ fn runScenario(allocator: std.mem.Allocator, io: std.Io, bin: []const u8, scenar
         try expectAtLeast(allocator, db_path, "select count(*) from events where kind='web_query_optimization' and body like '%success=true%' and body like '%final_query=R36S especificacoes tecnicas console%'", 1);
         try expectAtLeast(allocator, db_path, "select count(*) from events where kind='tool_start' and body like 'web_search%' and body like '%R36S%20especificacoes%20tecnicas%20console%'", 1);
     }
-    if (scenario == .length_usage_continuation) {
+    if (scenario == .length_usage_continuation or scenario == .web_length_continuation) {
         if (contains(result.stdout, "generation limit") or contains(result.stdout, "token limit")) {
             dumpChildOutput(result.stdout, result.stderr);
             return SmokeError.ProtocolLeak;
         }
         try expectCount(allocator, db_path, "select count(*) from events where kind='answer_repair' and body='server length stop with partial visible answer'", 1);
         try expectCount(allocator, db_path, "select count(*) from events where kind='answer_repair_done' and body='server length continuation emitted visible answer'", 1);
+        try expectAtLeast(allocator, db_path, "select count(*) from events where kind='assistant_delta' and body like '%CONTINUED%'", 1);
     }
 
     _ = c.shutdown(state.fd, c.SHUT_RDWR);
@@ -398,6 +401,7 @@ fn serverMain(state: *ServerState) void {
         .web_query_fanout => 5,
         .web_provider_fanout => 5,
         .length_usage_continuation => 2,
+        .web_length_continuation => 5,
         .web_language => 4,
         .web_language_empty => 7,
     };
@@ -467,6 +471,9 @@ fn handleClient(state: *ServerState, client: c_int) !void {
         if (state.scenario == .length_usage_continuation and completion_count == 0) {
             return sendSseWithUsage(client, text, 64, 512);
         }
+        if (state.scenario == .web_length_continuation and contains(text, "Resposta web parcial")) {
+            return sendSseWithUsage(client, text, 64, 512);
+        }
         return sendSse(client, text);
     }
     return send(client, "404 Not Found", "text/plain", "not found");
@@ -482,6 +489,7 @@ fn completionText(state: *ServerState, prompt: []const u8) []const u8 {
         .web_query_fanout => queryFanoutCompletion(prompt),
         .web_provider_fanout => providerFanoutCompletion(prompt),
         .length_usage_continuation => lengthUsageContinuationCompletion(prompt),
+        .web_length_continuation => webLengthContinuationCompletion(prompt),
         .web_language => languageCompletion(prompt, false, state.completion_count),
         .web_language_empty => languageCompletion(prompt, true, state.completion_count),
     };
@@ -536,6 +544,17 @@ fn lengthUsageContinuationCompletion(prompt: []const u8) []const u8 {
         return "a e finalizada pelo proprio modelo.\nPHENOM_LENGTH_USAGE_CONTINUED";
     }
     return "Resposta longa parcial que para no meio da palavr";
+}
+
+fn webLengthContinuationCompletion(prompt: []const u8) []const u8 {
+    if (contains(prompt, "MODEL_DECLARED_QUERY")) return "R36S especificacoes tecnicas console";
+    if (contains(prompt, "Previous visible answer stopped because the server reached the generation length limit")) {
+        return "a e finalizada pelo proprio modelo.\nPHENOM_WEB_LENGTH_CONTINUED";
+    }
+    if (contains(prompt, "[WEB_DOSSIER v1]") or contains(prompt, "tool phase is closed")) {
+        return "Resposta web parcial que para no meio da palavr";
+    }
+    return "preciso pesquisar specs\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>R36S especificacoes tecnicas console</parameter><parameter=reason>buscar dados tecnicos externos</parameter></function></tool_call>";
 }
 
 fn sourceFollowupCompletion(state: *ServerState, prompt: []const u8) []const u8 {
@@ -594,6 +613,7 @@ fn searchHtml(state: *ServerState, request_line: []const u8, search_count: usize
         else
             "<html><head><title>R36S Fanout Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
         .web_provider_fanout => providerFanoutHtml(request_line),
+        .web_length_continuation => "<html><head><title>R36S Specs</title></head><body><p>Console R36S: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320.</p></body></html>",
         .length_usage_continuation => "<html><head><title>unused</title></head><body></body></html>",
         .web_source_followup => std.fmt.bufPrint(
             &state.completion_buf,
@@ -648,6 +668,7 @@ fn scenarioPrompt(scenario: Scenario) []const u8 {
         .web_query_fanout => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_QUERY_FANOUT.",
         .web_provider_fanout => "busque as especificacoes tecnicas do console R36S em provedores web. pesquise na internet. Responda contendo PHENOM_WEB_PROVIDER_FANOUT.",
         .length_usage_continuation => "responda uma frase longa e termine contendo PHENOM_LENGTH_USAGE_CONTINUED.",
+        .web_length_continuation => "busque as especificacoes tecnicas do console R36S. pesquise na internet. Responda contendo PHENOM_WEB_LENGTH_CONTINUED.",
         .web_language, .web_language_empty => "Usuario esta usando o idioma operacional 'user-lang-a'. Pesquise e explique nesse idioma operacional o que entra no custo de uma casa off-grid solar. Responda contendo PHENOM_WEB_LANG_USER.",
     };
 }
@@ -662,6 +683,7 @@ fn scenarioExpect(scenario: Scenario) []const u8 {
         .web_query_fanout => "PHENOM_WEB_QUERY_FANOUT",
         .web_provider_fanout => "PHENOM_WEB_PROVIDER_FANOUT",
         .length_usage_continuation => "PHENOM_LENGTH_USAGE_CONTINUED",
+        .web_length_continuation => "PHENOM_WEB_LENGTH_CONTINUED",
         .web_language, .web_language_empty => "PHENOM_WEB_LANG_USER",
     };
 }
@@ -675,6 +697,7 @@ fn expectedWebSearchStarts(scenario: Scenario) i64 {
         .web_language_empty => 2,
         .web_source_followup => 3,
         .length_usage_continuation => 0,
+        .web_length_continuation => 1,
         else => 1,
     };
 }

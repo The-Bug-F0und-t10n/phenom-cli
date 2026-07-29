@@ -12700,3 +12700,51 @@ Invariantes afetadas:
 Risco residual:
 
 - Nenhum risco residual conhecido para as seis etapas solicitadas; smokes e unit tests passaram no fluxo implementado.
+
+## T343 - Output final: continuacao de length_stop no tool loop nao fica presa em buffer
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: em respostas medias/longas apos RAG web, o backend batia `max_tokens` e o agente gerava uma continuacao, mas ela podia nao aparecer no output final. O audit real da sessao `default` mostrou `answer_repair_done=server length continuation emitted visible answer`, porem o unico `assistant_delta` visivel era a resposta parcial cortada. A causa raiz era o sink principal ainda estar com `defer_visible=true` depois do tool loop: `repairLengthStoppedVisibleAnswer` chamava `writeVisible`, que guardava a continuacao em `raw_visible` sem emitir porque ja havia `visible_bytes > 0`.
+
+Referencia TS consultada:
+
+- `../phenom-cli-ts/src/use-cases/run-tool-loop.ts`: finalizacao pos-tool deve entregar o texto final visivel, nao apenas registrar evento operacional.
+- `alinhamento.md` A2/A3: loop operacional reinjeta contexto e depois preserva resposta final do modelo; audit nao substitui output.
+
+Passos de implementacao:
+
+1. Corrigir `repairLengthStoppedVisibleAnswer` para emitir diretamente a continuacao no sink agregado.
+2. Nao aumentar `max_tokens` como remendo; manter continuacao model-driven.
+3. Criar smoke `web_length_continuation` que corta a resposta final apos `WEB_DOSSIER`.
+4. Validar que a continuacao aparece em `assistant_delta`, nao apenas em `answer_repair_done`.
+
+Implementacao:
+
+- `phenom-zig/src/main.zig`: `repairLengthStoppedVisibleAnswer` usa `emitVisibleText` para continuação, evitando buffer deferido do tool loop.
+- `phenom-zig/src/agent_flow_smoke.zig`: adiciona `web_length_continuation`, com `web_search` real fake-server, parada por usage `output=512`, reparo e continuacao final.
+
+Criterio de aceite:
+
+- Resposta parcial pós-web continua visível.
+- Continuação pós-length aparece como novo `assistant_delta`.
+- Não aparece mensagem operacional `generation limit`/`token limit` no stdout.
+- `turn_done` final fica `status=ok`, `used_evidence=true`, `turn_error=false`.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-length-test bin/zig-x86_64-linux-0.16.0/zig build test` -> passou.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache-length-build bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+- `.zig-cache/o/b98dcb01d190a4d83b67d6e5cdcc9244/agent-flow-smoke zig-out/bin/phenom` -> passou fora do sandbox por requerer socket loopback; inclui `web_length_continuation`.
+- Audit real do smoke `web_length_continuation`: `assistant_delta` parcial, `answer_repair`, `assistant_delta` com `PHENOM_WEB_LENGTH_CONTINUED`, `answer_repair_done`, `model_stop reason=length`, `turn_error=0`.
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada.
+- 7. Cada turno consegue ser auditado e reproduzido: reforçada; agora audit e output visivel concordam.
+
+Risco residual:
+
+- Se o backend encerrar por limite sem `finish_reason`, sem `done_reason` e sem usage final, o agente ainda nao tem sinal objetivo de `length_stop`; essa frente exige contrato de backend ou detector estrutural separado.
