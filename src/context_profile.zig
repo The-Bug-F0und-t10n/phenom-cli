@@ -103,6 +103,19 @@ pub fn initialRouterSchema() []const u8 {
 }
 
 pub fn activeContractSchema() []const u8 {
+    return collectEvidenceActiveSchema();
+}
+
+pub fn workflowActiveSchema() []const u8 {
+    return
+    \\[TOOLS v1]
+    \\set_operational_contract(contract=answer_only|collect_evidence|mutate_file|validate_work|inspect_runtime|search_web|rag_web|memory, query?, intent?, terms?, target?, budget_bytes?, requiresInspection?, requiresMutation?, requiresRuntimeValidation?, requiresBrowserDiagnostics?, requiresMemoryPromotion?, reason?)
+    \\search_session(intent?, terms, scope=current|all, session?)
+    \\Workflow contract active. Select one operational contract or answer directly. Executors are unavailable until their specific contract is selected.
+    ;
+}
+
+pub fn collectEvidenceActiveSchema() []const u8 {
     return
     \\[TOOLS v1]
     \\collect_evidence(strategyId?, source=auto|file|code|git|web|diagnostic|rag?, intent?, need?, path?, target?, httpSearch=true|false?, query?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol|diagnostic|diff|history|show|reflog|unreachable, stage=overview|minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
@@ -119,8 +132,9 @@ pub fn activeContractSchema() []const u8 {
 
 pub fn activeContractSchemaFor(contract: contracts.ContractName) []const u8 {
     return switch (contract) {
-        .workflow => initialRouterSchema(),
+        .workflow => workflowActiveSchema(),
         .answer_only => answerOnlySchema(),
+        .collect_evidence => collectEvidenceActiveSchema(),
         .mutate_file => mutateFileSchema(),
         .validate_work => validateWorkSchema(),
         .inspect_runtime => inspectRuntimeSchema(),
@@ -282,6 +296,18 @@ test "schemas are state scoped" {
 }
 
 test "contract schemas expose executor families only after contract selection" {
+    const workflow = activeContractSchemaFor(.workflow);
+    try std.testing.expect(std.mem.indexOf(u8, workflow, "Workflow contract active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workflow, "Initial router") == null);
+    try std.testing.expect(std.mem.indexOf(u8, workflow, "collect_evidence(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, workflow, "Executors are unavailable") != null);
+
+    const collect = activeContractSchemaFor(.collect_evidence);
+    try std.testing.expect(std.mem.indexOf(u8, collect, "Contract active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collect, "collect_evidence(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collect, "stage=candidates") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collect, "apply_patch") == null);
+
     const mutation = activeContractSchemaFor(.mutate_file);
     try std.testing.expect(std.mem.indexOf(u8, mutation, "apply_patch") != null);
     try std.testing.expect(std.mem.indexOf(u8, mutation, "contextId") != null);

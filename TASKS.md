@@ -12499,3 +12499,53 @@ Invariantes afetadas:
 Risco residual:
 
 - `activeContractSchemaFor(.workflow)` ainda usa o router inicial como fallback ativo de workflow. A proxima etapa separa esse fallback para impedir router generico como active_contract.
+
+## T339 - Context economy etapa 3: active_contract especifico
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: `activeContractSchemaFor(.workflow)` reutilizava `initialRouterSchema()`. Isso misturava estado inicial com active contract e violava a regra de que o modelo deve ver somente o schema do contrato vigente. Alem disso, o contrato `collect_evidence` dependia do nome generico `activeContractSchema`, dificultando auditoria.
+
+Referencia TS consultada:
+
+- `../phenom-cli-ts/src/use-cases/run-tool-loop.ts`: o loop filtra tools por contrato/estado antes de continuar.
+- `alinhamento.md` A1/A2: tool surface pequena e tools internas escondidas por contrato.
+
+Passos de implementacao:
+
+1. Criar `workflowActiveSchema` sem executor ativo e sem texto `Initial router`.
+2. Criar `collectEvidenceActiveSchema` para o contrato `collect_evidence`.
+3. Manter `activeContractSchema` como compatibilidade apontando para `collectEvidenceActiveSchema`.
+4. Alterar `activeContractSchemaFor(.workflow)` para usar `workflowActiveSchema`.
+5. Alterar `activeContractSchemaFor(.collect_evidence)` para usar `collectEvidenceActiveSchema`.
+6. Testar que `workflow` nao contem `collect_evidence(`, `Initial router` ou executor indireto.
+
+Implementacao:
+
+- `phenom-zig/src/context_profile.zig`: `workflowActiveSchema` e `collectEvidenceActiveSchema`.
+- `phenom-zig/src/context_profile.zig`: teste de contrato prova superficie especifica por contrato.
+
+Criterio de aceite:
+
+- Workflow ativo nao devolve router inicial inteiro.
+- Workflow ativo nao anuncia executor de evidencia.
+- `collect_evidence` ativo continua com stages/candidates/expand.
+- Mutacao, validacao, runtime, memoria e web continuam especificos.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-context-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/context_profile.zig -lc -lsqlite3 --cache-dir /tmp/phenom-context-test-cache` -> passou; 13 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-main-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test-cache` -> passou; 466 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-build-local-cache bin/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/phenom-build-cache` -> passou.
+
+Invariantes afetadas:
+
+- 1. Tool nao anunciada nunca executa: ampliada; schema ativo condiz melhor com allowlist real.
+- 2. Contexto bruto nao vaza para o modelo: preservada.
+- 7. Cada turno consegue ser auditado e reproduzido: preservada; schema ativo fica mais legivel no audit.
+
+Risco residual:
+
+- RAG web ainda entra como varios blocos de evidencia quando ha multiplas coletas. A proxima etapa consolida isso em dossie curto.
