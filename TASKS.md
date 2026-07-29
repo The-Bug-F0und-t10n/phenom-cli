@@ -12163,3 +12163,60 @@ Invariantes afetadas:
 Risco residual:
 
 - Ainda nao ha fan-out paralelo real entre motores/fonte direta. A proxima etapa deve agregar variantes de query e provedores sem aumentar a surface de tools nem chamar o modelo para redestilar no hot path.
+
+## T333 - RAG Web etapa 6: fan-out deterministico de query
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: T332 garantiu frescor e qualidade por fonte, mas uma unica consulta longa ou ruim ainda podia voltar com evidencia fraca e encerrar a coleta cedo. O agente precisa ampliar a coleta operacional de forma deterministica e auditavel, sem expor multiplas tool calls ao modelo e sem reescrever a resposta final.
+
+Passos de implementacao:
+
+1. Adicionar `fetchQueryFanout` em `src/web_rag.zig` para consultas sem URL explicita.
+2. Gerar ate 3 variantes estruturais da query do modelo: normalizada, sem pontuacao e truncada por palavras.
+3. Deduplicar URLs resolvidas antes de executar HTTP.
+4. Agregar os resultados em um unico `EvidencePacket`, preservando cada alvo como entrada `web_http_get`.
+5. Parar o fan-out quando uma variante produz `has_direct_excerpt`.
+6. Auditar `web_search_fanout` com contagem e alvo primario.
+7. Impedir follow-up redundante para `source_url` que ja aparece como `target=` dentro da evidencia coletada.
+8. Adicionar smoke real `web_query_fanout`: uma chamada de tool visivel, duas coletas HTTP internas, resposta final do modelo.
+
+Implementacao:
+
+- `phenom-zig/src/web_rag.zig`: `Result.fanout_count`, `fetchQueryFanout`, `buildQueryVariants`, agregacao de resultados e auditoria de fan-out.
+- `phenom-zig/src/main.zig`: `web_search` query-only usa fan-out; URL explicita continua usando fetch direto; follow-up de fonte ignora alvos ja buscados dentro do pacote.
+- `phenom-zig/src/agent_flow_smoke.zig`: cenario `web_query_fanout` prova busca fraca inicial, variante truncada forte e finalizacao pelo modelo.
+
+Criterio de aceite:
+
+- Uma solicitacao de `web_search` query-only pode fazer fan-out interno sem emitir multiplas tool calls do modelo.
+- Evidencia fraca da primeira variante nao bloqueia a segunda variante.
+- URL ja coletada dentro do pacote nao e seguida de novo como `source_url`.
+- `assistant_delta` continua sendo exatamente o texto final do modelo.
+- JSON/tool call e `[WEB_EVIDENCE]` nao aparecem no output final.
+
+Validacao executada:
+
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-web-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/web_rag.zig -lc -lsqlite3 --cache-dir /tmp/phenom-web-rag-test` -> passou; 88 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-main-local-cache bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test` -> passou; 463 testes.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-smoke-local-cache bin/zig-x86_64-linux-0.16.0/zig build agent-flow-smoke` -> passou; inclui `web_query_fanout`.
+- `ZIG_GLOBAL_CACHE_DIR=/tmp/phenom-zig-global-cache ZIG_LOCAL_CACHE_DIR=/tmp/phenom-build-local-cache bin/zig-x86_64-linux-0.16.0/zig build` -> passou.
+
+Evidencia real do smoke:
+
+- `web_search_fanout|count=2 primary_target=http://127.0.0.1:42123/search?q=R36S%20especificacoes%20tecnicas%20console%20processador%20memoria%20tela%20resolucao%20sistema%20bateria%20armazenamento`
+- Sem evento `web_search_follow_source` no cenario `web_query_fanout`.
+- `assistant_delta|Specs verificadas por fan-out: RK3326, 1GB RAM, tela IPS 3.5 polegadas 480x320. PHENOM_WEB_QUERY_FANOUT`
+- `expectation_passed|PHENOM_WEB_QUERY_FANOUT`
+
+Invariantes afetadas:
+
+- 2. Contexto bruto nao vaza para o modelo: preservada; cada HTTP vira evidencia destilada antes do contexto.
+- 6. Falha de modelo nao parece falha de infraestrutura: ampliada; query ruim pode ser refinada operacionalmente sem fingir erro.
+- 7. Cada turno consegue ser auditado e reproduzido: ampliada; fan-out registra contagem, alvos e pacote agregado.
+
+Risco residual:
+
+- Fan-out ainda e sequencial e usa variantes estruturais locais. Proxima lacuna: politica multi-provedor/paralela com ranking por cobertura e qualidade, ainda sem aumentar a surface de tools do modelo.

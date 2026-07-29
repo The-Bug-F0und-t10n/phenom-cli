@@ -22,6 +22,7 @@ pub const Result = struct {
     raw_bytes_read: usize,
     model_bytes: usize,
     quality_score: i32,
+    fanout_count: usize = 1,
 
     pub fn deinit(self: Result, allocator: std.mem.Allocator) void {
         allocator.free(self.target);
@@ -105,6 +106,211 @@ pub fn fetch(allocator: std.mem.Allocator, io: std.Io, target: []const u8, query
         .model_bytes = evidence_text.len,
         .quality_score = webEvidenceQualityScore(http_ok, distilled.len > 0, selected_excerpt.text.len > 0, source_quality.score),
     };
+}
+
+pub fn fetchQueryFanout(allocator: std.mem.Allocator, io: std.Io, query: []const u8, configured_template: ?[]const u8, budget_bytes: usize) !Result {
+    var variants = try buildQueryVariants(allocator, query);
+    defer {
+        for (variants.items) |variant| allocator.free(variant);
+        variants.deinit(allocator);
+    }
+    if (variants.items.len == 0) return error.MissingWebSearchQuery;
+
+    var results = std.ArrayList(Result).empty;
+    errdefer {
+        for (results.items) |result| result.deinit(allocator);
+        results.deinit(allocator);
+    }
+
+    const per_fetch_budget = @max(@as(usize, 1024), @min(budget_bytes, @as(usize, 4096)));
+    for (variants.items) |variant| {
+        const target = try resolveSearchTargetWithTemplate(allocator, null, variant, configured_template);
+        defer allocator.free(target);
+        if (hasFetchedTarget(results.items, target)) continue;
+        var result = try fetch(allocator, io, target, variant, per_fetch_budget);
+        result.fanout_count = results.items.len + 1;
+        try results.append(allocator, result);
+        if (result.has_direct_excerpt) break;
+    }
+
+    if (results.items.len == 0) return error.MissingWebSearchTarget;
+    if (results.items.len == 1) {
+        const only = results.items[0];
+        results.deinit(allocator);
+        return only;
+    }
+    return aggregateFanoutResults(allocator, query, budget_bytes, results);
+}
+
+fn buildQueryVariants(allocator: std.mem.Allocator, raw: []const u8) !std.ArrayList([]u8) {
+    var variants = std.ArrayList([]u8).empty;
+    errdefer {
+        for (variants.items) |variant| allocator.free(variant);
+        variants.deinit(allocator);
+    }
+    const base = try normalizeQueryText(allocator, raw);
+    defer allocator.free(base);
+    try appendQueryVariant(allocator, &variants, base);
+
+    const no_punctuation = try queryWithoutPunctuation(allocator, base);
+    defer allocator.free(no_punctuation);
+    try appendQueryVariant(allocator, &variants, no_punctuation);
+
+    const truncated = try truncateQueryWords(allocator, no_punctuation, 9);
+    defer allocator.free(truncated);
+    try appendQueryVariant(allocator, &variants, truncated);
+    return variants;
+}
+
+fn appendQueryVariant(allocator: std.mem.Allocator, variants: *std.ArrayList([]u8), value: []const u8) !void {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0 or variants.items.len >= 3) return;
+    for (variants.items) |existing| {
+        if (std.ascii.eqlIgnoreCase(existing, trimmed)) return;
+    }
+    try variants.append(allocator, try allocator.dupe(u8, trimmed));
+}
+
+fn normalizeQueryText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var pending_space = false;
+    for (raw) |ch| {
+        if (ch == '\n' or ch == '\r' or ch == '\t' or ch == '"' or ch == '\'' or ch == '`' or std.ascii.isWhitespace(ch)) {
+            pending_space = out.items.len > 0;
+            continue;
+        }
+        if (pending_space) {
+            try out.append(allocator, ' ');
+            pending_space = false;
+        }
+        try out.append(allocator, ch);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn queryWithoutPunctuation(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var pending_space = false;
+    for (raw) |ch| {
+        if (ch == '?' or ch == '!' or ch == '.' or ch == ',' or ch == ';' or ch == ':' or ch == '(' or ch == ')' or ch == '[' or ch == ']' or ch == '{' or ch == '}') {
+            pending_space = out.items.len > 0;
+            continue;
+        }
+        if (std.ascii.isWhitespace(ch)) {
+            pending_space = out.items.len > 0;
+            continue;
+        }
+        if (pending_space) {
+            try out.append(allocator, ' ');
+            pending_space = false;
+        }
+        try out.append(allocator, ch);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn truncateQueryWords(allocator: std.mem.Allocator, raw: []const u8, max_words: usize) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var it = std.mem.tokenizeAny(u8, raw, " \t\r\n");
+    var count: usize = 0;
+    while (it.next()) |word| {
+        if (count >= max_words) break;
+        if (out.items.len > 0) try out.append(allocator, ' ');
+        try out.appendSlice(allocator, word);
+        count += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn hasFetchedTarget(results: []const Result, target: []const u8) bool {
+    for (results) |result| {
+        if (std.mem.eql(u8, result.target, target)) return true;
+    }
+    return false;
+}
+
+fn aggregateFanoutResults(allocator: std.mem.Allocator, query: []const u8, budget_bytes: usize, results: std.ArrayList(Result)) !Result {
+    var owned_results = results;
+    defer {
+        for (owned_results.items) |result| result.deinit(allocator);
+        owned_results.deinit(allocator);
+    }
+
+    var packet = evidence.EvidencePacket.init(allocator);
+    defer packet.deinit();
+    var raw_bytes: usize = 0;
+    var model_bytes: usize = 0;
+    var best_quality: i32 = 0;
+    var any_success = false;
+    var any_direct = false;
+    var status_code: ?u16 = null;
+
+    for (owned_results.items) |result| {
+        raw_bytes += result.raw_bytes_read;
+        model_bytes += result.model_bytes;
+        best_quality = @max(best_quality, result.quality_score);
+        any_success = any_success or result.http_success;
+        any_direct = any_direct or result.has_direct_excerpt;
+        if (status_code == null and result.status_code != null) status_code = result.status_code;
+        const block = webEvidenceBlockFromPacket(result.evidence_text);
+        const range = try renderRange(allocator, result.status_code);
+        errdefer allocator.free(range);
+        try packet.add(.{
+            .source = try allocator.dupe(u8, result.target),
+            .kind = try allocator.dupe(u8, "web_http_get"),
+            .range = range,
+            .hash = std.hash.Wyhash.hash(0, block),
+            .excerpt = try allocator.dupe(u8, block),
+        });
+    }
+
+    const evidence_text = try packet.render(allocator);
+    errdefer allocator.free(evidence_text);
+    const target = try std.fmt.allocPrint(allocator, "web_fanout:{s}", .{owned_results.items[0].target});
+    errdefer allocator.free(target);
+    const audit_text = try renderFanoutAuditText(allocator, query, budget_bytes, raw_bytes, evidence_text.len, any_success, owned_results.items);
+    errdefer allocator.free(audit_text);
+    const context_id = try std.fmt.allocPrint(allocator, "web_{x}", .{std.hash.Wyhash.hash(0, evidence_text)});
+    errdefer allocator.free(context_id);
+    return .{
+        .target = target,
+        .evidence_text = evidence_text,
+        .audit_text = audit_text,
+        .context_id = context_id,
+        .status_code = status_code,
+        .http_success = any_success,
+        .has_direct_excerpt = any_direct,
+        .raw_bytes_read = raw_bytes,
+        .model_bytes = evidence_text.len,
+        .quality_score = best_quality,
+        .fanout_count = owned_results.items.len,
+    };
+}
+
+fn webEvidenceBlockFromPacket(text: []const u8) []const u8 {
+    const start = std.mem.indexOf(u8, text, "[WEB_EVIDENCE]") orelse return text;
+    return text[start..];
+}
+
+fn renderFanoutAuditText(allocator: std.mem.Allocator, query: []const u8, budget_bytes: usize, raw_bytes: usize, model_bytes: usize, success: bool, results: []const Result) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    const header = try std.fmt.allocPrint(
+        allocator,
+        "[TOOL_EVENT]\ntool=web_search\nsuccess={}\nargs=fanout_count={} query_bytes={} raw_bytes={} model_bytes={} budget_bytes={} error=\n",
+        .{ success, results.len, query.len, raw_bytes, model_bytes, budget_bytes },
+    );
+    defer allocator.free(header);
+    try out.appendSlice(allocator, header);
+    for (results, 0..) |result, idx| {
+        const line = try std.fmt.allocPrint(allocator, "fanout_target_{}={s}\n", .{ idx + 1, result.target });
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn webEvidenceQualityScore(http_ok: bool, has_direct_excerpt: bool, has_any_excerpt: bool, source_score: u8) i32 {
@@ -1338,6 +1544,19 @@ test "web evidence quality combines content and source score" {
     try std.testing.expectEqual(@as(i32, 84), webEvidenceQualityScore(true, true, true, 92));
     try std.testing.expectEqual(@as(i32, 75), webEvidenceQualityScore(true, true, true, 55));
     try std.testing.expectEqual(@as(i32, 30), webEvidenceQualityScore(false, true, true, 92));
+}
+
+test "query fanout variants are normalized bounded and deduped" {
+    var variants = try buildQueryVariants(std.testing.allocator, "R36S especificacoes tecnicas console? preço ficha completa extra palavra longa");
+    defer {
+        for (variants.items) |variant| std.testing.allocator.free(variant);
+        variants.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), variants.items.len);
+    try std.testing.expectEqualStrings("R36S especificacoes tecnicas console? preço ficha completa extra palavra longa", variants.items[0]);
+    try std.testing.expectEqualStrings("R36S especificacoes tecnicas console preço ficha completa extra palavra longa", variants.items[1]);
+    try std.testing.expectEqualStrings("R36S especificacoes tecnicas console preço ficha completa extra palavra", variants.items[2]);
 }
 
 test "duckduckgo result urls become web evidence source urls" {

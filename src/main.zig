@@ -4184,7 +4184,10 @@ fn runWebSearchStep(
             try db.recordEvent(config.session, "web_cache_stale", stale_body);
         }
         try db.recordEvent(config.session, "web_cache_miss", target);
-        const result = web_rag.fetch(allocator, io, target, query, budget) catch |err| {
+        const result = (if (explicit_target == null and query != null)
+            web_rag.fetchQueryFanout(allocator, io, query.?, config.web_search_url, budget)
+        else
+            web_rag.fetch(allocator, io, target, query, budget)) catch |err| {
             try db.recordEvent(config.session, "tool_error", @errorName(err));
             try db.recordTurnError(config.session, .tool_runtime, "web_search", @errorName(err));
             try events.emit(.{ .tool_result = .{ .name = "web_search", .output = @errorName(err) } });
@@ -4202,6 +4205,11 @@ fn runWebSearchStep(
             return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
         };
         defer result.deinit(allocator);
+        if (result.fanout_count > 1) {
+            const fanout_body = try std.fmt.allocPrint(allocator, "count={} primary_target={s}", .{ result.fanout_count, target });
+            defer allocator.free(fanout_body);
+            try db.recordEvent(config.session, "web_search_fanout", fanout_body);
+        }
 
         const distilled_web = try distillWebEvidenceForContextTyped(allocator, config, prompt, target, query, result.evidence_text, client, db, &state.context, ui_ptr);
         defer distilled_web.deinit(allocator);
@@ -4316,6 +4324,7 @@ fn webEvidenceSourceFollowupTarget(summary: WebEvidenceSummary, current_target: 
     const source_url = summary.preferred_source_url orelse summary.first_source_url orelse return null;
     if (std.mem.eql(u8, source_url, current_target)) return null;
     if (state.hasExecutedWebTarget(source_url, strategy)) return null;
+    if (state.hasFetchedWebEvidenceTarget(source_url)) return null;
     return source_url;
 }
 
@@ -4330,10 +4339,25 @@ fn webEvidenceContextFollowupTarget(summary: WebEvidenceSummary, current_target:
             if (!web_rag.isHttpTarget(source_url)) continue;
             if (std.mem.eql(u8, source_url, current_target)) continue;
             if (state.hasExecutedWebTarget(source_url, strategy)) continue;
+            if (state.hasFetchedWebEvidenceTarget(source_url)) continue;
             return source_url;
         }
     }
     return null;
+}
+
+fn webEvidenceContainsTarget(text: []const u8, target: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        const idx = std.mem.indexOf(u8, trimmed, "target=") orelse continue;
+        const start = idx + "target=".len;
+        var end = start;
+        while (end < trimmed.len and !std.ascii.isWhitespace(trimmed[end])) : (end += 1) {}
+        const value = std.mem.trim(u8, trimmed[start..end], " \t\r\n");
+        if (std.mem.eql(u8, value, target)) return true;
+    }
+    return false;
 }
 
 fn stopWebSearchConfigurationError(
@@ -6039,6 +6063,13 @@ const ToolLoopState = struct {
     fn hasExecutedWebTarget(self: ToolLoopState, target: []const u8, strategy: contracts.StrategyName) bool {
         for (self.context.entries.items) |entry| {
             if (entry.strategy == strategy and entry.start_line == 1 and entry.max_lines == 1 and std.mem.eql(u8, entry.path, target)) return true;
+        }
+        return false;
+    }
+
+    fn hasFetchedWebEvidenceTarget(self: ToolLoopState, target: []const u8) bool {
+        for (self.context.entries.items) |entry| {
+            if (webEvidenceContainsTarget(entry.evidence_text, target)) return true;
         }
         return false;
     }
@@ -9709,6 +9740,26 @@ test "search result evidence follows source before closing" {
     const snippet_only = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nsource_url=https://example.test/first\nsource_url=https://example.test/eighth\nexcerpt=result=8 snippet=Generic technical specifications overview.\n");
     try std.testing.expect(snippet_only.preferred_result_index == null);
     try std.testing.expectEqualStrings("https://example.test/first", webEvidenceSourceFollowupTarget(snippet_only, "https://html.duckduckgo.com/html/?q=r36s", &state, .document_summary).?);
+
+    const fanout_evidence =
+        \\[EVIDENCE]
+        \\- E1 kind=web_http_get source=https://search.test/?q=r36s+long
+        \\[WEB_EVIDENCE]
+        \\source=http_get raw_context_persisted=false distill=source_excerpt target=https://search.test/?q=r36s+long
+        \\status=200
+        \\source_url=https://search.test/?q=r36s+long
+        \\excerpt=result=1 title=weak
+        \\- E2 kind=web_http_get source=https://search.test/?q=r36s
+        \\[WEB_EVIDENCE]
+        \\source=http_get raw_context_persisted=false distill=source_excerpt target=https://search.test/?q=r36s
+        \\status=200
+        \\source_url=https://search.test/?q=r36s
+        \\excerpt=R36S uses RK3326 and 1GB RAM.
+    ;
+    try state.rememberExecutedArgs("https://search.test/?q=r36s+long", null, .document_summary, 1, 1, "ctx_fanout", fanout_evidence, fanout_evidence.len, 80);
+    const fanout_summary = summarizeWebEvidence(fanout_evidence);
+    try std.testing.expect(webEvidenceSourceFollowupTarget(fanout_summary, "https://search.test/?q=r36s+long", &state, .document_summary) == null);
+    try std.testing.expect(webEvidenceContextFollowupTarget(fanout_summary, "https://search.test/?q=r36s+long", &state, .document_summary) == null);
 
     try state.rememberExecutedArgs("https://r36s.org/articles/r36s-specs-hardware-details", null, .document_summary, 1, 1, "ctx_web", "[WEB_EVIDENCE]\nstatus=200\n", 80, 30);
     try std.testing.expect(webEvidenceSourceFollowupTarget(serp, "https://html.duckduckgo.com/html/?q=r36s", &state, .document_summary) == null);
