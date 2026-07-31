@@ -116,6 +116,8 @@ wait "$SERVER_PID" 2>/dev/null || true
 trap - EXIT
 
 grep -q "$EXPECT" "$WORK/out.txt" || { printf 'simple-greeting-flow: missing final answer marker\n' >&2; exit 1; }
+test "$(grep -c "$EXPECT" "$WORK/out.txt")" -eq 1 || { printf 'simple-greeting-flow: final answer emitted more than once\n' >&2; exit 1; }
+! grep -q 'O usuario apenas cumprimentou' "$WORK/out.txt" || { printf 'simple-greeting-flow: hidden reasoning leaked to visible output\n' >&2; exit 1; }
 ! grep -q '\[MODEL_PROTOCOL_ERROR\]' "$WORK/out.txt" || { printf 'simple-greeting-flow: protocol error surfaced\n' >&2; exit 1; }
 
 sql_count() {

@@ -762,10 +762,9 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             .visible = std.ArrayList(u8).empty,
             .visible_bytes = 0,
             .thinking_bytes = 0,
-            .defer_visible = false,
-            .final_stream_guard = enable_tool_loop,
+            .defer_visible = enable_tool_loop,
             .trim_visible_leading_whitespace = false,
-            .suppress_thinking = false,
+            .suppress_thinking = enable_tool_loop,
         };
         defer sink.deinit();
         const model_context_text = try buildInitialModelContext(
@@ -1304,15 +1303,6 @@ fn rawVisibleContainsToolCall(visible: []const u8) bool {
 
 fn visibleContainsInternalEvidenceProtocol(visible: []const u8) bool {
     return std.mem.indexOf(u8, visible, "[WEB_EVIDENCE") != null;
-}
-
-fn visibleContainsLeakedReasoning(visible: []const u8) bool {
-    return containsAsciiIgnoreCase(visible, "The user is asking") or
-        containsAsciiIgnoreCase(visible, "I need to search") or
-        containsAsciiIgnoreCase(visible, "I'll search") or
-        containsAsciiIgnoreCase(visible, "I will search") or
-        containsAsciiIgnoreCase(visible, "Let me search") or
-        containsAsciiIgnoreCase(visible, "Let me craft");
 }
 
 fn rawModelContainsToolEnvelope(raw: []const u8) bool {
@@ -5664,7 +5654,7 @@ fn streamDeferredToolLoopTurnInternal(
                     required_tool_missing_visible,
                 );
             }
-            if (final_answer_mode and visibleContainsLeakedReasoning(follow_sink.raw_visible.items)) {
+            if (final_answer_mode and follow_sink.thinking_bytes > 0) {
                 follow_sink.discardDeferredVisible();
                 if (finalization_state) |state| {
                     if (state.finalization_repairs >= max_tool_repairs) {
@@ -7485,6 +7475,10 @@ const StreamSink = struct {
     }
 
     pub fn writeThinking(ctx: *StreamSink, thinking: []const u8) !void {
+        if (ctx.defer_visible and ctx.visible_bytes == 0 and ctx.raw_visible.items.len > 0) {
+            ctx.raw_visible.clearRetainingCapacity();
+            try ctx.db.recordEvent(ctx.session, "assistant_draft_discarded", "reasoning resumed after deferred visible content");
+        }
         ctx.thinking_bytes += thinking.len;
         if (ctx.suppress_thinking) {
             try ctx.db.recordEvent(ctx.session, "assistant_thinking_delta", thinking);
@@ -8501,6 +8495,38 @@ test "deferred stream sink flushes normal answer exactly once" {
     try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
 }
 
+test "deferred stream sink keeps only content after final reasoning block" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var recorder = EventRecorder{};
+    try bus.on(&recorder, EventRecorder.handleOpaque);
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "interleaved-reasoning-test",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = true,
+        .suppress_thinking = true,
+    };
+    defer sink.deinit();
+
+    try sink.onDelta("<think>primeira analise</think>Olá, rascunho.<think>revisao final</think>Olá! Como posso ajudar?");
+    try sink.flush();
+    try sink.flushDeferredVisible();
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
+    try std.testing.expectEqualStrings("Olá! Como posso ajudar?", sink.visible.items);
+}
+
 test "deferred follow-up answer emits through aggregate sink" {
     var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
     defer db.close();
@@ -8797,10 +8823,8 @@ test "raw visible tool call is not safe final prose" {
     try std.testing.expect(rawVisibleContainsToolCall("texto\n<function=apply_patch>"));
     try std.testing.expect(rawVisibleContainsToolCall("```json\n{\"tool_call\":{\"name\":\"web_search\"}}\n```"));
     try std.testing.expect(visibleContainsInternalEvidenceProtocol("[WEB_EVIDENCE_EMPTY] web_search returned no direct supporting excerpt"));
-    try std.testing.expect(visibleContainsLeakedReasoning("The user is asking about the average solar irradiation. Let me search."));
     try std.testing.expect(!rawVisibleContainsToolCall("texto final sem chamada"));
     try std.testing.expect(!visibleContainsInternalEvidenceProtocol("A pesquisa web nao trouxe evidencia direta suficiente."));
-    try std.testing.expect(!visibleContainsLeakedReasoning("A evidencia coletada nao contem o valor especifico para Londrina."));
 }
 
 test "direct model web_search remains parseable without prompt query synthesis" {
