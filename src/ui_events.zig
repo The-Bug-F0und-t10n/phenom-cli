@@ -83,6 +83,52 @@ pub const Event = union(EventType) {
     progress_update: []const u8,
 };
 
+fn cloneEvent(allocator: std.mem.Allocator, event: Event) !Event {
+    return switch (event) {
+        .user_message => |text| .{ .user_message = try allocator.dupe(u8, text) },
+        .agent_message => |text| .{ .agent_message = try allocator.dupe(u8, text) },
+        .message_chunk => |text| .{ .message_chunk = try allocator.dupe(u8, text) },
+        .reasoning_chunk => |text| .{ .reasoning_chunk = try allocator.dupe(u8, text) },
+        .tool_start => |tool| .{ .tool_start = .{ .name = try allocator.dupe(u8, tool.name), .detail = try allocator.dupe(u8, tool.detail) } },
+        .tool_result => |result| .{ .tool_result = .{ .name = try allocator.dupe(u8, result.name), .output = try allocator.dupe(u8, result.output), .success = result.success } },
+        .tool_error => |tool| .{ .tool_error = .{ .name = try allocator.dupe(u8, tool.name), .message = try allocator.dupe(u8, tool.message), .output = try allocator.dupe(u8, tool.output) } },
+        .think_start => |text| .{ .think_start = try allocator.dupe(u8, text) },
+        .think_end => .{ .think_end = {} },
+        .turn_done => |done| .{ .turn_done = done },
+        .context_update => |update| .{ .context_update = update },
+        .token_update => |update| .{ .token_update = update },
+        .file_diff => |diff| .{ .file_diff = .{ .path = try allocator.dupe(u8, diff.path), .action = try allocator.dupe(u8, diff.action), .content = try allocator.dupe(u8, diff.content) } },
+        .inference_cancel => |text| .{ .inference_cancel = try allocator.dupe(u8, text) },
+        .clear_streaming => .{ .clear_streaming = {} },
+        .progress_update => |text| .{ .progress_update = try allocator.dupe(u8, text) },
+    };
+}
+
+fn freeEvent(allocator: std.mem.Allocator, event: Event) void {
+    switch (event) {
+        .user_message, .agent_message, .message_chunk, .reasoning_chunk, .think_start, .inference_cancel, .progress_update => |text| allocator.free(text),
+        .tool_start => |tool| {
+            allocator.free(tool.name);
+            allocator.free(tool.detail);
+        },
+        .tool_result => |result| {
+            allocator.free(result.name);
+            allocator.free(result.output);
+        },
+        .tool_error => |tool| {
+            allocator.free(tool.name);
+            allocator.free(tool.message);
+            allocator.free(tool.output);
+        },
+        .file_diff => |diff| {
+            allocator.free(diff.path);
+            allocator.free(diff.action);
+            allocator.free(diff.content);
+        },
+        .think_end, .turn_done, .context_update, .token_update, .clear_streaming => {},
+    }
+}
+
 pub const Handler = struct {
     ctx: *anyopaque,
     call: *const fn (*anyopaque, Event) anyerror!void,
@@ -117,8 +163,11 @@ pub const EventBus = struct {
 pub fn RendererEventSink(comptime RendererPtr: type) type {
     return struct {
         renderer: RendererPtr,
+        allocator: ?std.mem.Allocator = null,
         write_mutex: ?*std.atomic.Mutex = null,
         terminal_columns: ?*const fn () usize = null,
+        history: std.ArrayList(Event) = .empty,
+        rendered_columns: usize = 0,
         assistant_started: bool = false,
         turn_started_ms: i64 = 0,
 
@@ -129,12 +178,32 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
             try self.handle(event);
         }
 
+        pub fn deinit(self: *Self) void {
+            const allocator = self.allocator orelse return;
+            for (self.history.items) |event| freeEvent(allocator, event);
+            self.history.deinit(allocator);
+        }
+
         pub fn handle(self: *Self, event: Event) !void {
             if (self.write_mutex) |mutex| {
                 lockTerminal(mutex);
                 defer mutex.unlock();
             }
-            if (self.terminal_columns) |columns| self.renderer.setTerminalColumns(columns());
+            const columns = if (self.terminal_columns) |current| current() else 0;
+            if (columns > 0 and self.rendered_columns > 0 and columns != self.rendered_columns and self.history.items.len > 0) {
+                try self.renderer.redrawStart(columns);
+                self.assistant_started = false;
+                self.turn_started_ms = 0;
+                for (self.history.items) |recorded| try self.render(recorded);
+            } else if (columns > 0) {
+                self.renderer.setTerminalColumns(columns);
+            }
+            if (columns > 0) self.rendered_columns = columns;
+            try self.render(event);
+            if (self.allocator) |allocator| try self.history.append(allocator, try cloneEvent(allocator, event));
+        }
+
+        fn render(self: *Self, event: Event) !void {
             switch (event) {
                 .user_message => |text| {
                     if (self.turn_started_ms == 0) self.turn_started_ms = monotonicMillis();
@@ -240,6 +309,12 @@ fn lockTerminal(mutex: *std.atomic.Mutex) void {
     }
 }
 
+var test_terminal_columns: usize = 80;
+
+fn testTerminalColumns() usize {
+    return test_terminal_columns;
+}
+
 test "event bus dispatches events in registration order" {
     var bus = EventBus.init(std.testing.allocator);
     defer bus.deinit();
@@ -300,4 +375,30 @@ test "renderer sink maps chat events to transcript" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "> [user] ola") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "resposta") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Worked for") != null);
+}
+
+test "renderer sink replays responsive components after resize" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = render.AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 40 });
+    var sink = RendererEventSink(@TypeOf(&renderer)){
+        .renderer = &renderer,
+        .allocator = std.testing.allocator,
+        .terminal_columns = testTerminalColumns,
+    };
+    defer sink.deinit();
+
+    test_terminal_columns = 40;
+    try sink.handle(.{ .user_message = "consulta responsiva longa" });
+    try sink.handle(.{ .message_chunk = "| Nome | Descricao |\n| --- | --- |\n| A | texto longo dentro da celula |\n" });
+    test_terminal_columns = 20;
+    try sink.handle(.{ .progress_update = "redimensionado" });
+
+    const redraw = std.mem.lastIndexOf(u8, buffer.items, "\x1b[H\x1b[J") orelse return error.ExpectedRedraw;
+    const replay = buffer.items[redraw + "\x1b[H\x1b[J".len ..];
+    try std.testing.expect(std.mem.indexOf(u8, replay, "> [user] consulta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "│ Nome") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "│      │ longo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "redimensionado") != null);
 }

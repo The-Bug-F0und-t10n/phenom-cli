@@ -820,7 +820,7 @@ pub fn TerminalUi(comptime Writer: type) type {
             self.attached = true;
             lockTerminal(&self.write_mutex);
             defer self.write_mutex.unlock();
-            try self.writer.writeAll("\x1b[?7h\x1b[?2004h");
+            try self.writer.writeAll("\x1b[?7l\x1b[?2004h");
             try self.resyncScrollRegion();
             try self.drawUnlocked(.{ .status = null, .show_prompt = true, .preserve_cursor = false });
         }

@@ -655,9 +655,11 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
     defer events.deinit();
     var render_sink = ui_events.RendererEventSink(@TypeOf(&renderer)){
         .renderer = &renderer,
+        .allocator = allocator,
         .write_mutex = if (ui_ptr) |active_ui| active_ui.mutex() else null,
         .terminal_columns = if (ui_ptr != null) currentTerminalColumns else null,
     };
+    defer render_sink.deinit();
     try events.on(&render_sink, @TypeOf(render_sink).handleOpaque);
 
     try makeDirIfMissing(".phenom-zig");
