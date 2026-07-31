@@ -5,7 +5,7 @@ Este documento descreve os comandos de compilacao, teste e smoke do Phenom Zig.
 ## Build padrao
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build
 ```
 
 O build padrao:
@@ -20,7 +20,7 @@ O build padrao:
 ## Build release
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast
 ```
 
 Use para o binario que sera chamado por `phenom` no terminal.
@@ -28,7 +28,7 @@ Use para o binario que sera chamado por `phenom` no terminal.
 ## Rodar sem instalar manualmente
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build run -- chat --offline --session dev --prompt "ola"
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build run -- chat --offline --session dev --prompt "ola"
 ```
 
 O step `run` depende do install step. Portanto ele tambem sincroniza o binario local.
@@ -36,7 +36,7 @@ O step `run` depende do install step. Portanto ele tambem sincroniza o binario l
 ## Testes offline
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test
 ```
 
 A suite offline nao deve depender de:
@@ -54,9 +54,9 @@ Ela cobre CLI, renderer, parser, HTTP body/parsing, auditoria SQLite, session co
 Exemplos:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/render.zig --cache-dir /tmp/phenom-render-test
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/audit.zig -lc -lsqlite3 --cache-dir /tmp/phenom-audit-test
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/render.zig --cache-dir /tmp/phenom-render-test
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/audit.zig -lc -lsqlite3 --cache-dir /tmp/phenom-audit-test
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test
 ```
 
 Use testes por arquivo quando estiver isolando regressao de renderer, SQLite ou fluxo principal.
@@ -66,8 +66,8 @@ Use testes por arquivo quando estiver isolando regressao de renderer, SQLite ou 
 O probe testa conectividade sem inferencia:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build run -- probe --backend ollama --host HOST:PORT
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build run -- probe --backend llamacpp --host HOST:PORT
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build run -- probe --backend ollama --host HOST:PORT
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build run -- probe --backend llamacpp --host HOST:PORT
 ```
 
 Endpoints usados:
@@ -82,7 +82,7 @@ Smokes reais sao opt-in e exigem backend ativo.
 Smoke simples:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build real-smoke \
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build real-smoke \
   -Dreal-backend=llamacpp \
   -Dreal-host=HOST:PORT \
   -Dreal-model=MODEL
@@ -91,7 +91,7 @@ ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build real
 Smoke de recuperacao de sessao:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build real-session-smoke \
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build real-session-smoke \
   -Dreal-backend=llamacpp \
   -Dreal-host=HOST:PORT \
   -Dreal-model=MODEL
@@ -100,7 +100,7 @@ ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build real
 Smoke de continuidade de dialogo recente:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build real-dialogue-smoke \
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build real-dialogue-smoke \
   -Dreal-backend=llamacpp \
   -Dreal-host=HOST:PORT \
   -Dreal-model=MODEL
@@ -109,7 +109,7 @@ ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build real
 Smoke de sessao longa:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build real-long-session-smoke \
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build real-long-session-smoke \
   -Dreal-backend=llamacpp \
   -Dreal-host=HOST:PORT \
   -Dreal-model=MODEL
@@ -137,7 +137,7 @@ ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache
 Use `--cache-dir /tmp/...` em testes pontuais quando quiser separar artefatos:
 
 ```sh
-./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test
+zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test
 ```
 
 ## Validacao antes de fechar alteracao
@@ -145,20 +145,20 @@ Use `--cache-dir /tmp/...` em testes pontuais quando quiser separar artefatos:
 Para alteracoes de renderer:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/render.zig --cache-dir /tmp/phenom-render-test
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/render.zig --cache-dir /tmp/phenom-render-test
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test
 ```
 
 Para alteracoes de contexto/sessao:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/session_context.zig -lc -lsqlite3 --cache-dir /tmp/phenom-session-test
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/session_context.zig -lc -lsqlite3 --cache-dir /tmp/phenom-session-test
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test
 ```
 
 Para alteracoes em tool loop/contratos:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/contracts.zig --cache-dir /tmp/phenom-contracts-test
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/contracts.zig --cache-dir /tmp/phenom-contracts-test
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig test src/main.zig -lc -lsqlite3 --cache-dir /tmp/phenom-main-test
 ```

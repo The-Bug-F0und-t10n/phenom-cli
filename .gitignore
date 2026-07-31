@@ -14,8 +14,15 @@ graph.html
 phenom-zig/zig-out/
 phenom-zig/.zig-cache/
 TASKS.md
+TAKS.md
 alinhamento.md
+AUDIT.md
+PROJECT_AUDIT.md
 Phenom.md
+
+# Local build/test binaries
+phenom-test-build
+test_fetch
 
 # ChromaDB
 data/

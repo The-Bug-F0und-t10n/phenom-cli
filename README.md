@@ -21,7 +21,7 @@ O projeto e voltado a uso local-first com backends como Ollama e llama.cpp. A pr
 ## Requisitos
 
 - Linux ou ambiente POSIX compativel.
-- Zig 0.16.0 ou binario Zig equivalente em `bin/zig-x86_64-linux-0.16.0/zig`.
+- Zig 0.16.0 disponivel no `PATH`.
 - `sqlite3` e headers de desenvolvimento.
 - Opcional: Ollama ou llama.cpp ativo para inferencia real.
 
@@ -36,7 +36,7 @@ sudo apt-get install sqlite3 libsqlite3-dev
 Build e instalacao local:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast
 ```
 
 O build instala:
@@ -96,18 +96,18 @@ O audit SQLite nao deve ser tratado como memoria persistente do modelo. Ele e tr
 Suite offline:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test
 ```
 
 Smokes reais exigem backend ativo:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build real-alignment-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build real-alignment-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL
 ```
 
 ## Estado do projeto
 
 Phenom Zig e produto em desenvolvimento ativo. O nucleo de CLI/TUI, renderizacao, streaming, auditoria, recuperacao de sessao, contexto operacional, contratos e ferramentas principais ja existe. Familias adicionais de tools, integracoes externas e politicas mais amplas devem seguir as tasks e guardrails do repositorio antes de serem consideradas completas.
 
-Ao alterar codigo, use os documentos de `doc/`, `TASKS.md`, `alinhamento.md` e os testes como fonte de verdade operacional.
+Ao alterar codigo, use os documentos publicos de `doc/` e os testes como fonte de verdade operacional. Planejamento, auditorias e devlogs locais nao fazem parte da distribuicao do repositorio.

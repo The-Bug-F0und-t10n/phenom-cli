@@ -395,9 +395,9 @@ const interactive_help_text =
     \\         show_expect_status, demo_read_file, session, system_prompt_profile
     \\
     \\Build and validation:
-    \\  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast
-    \\  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test
-    \\  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build run -- chat --offline --session dev --prompt "hello"
+    \\  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast
+    \\  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test
+    \\  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build run -- chat --offline --session dev --prompt "hello"
     \\
     \\Real smokes:
     \\  zig build real-smoke -Dreal-backend=llamacpp -Dreal-host=HOST:PORT -Dreal-model=MODEL

@@ -262,7 +262,7 @@ Isso preserva markdown e evita que thinking antigo esconda mensagens novas.
 Instalar:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast
 ```
 
 Rodar:
@@ -280,7 +280,7 @@ phenom chat --session default --prompt "o que este projeto implementa?"
 Testar:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build test
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test
 ```
 
 Probe:

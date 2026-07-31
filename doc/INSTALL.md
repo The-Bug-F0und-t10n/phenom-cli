@@ -15,7 +15,7 @@ Obrigatorios:
 O repositorio ja inclui um binario Zig esperado em:
 
 ```sh
-./bin/zig-x86_64-linux-0.16.0/zig
+zig
 ```
 
 Se preferir usar `zig` global, garanta que a versao seja compativel com 0.16.0.
@@ -32,7 +32,7 @@ sudo apt-get install sqlite3 libsqlite3-dev
 Na raiz `phenom-zig`:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast
 ```
 
 Esse comando compila e instala:
@@ -135,7 +135,7 @@ ls -l "$(which phenom)" zig-out/bin/phenom
 Reinstale com:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache ./bin/zig-x86_64-linux-0.16.0/zig build -Doptimize=ReleaseFast
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build -Doptimize=ReleaseFast
 ```
 
 Backend nao conecta:
