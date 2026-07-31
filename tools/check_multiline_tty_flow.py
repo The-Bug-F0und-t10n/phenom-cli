@@ -65,7 +65,7 @@ def server():
                 send(conn, "200 OK", "application/json", '{"n_ctx":65536}')
             elif method == "POST" and path == "/tokenize":
                 send(conn, "200 OK", "application/json", '{"tokens":[1,2,3,4]}')
-            elif method == "POST" and path == "/completion":
+            elif method == "POST" and path == "/v1/chat/completions":
                 requests.append(json.loads(body))
                 payload = "data: " + json.dumps({"content": "MULTILINE_TTY_OK", "stop": True}) + "\n\n"
                 send(conn, "200 OK", "text/event-stream", payload)

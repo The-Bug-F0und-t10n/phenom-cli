@@ -71,7 +71,8 @@ def completion_payload(text):
 
 def prompt_from_body(body):
     try:
-        return json.loads(body.decode("utf-8")).get("prompt", "")
+        payload = json.loads(body.decode("utf-8"))
+        return payload.get("prompt") or "\n".join(message.get("content", "") for message in payload.get("messages", []))
     except Exception:
         return body.decode("utf-8", "replace")
 
@@ -98,7 +99,7 @@ with open(log_file, "w", encoding="utf-8") as log:
                 send(conn, "200 OK", "application/json", '{"n_ctx":8192}')
             elif method == "POST" and path == "/tokenize":
                 send(conn, "200 OK", "application/json", '{"tokens":[1,2,3,4]}')
-            elif method == "POST" and path == "/completion":
+            elif method == "POST" and path == "/v1/chat/completions":
                 prompt = prompt_from_body(body)
                 if completion_count == 2:
                     match = re.search(r"ctx_[A-Za-z0-9_]+", prompt)

@@ -89,7 +89,7 @@ with open(log_file, "w", encoding="utf-8") as log:
                 send(conn, "200 OK", "application/json", '{"n_ctx":8192}')
             elif method == "POST" and path == "/tokenize":
                 send(conn, "200 OK", "application/json", '{"tokens":[1,2,3,4]}')
-            elif method == "POST" and path == "/completion":
+            elif method == "POST" and path == "/v1/chat/completions":
                 text = responses[completion_count] if completion_count < len(responses) else responses[-1]
                 completion_count += 1
                 send(conn, "200 OK", "text/event-stream", completion_payload(text))

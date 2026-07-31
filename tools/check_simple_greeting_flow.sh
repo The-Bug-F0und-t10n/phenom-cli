@@ -63,7 +63,7 @@ with open(port_file, "w", encoding="utf-8") as f:
 
 responses = [
     "O usuario apenas cumprimentou. Responder curto.\n</think>\n\n",
-    f"Olá! Como posso ajudar? {expect}",
+    f"Olá! Como posso ajudar?\n{expect}",
 ]
 while True:
     conn, _ = sock.accept()
@@ -76,7 +76,7 @@ while True:
             send(conn, "200 OK", "application/json", '{"n_ctx":65536}')
         elif method == "POST" and path == "/tokenize":
             send(conn, "200 OK", "application/json", '{"tokens":[1,2,3,4]}')
-        elif method == "POST" and path == "/completion":
+        elif method == "POST" and path == "/v1/chat/completions":
             text = responses[completion_count] if completion_count < len(responses) else responses[-1]
             completion_count += 1
             send(conn, "200 OK", "text/event-stream", completion_payload(text))

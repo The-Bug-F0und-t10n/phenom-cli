@@ -59,7 +59,6 @@ pub const ReasoningFilter = struct {
                     continue;
                 } else {
                     const keep = @max(suffixPrefixLen(self.pending.items, open_tag), suffixPrefixLen(self.pending.items, close_tag));
-                    if (self.pending.items.len < 4096) return;
                     const emit_len = self.pending.items.len - keep;
                     if (emit_len > 0) {
                         try sink.writeVisible(self.pending.items[0..emit_len]);
@@ -153,6 +152,32 @@ test "classifies complete think block" {
     try std.testing.expectEqualStrings("hidden", thinking.items);
 }
 
+test "streams ordinary text without waiting for flush" {
+    var visible = std.ArrayList(u8).empty;
+    defer visible.deinit(std.testing.allocator);
+    var thinking = std.ArrayList(u8).empty;
+    defer thinking.deinit(std.testing.allocator);
+    const Sink = struct {
+        visible: *std.ArrayList(u8),
+        thinking: *std.ArrayList(u8),
+        pub fn writeVisible(self: *@This(), text: []const u8) !void {
+            try self.visible.appendSlice(std.testing.allocator, text);
+        }
+        pub fn writeThinking(self: *@This(), text: []const u8) !void {
+            try self.thinking.appendSlice(std.testing.allocator, text);
+        }
+        pub fn endThinking(_: *@This()) !void {}
+    };
+    var sink = Sink{ .visible = &visible, .thinking = &thinking };
+    var filter = ReasoningFilter.init(std.testing.allocator, false);
+    defer filter.deinit();
+
+    try filter.feed("resposta em streaming", &sink);
+
+    try std.testing.expectEqualStrings("resposta em streaming", visible.items);
+    try std.testing.expectEqualStrings("", thinking.items);
+}
+
 test "classifies split think tags across deltas" {
     var visible = std.ArrayList(u8).empty;
     defer visible.deinit(std.testing.allocator);
@@ -183,7 +208,7 @@ test "classifies split think tags across deltas" {
     try std.testing.expectEqualStrings("hidden", thinking.items);
 }
 
-test "classifies reasoning when close tag arrives without open tag" {
+test "does not retract streamed text when stray close tag arrives" {
     var visible = std.ArrayList(u8).empty;
     defer visible.deinit(std.testing.allocator);
     var thinking = std.ArrayList(u8).empty;
@@ -208,6 +233,6 @@ test "classifies reasoning when close tag arrives without open tag" {
     try filter.feed("raciocinio", &sink);
     try filter.feed("</think>\nfinal", &sink);
     try filter.flush(&sink);
-    try std.testing.expectEqualStrings("\nfinal", visible.items);
-    try std.testing.expectEqualStrings("raciocinio", thinking.items);
+    try std.testing.expectEqualStrings("raciocinio\nfinal", visible.items);
+    try std.testing.expectEqualStrings("", thinking.items);
 }

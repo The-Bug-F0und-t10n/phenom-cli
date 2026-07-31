@@ -92,10 +92,10 @@ try:
             if path.startswith("/props"):
                 send(conn, "200 OK", "application/json", json.dumps({"default_generation_settings": {"n_ctx": 65536}}))
                 continue
-            if path.startswith("/completion"):
+            if path.startswith("/v1/chat/completions"):
                 try:
                     payload = json.loads(body.decode("utf-8", "ignore") or "{}")
-                    prompt = payload.get("prompt", "")
+                    prompt = payload.get("prompt") or "\n".join(message.get("content", "") for message in payload.get("messages", []))
                 except Exception:
                     prompt = ""
                 with open(prompts_file, "a", encoding="utf-8") as f:

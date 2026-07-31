@@ -66,7 +66,7 @@ responses = [
     "pergunta externa sem URL declara contrato rag web\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>rag_web</parameter><parameter=strategyId>search_web_distilled</parameter><parameter=query>horario de brasilia agora fonte confiavel</parameter><parameter=budget_bytes>4096</parameter><parameter=reason>conhecimento externo nao atribuido ao contexto do modelo</parameter></function></tool_call>",
     "horario de brasilia agora fonte confiavel",
     f"[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1:{port}/search?q=horario%20de%20brasilia%20agora%20fonte%20confiavel\nstatus=200\nquery=horario de brasilia agora fonte confiavel\ntitle=Busca local Web RAG\nexcerpt=A busca por query retornou PHENOM_QUERY_WEB_FACT para uma pergunta sem URL.",
-    f"responder com web rag\n</think>\n\nE1 mostra que a pergunta sem URL foi resolvida via Web RAG por query e retornou PHENOM_QUERY_WEB_FACT. {expect}",
+    f"responder com web rag\n</think>\n\nE1 mostra que a pergunta sem URL foi resolvida via Web RAG por query e retornou PHENOM_QUERY_WEB_FACT.\n{expect}",
 ]
 
 with open(port_file, "w", encoding="utf-8") as f:
@@ -91,10 +91,10 @@ with open(prompts_file, "w", encoding="utf-8") as prompts:
                 send(conn, "200 OK", "application/json", '{"n_ctx":65536}')
             elif method == "POST" and path == "/tokenize":
                 send(conn, "200 OK", "application/json", '{"tokens":[1,2,3,4,5,6,7,8]}')
-            elif method == "POST" and path == "/completion":
+            elif method == "POST" and path == "/v1/chat/completions":
                 payload = json.loads(body.decode("utf-8"))
                 prompts.write(f"---REQUEST {completion_count + 1}---\n")
-                prompts.write(payload.get("prompt", ""))
+                prompts.write(payload.get("prompt") or "\n".join(message.get("content", "") for message in payload.get("messages", [])))
                 prompts.write("\n")
                 prompts.flush()
                 text = responses[completion_count] if completion_count < len(responses) else responses[-1]

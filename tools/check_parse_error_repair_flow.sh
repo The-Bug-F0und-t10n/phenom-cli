@@ -80,7 +80,7 @@ while True:
             send(conn, "200 OK", "application/json", '{"n_ctx":65536}')
         elif method == "POST" and path == "/tokenize":
             send(conn, "200 OK", "application/json", '{"tokens":[1,2,3,4,5,6]}')
-        elif method == "POST" and path == "/completion":
+        elif method == "POST" and path == "/v1/chat/completions":
             text = responses[completion_count] if completion_count < len(responses) else responses[-1]
             completion_count += 1
             send(conn, "200 OK", "text/event-stream", completion_payload(text))

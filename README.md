@@ -9,7 +9,7 @@ O projeto e voltado a uso local-first com backends como Ollama e llama.cpp. A pr
 - CLI com comandos `chat`, `probe`, `snapshot`, `version` e `help`.
 - TUI append-only, sem alternate screen, com recuperacao de sessao ao reabrir o binario.
 - Renderer markdown com headings, listas, code blocks, diff, tabelas com quebra interna de celulas e output de tools.
-- Streaming HTTP local para Ollama (`/api/chat`) e llama.cpp (`/completion`).
+- Streaming HTTP local para Ollama (`/api/chat`) e llama.cpp (`/v1/chat/completions`) com o template nativo do GGUF.
 - Filtro de reasoning para blocos `<think>...</think>`.
 - Auditoria SQLite em `.phenom-zig/phenom.db`.
 - Recuperacao de sessao por eventos recentes, `SESSION_FOCUS`, FTS5/BM25 e resumo operacional de sessoes longas.

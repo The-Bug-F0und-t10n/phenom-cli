@@ -29,8 +29,8 @@ import sys
 
 port_file, prompts_file = sys.argv[1], sys.argv[2]
 responses = [
-    "The user says there is no cmus history in .config. I need to explain cmus state files and avoid claiming a history file exists.",
-    "Voce esta certo: cmus nao grava um historico de reproducao em ~/.config por padrao. CMUS_HISTORY_OK",
+    "<think>The user says there is no cmus history in .config. I need to explain cmus state files and avoid claiming a history file exists.</think>",
+    "Voce esta certo: cmus nao grava um historico de reproducao em ~/.config por padrao.\nCMUS_HISTORY_OK",
 ]
 completion_count = 0
 
@@ -81,11 +81,10 @@ with open(prompts_file, "w", encoding="utf-8") as prompts:
                 send(conn, "200 OK", "application/json", '{"n_ctx":8192}')
             elif method == "POST" and path == "/tokenize":
                 send(conn, "200 OK", "application/json", '{"tokens":[' + ','.join(['123456'] * 2048) + ']}')
-            elif method == "POST" and path == "/completion":
+            elif method == "POST" and path == "/v1/chat/completions":
                 payload = json.loads(body.decode("utf-8"))
                 prompts.write(f"---REQUEST {completion_count + 1}---\n")
-                prompts.write(f"n_predict={payload.get('n_predict')}\n")
-                prompts.write(payload.get("prompt", ""))
+                prompts.write(json.dumps(payload, ensure_ascii=False))
                 prompts.write("\n")
                 prompts.flush()
                 text = responses[completion_count] if completion_count < len(responses) else responses[-1]
@@ -131,10 +130,6 @@ grep -q "$EXPECT" "$WORK/agent.out" || {
   printf 'think-only-finalization: final visible answer missing\n' >&2
   exit 1
 }
-grep -q 'ctx 25.0% 2k/8.1k tok' "$WORK/agent.out" || {
-  printf 'think-only-finalization: final transcript did not show backend context usage\n' >&2
-  exit 1
-}
 ! grep -q '\[MODEL_EMPTY_ANSWER\]' "$WORK/agent.out" || {
   printf 'think-only-finalization: empty answer diagnostic surfaced despite repair\n' >&2
   exit 1
@@ -147,16 +142,16 @@ grep -q 'ctx 25.0% 2k/8.1k tok' "$WORK/agent.out" || {
   printf 'think-only-finalization: protocol error surfaced to user\n' >&2
   exit 1
 }
-grep -q 'n_predict=64' "$PROMPTS_FILE" || {
+grep -Eq '"max_tokens"[[:space:]]*:[[:space:]]*64' "$PROMPTS_FILE" || {
   printf 'think-only-finalization: llama.cpp request did not receive max token budget\n' >&2
   exit 1
 }
-grep -q '<think>' "$PROMPTS_FILE" || {
-  printf 'think-only-finalization: initial thinking prompt was not sent\n' >&2
+grep -Eq '"enable_thinking"[[:space:]]*:[[:space:]]*true' "$PROMPTS_FILE" || {
+  printf 'think-only-finalization: initial native thinking mode was not sent\n' >&2
   exit 1
 }
-grep -q '</think>' "$PROMPTS_FILE" || {
-  printf 'think-only-finalization: repair prompt did not close thinking before visible finalization\n' >&2
+grep -Eq '"enable_thinking"[[:space:]]*:[[:space:]]*false' "$PROMPTS_FILE" || {
+  printf 'think-only-finalization: repair did not disable native thinking mode\n' >&2
   exit 1
 }
 

@@ -758,13 +758,14 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             .db = &db,
             .session = config.session,
             .ui = ui_ptr,
-            .filter = reasoning_filter.ReasoningFilter.init(allocator, http.resolveThinking(config.thinking, prompt) == .on),
+            .filter = reasoning_filter.ReasoningFilter.init(allocator, false),
             .visible = std.ArrayList(u8).empty,
             .visible_bytes = 0,
             .thinking_bytes = 0,
-            .defer_visible = enable_tool_loop,
+            .defer_visible = false,
+            .final_stream_guard = enable_tool_loop,
             .trim_visible_leading_whitespace = false,
-            .suppress_thinking = enable_tool_loop,
+            .suppress_thinking = false,
         };
         defer sink.deinit();
         const model_context_text = try buildInitialModelContext(
@@ -1281,7 +1282,6 @@ const max_pathless_collect_budget: usize = 6 * 1024;
 const max_web_evidence_budget: usize = 8192;
 const web_cache_ttl_seconds: i64 = 6 * 60 * 60;
 const max_model_context_send_bytes: usize = 24 * 1024;
-const final_stream_protocol_holdback_bytes: usize = 256;
 const weak_evidence_quality_score: i32 = 64;
 const required_tool_missing_answer = "[MODEL_FINALIZATION_BLOCKED] operational work was not completed; no final answer accepted.";
 const required_work_missing_answer = "[MODEL_FINALIZATION_BLOCKED] required operational work was not completed; no final answer accepted.";
@@ -1303,9 +1303,7 @@ fn rawVisibleContainsToolCall(visible: []const u8) bool {
 }
 
 fn visibleContainsInternalEvidenceProtocol(visible: []const u8) bool {
-    return std.mem.indexOf(u8, visible, "[WEB_EVIDENCE") != null or
-        containsAsciiIgnoreCase(visible, "web_search returned no direct supporting excerpt") or
-        containsAsciiIgnoreCase(visible, "no current factual answer is evidenced by collected WEB_EVIDENCE");
+    return std.mem.indexOf(u8, visible, "[WEB_EVIDENCE") != null;
 }
 
 fn visibleContainsLeakedReasoning(visible: []const u8) bool {
@@ -5037,7 +5035,7 @@ fn streamSearchPlanTurn(
         .db = db,
         .session = config.session,
         .ui = ui_ptr,
-        .filter = reasoning_filter.ReasoningFilter.init(allocator, http.resolveThinking(config.thinking, prompt) == .on),
+        .filter = reasoning_filter.ReasoningFilter.init(allocator, false),
         .visible = std.ArrayList(u8).empty,
         .visible_bytes = 0,
         .thinking_bytes = 0,
@@ -5198,6 +5196,7 @@ fn repairThinkOnlyFinalAnswer(
         return false;
     }
     try aggregate_sink.writeVisible(repair_sink.raw_visible.items);
+    try aggregate_sink.flushFinalStreamHoldback();
     repair_sink.raw_visible.clearRetainingCapacity();
     try db.recordEvent(config.session, "answer_repair_done", "think-only finalization emitted visible answer");
     return true;
@@ -5524,7 +5523,7 @@ fn streamDeferredToolLoopTurnInternal(
         .db = db,
         .session = config.session,
         .ui = ui_ptr,
-        .filter = reasoning_filter.ReasoningFilter.init(allocator, !protocol_hidden_mode and http.resolveThinking(config.thinking, prompt) == .on),
+        .filter = reasoning_filter.ReasoningFilter.init(allocator, false),
         .visible = std.ArrayList(u8).empty,
         .visible_bytes = 0,
         .thinking_bytes = 0,
@@ -7286,6 +7285,15 @@ const InternalCaptureSink = struct {
         try ctx.filter.feed(delta, ctx);
     }
 
+    pub fn onReasoningDelta(ctx: *InternalCaptureSink, delta: []const u8) !void {
+        try ctx.writeThinking(delta);
+        try ctx.endThinking();
+    }
+
+    pub fn onReasoningEnd(ctx: *InternalCaptureSink) !void {
+        try ctx.endThinking();
+    }
+
     pub fn onTokenUsage(ctx: *InternalCaptureSink, usage: http.TokenUsage) !void {
         _ = ctx;
         _ = usage;
@@ -7327,7 +7335,9 @@ const StreamSink = struct {
     defer_visible: bool = false,
     final_stream_guard: bool = false,
     final_stream_blocked: bool = false,
+    final_stream_classified_visible: bool = false,
     final_stream_holdback: std.ArrayList(u8) = std.ArrayList(u8).empty,
+    native_reasoning_pending: std.ArrayList(u8) = std.ArrayList(u8).empty,
     trim_visible_leading_whitespace: bool = false,
     suppress_thinking: bool = false,
     completion_stop_reason: http.StopReason = .unknown,
@@ -7340,12 +7350,23 @@ const StreamSink = struct {
         ctx.raw_model.deinit(ctx.allocator);
         ctx.raw_visible.deinit(ctx.allocator);
         ctx.final_stream_holdback.deinit(ctx.allocator);
+        ctx.native_reasoning_pending.deinit(ctx.allocator);
         if (ctx.length_repair_context) |text| ctx.allocator.free(text);
     }
 
     pub fn onDelta(ctx: *StreamSink, delta: []const u8) !void {
         try ctx.raw_model.appendSlice(ctx.allocator, delta);
         try ctx.filter.feed(delta, ctx);
+    }
+
+    pub fn onReasoningDelta(ctx: *StreamSink, delta: []const u8) !void {
+        try ctx.raw_model.appendSlice(ctx.allocator, delta);
+        try ctx.writeNativeReasoningDelta(delta, false);
+    }
+
+    pub fn onReasoningEnd(ctx: *StreamSink) !void {
+        try ctx.writeNativeReasoningDelta("", true);
+        try ctx.endThinking();
     }
 
     pub fn onTokenUsage(ctx: *StreamSink, usage: http.TokenUsage) !void {
@@ -7381,6 +7402,7 @@ const StreamSink = struct {
 
     pub fn flush(ctx: *StreamSink) !void {
         try ctx.filter.flush(ctx);
+        try ctx.writeNativeReasoningDelta("", true);
         try ctx.flushFinalStreamHoldback();
     }
 
@@ -7410,18 +7432,23 @@ const StreamSink = struct {
 
     fn writeVisibleGuarded(ctx: *StreamSink, text: []const u8) !void {
         if (ctx.final_stream_blocked) return;
+        if (ctx.final_stream_classified_visible) {
+            if (finalStreamProtocolDetected(ctx.raw_visible.items)) {
+                ctx.final_stream_blocked = true;
+                return;
+            }
+            return ctx.emitVisibleText(text);
+        }
         try ctx.final_stream_holdback.appendSlice(ctx.allocator, text);
         if (finalStreamProtocolDetected(ctx.raw_visible.items)) {
             ctx.final_stream_blocked = true;
             ctx.final_stream_holdback.clearRetainingCapacity();
             return;
         }
-        if (ctx.final_stream_holdback.items.len <= final_stream_protocol_holdback_bytes) return;
-        const emit_len = ctx.final_stream_holdback.items.len - final_stream_protocol_holdback_bytes;
-        try ctx.emitVisibleText(ctx.final_stream_holdback.items[0..emit_len]);
-        const remaining = ctx.final_stream_holdback.items.len - emit_len;
-        std.mem.copyForwards(u8, ctx.final_stream_holdback.items[0..remaining], ctx.final_stream_holdback.items[emit_len..]);
-        ctx.final_stream_holdback.shrinkRetainingCapacity(remaining);
+        if (finalStreamNeedsMoreProtocolBytes(ctx.final_stream_holdback.items)) return;
+        ctx.final_stream_classified_visible = true;
+        try ctx.emitVisibleText(ctx.final_stream_holdback.items);
+        ctx.final_stream_holdback.clearRetainingCapacity();
     }
 
     fn flushFinalStreamHoldback(ctx: *StreamSink) !void {
@@ -7469,6 +7496,42 @@ const StreamSink = struct {
         try ctx.db.recordEvent(ctx.session, "assistant_thinking_delta", thinking);
     }
 
+    fn writeNativeReasoningDelta(ctx: *StreamSink, delta: []const u8, finalize: bool) !void {
+        try ctx.native_reasoning_pending.appendSlice(ctx.allocator, delta);
+        while (ctx.native_reasoning_pending.items.len > 0) {
+            const open_at = std.mem.indexOf(u8, ctx.native_reasoning_pending.items, "<think>");
+            const close_at = std.mem.indexOf(u8, ctx.native_reasoning_pending.items, "</think>");
+            const tag_at = if (open_at) |index|
+                if (close_at) |close_index| @min(index, close_index) else index
+            else
+                close_at;
+            if (tag_at) |index| {
+                if (index > 0) try ctx.writeThinking(ctx.native_reasoning_pending.items[0..index]);
+                const tag_len: usize = if (std.mem.startsWith(u8, ctx.native_reasoning_pending.items[index..], "</think>")) 8 else 7;
+                ctx.dropNativeReasoningPrefix(index + tag_len);
+                continue;
+            }
+            const keep = if (finalize) 0 else @max(
+                suffixPrefixLength(ctx.native_reasoning_pending.items, "<think>"),
+                suffixPrefixLength(ctx.native_reasoning_pending.items, "</think>"),
+            );
+            const emit_len = ctx.native_reasoning_pending.items.len - keep;
+            if (emit_len > 0) try ctx.writeThinking(ctx.native_reasoning_pending.items[0..emit_len]);
+            ctx.dropNativeReasoningPrefix(emit_len);
+            break;
+        }
+    }
+
+    fn dropNativeReasoningPrefix(ctx: *StreamSink, count: usize) void {
+        if (count >= ctx.native_reasoning_pending.items.len) {
+            ctx.native_reasoning_pending.clearRetainingCapacity();
+            return;
+        }
+        const remaining = ctx.native_reasoning_pending.items.len - count;
+        std.mem.copyForwards(u8, ctx.native_reasoning_pending.items[0..remaining], ctx.native_reasoning_pending.items[count..]);
+        ctx.native_reasoning_pending.shrinkRetainingCapacity(remaining);
+    }
+
     pub fn endThinking(ctx: *StreamSink) !void {
         ctx.trim_visible_leading_whitespace = true;
     }
@@ -7476,6 +7539,30 @@ const StreamSink = struct {
 
 fn finalStreamProtocolDetected(visible: []const u8) bool {
     return rawVisibleContainsToolCall(visible) or visibleContainsInternalEvidenceProtocol(visible);
+}
+
+fn finalStreamNeedsMoreProtocolBytes(visible: []const u8) bool {
+    const prefix = std.mem.trim(u8, visible, " \t\r\n");
+    if (prefix.len == 0) return true;
+    const markers = [_][]const u8{
+        "<tool_call>",
+        "<function=",
+        "{\"tool_call\"",
+        "[WEB_EVIDENCE",
+    };
+    for (markers) |marker| {
+        const compared = @min(prefix.len, marker.len);
+        if (std.mem.eql(u8, prefix[0..compared], marker[0..compared])) return prefix.len < marker.len;
+    }
+    return false;
+}
+
+fn suffixPrefixLength(text: []const u8, marker: []const u8) usize {
+    var length = @min(text.len, marker.len - 1);
+    while (length > 0) : (length -= 1) {
+        if (std.mem.eql(u8, text[text.len - length ..], marker[0..length])) return length;
+    }
+    return 0;
 }
 
 fn trimLeadingWhitespaceAfterThinking(text: []const u8, active: *bool) []const u8 {
@@ -8533,11 +8620,40 @@ test "final stream sink flushes short guarded answer" {
 
     const text = "continuacao curta PHENOM_SHORT_STREAM";
     try sink.writeVisible(text);
-    try std.testing.expectEqual(@as(usize, 0), recorder.message_chunks);
+    try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
     try sink.flush();
 
     try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
     try std.testing.expectEqualStrings(text, sink.visible.items);
+}
+
+test "guarded stream emits long answer before completion" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var recorder = EventRecorder{};
+    try bus.on(&recorder, EventRecorder.handleOpaque);
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "guarded-stream-live",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = false,
+        .final_stream_guard = true,
+    };
+    defer sink.deinit();
+
+    try sink.writeVisible("Primeiro trecho de uma resposta normal que deve ultrapassar a janela protegida. ");
+    try std.testing.expect(recorder.message_chunks > 0);
+    try std.testing.expectEqual(@as(usize, 0), sink.final_stream_holdback.items.len);
 }
 
 test "final stream sink flushes short guarded delta through reasoning filter" {
@@ -8566,7 +8682,7 @@ test "final stream sink flushes short guarded delta through reasoning filter" {
 
     const text = "continuacao curta PHENOM_SHORT_STREAM";
     try sink.onDelta(text);
-    try std.testing.expectEqual(@as(usize, 0), recorder.message_chunks);
+    try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
     try sink.flush();
 
     try std.testing.expectEqual(@as(usize, 1), recorder.message_chunks);
@@ -8604,6 +8720,48 @@ test "final stream protocol guard blocks explicit tool protocol before render" {
     try std.testing.expectEqual(@as(usize, 0), recorder.message_chunks);
     try std.testing.expectEqual(@as(usize, 0), sink.visible_bytes);
     try std.testing.expect(sink.final_stream_blocked);
+}
+
+test "native reasoning stream strips split think tags" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var captured = std.ArrayList(u8).empty;
+    defer captured.deinit(std.testing.allocator);
+    const Capture = struct {
+        output: *std.ArrayList(u8),
+        fn handleOpaque(context: *anyopaque, event: ui_events.Event) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            switch (event) {
+                .reasoning_chunk => |text| try self.output.appendSlice(std.testing.allocator, text),
+                else => {},
+            }
+        }
+    };
+    var capture = Capture{ .output = &captured };
+    try bus.on(&capture, Capture.handleOpaque);
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "native-reasoning-tags",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+    };
+    defer sink.deinit();
+
+    try sink.onReasoningDelta("<thi");
+    try sink.onReasoningDelta("nk>analise</thi");
+    try sink.onReasoningDelta("nk>");
+    try sink.onReasoningEnd();
+
+    try std.testing.expectEqualStrings("analise", captured.items);
 }
 
 test "deferred stream sink can discard protocol violating prose" {

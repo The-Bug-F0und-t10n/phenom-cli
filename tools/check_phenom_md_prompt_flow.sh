@@ -82,10 +82,10 @@ with open(prompts_file, "w", encoding="utf-8") as prompts:
                 send(conn, "200 OK", "application/json", '{"n_ctx":65536}')
             elif method == "POST" and path == "/tokenize":
                 send(conn, "200 OK", "application/json", '{"tokens":[1,2,3,4,5,6,7,8]}')
-            elif method == "POST" and path == "/completion":
+            elif method == "POST" and path == "/v1/chat/completions":
                 payload = json.loads(body.decode("utf-8"))
                 prompts.write(f"---REQUEST {completion_count + 1}---\n")
-                prompts.write(payload.get("prompt", ""))
+                prompts.write(payload.get("prompt") or "\n".join(message.get("content", "") for message in payload.get("messages", [])))
                 prompts.write("\n")
                 prompts.flush()
                 text = responses[completion_count] if completion_count < len(responses) else responses[-1]

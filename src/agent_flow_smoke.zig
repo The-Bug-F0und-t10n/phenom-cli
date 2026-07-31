@@ -490,7 +490,7 @@ fn handleClient(state: *ServerState, client: c_int) !void {
     if (std.mem.startsWith(u8, first_line, "GET /source-empty ")) {
         return send(client, "200 OK", "text/html", sourceEmptyHtml(state.scenario));
     }
-    if (std.mem.startsWith(u8, first_line, "POST /completion ")) {
+    if (std.mem.startsWith(u8, first_line, "POST /v1/chat/completions ")) {
         const prompt = request[header_end .. header_end + body_len];
         const text = completionText(state, prompt);
         const completion_count = @atomicRmw(usize, &state.completion_count, .Add, 1, .seq_cst);

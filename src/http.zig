@@ -32,7 +32,7 @@ pub const LocalModelClient = struct {
     }
 
     pub fn pathForBackend(backend: cli.Backend) []const u8 {
-        return if (backend == .ollama) "/api/chat" else "/completion";
+        return if (backend == .ollama) "/api/chat" else "/v1/chat/completions";
     }
 
     pub fn endpointSummary(self: *LocalModelClient, allocator: std.mem.Allocator) ![]u8 {
@@ -63,8 +63,11 @@ pub const LocalModelClient = struct {
         defer if (stable_context) |context| self.allocator.free(context);
         var stable_input = input;
         stable_input.model_context = stable_context;
-        const resolved_thinking = resolveThinking(self.thinking, input.user_prompt);
-        const generation_prefix = if (resolved_thinking == .on) "<think>\n" else "<think>\n\n</think>\n\n";
+        const generation_prefix = switch (self.thinking) {
+            .on => "<think>\n",
+            .off => "<think>\n\n</think>\n\n",
+            .auto => "",
+        };
         const chat_prompt = self.buildLlamaCppPrompt(stable_input, generation_prefix) catch return null;
         defer self.allocator.free(chat_prompt);
         return self.countTextTokens(chat_prompt);
@@ -208,52 +211,79 @@ pub const LocalModelClient = struct {
 
         return switch (self.backend) {
             .ollama => try self.buildOllamaBody(escaped_model, escaped_system_prompt, escaped_context, escaped_prompt, input.dialogue, input.max_tokens),
-            .llamacpp => blk: {
-                const resolved_thinking = resolveThinking(self.thinking, input.user_prompt);
-                const generation_prefix = if (resolved_thinking == .on)
-                    "<think>\n"
-                else
-                    "<think>\n\n</think>\n\n";
-                const chat_prompt = try self.buildLlamaCppPrompt(stable_input, generation_prefix);
-                defer self.allocator.free(chat_prompt);
-                const escaped_chat_prompt = try jsonEscape(self.allocator, chat_prompt);
-                defer self.allocator.free(escaped_chat_prompt);
-                break :blk try std.fmt.allocPrint(
-                    self.allocator,
-                    "{{\"stream\":true,\"prompt\":\"{s}\",\"temperature\":0.2,\"cache_prompt\":true,\"n_predict\":{},\"stop\":[\"<|im_end|>\"]}}",
-                    .{ escaped_chat_prompt, generationTokenLimit(input.max_tokens) },
-                );
-            },
+            .llamacpp => try self.buildLlamaCppBody(
+                escaped_model,
+                escaped_system_prompt,
+                escaped_context,
+                escaped_prompt,
+                input.dialogue,
+                input.max_tokens,
+                self.thinking,
+            ),
         };
+    }
+
+    fn buildLlamaCppBody(
+        self: *LocalModelClient,
+        escaped_model: []const u8,
+        escaped_system_prompt: []const u8,
+        escaped_context: ?[]const u8,
+        escaped_prompt: []const u8,
+        dialogue: []const ChatMessage,
+        max_tokens: u16,
+        thinking: cli.ThinkingMode,
+    ) ![]u8 {
+        var messages = std.ArrayList(u8).empty;
+        defer messages.deinit(self.allocator);
+        try appendJsonMessages(self.allocator, &messages, escaped_system_prompt, escaped_context, escaped_prompt, dialogue);
+        const token_limit = if (max_tokens == 0)
+            ""
+        else
+            try std.fmt.allocPrint(self.allocator, ",\"max_tokens\":{}", .{max_tokens});
+        defer if (max_tokens != 0) self.allocator.free(token_limit);
+        const thinking_option = switch (thinking) {
+            .auto => "",
+            .on => ",\"chat_template_kwargs\":{\"enable_thinking\":true}",
+            .off => ",\"chat_template_kwargs\":{\"enable_thinking\":false}",
+        };
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"model\":\"{s}\",\"stream\":true,\"messages\":[{s}]{s},\"reasoning_format\":\"none\",\"stream_options\":{{\"include_usage\":true}}{s}}}",
+            .{ escaped_model, messages.items, thinking_option, token_limit },
+        );
     }
 
     fn buildOllamaBody(self: *LocalModelClient, escaped_model: []const u8, escaped_system_prompt: []const u8, escaped_context: ?[]const u8, escaped_prompt: []const u8, dialogue: []const ChatMessage, max_tokens: u16) ![]u8 {
         var messages = std.ArrayList(u8).empty;
         defer messages.deinit(self.allocator);
-        try messages.appendSlice(self.allocator, "{\"role\":\"system\",\"content\":\"");
-        try messages.appendSlice(self.allocator, escaped_system_prompt);
-        if (escaped_context) |context| {
-            try messages.appendSlice(self.allocator, "\\n\\n");
-            try messages.appendSlice(self.allocator, context);
-        }
-        try messages.appendSlice(self.allocator, "\"}");
-        for (dialogue) |message| {
-            const escaped = try jsonEscape(self.allocator, message.content);
-            defer self.allocator.free(escaped);
-            try messages.appendSlice(self.allocator, ",{\"role\":\"");
-            try messages.appendSlice(self.allocator, chatRoleName(message.role));
-            try messages.appendSlice(self.allocator, "\",\"content\":\"");
-            try messages.appendSlice(self.allocator, escaped);
-            try messages.appendSlice(self.allocator, "\"}");
-        }
-        try messages.appendSlice(self.allocator, ",{\"role\":\"user\",\"content\":\"");
-        try messages.appendSlice(self.allocator, escaped_prompt);
-        try messages.appendSlice(self.allocator, "\"}");
+        try appendJsonMessages(self.allocator, &messages, escaped_system_prompt, escaped_context, escaped_prompt, dialogue);
         return std.fmt.allocPrint(
             self.allocator,
             "{{\"model\":\"{s}\",\"stream\":true,\"messages\":[{s}],\"options\":{{\"temperature\":0.2,\"num_predict\":{}}}}}",
             .{ escaped_model, messages.items, generationTokenLimit(max_tokens) },
         );
+    }
+
+    fn appendJsonMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(u8), escaped_system_prompt: []const u8, escaped_context: ?[]const u8, escaped_prompt: []const u8, dialogue: []const ChatMessage) !void {
+        try messages.appendSlice(allocator, "{\"role\":\"system\",\"content\":\"");
+        try messages.appendSlice(allocator, escaped_system_prompt);
+        if (escaped_context) |context| {
+            try messages.appendSlice(allocator, "\\n\\n");
+            try messages.appendSlice(allocator, context);
+        }
+        try messages.appendSlice(allocator, "\"}");
+        for (dialogue) |message| {
+            const escaped = try jsonEscape(allocator, message.content);
+            defer allocator.free(escaped);
+            try messages.appendSlice(allocator, ",{\"role\":\"");
+            try messages.appendSlice(allocator, chatRoleName(message.role));
+            try messages.appendSlice(allocator, "\",\"content\":\"");
+            try messages.appendSlice(allocator, escaped);
+            try messages.appendSlice(allocator, "\"}");
+        }
+        try messages.appendSlice(allocator, ",{\"role\":\"user\",\"content\":\"");
+        try messages.appendSlice(allocator, escaped_prompt);
+        try messages.appendSlice(allocator, "\"}");
     }
 
     fn generationTokenLimit(max_tokens: u16) i32 {
@@ -621,36 +651,8 @@ fn probePathForBackend(backend: cli.Backend) []const u8 {
     return if (backend == .ollama) "/api/tags" else "/";
 }
 
-pub fn resolveThinking(mode: cli.ThinkingMode, prompt: []const u8) cli.ThinkingMode {
-    return switch (mode) {
-        .on => .on,
-        .off => .off,
-        .auto => if (looksComplex(prompt)) .on else .off,
-    };
-}
-
-fn looksComplex(prompt: []const u8) bool {
-    if (prompt.len > 180) return true;
-    const needles: []const []const u8 = &.{
-        "codigo",
-        "código",
-        "bug",
-        "erro",
-        "stack",
-        "trace",
-        "patch",
-        "arquivo",
-        "implemente",
-        "refator",
-        "analise",
-        "debug",
-        "tool",
-        "teste",
-    };
-    for (needles) |needle| {
-        if (std.mem.indexOf(u8, prompt, needle) != null) return true;
-    }
-    return false;
+pub fn resolveThinking(mode: cli.ThinkingMode) cli.ThinkingMode {
+    return mode;
 }
 
 fn appendChatMessage(out: *std.ArrayList(u8), allocator: std.mem.Allocator, role: ChatRole, content: []const u8) !void {
@@ -1215,6 +1217,11 @@ fn processModelLine(allocator: std.mem.Allocator, raw_line: []const u8, sink: an
     if (line.len == 0) return false;
     if (std.mem.eql(u8, line, "data: [DONE]")) return true;
     const json_line = if (std.mem.startsWith(u8, line, "data:")) std.mem.trim(u8, line[5..], " \t") else line;
+    if (extractJsonStringField(json_line, "reasoning_content")) |reasoning| {
+        const decoded = try jsonUnescape(allocator, reasoning);
+        defer allocator.free(decoded);
+        try emitReasoningDelta(sink, decoded);
+    }
     if (extractJsonStringField(json_line, "content")) |content| {
         const decoded = try jsonUnescape(allocator, content);
         defer allocator.free(decoded);
@@ -1228,6 +1235,18 @@ fn processModelLine(allocator: std.mem.Allocator, raw_line: []const u8, sink: an
     if (done) try emitCompletionStop(sink, completionStopFromLine(json_line));
     if (extractTokenUsage(json_line, done)) |usage| try emitTokenUsage(sink, usage);
     return done;
+}
+
+fn emitReasoningDelta(sink: anytype, reasoning: []const u8) !void {
+    const Sink = @TypeOf(sink);
+    switch (@typeInfo(Sink)) {
+        .pointer => |ptr| {
+            if (@hasDecl(ptr.child, "onReasoningDelta")) try sink.onReasoningDelta(reasoning);
+        },
+        else => {
+            if (@hasDecl(Sink, "onReasoningDelta")) try sink.onReasoningDelta(reasoning);
+        },
+    }
 }
 
 fn emitCompletionStop(sink: anytype, stop: CompletionStop) !void {
@@ -1509,6 +1528,35 @@ test "extract llama cpp sse content field" {
     try std.testing.expectEqual(@as(usize, 1), calls);
 }
 
+test "openai reasoning content reaches reasoning sink before visible content" {
+    const lines =
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"pensando\"},\"finish_reason\":null}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"resposta\"},\"finish_reason\":\"stop\"}]}\n";
+    var reasoning = std.ArrayList(u8).empty;
+    defer reasoning.deinit(std.testing.allocator);
+    var visible = std.ArrayList(u8).empty;
+    defer visible.deinit(std.testing.allocator);
+    const Ctx = struct {
+        reasoning: *std.ArrayList(u8),
+        visible: *std.ArrayList(u8),
+        ended: bool = false,
+        pub fn onReasoningDelta(self: *@This(), delta: []const u8) !void {
+            try self.reasoning.appendSlice(std.testing.allocator, delta);
+            self.ended = true;
+        }
+        pub fn onDelta(self: *@This(), delta: []const u8) !void {
+            try std.testing.expect(self.ended);
+            try self.visible.appendSlice(std.testing.allocator, delta);
+        }
+    };
+    var ctx = Ctx{ .reasoning = &reasoning, .visible = &visible };
+    var line_buffer = std.ArrayList(u8).empty;
+    defer line_buffer.deinit(std.testing.allocator);
+    try std.testing.expect(try feedLines(std.testing.allocator, &line_buffer, lines, &ctx));
+    try std.testing.expectEqualStrings("pensando", reasoning.items);
+    try std.testing.expectEqualStrings("resposta", visible.items);
+}
+
 test "llamacpp stop true ends stream after visible content" {
     const line = "data: {\"content\":\"PHENOM_REAL_7319\",\"stop\":true}\n";
     var seen = std.ArrayList(u8).empty;
@@ -1715,7 +1763,7 @@ test "tokenize response limit fits real prompt token arrays" {
     try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), tokenizeResponseLimit(2_000_000));
 }
 
-test "llamacpp body uses qwopus chat template with thinking disabled" {
+test "llamacpp body delegates formatting to native chat template" {
     var client = LocalModelClient{
         .allocator = std.testing.allocator,
         .host = "127.0.0.1:11434",
@@ -1725,12 +1773,13 @@ test "llamacpp body uses qwopus chat template with thinking disabled" {
     };
     const body = try client.buildBody("ola");
     defer std.testing.allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "<|im_start|>system") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "<|im_start|>user") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "<|im_start|>assistant") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "<think>\\n\\n</think>\\n\\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"stop\":[\"<|im_end|>\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_prompt\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"messages\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_format\":\"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<|im_start|>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\"") == null);
 }
 
 test "llamacpp prompt keeps persistent session focus and excludes volatile current task" {
@@ -1776,7 +1825,7 @@ test "llamacpp prompt keeps persistent session focus and excludes volatile curre
     try std.testing.expect(std.mem.indexOf(u8, body_a, "old focus A") != null);
     try std.testing.expect(std.mem.indexOf(u8, body_a, "[RECENT_DIALOGUE]") == null);
     try std.testing.expect(std.mem.indexOf(u8, body_a, "mode: code_evidence") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body_a, "\"cache_prompt\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body_a, "\"messages\":[") != null);
 }
 
 test "request body sets generation token limit for supported backends" {
@@ -1789,7 +1838,7 @@ test "request body sets generation token limit for supported backends" {
     };
     const llama_body = try llama_client.buildBodyForInput(.{ .user_prompt = "explique com detalhes", .max_tokens = 128 });
     defer std.testing.allocator.free(llama_body);
-    try std.testing.expect(std.mem.indexOf(u8, llama_body, "\"n_predict\":128") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llama_body, "\"max_tokens\":128") != null);
 
     var ollama_client = LocalModelClient{
         .allocator = std.testing.allocator,
@@ -1813,7 +1862,7 @@ test "zero generation token limit asks supported backends for unlimited generati
     };
     const llama_body = try llama_client.buildBodyForInput(.{ .user_prompt = "explique com detalhes", .max_tokens = 0 });
     defer std.testing.allocator.free(llama_body);
-    try std.testing.expect(std.mem.indexOf(u8, llama_body, "\"n_predict\":-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llama_body, "\"max_tokens\"") == null);
 
     var ollama_client = LocalModelClient{
         .allocator = std.testing.allocator,
@@ -1827,7 +1876,7 @@ test "zero generation token limit asks supported backends for unlimited generati
     try std.testing.expect(std.mem.indexOf(u8, ollama_body, "\"num_predict\":-1") != null);
 }
 
-test "llamacpp thinking on opens reasoning block" {
+test "llamacpp thinking on uses native template argument" {
     var client = LocalModelClient{
         .allocator = std.testing.allocator,
         .host = "127.0.0.1:11434",
@@ -1837,8 +1886,24 @@ test "llamacpp thinking on opens reasoning block" {
     };
     const body = try client.buildBody("analise este bug");
     defer std.testing.allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "<|im_start|>assistant\\n<think>\\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "<think>\\n\\n</think>\\n\\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<think>") == null);
+}
+
+test "llamacpp thinking auto leaves native template policy unset" {
+    var client = LocalModelClient{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1:11434",
+        .backend = .llamacpp,
+        .model = "phenom:latest",
+        .thinking = .auto,
+    };
+    const simple = try client.buildBody("ola");
+    defer std.testing.allocator.free(simple);
+    const complex = try client.buildBody("analise este bug no codigo");
+    defer std.testing.allocator.free(complex);
+    try std.testing.expect(std.mem.indexOf(u8, simple, "chat_template_kwargs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, complex, "chat_template_kwargs") == null);
 }
 
 test "ollama body includes model context in system message" {
@@ -1929,11 +1994,11 @@ test "llamacpp body can include model context before user request" {
 
     const context_idx = std.mem.indexOf(u8, body, "[TURN_CONTEXT v1]") orelse return error.MissingContext;
     const user_idx = std.mem.indexOf(u8, body, "corrija") orelse return error.MissingPrompt;
-    try std.testing.expectEqual(@as(usize, 1), countNeedle(body, "<|im_start|>user"));
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(body, "\"role\":\"user\""));
     try std.testing.expect(context_idx < user_idx);
     try std.testing.expect(std.mem.indexOf(u8, body, "task: corrigir") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "mode: code_evidence") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":false") != null);
 }
 
 test "llamacpp body includes recent dialogue before current user request" {
@@ -1959,8 +2024,8 @@ test "llamacpp body includes recent dialogue before current user request" {
     const prior_user_idx = std.mem.indexOf(u8, body, "qual e meu nome?") orelse return error.MissingPriorUser;
     const prior_assistant_idx = std.mem.indexOf(u8, body, "Voce aparece como ashirak.") orelse return error.MissingPriorAssistant;
     const current_idx = std.mem.indexOf(u8, body, "da google?") orelse return error.MissingPrompt;
-    try std.testing.expectEqual(@as(usize, 2), countNeedle(body, "<|im_start|>user"));
-    try std.testing.expectEqual(@as(usize, 2), countNeedle(body, "<|im_start|>assistant"));
+    try std.testing.expectEqual(@as(usize, 2), countNeedle(body, "\"role\":\"user\""));
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(body, "\"role\":\"assistant\""));
     try std.testing.expect(context_idx < prior_user_idx);
     try std.testing.expect(prior_user_idx < prior_assistant_idx);
     try std.testing.expect(prior_assistant_idx < current_idx);
@@ -1978,9 +2043,8 @@ fn countNeedle(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
-test "thinking auto resolves simple prompt off and code prompt on" {
-    try std.testing.expectEqual(cli.ThinkingMode.off, resolveThinking(.auto, "ola"));
-    try std.testing.expectEqual(cli.ThinkingMode.on, resolveThinking(.auto, "analise este bug no codigo"));
+test "thinking auto remains backend native without prompt classification" {
+    try std.testing.expectEqual(cli.ThinkingMode.auto, resolveThinking(.auto));
 }
 
 test "cancel token stops socket wait before polling fd" {
