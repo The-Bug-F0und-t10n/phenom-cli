@@ -130,7 +130,16 @@ fn boxRow(writer: anytype, color: bool, segs: []const Seg, inner: usize) !void {
     w += 2;
     for (segs) |seg| {
         const dw = displayWidth(seg.text);
-        if (w + dw > inner) break; // defensive: never overflow a clamped box
+        const remaining = inner - w;
+        if (dw > remaining) {
+            if (remaining > 0) {
+                const prefix_len = prefixByteLen(seg.text, remaining - 1);
+                try writeStyled(writer, color, seg.style, seg.text[0..prefix_len]);
+                try writeStyled(writer, color, seg.style, "…");
+                w = inner;
+            }
+            break;
+        }
         try writeStyled(writer, color, seg.style, seg.text);
         w += dw;
     }
@@ -165,6 +174,15 @@ fn displayWidth(bytes: []const u8) usize {
         if ((b & 0b1100_0000) != 0b1000_0000) cols += 1;
     }
     return cols;
+}
+
+fn prefixByteLen(bytes: []const u8, max_columns: usize) usize {
+    var columns: usize = 0;
+    var index: usize = 0;
+    while (index < bytes.len and columns < max_columns) : (columns += 1) {
+        index += std.unicode.utf8ByteSequenceLength(bytes[index]) catch 1;
+    }
+    return @min(index, bytes.len);
 }
 
 const fd_writer = @import("fd_writer.zig");
@@ -256,6 +274,25 @@ test "welcome banner box borders align to a single width" {
         }
     }
     try std.testing.expect(box_width != null);
+}
+
+test "welcome banner truncates long model and cwd instead of hiding them" {
+    const alloc = std.testing.allocator;
+    var out = try collectPlain(alloc, .{
+        .session = "actual-session",
+        .model = "very-long-local-model-name",
+        .backend = "llamacpp",
+        .host = "127.0.0.1:8080",
+        .cwd = "/home/dev/projects/a-directory-name-that-does-not-fit",
+        .color = false,
+        .columns = 40,
+    });
+    defer out.deinit(alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "session actual-session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "model   very-long") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "cwd     /home/dev") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "…") != null);
 }
 
 test "welcome banner offline shows stub label" {
