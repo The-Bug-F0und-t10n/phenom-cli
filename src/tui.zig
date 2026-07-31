@@ -3,6 +3,7 @@ const fd_writer = @import("fd_writer.zig");
 
 const c = @cImport({
     @cInclude("fcntl.h");
+    @cInclude("stdlib.h");
     @cInclude("termios.h");
     @cInclude("unistd.h");
     @cInclude("sys/ioctl.h");
@@ -677,7 +678,11 @@ pub fn TerminalUi(comptime Writer: type) type {
 
         pub fn refreshFooterCwd(self: *Self) void {
             if (c.getcwd(&self.cwd_buf, self.cwd_buf.len)) |ptr| {
-                self.footer_cwd = std.mem.span(ptr);
+                const cwd = std.mem.span(ptr);
+                self.footer_cwd = if (c.getenv("HOME")) |home_ptr|
+                    abbreviateHomeInPlace(&self.cwd_buf, cwd, std.mem.span(home_ptr))
+                else
+                    cwd;
             } else {
                 self.footer_cwd = "";
             }
@@ -1021,6 +1026,15 @@ pub fn TerminalUi(comptime Writer: type) type {
             }
         }
     };
+}
+
+fn abbreviateHomeInPlace(buffer: []u8, path: []const u8, home: []const u8) []const u8 {
+    if (home.len == 0 or !std.mem.startsWith(u8, path, home)) return path;
+    if (path.len > home.len and path[home.len] != '/') return path;
+    const suffix = path[home.len..];
+    std.mem.copyForwards(u8, buffer[1 .. 1 + suffix.len], suffix);
+    buffer[0] = '~';
+    return buffer[0 .. 1 + suffix.len];
 }
 
 fn monotonicMs() i64 {
@@ -1418,6 +1432,17 @@ test "footer shows model cwd and context usage" {
     var footer_buf: [512]u8 = undefined;
     const footer = ui.formatFooter(&footer_buf);
     try std.testing.expectEqualStrings("llama3.2 · cwd /tmp/project · ctx 33.3% 8.1k/24k tok", footer);
+}
+
+test "footer cwd abbreviates only the exact home path" {
+    var buffer: [128]u8 = undefined;
+    const path = "/home/alice/project";
+    @memcpy(buffer[0..path.len], path);
+    try std.testing.expectEqualStrings("~/project", abbreviateHomeInPlace(&buffer, buffer[0..path.len], "/home/alice"));
+
+    const sibling = "/home/alice2/project";
+    @memcpy(buffer[0..sibling.len], sibling);
+    try std.testing.expectEqualStrings(sibling, abbreviateHomeInPlace(&buffer, buffer[0..sibling.len], "/home/alice"));
 }
 
 test "context usage starts thinking status when shown before model tokens" {
