@@ -33,7 +33,7 @@ pub const BottomBarState = struct {
     prompt: []const u8 = "",
     cursor: usize = 0,
     show_prompt: bool = true,
-    prompt_line_limit: usize = max_prompt_rows,
+    prompt_line_limit: usize = 1,
 };
 
 const user_bg = "\x1b[48;5;236m";
@@ -42,7 +42,7 @@ const reset = "\x1b[0m";
 const dim = "\x1b[2m";
 const green = "\x1b[32m";
 const cyan = "\x1b[36m";
-const max_prompt_rows: usize = 10;
+const max_rendered_prompt_rows: usize = 10;
 
 pub const VisualizerMode = enum {
     idle,
@@ -226,7 +226,7 @@ pub fn modeFromLabel(label: []const u8) VisualizerMode {
 }
 
 pub fn bottomBarRows(prompt_rows: usize) usize {
-    return 1 + 1 + 1 + @max(@as(usize, 1), @min(max_prompt_rows, prompt_rows)) + 1 + 1;
+    return 1 + 1 + 1 + @max(@as(usize, 1), prompt_rows) + 1 + 1;
 }
 
 pub fn renderBottomBar(writer: anytype, state: BottomBarState) !usize {
@@ -255,7 +255,8 @@ pub fn renderBottomBar(writer: anytype, state: BottomBarState) !usize {
     rows_written += 1;
 
     if (state.show_prompt) {
-        const view = computePromptViewLimited(state.prompt, state.cursor, paint_cols, state.prompt_line_limit);
+        var view = try computePromptViewLimited(std.heap.page_allocator, state.prompt, state.cursor, paint_cols, state.prompt_line_limit);
+        defer view.deinit();
         var i: usize = 0;
         while (i < view.line_count) : (i += 1) {
             try writer.writeAll("\r\n");
@@ -284,26 +285,31 @@ pub fn renderBottomBar(writer: anytype, state: BottomBarState) !usize {
 }
 
 pub const PromptView = struct {
-    storage: [max_prompt_rows][]const u8 = [_][]const u8{""} ** max_prompt_rows,
+    allocator: std.mem.Allocator,
+    storage: []const []const u8,
     line_count: usize = 1,
     cursor_row: usize = 0,
     cursor_col: usize = 0,
     first_visible: usize = 0,
 
     pub fn lines(self: PromptView) []const []const u8 {
-        return self.storage[0..self.line_count];
+        return self.storage;
+    }
+
+    pub fn deinit(self: *PromptView) void {
+        self.allocator.free(self.storage);
     }
 };
 
-pub fn computePromptView(prompt: []const u8, cursor: usize, paint_cols: usize) PromptView {
-    return computePromptViewLimited(prompt, cursor, paint_cols, max_prompt_rows);
+pub fn computePromptView(allocator: std.mem.Allocator, prompt: []const u8, cursor: usize, paint_cols: usize, line_limit: usize) !PromptView {
+    return computePromptViewLimited(allocator, prompt, cursor, paint_cols, line_limit);
 }
 
-pub fn computePromptViewLimited(prompt: []const u8, cursor: usize, paint_cols: usize, line_limit: usize) PromptView {
+pub fn computePromptViewLimited(allocator: std.mem.Allocator, prompt: []const u8, cursor: usize, paint_cols: usize, line_limit: usize) !PromptView {
     const content_width = @max(@as(usize, 1), paint_cols -| 2);
-    var view = PromptView{};
-    var wrapped: [256]struct { start: usize, end: usize, logical_row: usize, col_start: usize } = undefined;
-    var wrapped_len: usize = 0;
+    const WrappedLine = struct { start: usize, end: usize, logical_row: usize, col_start: usize };
+    var wrapped = std.ArrayList(WrappedLine).empty;
+    defer wrapped.deinit(allocator);
 
     var logical_row: usize = 0;
     var line_start: usize = 0;
@@ -312,23 +318,17 @@ pub fn computePromptViewLimited(prompt: []const u8, cursor: usize, paint_cols: u
         if (i == prompt.len or prompt[i] == '\n') {
             const line = prompt[line_start..i];
             if (line.len == 0) {
-                if (wrapped_len < wrapped.len) {
-                    wrapped[wrapped_len] = .{ .start = line_start, .end = line_start, .logical_row = logical_row, .col_start = 0 };
-                    wrapped_len += 1;
-                }
+                try wrapped.append(allocator, .{ .start = line_start, .end = line_start, .logical_row = logical_row, .col_start = 0 });
             } else {
                 var part_start: usize = 0;
                 while (part_start < line.len) {
                     const take = @min(content_width, line.len - part_start);
-                    if (wrapped_len < wrapped.len) {
-                        wrapped[wrapped_len] = .{
-                            .start = line_start + part_start,
-                            .end = line_start + part_start + take,
-                            .logical_row = logical_row,
-                            .col_start = part_start,
-                        };
-                        wrapped_len += 1;
-                    }
+                    try wrapped.append(allocator, .{
+                        .start = line_start + part_start,
+                        .end = line_start + part_start + take,
+                        .logical_row = logical_row,
+                        .col_start = part_start,
+                    });
                     part_start += take;
                 }
             }
@@ -336,10 +336,7 @@ pub fn computePromptViewLimited(prompt: []const u8, cursor: usize, paint_cols: u
             line_start = i + 1;
         }
     }
-    if (wrapped_len == 0) {
-        wrapped[0] = .{ .start = 0, .end = 0, .logical_row = 0, .col_start = 0 };
-        wrapped_len = 1;
-    }
+    if (wrapped.items.len == 0) try wrapped.append(allocator, .{ .start = 0, .end = 0, .logical_row = 0, .col_start = 0 });
 
     const safe_cursor = @min(cursor, prompt.len);
     var cursor_line_start: usize = 0;
@@ -356,32 +353,37 @@ pub fn computePromptViewLimited(prompt: []const u8, cursor: usize, paint_cols: u
     var cursor_wrapped_row: usize = 0;
     var found_cursor = false;
     var w: usize = 0;
-    while (w < wrapped_len) : (w += 1) {
-        if (wrapped[w].logical_row == cursor_logical_row and wrapped[w].col_start / content_width == cursor_wrap) {
+    while (w < wrapped.items.len) : (w += 1) {
+        if (wrapped.items[w].logical_row == cursor_logical_row and wrapped.items[w].col_start / content_width == cursor_wrap) {
             cursor_wrapped_row = w;
             found_cursor = true;
             break;
         }
     }
-    if (!found_cursor) cursor_wrapped_row = wrapped_len - 1;
+    if (!found_cursor) cursor_wrapped_row = wrapped.items.len - 1;
 
-    const safe_limit = @max(@as(usize, 1), @min(max_prompt_rows, line_limit));
-    const visible_count = @min(safe_limit, wrapped_len);
+    const safe_limit = @max(@as(usize, 1), line_limit);
+    const visible_count = @min(safe_limit, wrapped.items.len);
     var first_visible: usize = 0;
-    if (wrapped_len > safe_limit) {
-        first_visible = @min(wrapped_len - safe_limit, cursor_wrapped_row);
+    if (wrapped.items.len > safe_limit) {
+        first_visible = @min(wrapped.items.len - safe_limit, (cursor_wrapped_row + 1) -| safe_limit);
     }
-    view.first_visible = first_visible;
-    view.line_count = visible_count;
+    const storage = try allocator.alloc([]const u8, visible_count);
+    errdefer allocator.free(storage);
 
     var out_i: usize = 0;
     while (out_i < visible_count) : (out_i += 1) {
-        const item = wrapped[first_visible + out_i];
-        view.storage[out_i] = prompt[item.start..item.end];
+        const item = wrapped.items[first_visible + out_i];
+        storage[out_i] = prompt[item.start..item.end];
     }
-    view.cursor_row = if (cursor_wrapped_row >= first_visible) @min(visible_count - 1, cursor_wrapped_row - first_visible) else 0;
-    view.cursor_col = cursor_col_in_line % content_width;
-    return view;
+    return .{
+        .allocator = allocator,
+        .storage = storage,
+        .line_count = visible_count,
+        .cursor_row = if (cursor_wrapped_row >= first_visible) @min(visible_count - 1, cursor_wrapped_row - first_visible) else 0,
+        .cursor_col = cursor_col_in_line % content_width,
+        .first_visible = first_visible,
+    };
 }
 
 pub const InputEditor = struct {
@@ -445,6 +447,11 @@ pub const InputEditor = struct {
             }
             if (ch == 0x03) return .cancelled;
             if (ch == 0x04 and self.buffer.items.len == 0) return .closed;
+            if (ch == '\x1b' and i + 1 < data.len and (data[i + 1] == '\r' or data[i + 1] == '\n')) {
+                try self.insertByte('\n');
+                i += 2;
+                continue;
+            }
             if (ch == '\r' or ch == '\n') {
                 if (i + 1 < data.len) try self.pending.appendSlice(self.allocator, data[i + 1 ..]);
                 return .{ .submitted = try self.submit() };
@@ -497,6 +504,10 @@ pub const InputEditor = struct {
         if (std.mem.startsWith(u8, data, "\x1b[3~")) {
             self.deleteForward();
             return 4;
+        }
+        if (std.mem.startsWith(u8, data, "\x1b[13;2u") or std.mem.startsWith(u8, data, "\x1b[13;3u")) {
+            try self.insertByte('\n');
+            return 7;
         }
         return 0;
     }
@@ -871,10 +882,11 @@ pub fn TerminalUi(comptime Writer: type) type {
             if (!self.attached) return;
             const size = terminalSize();
             const paint_cols = @max(@as(usize, 1), size.cols -| 1);
-            const view = computePromptView(self.editor.buffer.items, self.editor.cursor, paint_cols);
             const max_footer_rows = @max(@as(usize, 1), size.rows -| 1);
-            const max_prompt_lines = @max(@as(usize, 1), max_footer_rows -| 5);
-            const active_prompt_lines = if (opts.show_prompt) @min(view.line_count, max_prompt_lines) else 1;
+            const max_prompt_lines = @min(max_rendered_prompt_rows, @max(@as(usize, 1), max_footer_rows -| 5));
+            var view = try computePromptView(self.allocator, self.editor.buffer.items, self.editor.cursor, paint_cols, max_prompt_lines);
+            defer view.deinit();
+            const active_prompt_lines = if (opts.show_prompt) view.line_count else 1;
             const rows = @min(bottomBarRows(active_prompt_lines), max_footer_rows);
             const size_changed = size.rows != self.terminal_rows or size.cols != self.terminal_cols;
             if (rows != self.bottom_rows or size_changed) {
@@ -1288,6 +1300,47 @@ test "input editor preserves bytes after submit for next read" {
     try std.testing.expectEqual(InputEvent.closed, try editor.feed(""));
 }
 
+test "input editor preserves multiline keyboard input until plain enter" {
+    var editor = InputEditor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("primeira\x1b\r  segunda\x1b[13;2u\x1b\rquarta"));
+    switch (try editor.feed("\r")) {
+        .submitted => |line| {
+            defer std.testing.allocator.free(line);
+            try std.testing.expectEqualStrings("primeira\n  segunda\n\nquarta", line);
+        },
+        else => return error.ExpectedSubmit,
+    }
+}
+
+test "input editor preserves thousand line bracketed paste" {
+    var editor = InputEditor.init(std.testing.allocator);
+    defer editor.deinit();
+    var expected = std.ArrayList(u8).empty;
+    defer expected.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[200~"));
+    for (0..1000) |index| {
+        if (index > 0) {
+            try expected.append(std.testing.allocator, '\n');
+            try std.testing.expectEqual(InputEvent.none, try editor.feed("\r"));
+        }
+        var line_buf: [32]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "linha {d:0>4}", .{index});
+        try expected.appendSlice(std.testing.allocator, line);
+        try std.testing.expectEqual(InputEvent.none, try editor.feed(line));
+    }
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[201~"));
+    switch (try editor.feed("\r")) {
+        .submitted => |line| {
+            defer std.testing.allocator.free(line);
+            try std.testing.expectEqualStrings(expected.items, line);
+        },
+        else => return error.ExpectedSubmit,
+    }
+}
+
 test "bottom bar snapshot matches prompt and status surface" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
@@ -1435,7 +1488,8 @@ test "bottom bar shows footer below prompt while idle" {
 }
 
 test "prompt view wraps and keeps cursor in visible window" {
-    const view = computePromptView("abcdefghi", 9, 6);
+    var view = try computePromptView(std.testing.allocator, "abcdefghi", 9, 6, 10);
+    defer view.deinit();
     try std.testing.expectEqual(@as(usize, 3), view.line_count);
     try std.testing.expectEqualStrings("abcd", view.storage[0]);
     try std.testing.expectEqualStrings("efgh", view.storage[1]);
@@ -1445,10 +1499,50 @@ test "prompt view wraps and keeps cursor in visible window" {
 }
 
 test "prompt view honors small terminal line limit" {
-    const view = computePromptViewLimited("abcdefghijkl", 12, 6, 2);
+    var view = try computePromptViewLimited(std.testing.allocator, "abcdefghijkl", 12, 6, 2);
+    defer view.deinit();
     try std.testing.expectEqual(@as(usize, 2), view.line_count);
     try std.testing.expectEqualStrings("efgh", view.storage[0]);
     try std.testing.expectEqualStrings("ijkl", view.storage[1]);
+}
+
+test "prompt view has no hidden 256 line truncation" {
+    var prompt = std.ArrayList(u8).empty;
+    defer prompt.deinit(std.testing.allocator);
+    for (0..1000) |index| {
+        if (index > 0) try prompt.append(std.testing.allocator, '\n');
+        try prompt.appendSlice(std.testing.allocator, "x");
+    }
+    var view = try computePromptViewLimited(std.testing.allocator, prompt.items, prompt.items.len, 80, max_rendered_prompt_rows);
+    defer view.deinit();
+    try std.testing.expectEqual(@as(usize, 10), view.line_count);
+    try std.testing.expectEqual(@as(usize, 990), view.first_visible);
+    try std.testing.expectEqual(@as(usize, 9), view.cursor_row);
+}
+
+test "prompt viewport scrolls around cursor with ten rendered lines" {
+    const prompt = "00\n01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n13\n14";
+
+    var start = try computePromptViewLimited(std.testing.allocator, prompt, 0, 80, max_rendered_prompt_rows);
+    defer start.deinit();
+    try std.testing.expectEqual(@as(usize, 0), start.first_visible);
+    try std.testing.expectEqualStrings("00", start.storage[0]);
+    try std.testing.expectEqualStrings("09", start.storage[9]);
+
+    const middle_cursor = std.mem.indexOf(u8, prompt, "10") orelse return error.ExpectedLine;
+    var middle = try computePromptViewLimited(std.testing.allocator, prompt, middle_cursor, 80, max_rendered_prompt_rows);
+    defer middle.deinit();
+    try std.testing.expectEqual(@as(usize, 1), middle.first_visible);
+    try std.testing.expectEqual(@as(usize, 9), middle.cursor_row);
+    try std.testing.expectEqualStrings("01", middle.storage[0]);
+    try std.testing.expectEqualStrings("10", middle.storage[9]);
+
+    var end = try computePromptViewLimited(std.testing.allocator, prompt, prompt.len, 80, max_rendered_prompt_rows);
+    defer end.deinit();
+    try std.testing.expectEqual(@as(usize, 5), end.first_visible);
+    try std.testing.expectEqual(@as(usize, 9), end.cursor_row);
+    try std.testing.expectEqualStrings("05", end.storage[0]);
+    try std.testing.expectEqualStrings("14", end.storage[9]);
 }
 
 test "visualizer frame and mode mapping are deterministic" {
