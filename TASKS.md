@@ -12969,3 +12969,116 @@ Invariantes afetadas:
 Risco residual:
 
 - Backends que nao implementam o formato OpenAI-compatible exigem o backend Ollama existente ou adaptador explicito; nao ha fallback heuristico de endpoint.
+
+## T348 - Finalizacao unica para reasoning intercalado
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: modelos locais podem emitir uma unica geracao no formato `reasoning -> resposta provisoria -> reasoning -> resposta final`. O streaming incremental publicava a resposta provisoria antes de conhecer o restante do protocolo, produzindo dois outputs visiveis em saudacoes simples. A reparacao tambem classificava vazamento de reasoning por frases hardcoded em ingles.
+
+Passos de implementacao:
+
+1. Reproduzir a sequencia intercalada em teste de `StreamSink`.
+2. Bufferizar conteudo visivel enquanto o tool loop ainda classifica a geracao.
+3. Descartar o candidato bufferizado quando o canal estrutural de reasoning reabrir.
+4. Detectar reasoning de finalizacao pelo contador `thinking_bytes`, sem keywords ou idioma.
+5. Reforcar o smoke de saudacao para exigir exatamente uma resposta e nenhum reasoning visivel.
+
+Implementacao:
+
+- `src/main.zig`: sink principal volta a diferir texto durante classificacao; reasoning reaberto descarta o rascunho; heuristica `visibleContainsLeakedReasoning` removida.
+- `tools/check_simple_greeting_flow.sh`: valida uma unica ocorrencia da resposta final e ausencia do rascunho oculto no stdout.
+
+Validacao executada:
+
+- `zig build test` -> passou.
+- `zig build` -> passou.
+- `tools/check_simple_greeting_flow.sh` -> passou.
+- `tools/check_think_only_finalization.sh` -> passou.
+
+Invariantes afetadas:
+
+- Controller nao decide protocolo por palavras do output: reforcada; classificacao usa canais e estado do stream.
+- Protocolo interno nao vaza no transcript: reforcada; reasoning fica auditado e rascunhos intercalados nao sao publicados.
+- 7. Cada turno consegue ser auditado e reproduzido: reforcada pelo evento `assistant_draft_discarded` e teste deterministico.
+
+Risco residual:
+
+- Backend que mistura dois textos finais sem reabrir reasoning nao fornece sinal estrutural para distinguir rascunho de resposta final.
+
+## T349 - Banner inicial preserva campos longos
+
+Status: implemented-verified.
+
+Prioridade: alta.
+
+Motivacao: `session` aparecia porque era curto, mas `model` e `cwd` ficavam vazios em terminais estreitos. Os valores reais chegavam ao renderer; `boxRow` descartava integralmente qualquer segmento maior que o espaco restante.
+
+Passos de implementacao:
+
+1. Confirmar a origem de `session`, `model` e `cwd` em `cli.Config` e `renderWelcome`.
+2. Reproduzir o clipping com modelo e cwd maiores que a caixa.
+3. Truncar por limites UTF-8 sem quebrar codepoints.
+4. Sinalizar truncamento com reticencias e preservar o alinhamento da borda.
+5. Validar banner estreito e suite completa.
+
+Implementacao:
+
+- `src/welcome.zig`: segmentos longos recebem prefixo UTF-8 seguro e `…` em vez de serem omitidos.
+- `session default` permanece o nome efetivo da sessao quando nenhuma configuracao ou flag `--session` o substitui.
+
+Validacao executada:
+
+- Teste `welcome banner truncates long model and cwd instead of hiding them` -> passou.
+- `zig build test` -> passou.
+- `zig build` -> passou.
+
+Invariantes afetadas:
+
+- Estado operacional exibido deve refletir a configuracao efetiva: reforcada para sessao, modelo, backend, host e cwd.
+- O renderer nao deve quebrar largura do terminal: preservada por truncamento antes da borda.
+
+Risco residual:
+
+- A largura visual continua tratando cada codepoint como uma coluna; grapheme clusters e caracteres wide podem exigir uma biblioteca de largura terminal no futuro.
+
+## T350 - Relogio local autoritativo no contexto do modelo
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: o contexto temporal usava UTC hardcoded apesar do sistema operar em UTC-03, permitindo erro de data perto da meia-noite. Ao migrar para `struct tm`, inteiros assinados foram inicialmente formatados como `+2026-+7-+31`. Depois da correcao da data, o modelo ainda inventou quarta-feira para 31 de julho de 2026 porque o weekday nao era fornecido.
+
+Passos de implementacao:
+
+1. Rastrear a data desde libc ate o request OpenAI-compatible.
+2. Substituir data UTC hardcoded por snapshot do relogio local do sistema.
+3. Normalizar campos assinados para ISO `YYYY-MM-DD` e `HH:MM:SS`.
+4. Incluir timezone, offset UTC, weekday e indice ISO diretamente de `struct tm`.
+5. Marcar data, hora e weekday como autoritativos e proibir recalculo pelo modelo.
+6. Validar o contexto persistido no audit contra o relogio real e reinstalar o binario.
+
+Implementacao:
+
+- `src/temporal.zig`: snapshot local com data, hora, zona, offset, weekday e indice ISO; formatacao unsigned e testes para `2026-07-31`, `05:06:07` e Friday/ISO 5.
+- `src/model_context.zig`: `TEMPORAL_CONTEXT` inclui fonte `system_clock`, autoridade explicita e regra de uso literal do weekday.
+
+Validacao executada:
+
+- `zig build test` -> passou.
+- `zig build` -> passou.
+- Smoke com audit SQLite confirmou `current_date=2026-07-31`, `current_weekday=Friday`, `iso_weekday=5`, `timezone=-03` e `utc_offset=-0300`.
+- `zig-out/bin/phenom` e `~/.local/bin/phenom` sincronizados; SHA-256 `97c8ec13247491cb65e9a892f6e58ec2b2f87280ea241b9bdd1088aba29c4096`.
+
+Invariantes afetadas:
+
+- 6. Falha de modelo nao parece falha de infraestrutura: reforcada; data e weekday deixam de depender de aritmetica do modelo.
+- 7. Cada turno consegue ser auditado e reproduzido: reforcada; snapshot temporal completo fica registrado em `model_context`.
+- Fatos temporais locais nao exigem web: o relogio do sistema e a fonte autoritativa; ferramentas continuam obrigatorias para fatos externos atuais.
+
+Risco residual:
+
+- O nome abreviado da zona depende da libc e pode aparecer como `-03`; o offset numerico permanece a referencia inequivoca.
