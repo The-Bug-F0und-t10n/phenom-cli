@@ -24,9 +24,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         suppress_next_block_gap: bool = false,
         thinking_open: bool = false,
         stream_needs_gutter: bool = true,
-        stream_col: usize = 0,
         thinking_needs_gutter: bool = true,
-        thinking_col: usize = 0,
         markdown_pending: [8192]u8 = undefined,
         markdown_pending_len: usize = 0,
         markdown_in_code: bool = false,
@@ -114,7 +112,6 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             self.assistant_wrote_content = false;
             self.assistant_escape_state = .plain;
             self.stream_needs_gutter = true;
-            self.stream_col = 0;
             self.last_block = .assistant;
         }
 
@@ -148,7 +145,6 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 if (!wrote_gap and self.last_block != .user) try self.writer.writeAll("\n");
                 self.thinking_open = true;
                 self.thinking_needs_gutter = true;
-                self.thinking_col = 0;
                 self.last_block = .thinking;
             }
 
@@ -158,7 +154,6 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                     if (self.thinking_needs_gutter) try self.writeThinkingBlankLine();
                     try self.writeDim("\n");
                     self.thinking_needs_gutter = true;
-                    self.thinking_col = 0;
                     start += 1;
                     continue;
                 }
@@ -179,14 +174,12 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             if (!self.thinking_needs_gutter) try self.writer.writeAll("\n");
             self.thinking_open = false;
             self.thinking_needs_gutter = true;
-            self.thinking_col = 0;
             self.thinking_escape_state = .plain;
             try self.writer.writeAll("\n");
             self.assistant_open = true;
             self.assistant_wrote_content = false;
             self.suppress_next_block_gap = true;
             self.stream_needs_gutter = true;
-            self.stream_col = 0;
             self.last_block = .assistant;
         }
 
@@ -311,7 +304,6 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         }
 
         fn writeWrappedUserLine(self: *Self, prefix: []const u8, text: []const u8) !void {
-            const inner_width = self.userInnerWidth();
             var logical_start: usize = 0;
             var first_logical = true;
             while (logical_start <= text.len) {
@@ -319,18 +311,11 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 const logical_end = if (rel) |idx| logical_start + idx else text.len;
                 const line = text[logical_start..logical_end];
 
-                const active_prefix = if (first_logical) prefix else "";
-                const virtual_len = active_prefix.len + line.len;
-                var pos: usize = 0;
-                var wrote_chunk = false;
-                while (pos < virtual_len or !wrote_chunk) {
-                    const take = if (pos < virtual_len) @min(inner_width, virtual_len - pos) else 0;
-                    try self.writeContentGutter();
-                    try self.writeUserVirtualLine(active_prefix, line, pos, take);
-                    wrote_chunk = true;
-                    pos += take;
-                    if (pos < virtual_len) try self.writer.writeAll("\n");
-                }
+                try self.writeContentGutter();
+                if (self.options.color) try self.writer.writeAll(user_bg ++ user_fg);
+                if (first_logical) try self.writer.writeAll(prefix);
+                try self.writer.writeAll(line);
+                if (self.options.color) try self.writer.writeAll(reset);
 
                 first_logical = false;
                 if (rel == null) break;
@@ -344,31 +329,6 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             if (self.options.color) try self.writer.writeAll(user_bg ++ user_fg);
             try self.writeSpaces(self.userInnerWidth() + 1);
             if (self.options.color) try self.writer.writeAll(reset);
-        }
-
-        fn writeUserVirtualLine(self: *Self, prefix: []const u8, text: []const u8, pos: usize, take: usize) !void {
-            const width = self.userInnerWidth();
-            if (self.options.color) {
-                try self.writer.writeAll(user_bg ++ user_fg);
-            }
-            try self.writeVirtualSegment(prefix, text, pos, take);
-            if (take < width) try self.writeSpaces(width - take);
-            try self.writer.writeAll(" ");
-            if (self.options.color) try self.writer.writeAll(reset);
-        }
-
-        fn writeVirtualSegment(self: *Self, prefix: []const u8, text: []const u8, pos: usize, take: usize) !void {
-            if (take == 0) return;
-            const end = pos + take;
-            if (pos < prefix.len) {
-                const prefix_end = @min(prefix.len, end);
-                try self.writer.writeAll(prefix[pos..prefix_end]);
-            }
-            if (end > prefix.len) {
-                const text_start = if (pos > prefix.len) pos - prefix.len else 0;
-                const text_end = @min(text.len, end - prefix.len);
-                if (text_start < text_end) try self.writer.writeAll(text[text_start..text_end]);
-            }
         }
 
         fn writeMarkdownStream(self: *Self, text: []const u8) !void {
@@ -387,7 +347,6 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 if (direct_plain) {
                     try self.writer.writeAll("\n");
                     self.stream_needs_gutter = true;
-                    self.stream_col = 0;
                 } else {
                     try self.renderMarkdownPending(true);
                 }
@@ -524,7 +483,6 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 try self.writeMarkdownProseLine(line);
                 try self.writer.writeAll("\n");
                 self.stream_needs_gutter = true;
-                self.stream_col = 0;
             }
         }
 
@@ -547,7 +505,6 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             }
             if (newline) try self.writer.writeAll("\n");
             self.stream_needs_gutter = true;
-            self.stream_col = 0;
         }
 
         fn setMarkdownFence(self: *Self, line: []const u8) void {
@@ -582,7 +539,6 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                     try self.flushMarkdownTables();
                     if (newline) try self.writer.writeAll("\n");
                     self.stream_needs_gutter = true;
-                    self.stream_col = 0;
                     return;
                 }
                 try self.writeFenceLine("```");
@@ -592,7 +548,6 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 self.setMarkdownFence(line);
                 if (newline) try self.writer.writeAll("\n");
                 self.stream_needs_gutter = true;
-                self.stream_col = 0;
                 return;
             }
             if (isMarkdownTableRow(line)) {
@@ -606,7 +561,6 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             try self.writeCodeLine(line);
             if (newline) try self.writer.writeAll("\n");
             self.stream_needs_gutter = true;
-            self.stream_col = 0;
         }
 
         fn writeDeferredPlainFenceRowsAsCode(self: *Self) anyerror!void {
@@ -739,19 +693,11 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         }
 
         fn writeMarkdownProseLine(self: *Self, line: []const u8) !void {
-            const width = self.contentWrapWidth();
             if (line.len == 0) {
                 try self.writeContentGutter();
                 return;
             }
-            var start: usize = 0;
-            while (start < line.len) {
-                if (start > 0) try self.writer.writeAll("\n");
-                const take = utf8PrefixBytes(line[start..], width);
-                const end = start + @max(@as(usize, 1), take);
-                try self.writeMarkdownProseSegment(line[start..@min(end, line.len)]);
-                start = @min(end, line.len);
-            }
+            try self.writeMarkdownProseSegment(line);
         }
 
         fn writeMarkdownProseSegment(self: *Self, line: []const u8) !void {
@@ -1006,20 +952,13 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         }
 
         fn writeContentStream(self: *Self, text: []const u8) !void {
-            const width = self.contentWrapWidth();
             var index: usize = 0;
             while (index < text.len) {
                 if (text[index] == '\n') {
                     try self.writer.writeAll("\n");
                     self.stream_needs_gutter = true;
-                    self.stream_col = 0;
                     index += 1;
                     continue;
-                }
-                if (self.stream_col >= width) {
-                    try self.writer.writeAll("\n");
-                    self.stream_needs_gutter = true;
-                    self.stream_col = 0;
                 }
                 if (self.stream_needs_gutter) {
                     try self.writeContentGutter();
@@ -1028,35 +967,12 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 const len = utf8ByteLen(text[index]);
                 const end = @min(text.len, index + len);
                 try self.writer.writeAll(text[index..end]);
-                self.stream_col += 1;
                 index = end;
             }
         }
 
         fn writeWrappedThinkingText(self: *Self, text: []const u8) !void {
-            const width = self.thinkingTextWidth();
-            var start: usize = 0;
-            while (start < text.len) {
-                if (self.thinking_col >= width) {
-                    try self.writeDim("\n");
-                    self.thinking_needs_gutter = true;
-                    self.thinking_col = 0;
-                }
-                if (self.thinking_needs_gutter) {
-                    try self.writeContentGutter();
-                    try self.writeCyan("│ ");
-                    self.thinking_needs_gutter = false;
-                }
-                const remaining_cols = width - self.thinking_col;
-                var end = start;
-                var cols: usize = 0;
-                while (end < text.len and cols < remaining_cols) : (cols += 1) {
-                    end = @min(text.len, end + utf8ByteLen(text[end]));
-                }
-                try self.writeDim(text[start..end]);
-                self.thinking_col += cols;
-                start = end;
-            }
+            try self.writeDim(text);
         }
 
         fn writeThinkingBlankLine(self: *Self) !void {
@@ -1098,35 +1014,10 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
 
         fn writeWrappedToolLine(self: *Self, line: []const u8) !void {
             const prefix = "    │ ";
-            const width = @max(@as(usize, 1), self.contentWrapWidth() -| utf8Columns(prefix));
-            var start: usize = 0;
-            var wrote = false;
-            while (start < line.len or !wrote) {
-                var end = start;
-                var cols: usize = 0;
-                var last_space: ?usize = null;
-                while (end < line.len and cols < width) : (cols += 1) {
-                    if ((line[end] == ' ' or line[end] == '\t') and end > start) last_space = end;
-                    end = @min(line.len, end + utf8ByteLen(line[end]));
-                }
-                const next_start = blk: {
-                    if (end < line.len) {
-                        if (last_space) |space_idx| {
-                            end = space_idx;
-                            var next = space_idx + 1;
-                            while (next < line.len and (line[next] == ' ' or line[next] == '\t')) : (next += 1) {}
-                            break :blk next;
-                        }
-                    }
-                    break :blk end;
-                };
-                try self.writeContentGutter();
-                try self.writeDim(prefix);
-                try self.writer.writeAll(line[start..end]);
-                try self.writer.writeAll("\n");
-                wrote = true;
-                start = next_start;
-            }
+            try self.writeContentGutter();
+            try self.writeDim(prefix);
+            try self.writer.writeAll(line);
+            try self.writer.writeAll("\n");
         }
 
         fn writeDiffPreview(self: *Self, content: []const u8) !void {
@@ -1212,10 +1103,6 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
 
         fn contentWrapWidth(self: *Self) usize {
             return @max(@as(usize, 1), self.paintCols() -| content_gutter_cols);
-        }
-
-        fn thinkingTextWidth(self: *Self) usize {
-            return @max(@as(usize, 1), self.contentWrapWidth() -| 2);
         }
 
         fn userInnerWidth(self: *Self) usize {
@@ -1327,15 +1214,6 @@ fn utf8Columns(bytes: []const u8) usize {
         if ((byte & 0b1100_0000) != 0b1000_0000) cols += 1;
     }
     return cols;
-}
-
-fn utf8PrefixBytes(bytes: []const u8, max_cols: usize) usize {
-    var index: usize = 0;
-    var columns: usize = 0;
-    while (index < bytes.len and columns < max_cols) : (columns += 1) {
-        index = @min(bytes.len, index + utf8ByteLen(bytes[index]));
-    }
-    return index;
 }
 
 fn toolLabel(name: []const u8) []const u8 {
@@ -1691,10 +1569,10 @@ fn isTypeToken(word: []const u8) bool {
 
 fn isCodeKeyword(word: []const u8, lang: []const u8) bool {
     const common = [_][]const u8{
-        "const", "let", "var", "fn", "pub", "return", "if", "else", "for", "while", "switch", "case", "break", "continue",
-        "try", "catch", "defer", "async", "await", "class", "struct", "enum", "interface", "type", "import", "export",
-        "from", "as", "def", "lambda", "yield", "local", "function", "end", "then", "do", "select", "insert", "update",
-        "delete", "where", "join", "create", "table",
+        "const",  "let",    "var",   "fn",    "pub",      "return", "if",     "else", "for",       "while",  "switch", "case",   "break", "continue",
+        "try",    "catch",  "defer", "async", "await",    "class",  "struct", "enum", "interface", "type",   "import", "export", "from",  "as",
+        "def",    "lambda", "yield", "local", "function", "end",    "then",   "do",   "select",    "insert", "update", "delete", "where", "join",
+        "create", "table",
     };
     _ = lang;
     for (common) |item| {
@@ -1793,7 +1671,7 @@ test "assistant plain prose does not get syntax color" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Ola! Tudo bem? Em que posso ajudar hoje?") != null);
 }
 
-test "assistant output keeps explicit wrapping across terminal resize" {
+test "assistant output stays logical across terminal resize" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
 
@@ -1804,10 +1682,10 @@ test "assistant output keeps explicit wrapping across terminal resize" {
     renderer.setTerminalColumns(6);
     try renderer.assistantDelta("ijklmnop");
 
-    try std.testing.expectEqualStrings(" abcdefgh\n ijkl\n mnop", buffer.items);
+    try std.testing.expectEqualStrings(" abcdefghijklmnop", buffer.items);
 }
 
-test "assistant markdown prose wraps without terminal soft wrap" {
+test "assistant markdown prose stays logical for terminal reflow" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
 
@@ -1816,7 +1694,7 @@ test "assistant markdown prose wraps without terminal soft wrap" {
     try renderer.assistantStart();
     try renderer.assistantDelta("# abcdefghijk\n");
 
-    try std.testing.expectEqualStrings(" # abcdef\n ghijk\n", buffer.items);
+    try std.testing.expectEqualStrings(" # abcdefghijk\n", buffer.items);
 }
 
 test "assistant strips model ansi escapes across stream chunks" {
@@ -1836,7 +1714,7 @@ test "assistant strips model ansi escapes across stream chunks" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Ola! Tudo Em") != null);
 }
 
-test "thinking wraps inside narrow terminal with gutter on continuation" {
+test "thinking stays logical for terminal reflow" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
 
@@ -1848,8 +1726,7 @@ test "thinking wraps inside narrow terminal with gutter on continuation" {
 
     const expected =
         \\
-        \\ │ abcdefgh
-        \\ │ i
+        \\ │ abcdefghi
         \\
         \\ final
     ;
@@ -1867,7 +1744,7 @@ test "append only snapshot matches phenom cli ts plain surface" {
     try renderer.assistantDelta("ok");
     try renderer.done();
 
-    const expected = "\n                 \n > [user] ola    \n                 \n\n ok\n\n  ─ Worked for 0s\n";
+    const expected = "\n                 \n > [user] ola\n                 \n\n ok\n\n  ─ Worked for 0s\n";
     try std.testing.expectEqualStrings(expected, buffer.items);
 }
 
@@ -1911,7 +1788,7 @@ test "tool sample uses phenom cli ts tool announcement and output gutter" {
     try std.testing.expectEqualStrings(expected, buffer.items);
 }
 
-test "tool sample wraps long output lines with gutter on continuations" {
+test "tool sample keeps long output logical for terminal reflow" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
 
@@ -1921,14 +1798,13 @@ test "tool sample wraps long output lines with gutter on continuations" {
 
     const expected =
         \\ ▸ collect_evidence
-        \\     │ abcdefghij
-        \\     │ klmnopqrst
+        \\     │ abcdefghijklmnopqrst
         \\
     ;
     try std.testing.expectEqualStrings(expected, buffer.items);
 }
 
-test "tool sample wraps prose at word boundaries" {
+test "tool sample keeps prose logical for terminal reflow" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
 
@@ -1938,8 +1814,7 @@ test "tool sample wraps prose at word boundaries" {
 
     const expected =
         \\ ▸ collect_evidence
-        \\     │ um agente local
-        \\     │ de terminal
+        \\     │ um agente local de terminal
         \\
     ;
     try std.testing.expectEqualStrings(expected, buffer.items);
@@ -2062,7 +1937,7 @@ test "codex style append only turn snapshot covers core blocks" {
     const expected =
         "\n" ++
         "                                         \n" ++
-        " > [user] corrija o bug                  \n" ++
+        " > [user] corrija o bug\n" ++
         "                                         \n" ++
         "\n" ++
         " │ vou inspecionar\n" ++
@@ -2093,7 +1968,7 @@ test "ansi user bubble uses same palette constants as phenom cli ts" {
     var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = true, .terminal_columns = 16 });
     try renderer.user("ola");
 
-    const expected = "\n \x1b[48;5;236m\x1b[38;5;252m              \x1b[0m\n \x1b[48;5;236m\x1b[38;5;252m> [user] ola  \x1b[0m\n \x1b[48;5;236m\x1b[38;5;252m              \x1b[0m\n\n";
+    const expected = "\n \x1b[48;5;236m\x1b[38;5;252m              \x1b[0m\n \x1b[48;5;236m\x1b[38;5;252m> [user] ola\x1b[0m\n \x1b[48;5;236m\x1b[38;5;252m              \x1b[0m\n\n";
     try std.testing.expectEqualStrings(expected, buffer.items);
 }
 
@@ -2527,7 +2402,7 @@ test "assistant markdown spaced fence language renders once" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "tss") == null);
 }
 
-test "broad visual transcript fixture fits small and wide terminals" {
+test "broad visual transcript fixture keeps reflowable logical prose" {
     const widths = [_]usize{ 40, 80, 120, 180 };
     for (widths) |columns| {
         var buffer = std.ArrayList(u8).empty;
@@ -2567,10 +2442,6 @@ test "broad visual transcript fixture fits small and wide terminals" {
         try std.testing.expect(std.mem.indexOf(u8, buffer.items, "raw tail must not render") == null);
         try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Worked for 2s") != null);
 
-        var start: usize = 0;
-        while (nextLine(buffer.items, &start)) |line| {
-            if (line.len == 0) continue;
-            try std.testing.expect(visibleTextWidth(line) <= columns - 1);
-        }
+        try std.testing.expect(std.mem.indexOf(u8, buffer.items, "planejar fases e evidencias sem vazar contexto bruto") != null);
     }
 }

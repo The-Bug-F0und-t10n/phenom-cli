@@ -227,8 +227,8 @@ try:
         raise AssertionError("setas não editaram o prompt multiline na posição esperada")
     if not contains_exact(requests[2], expected):
         raise AssertionError("Ctrl-A não removeu o conteúdo anterior antes da nova query")
-    if b"\x1b[?7l" not in output or b"\x1b[?7h" not in output:
-        raise AssertionError("CLI não controlou deterministicamente o autowrap do terminal")
+    if b"\x1b[?7h" not in output:
+        raise AssertionError("CLI não habilitou autowrap para reflow do transcript")
     print(f"multiline-tty: ok wrapped={expected_wrapped!r} navigation={expected_navigation!r} lines=1003 bytes={len(expected.encode())} requests={len(requests)}")
 finally:
     stop.set()
