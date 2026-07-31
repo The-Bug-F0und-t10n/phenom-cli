@@ -65,7 +65,6 @@ port = sock.getsockname()[1]
 responses = [
     "pergunta externa sem URL declara contrato rag web\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>rag_web</parameter><parameter=strategyId>search_web_distilled</parameter><parameter=query>horario de brasilia agora fonte confiavel</parameter><parameter=budget_bytes>4096</parameter><parameter=reason>conhecimento externo nao atribuido ao contexto do modelo</parameter></function></tool_call>",
     "horario de brasilia agora fonte confiavel",
-    f"[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1:{port}/search?q=horario%20de%20brasilia%20agora%20fonte%20confiavel\nstatus=200\nquery=horario de brasilia agora fonte confiavel\ntitle=Busca local Web RAG\nexcerpt=A busca por query retornou PHENOM_QUERY_WEB_FACT para uma pergunta sem URL.",
     f"responder com web rag\n</think>\n\nE1 mostra que a pergunta sem URL foi resolvida via Web RAG por query e retornou PHENOM_QUERY_WEB_FACT.\n{expect}",
 ]
 

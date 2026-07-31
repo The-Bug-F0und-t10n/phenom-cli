@@ -23,6 +23,7 @@ PORT_FILE="$WORK/port"
 PROMPTS_FILE="$WORK/prompts.log"
 python3 - "$PORT_FILE" "$PROMPTS_FILE" <<'PY' &
 import json
+import re
 import socket
 import sys
 from urllib.parse import parse_qs, urlparse
@@ -64,15 +65,15 @@ port = sock.getsockname()[1]
 
 responses = [
     "usuario ambiguo pediu fato externo atual; declaro ragweb com query propria\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>rag_web</parameter><parameter=strategyId>search_web_distilled</parameter><parameter=query>horario de brasilia agora fonte oficial</parameter><parameter=budget_bytes>3072</parameter><parameter=reason>external fact from ambiguous user wording</parameter></function></tool_call>",
-    f"[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1:{port}/search?q=horario%20de%20brasilia%20agora%20fonte%20oficial\nstatus=200\nquery=horario de brasilia agora fonte oficial\ntitle=Busca horario Brasilia\nexcerpt=Resultado atual sintetizado: PHENOM_WEB_AMBIG_BRASILIA_FACT.",
-    "resposta do primeiro turno usando evidencia web destilada\n</think>\n\nE1 confirma a atualizacao ambigua por Web RAG: PHENOM_WEB_AMBIG_BRASILIA_FACT. Vou manter este fio para as proximas perguntas. PHENOM_AMBIG_T1.",
+    "horario de brasilia agora fonte oficial",
+    "resposta do primeiro turno usando evidencia web destilada\n</think>\n\nE1 confirma a atualizacao ambigua por Web RAG: PHENOM_WEB_AMBIG_BRASILIA_FACT. Vou manter este fio para as proximas perguntas.\nPHENOM_AMBIG_T1",
     "continuidade ambigua sem usuario dizer web; declaro ragweb para cotacao\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>rag_web</parameter><parameter=strategyId>search_web_distilled</parameter><parameter=query>cotacao dolar real hoje fonte confiavel</parameter><parameter=budget_bytes>3072</parameter><parameter=reason>ambiguous follow-up needs current external evidence</parameter></function></tool_call>",
-    f"[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1:{port}/search?q=cotacao%20dolar%20real%20hoje%20fonte%20confiavel\nstatus=200\nquery=cotacao dolar real hoje fonte confiavel\ntitle=Busca dolar real\nexcerpt=Resultado atual sintetizado: PHENOM_WEB_AMBIG_DOLAR_FACT.",
-    "resposta do segundo turno preservando continuidade\n</think>\n\nE1 confirma a atualizacao da cotacao em continuidade: PHENOM_WEB_AMBIG_DOLAR_FACT. O contexto anterior continua sendo PHENOM_AMBIG_T1. PHENOM_AMBIG_T2.",
+    "cotacao dolar real hoje fonte confiavel",
+    "resposta do segundo turno preservando continuidade\n</think>\n\nE1 confirma a atualizacao da cotacao em continuidade: PHENOM_WEB_AMBIG_DOLAR_FACT. O contexto anterior continua sendo PHENOM_AMBIG_T1.\nPHENOM_AMBIG_T2",
     "usuario declarou ragweb explicitamente; contrato web continua model-driven\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=strategyId>search_web_distilled</parameter><parameter=query>cotacao euro real hoje fonte confiavel</parameter><parameter=budget_bytes>3072</parameter><parameter=reason>user explicitly requested ragweb</parameter></function></tool_call>",
-    f"[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1:{port}/search?q=cotacao%20euro%20real%20hoje%20fonte%20confiavel\nstatus=200\nquery=cotacao euro real hoje fonte confiavel\ntitle=Busca euro real\nexcerpt=Resultado atual sintetizado: PHENOM_WEB_DECL_EURO_FACT.",
-    "resposta do terceiro turno declarativo\n</think>\n\nE1 confirma a busca declarativa por RAG Web: PHENOM_WEB_DECL_EURO_FACT. Mantive os pontos anteriores PHENOM_AMBIG_T1 e PHENOM_AMBIG_T2. PHENOM_DECL_T3.",
-    "resumo linear sem nova busca\n</think>\n\nResumo da sessao: primeiro o pedido ambiguo virou PHENOM_WEB_AMBIG_BRASILIA_FACT; depois a continuidade ambigua virou PHENOM_WEB_AMBIG_DOLAR_FACT; por fim o pedido declarativo com RAG Web virou PHENOM_WEB_DECL_EURO_FACT. A conversa manteve PHENOM_AMBIG_T1, PHENOM_AMBIG_T2 e PHENOM_DECL_T3. PHENOM_CONTINUITY_FINAL.",
+    "cotacao euro real hoje fonte confiavel",
+    "resposta do terceiro turno declarativo\n</think>\n\nE1 confirma a busca declarativa por RAG Web: PHENOM_WEB_DECL_EURO_FACT. Mantive os pontos anteriores PHENOM_AMBIG_T1 e PHENOM_AMBIG_T2.\nPHENOM_DECL_T3",
+    "resumo linear sem nova busca\n</think>\n\nResumo da sessao: primeiro o pedido ambiguo virou PHENOM_WEB_AMBIG_BRASILIA_FACT; depois a continuidade ambigua virou PHENOM_WEB_AMBIG_DOLAR_FACT; por fim o pedido declarativo com RAG Web virou PHENOM_WEB_DECL_EURO_FACT. A conversa manteve PHENOM_AMBIG_T1, PHENOM_AMBIG_T2 e PHENOM_DECL_T3.\nPHENOM_CONTINUITY_FINAL",
 ]
 
 def search_body(query):
@@ -109,14 +110,26 @@ with open(prompts_file, "w", encoding="utf-8") as prompts:
                 send(conn, "200 OK", "application/json", '{"tokens":[1,2,3,4,5,6,7,8,9,10]}')
             elif method == "POST" and path == "/v1/chat/completions":
                 payload = json.loads(body.decode("utf-8"))
+                prompt = payload.get("prompt") or "\n".join(message.get("content", "") for message in payload.get("messages", []))
                 prompts.write(f"---REQUEST {completion_count + 1}---\n")
-                prompts.write(payload.get("prompt") or "\n".join(message.get("content", "") for message in payload.get("messages", [])))
+                prompts.write(prompt)
                 prompts.write("\n")
                 prompts.flush()
-                text = responses[completion_count] if completion_count < len(responses) else responses[-1]
+                if completion_count < 2:
+                    current_date = re.search(r"(?m)^current_date=(\d{4}-\d{2}-\d{2})$", prompt)
+                    current_weekday = re.search(r"(?m)^current_weekday=([A-Za-z]+)$", prompt)
+                    if not current_date or not current_weekday:
+                        text = "contexto temporal ausente\n</think>\n\nTEMPORAL_CONTEXT_MISSING"
+                    elif completion_count == 0:
+                        text = f"usar data autoritativa do sistema\n</think>\n\nHoje e {current_date.group(1)}.\nPHENOM_TEMPORAL_DATE_OK"
+                    else:
+                        text = f"usar dia autoritativo do sistema\n</think>\n\nHoje cai em {current_weekday.group(1)}.\nPHENOM_TEMPORAL_WEEKDAY_OK"
+                else:
+                    response_index = completion_count - 2
+                    text = responses[response_index] if response_index < len(responses) else responses[-1]
                 completion_count += 1
                 send(conn, "200 OK", "text/event-stream", completion_payload(text))
-                if completion_count >= len(responses):
+                if completion_count >= len(responses) + 2:
                     break
             else:
                 send(conn, "404 Not Found", "text/plain", "not found")
@@ -153,10 +166,12 @@ run_turn() {
   ) >"$WORK/$out.out" 2>"$WORK/$out.err"
 }
 
-run_turn PHENOM_AMBIG_T1 "Atualiza aquele horario de Brasilia para mim, sem enrolar." turn1
-run_turn PHENOM_AMBIG_T2 "E aquele valor em real que vou comparar depois, como esta agora?" turn2
-run_turn PHENOM_DECL_T3 "Agora declarativamente use ragweb para conferir o euro em real hoje." turn3
-run_turn PHENOM_CONTINUITY_FINAL "Sem pesquisar de novo, resume o que voce fez nas buscas e mantenha a ordem da conversa." turn4
+run_turn PHENOM_TEMPORAL_DATE_OK "moço, que dia é hoje?" temporal-date
+run_turn PHENOM_TEMPORAL_WEEKDAY_OK "e hoje cai em que dia da semana?" temporal-weekday
+run_turn PHENOM_AMBIG_T1 "vi falar que o horário mudou, como ficou isso em Brasília?" turn1
+run_turn PHENOM_AMBIG_T2 "e aquele valor em real que o pessoal olha, como está agora?" turn2
+run_turn PHENOM_DECL_T3 "confere também esse negócio do euro em real pra mim hoje" turn3
+run_turn PHENOM_CONTINUITY_FINAL "sem olhar de novo, me explica rapidinho o que você conferiu" turn4
 
 wait "$SERVER_PID" 2>/dev/null || true
 trap - EXIT
@@ -171,8 +186,8 @@ sql_count() {
   sqlite3 "$DB" "select count(*) from events where session = '$SESSION' and $1;"
 }
 
-test "$(sql_count "kind = 'turn_start'")" -eq 4 || { printf 'ambiguous-web-continuity-flow: expected four user turns\n' >&2; exit 1; }
-test "$(sql_count "kind = 'turn_done' and body like 'status=ok%quality=confirmed%'")" -eq 4 || { printf 'ambiguous-web-continuity-flow: not all turns confirmed\n' >&2; exit 1; }
+test "$(sql_count "kind = 'turn_start'")" -eq 6 || { printf 'ambiguous-web-continuity-flow: expected six user turns\n' >&2; exit 1; }
+test "$(sql_count "kind = 'turn_done' and body like 'status=ok%quality=confirmed%'")" -eq 6 || { printf 'ambiguous-web-continuity-flow: not all turns confirmed\n' >&2; exit 1; }
 test "$(sql_count "kind = 'tool_envelope' and body like '%raw_name=set_operational_contract%' and body like '%state=accepted%'")" -ge 3 || { printf 'ambiguous-web-continuity-flow: missing accepted model contract declarations\n' >&2; exit 1; }
 test "$(sql_count "kind = 'contract_selected' and body like '%contract=search_web%'")" -ge 3 || { printf 'ambiguous-web-continuity-flow: missing search_web contract selections\n' >&2; exit 1; }
 test "$(sql_count "kind = 'contract_selected' and body like '%external fact from ambiguous user wording%'")" -ge 1 || { printf 'ambiguous-web-continuity-flow: missing non-declarative ambiguous web contract\n' >&2; exit 1; }
@@ -188,10 +203,14 @@ test "$(sql_count "kind = 'tool_envelope' and body like '%raw_name=web_search%'"
 test "$(sql_count "kind = 'tool_repair' and body like '%synthetic%'")" -eq 0 || { printf 'ambiguous-web-continuity-flow: synthetic repair was used\n' >&2; exit 1; }
 
 grep -q '\[RECENT_DIALOGUE\]' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: recent dialogue was not sent to model\n' >&2; exit 1; }
+grep -q '^current_date=' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: current_date missing from model context\n' >&2; exit 1; }
+grep -q '^current_weekday=' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: current_weekday missing from model context\n' >&2; exit 1; }
+! grep -q 'TEMPORAL_CONTEXT_MISSING' "$WORK/all.out" || { printf 'ambiguous-web-continuity-flow: temporal context was unavailable\n' >&2; exit 1; }
 grep -q 'PHENOM_AMBIG_T1' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: turn 1 marker not present in later context\n' >&2; exit 1; }
 grep -q 'PHENOM_AMBIG_T2' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: turn 2 marker not present in later context\n' >&2; exit 1; }
 grep -q 'PHENOM_DECL_T3' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: turn 3 marker not present in later context\n' >&2; exit 1; }
-grep -q 'contract=rag_web' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: initial schema did not expose rag_web contract declaration\n' >&2; exit 1; }
+grep -q 'set_operational_contract(contract=answer_only|' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: operational contract schema missing\n' >&2; exit 1; }
+grep -q '|search_web|rag_web|' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: web contracts missing from schema\n' >&2; exit 1; }
 ! grep -q 'required_tool_calls' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: required_tool_calls leaked into model prompt\n' >&2; exit 1; }
 
 printf 'ambiguous-web-continuity-flow: ok work=%s db=%s\n' "$WORK" "$DB"

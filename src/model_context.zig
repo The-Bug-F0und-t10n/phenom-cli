@@ -394,8 +394,8 @@ test "system prompt stays compact and stable" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "You are Phenom") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Model decides when contracts/tools are needed") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Answer directly for social turns") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "do not expose these labels or process") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "safe read-only context/search can verify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Internally separate known, inferred, and unknown factual claims") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Low factual confidence requires read-only verification") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not invent MEMORY/SKILLS") != null);
 }
 
@@ -590,7 +590,7 @@ test "system prompt delegates evidence decisions to model contracts" {
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Model decides when contracts/tools are needed") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Do not roleplay identity") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "controller only executes accepted calls") != null);
-    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "do not expose these labels or process") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Internally separate known, inferred, and unknown factual claims") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "TEMPORAL_CONTEXT signals freshness") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Ungrounded facts require search_web/rag_web") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Named/obscure entities") != null);

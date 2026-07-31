@@ -24,6 +24,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         suppress_next_block_gap: bool = false,
         thinking_open: bool = false,
         stream_needs_gutter: bool = true,
+        stream_col: usize = 0,
         thinking_needs_gutter: bool = true,
         thinking_col: usize = 0,
         markdown_pending: [8192]u8 = undefined,
@@ -113,6 +114,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             self.assistant_wrote_content = false;
             self.assistant_escape_state = .plain;
             self.stream_needs_gutter = true;
+            self.stream_col = 0;
             self.last_block = .assistant;
         }
 
@@ -184,6 +186,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             self.assistant_wrote_content = false;
             self.suppress_next_block_gap = true;
             self.stream_needs_gutter = true;
+            self.stream_col = 0;
             self.last_block = .assistant;
         }
 
@@ -271,7 +274,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
 
         pub fn promptRow(self: *Self, prompt: []const u8) !void {
             const paint_cols = self.paintCols();
-            const content_width = if (paint_cols > 2) paint_cols - 2 else 1;
+            const content_width = if (paint_cols > 3) paint_cols - 3 else 1;
             try self.paintInputRow("> ", prompt[0..@min(prompt.len, content_width)], paint_cols);
         }
 
@@ -384,6 +387,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 if (direct_plain) {
                     try self.writer.writeAll("\n");
                     self.stream_needs_gutter = true;
+                    self.stream_col = 0;
                 } else {
                     try self.renderMarkdownPending(true);
                 }
@@ -520,6 +524,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 try self.writeMarkdownProseLine(line);
                 try self.writer.writeAll("\n");
                 self.stream_needs_gutter = true;
+                self.stream_col = 0;
             }
         }
 
@@ -542,6 +547,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             }
             if (newline) try self.writer.writeAll("\n");
             self.stream_needs_gutter = true;
+            self.stream_col = 0;
         }
 
         fn setMarkdownFence(self: *Self, line: []const u8) void {
@@ -576,6 +582,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                     try self.flushMarkdownTables();
                     if (newline) try self.writer.writeAll("\n");
                     self.stream_needs_gutter = true;
+                    self.stream_col = 0;
                     return;
                 }
                 try self.writeFenceLine("```");
@@ -585,6 +592,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 self.setMarkdownFence(line);
                 if (newline) try self.writer.writeAll("\n");
                 self.stream_needs_gutter = true;
+                self.stream_col = 0;
                 return;
             }
             if (isMarkdownTableRow(line)) {
@@ -598,6 +606,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             try self.writeCodeLine(line);
             if (newline) try self.writer.writeAll("\n");
             self.stream_needs_gutter = true;
+            self.stream_col = 0;
         }
 
         fn writeDeferredPlainFenceRowsAsCode(self: *Self) anyerror!void {
@@ -730,6 +739,22 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         }
 
         fn writeMarkdownProseLine(self: *Self, line: []const u8) !void {
+            const width = self.contentWrapWidth();
+            if (line.len == 0) {
+                try self.writeContentGutter();
+                return;
+            }
+            var start: usize = 0;
+            while (start < line.len) {
+                if (start > 0) try self.writer.writeAll("\n");
+                const take = utf8PrefixBytes(line[start..], width);
+                const end = start + @max(@as(usize, 1), take);
+                try self.writeMarkdownProseSegment(line[start..@min(end, line.len)]);
+                start = @min(end, line.len);
+            }
+        }
+
+        fn writeMarkdownProseSegment(self: *Self, line: []const u8) !void {
             const trimmed = trimLeft(line, " \t");
             const indent_len = line.len - trimmed.len;
             try self.writeContentGutter();
@@ -981,11 +1006,30 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         }
 
         fn writeContentStream(self: *Self, text: []const u8) !void {
-            for (text) |ch| {
-                if (self.stream_needs_gutter) try self.writeContentGutter();
-                const one = [1]u8{ch};
-                try self.writer.writeAll(&one);
-                self.stream_needs_gutter = ch == '\n';
+            const width = self.contentWrapWidth();
+            var index: usize = 0;
+            while (index < text.len) {
+                if (text[index] == '\n') {
+                    try self.writer.writeAll("\n");
+                    self.stream_needs_gutter = true;
+                    self.stream_col = 0;
+                    index += 1;
+                    continue;
+                }
+                if (self.stream_col >= width) {
+                    try self.writer.writeAll("\n");
+                    self.stream_needs_gutter = true;
+                    self.stream_col = 0;
+                }
+                if (self.stream_needs_gutter) {
+                    try self.writeContentGutter();
+                    self.stream_needs_gutter = false;
+                }
+                const len = utf8ByteLen(text[index]);
+                const end = @min(text.len, index + len);
+                try self.writer.writeAll(text[index..end]);
+                self.stream_col += 1;
+                index = end;
             }
         }
 
@@ -1283,6 +1327,15 @@ fn utf8Columns(bytes: []const u8) usize {
         if ((byte & 0b1100_0000) != 0b1000_0000) cols += 1;
     }
     return cols;
+}
+
+fn utf8PrefixBytes(bytes: []const u8, max_cols: usize) usize {
+    var index: usize = 0;
+    var columns: usize = 0;
+    while (index < bytes.len and columns < max_cols) : (columns += 1) {
+        index = @min(bytes.len, index + utf8ByteLen(bytes[index]));
+    }
+    return index;
 }
 
 fn toolLabel(name: []const u8) []const u8 {
@@ -1740,6 +1793,32 @@ test "assistant plain prose does not get syntax color" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Ola! Tudo bem? Em que posso ajudar hoje?") != null);
 }
 
+test "assistant output keeps explicit wrapping across terminal resize" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 10 });
+    try renderer.assistantStart();
+    try renderer.assistantDelta("abcdefgh");
+    renderer.setTerminalColumns(6);
+    try renderer.assistantDelta("ijklmnop");
+
+    try std.testing.expectEqualStrings(" abcdefgh\n ijkl\n mnop", buffer.items);
+}
+
+test "assistant markdown prose wraps without terminal soft wrap" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 10 });
+    try renderer.assistantStart();
+    try renderer.assistantDelta("# abcdefghijk\n");
+
+    try std.testing.expectEqualStrings(" # abcdef\n ghijk\n", buffer.items);
+}
+
 test "assistant strips model ansi escapes across stream chunks" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
@@ -2028,6 +2107,17 @@ test "prompt row uses phenom cli ts input palette and prefix" {
 
     const expected = "\x1b[48;5;236m\x1b[38;5;252m> ola          \x1b[0m";
     try std.testing.expectEqualStrings(expected, buffer.items);
+}
+
+test "prompt row preserves one right padding column at full width" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 16 });
+    try renderer.promptRow("abcdefghijklmnop");
+
+    try std.testing.expectEqualStrings("> abcdefghijkl ", buffer.items);
 }
 
 test "status row uses phenom cli ts active prose shape" {

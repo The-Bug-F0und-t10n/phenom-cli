@@ -37,8 +37,10 @@ test "default system prompt is loaded from template file" {
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "SKILLS=user-confirmed durable rules/preferences/operational constraints") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "before a relevant memory lookup") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "explicitly states a durable future-turn rule/preference") != null);
-    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "do not expose these labels or process") != null);
-    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "safe read-only context/search can verify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Internally separate known, inferred, and unknown factual claims") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Low factual confidence requires read-only verification") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "external facts use search_web/rag_web") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "state insufficient evidence; never guess") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Do not fill gaps") != null);
 }
 
@@ -50,4 +52,5 @@ test "system prompt profiles are named and selectable" {
     try std.testing.expectEqualStrings("strict", profileName(.strict));
     try std.testing.expect(profileText(.stock).ptr == default_system_prompt.ptr);
     try std.testing.expect(std.mem.indexOf(u8, profileText(.strict), "Do not infer identity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profileText(.strict), "unsupported external facts require search_web/rag_web") != null);
 }

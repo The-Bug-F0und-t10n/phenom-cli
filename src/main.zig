@@ -6976,7 +6976,9 @@ fn groundingRules() []const []const u8 {
         "Answer in the user's language unless USER_TASK explicitly requests another language; translate or summarize evidence instead of switching to the source language.",
         "When answering a local rule/preference/protocol from retrieved MEMORY/SKILLS, answer only the directly retrieved entry and do not add adjacent advice or generic best practices.",
         "Low confidence is operational: when a read-only tool can verify or triangulate the answer, use it before generic clarification.",
-        "Non-workspace technical answers may be unverified estimates; do not collect workspace evidence for them.",
+        "For external factual claims, uncertainty requires search_web/rag_web before answering; never convert plausibility, weak recall, or missing evidence into fact.",
+        "If external retrieval is unavailable, fails, or has no direct support, state that limitation and do not invent the missing fact.",
+        "Estimates must be explicitly requested or clearly labeled as estimates; never present them as verified facts.",
     };
 }
 

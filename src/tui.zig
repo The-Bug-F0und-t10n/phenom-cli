@@ -3,6 +3,8 @@ const fd_writer = @import("fd_writer.zig");
 
 const c = @cImport({
     @cInclude("fcntl.h");
+    @cInclude("errno.h");
+    @cInclude("poll.h");
     @cInclude("stdlib.h");
     @cInclude("termios.h");
     @cInclude("unistd.h");
@@ -307,7 +309,7 @@ pub fn computePromptView(allocator: std.mem.Allocator, prompt: []const u8, curso
 }
 
 pub fn computePromptViewLimited(allocator: std.mem.Allocator, prompt: []const u8, cursor: usize, paint_cols: usize, line_limit: usize) !PromptView {
-    const content_width = @max(@as(usize, 1), paint_cols -| 2);
+    const content_width = promptContentWidth(paint_cols);
     const WrappedLine = struct { start: usize, end: usize, logical_row: usize, col_start: usize };
     var wrapped = std.ArrayList(WrappedLine).empty;
     defer wrapped.deinit(allocator);
@@ -350,7 +352,9 @@ pub fn computePromptViewLimited(allocator: std.mem.Allocator, prompt: []const u8
         }
     }
     const cursor_col_in_line = safe_cursor - cursor_line_start;
-    const cursor_wrap = cursor_col_in_line / content_width;
+    const cursor_line_end = logicalLineEnd(prompt, safe_cursor);
+    const cursor_line_columns = codepointCount(prompt[cursor_line_start..cursor_line_end]);
+    const cursor_wrap = visualRowIndex(cursor_col_in_line, cursor_line_columns, content_width);
     var cursor_wrapped_row: usize = 0;
     var found_cursor = false;
     var w: usize = 0;
@@ -382,7 +386,7 @@ pub fn computePromptViewLimited(allocator: std.mem.Allocator, prompt: []const u8
         .storage = storage,
         .line_count = visible_count,
         .cursor_row = if (cursor_wrapped_row >= first_visible) @min(visible_count - 1, cursor_wrapped_row - first_visible) else 0,
-        .cursor_col = cursor_col_in_line % content_width,
+        .cursor_col = cursor_col_in_line - cursor_wrap * content_width,
         .first_visible = first_visible,
     };
 }
@@ -395,7 +399,11 @@ pub const InputEditor = struct {
     history_index: ?usize = null,
     draft: std.ArrayList(u8),
     pending: std.ArrayList(u8),
+    escape_pending: std.ArrayList(u8),
     in_paste: bool = false,
+    select_all: bool = false,
+    preferred_column: ?usize = null,
+    navigation_width: usize = std.math.maxInt(usize),
 
     pub fn init(allocator: std.mem.Allocator) InputEditor {
         return .{
@@ -404,6 +412,7 @@ pub const InputEditor = struct {
             .history = std.ArrayList([]u8).empty,
             .draft = std.ArrayList(u8).empty,
             .pending = std.ArrayList(u8).empty,
+            .escape_pending = std.ArrayList(u8).empty,
         };
     }
 
@@ -413,6 +422,7 @@ pub const InputEditor = struct {
         self.buffer.deinit(self.allocator);
         self.draft.deinit(self.allocator);
         self.pending.deinit(self.allocator);
+        self.escape_pending.deinit(self.allocator);
     }
 
     pub fn feed(self: *InputEditor, data: []const u8) !InputEvent {
@@ -422,6 +432,14 @@ pub const InputEditor = struct {
             try combined.appendSlice(self.allocator, self.pending.items);
             try combined.appendSlice(self.allocator, data);
             self.pending.clearRetainingCapacity();
+            return self.feed(combined.items);
+        }
+        if (self.escape_pending.items.len > 0) {
+            var combined = std.ArrayList(u8).empty;
+            defer combined.deinit(self.allocator);
+            try combined.appendSlice(self.allocator, self.escape_pending.items);
+            try combined.appendSlice(self.allocator, data);
+            self.escape_pending.clearRetainingCapacity();
             return self.feedReady(combined.items);
         }
         return self.feedReady(data);
@@ -430,17 +448,27 @@ pub const InputEditor = struct {
     fn feedReady(self: *InputEditor, data: []const u8) !InputEvent {
         var i: usize = 0;
         while (i < data.len) {
-            if (std.mem.startsWith(u8, data[i..], "\x1b[200~")) {
-                self.in_paste = true;
-                i += 6;
-                continue;
-            }
-            if (std.mem.startsWith(u8, data[i..], "\x1b[201~")) {
-                self.in_paste = false;
-                i += 6;
-                continue;
-            }
             const ch = data[i];
+            if (ch == '\x1b') {
+                const sequence_len = escapeSequenceLength(data[i..]) orelse {
+                    try self.escape_pending.appendSlice(self.allocator, data[i..]);
+                    return .none;
+                };
+                const sequence = data[i .. i + sequence_len];
+                if (std.mem.eql(u8, sequence, "\x1b[200~")) {
+                    self.in_paste = true;
+                } else if (std.mem.eql(u8, sequence, "\x1b[201~")) {
+                    self.in_paste = false;
+                } else if (self.in_paste) {
+                    for (sequence) |byte| try self.insertByte(byte);
+                } else if (sequence.len == 2 and (sequence[1] == '\r' or sequence[1] == '\n')) {
+                    try self.insertByte('\n');
+                } else {
+                    try self.handleEscape(sequence);
+                }
+                i += sequence_len;
+                continue;
+            }
             if (self.in_paste) {
                 try self.insertByte(if (ch == '\r') '\n' else ch);
                 i += 1;
@@ -448,9 +476,9 @@ pub const InputEditor = struct {
             }
             if (ch == 0x03) return .cancelled;
             if (ch == 0x04 and self.buffer.items.len == 0) return .closed;
-            if (ch == '\x1b' and i + 1 < data.len and (data[i + 1] == '\r' or data[i + 1] == '\n')) {
-                try self.insertByte('\n');
-                i += 2;
+            if (ch == 0x01) {
+                self.selectAll();
+                i += 1;
                 continue;
             }
             if (ch == '\r' or ch == '\n') {
@@ -462,13 +490,6 @@ pub const InputEditor = struct {
                 i += 1;
                 continue;
             }
-            if (ch == '\x1b' and i + 2 < data.len and data[i + 1] == '[') {
-                const consumed = try self.handleCsi(data[i..]);
-                if (consumed > 0) {
-                    i += consumed;
-                    continue;
-                }
-            }
             if (ch >= ' ' or ch == '\t') {
                 try self.insertByte(ch);
             }
@@ -477,61 +498,145 @@ pub const InputEditor = struct {
         return .none;
     }
 
-    fn handleCsi(self: *InputEditor, data: []const u8) !usize {
-        if (std.mem.startsWith(u8, data, "\x1b[A")) {
-            try self.historyPrev();
-            return 3;
+    fn handleEscape(self: *InputEditor, sequence: []const u8) !void {
+        const final = sequence[sequence.len - 1];
+        if (final == 'A') {
+            if (self.buffer.items.len == 0 or self.history_index != null) {
+                try self.historyPrev();
+            } else {
+                self.moveVertical(-1);
+            }
+            return;
         }
-        if (std.mem.startsWith(u8, data, "\x1b[B")) {
-            try self.historyNext();
-            return 3;
+        if (final == 'B') {
+            if (self.history_index != null) {
+                try self.historyNext();
+            } else {
+                self.moveVertical(1);
+            }
+            return;
         }
-        if (std.mem.startsWith(u8, data, "\x1b[C")) {
-            self.cursor = nextCodepointStart(self.buffer.items, self.cursor);
-            return 3;
+        if (final == 'C') {
+            if (self.select_all) {
+                self.cursor = self.buffer.items.len;
+                self.select_all = false;
+            } else {
+                self.cursor = nextCodepointStart(self.buffer.items, self.cursor);
+            }
+            self.preferred_column = null;
+            return;
         }
-        if (std.mem.startsWith(u8, data, "\x1b[D")) {
-            self.cursor = prevCodepointStart(self.buffer.items, self.cursor);
-            return 3;
+        if (final == 'D') {
+            if (self.select_all) {
+                self.cursor = 0;
+                self.select_all = false;
+            } else {
+                self.cursor = prevCodepointStart(self.buffer.items, self.cursor);
+            }
+            self.preferred_column = null;
+            return;
         }
-        if (std.mem.startsWith(u8, data, "\x1b[H")) {
+        if (final == 'H') {
             self.cursor = 0;
-            return 3;
+            self.select_all = false;
+            self.preferred_column = null;
+            return;
         }
-        if (std.mem.startsWith(u8, data, "\x1b[F")) {
+        if (final == 'F') {
             self.cursor = self.buffer.items.len;
-            return 3;
+            self.select_all = false;
+            self.preferred_column = null;
+            return;
         }
-        if (std.mem.startsWith(u8, data, "\x1b[3~")) {
+        if (std.mem.eql(u8, sequence, "\x1b[3~")) {
             self.deleteForward();
-            return 4;
+            return;
         }
-        if (std.mem.startsWith(u8, data, "\x1b[13;2u") or std.mem.startsWith(u8, data, "\x1b[13;3u")) {
+        if (std.mem.eql(u8, sequence, "\x1b[13;2u") or std.mem.eql(u8, sequence, "\x1b[13;3u")) {
             try self.insertByte('\n');
-            return 7;
+            return;
         }
-        return 0;
+        if (std.mem.eql(u8, sequence, "\x1b[97;5u")) {
+            self.selectAll();
+        }
+    }
+
+    fn selectAll(self: *InputEditor) void {
+        self.select_all = self.buffer.items.len > 0;
+        self.cursor = self.buffer.items.len;
+        self.preferred_column = null;
     }
 
     fn insertByte(self: *InputEditor, byte: u8) !void {
+        self.deleteSelection();
         try self.buffer.insert(self.allocator, self.cursor, byte);
         self.cursor += 1;
         self.history_index = null;
+        self.preferred_column = null;
     }
 
     fn backspace(self: *InputEditor) void {
+        if (self.select_all) return self.deleteSelection();
         if (self.cursor == 0) return;
         const start = prevCodepointStart(self.buffer.items, self.cursor);
         self.buffer.replaceRange(self.allocator, start, self.cursor - start, &.{}) catch return;
         self.cursor = start;
         self.history_index = null;
+        self.preferred_column = null;
     }
 
     fn deleteForward(self: *InputEditor) void {
+        if (self.select_all) return self.deleteSelection();
         if (self.cursor >= self.buffer.items.len) return;
         const end = nextCodepointStart(self.buffer.items, self.cursor);
         self.buffer.replaceRange(self.allocator, self.cursor, end - self.cursor, &.{}) catch return;
         self.history_index = null;
+        self.preferred_column = null;
+    }
+
+    fn deleteSelection(self: *InputEditor) void {
+        if (!self.select_all) return;
+        self.buffer.clearRetainingCapacity();
+        self.cursor = 0;
+        self.select_all = false;
+        self.history_index = null;
+        self.preferred_column = null;
+    }
+
+    fn moveVertical(self: *InputEditor, direction: i8) void {
+        self.select_all = false;
+        const current_start = logicalLineStart(self.buffer.items, self.cursor);
+        const current_end = logicalLineEnd(self.buffer.items, self.cursor);
+        const line_columns = codepointCount(self.buffer.items[current_start..current_end]);
+        const current_column = codepointCount(self.buffer.items[current_start..self.cursor]);
+        const width = @max(@as(usize, 1), self.navigation_width);
+        const current_row = visualRowIndex(current_column, line_columns, width);
+        const desired = self.preferred_column orelse current_column - current_row * width;
+        self.preferred_column = desired;
+        if (direction < 0) {
+            if (current_row > 0) {
+                const target_column = @min((current_row - 1) * width + desired, current_row * width);
+                self.cursor = cursorAtColumn(self.buffer.items, current_start, current_end, target_column);
+                return;
+            }
+            if (current_start == 0) return;
+            const target_end = current_start - 1;
+            const target_start = logicalLineStart(self.buffer.items, target_end);
+            const target_columns = codepointCount(self.buffer.items[target_start..target_end]);
+            const target_row = visualRowIndex(target_columns, target_columns, width);
+            self.cursor = cursorAtColumn(self.buffer.items, target_start, target_end, @min(target_row * width + desired, target_columns));
+            return;
+        }
+        const last_row = visualRowIndex(line_columns, line_columns, width);
+        if (current_row < last_row) {
+            const target_column = @min((current_row + 1) * width + desired, line_columns);
+            self.cursor = cursorAtColumn(self.buffer.items, current_start, current_end, target_column);
+            return;
+        }
+        if (current_end == self.buffer.items.len) return;
+        const target_start = current_end + 1;
+        const target_end = logicalLineEnd(self.buffer.items, target_start);
+        self.cursor = cursorAtColumn(self.buffer.items, target_start, target_end, desired);
     }
 
     fn submit(self: *InputEditor) ![]u8 {
@@ -542,6 +647,8 @@ pub const InputEditor = struct {
         }
         self.buffer.clearRetainingCapacity();
         self.cursor = 0;
+        self.select_all = false;
+        self.preferred_column = null;
         self.history_index = null;
         self.draft.clearRetainingCapacity();
         return line;
@@ -590,6 +697,8 @@ pub const InputEditor = struct {
         self.buffer.clearRetainingCapacity();
         try self.buffer.appendSlice(self.allocator, text);
         self.cursor = self.buffer.items.len;
+        self.select_all = false;
+        self.preferred_column = null;
     }
 
     pub fn loadHistoryNewestFirst(self: *InputEditor, lines: []const []const u8) !void {
@@ -610,6 +719,18 @@ pub const InputEditor = struct {
         self.draft.clearRetainingCapacity();
     }
 };
+
+fn escapeSequenceLength(data: []const u8) ?usize {
+    if (data.len < 2) return null;
+    if (data[1] == '\r' or data[1] == '\n') return 2;
+    if (data[1] == 'O') return if (data.len >= 3) 3 else null;
+    if (data[1] != '[') return 2;
+    var index: usize = 2;
+    while (index < data.len) : (index += 1) {
+        if (data[index] >= 0x40 and data[index] <= 0x7e) return index + 1;
+    }
+    return null;
+}
 
 pub fn TerminalUi(comptime Writer: type) type {
     return struct {
@@ -699,7 +820,7 @@ pub fn TerminalUi(comptime Writer: type) type {
             self.attached = true;
             lockTerminal(&self.write_mutex);
             defer self.write_mutex.unlock();
-            try self.writer.writeAll("\x1b[?2004h");
+            try self.writer.writeAll("\x1b[?7l\x1b[?2004h");
             try self.resyncScrollRegion();
             try self.drawUnlocked(.{ .status = null, .show_prompt = true, .preserve_cursor = false });
         }
@@ -712,7 +833,7 @@ pub fn TerminalUi(comptime Writer: type) type {
             defer self.write_mutex.unlock();
             try self.writer.writeAll("\x1b[r");
             try self.clearBottom();
-            try self.writer.writeAll("\x1b[?2004l");
+            try self.writer.writeAll("\x1b[?2004l\x1b[?7h");
             if (self.raw_enabled) {
                 _ = c.tcsetattr(self.stdin_fd, c.TCSAFLUSH, &self.original_termios);
                 self.raw_enabled = false;
@@ -723,11 +844,28 @@ pub fn TerminalUi(comptime Writer: type) type {
         pub fn readLine(self: *Self) !?[]u8 {
             var buf: [64]u8 = undefined;
             while (true) {
+                const size = terminalSize();
+                self.editor.navigation_width = promptContentWidth(@max(@as(usize, 1), size.cols -| 1));
                 const event = if (self.editor.pending.items.len > 0) blk: {
                     break :blk try self.editor.feed("");
                 } else blk: {
+                    var descriptor = c.pollfd{ .fd = self.stdin_fd, .events = c.POLLIN, .revents = 0 };
+                    const poll_result = c.poll(&descriptor, 1, 100);
+                    if (poll_result < 0) {
+                        if (c.__errno_location().* == c.EINTR) continue;
+                        return error.StdinReadFailed;
+                    }
+                    if (poll_result == 0) {
+                        if (size.rows != self.terminal_rows or size.cols != self.terminal_cols) {
+                            try self.draw(.{ .status = null, .show_prompt = true, .preserve_cursor = false });
+                        }
+                        continue;
+                    }
                     const n_raw = c.read(self.stdin_fd, &buf, buf.len);
-                    if (n_raw < 0) return error.StdinReadFailed;
+                    if (n_raw < 0) {
+                        if (c.__errno_location().* == c.EINTR) continue;
+                        return error.StdinReadFailed;
+                    }
                     if (n_raw == 0) return null;
                     const n: usize = @intCast(n_raw);
                     break :blk try self.editor.feed(buf[0..n]);
@@ -895,6 +1033,10 @@ pub fn TerminalUi(comptime Writer: type) type {
             const rows = @min(bottomBarRows(active_prompt_lines), max_footer_rows);
             const size_changed = size.rows != self.terminal_rows or size.cols != self.terminal_cols;
             if (rows != self.bottom_rows or size_changed) {
+                const old_start = @max(@as(usize, 1), (size.rows -| self.bottom_rows) + 1);
+                const new_start = @max(@as(usize, 1), (size.rows -| rows) + 1);
+                const clear_start = @min(old_start, new_start);
+                try self.writer.print("\x1b[r\x1b[{};1H\x1b[J", .{clear_start});
                 self.prompt_rows = view.line_count;
                 self.bottom_rows = rows;
                 self.terminal_rows = size.rows;
@@ -1166,11 +1308,17 @@ fn formatByteCount(buf: *[24]u8, value: usize) []const u8 {
 
 fn paintInputRow(writer: anytype, color: bool, prefix: []const u8, content: []const u8, width: usize) !void {
     if (color) try writer.writeAll(user_bg ++ user_fg);
-    const used = @min(width, prefix.len + content.len);
-    try writer.writeAll(prefix[0..@min(prefix.len, width)]);
-    if (prefix.len < width) try writer.writeAll(content[0..@min(content.len, width - prefix.len)]);
+    const prefix_len = @min(prefix.len, width);
+    const content_len = @min(content.len, (width - prefix_len) -| 1);
+    const used = prefix_len + content_len;
+    try writer.writeAll(prefix[0..prefix_len]);
+    try writer.writeAll(content[0..content_len]);
     if (used < width) try writeSpaces(writer, width - used);
     if (color) try writer.writeAll(reset);
+}
+
+fn promptContentWidth(paint_cols: usize) usize {
+    return @max(@as(usize, 1), paint_cols -| 3);
 }
 
 fn paintInputBlank(writer: anytype, color: bool, width: usize) !void {
@@ -1196,6 +1344,37 @@ fn nextCodepointStart(bytes: []const u8, cursor: usize) usize {
     var i = cursor + 1;
     while (i < bytes.len and (bytes[i] & 0b1100_0000) == 0b1000_0000) : (i += 1) {}
     return i;
+}
+
+fn logicalLineStart(bytes: []const u8, cursor: usize) usize {
+    var index = @min(cursor, bytes.len);
+    while (index > 0) : (index -= 1) {
+        if (bytes[index - 1] == '\n') break;
+    }
+    return index;
+}
+
+fn logicalLineEnd(bytes: []const u8, cursor: usize) usize {
+    return std.mem.indexOfScalarPos(u8, bytes, @min(cursor, bytes.len), '\n') orelse bytes.len;
+}
+
+fn codepointCount(bytes: []const u8) usize {
+    var count: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < bytes.len) : (count += 1) cursor = nextCodepointStart(bytes, cursor);
+    return count;
+}
+
+fn visualRowIndex(column: usize, line_columns: usize, width: usize) usize {
+    if (line_columns == 0) return 0;
+    return @min(column / width, (line_columns - 1) / width);
+}
+
+fn cursorAtColumn(bytes: []const u8, start: usize, end: usize, column: usize) usize {
+    var cursor = start;
+    var current: usize = 0;
+    while (cursor < end and current < column) : (current += 1) cursor = nextCodepointStart(bytes, cursor);
+    return @min(cursor, end);
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -1287,6 +1466,22 @@ test "input editor history navigation" {
     try std.testing.expectEqualStrings("segundo", editor.buffer.items);
 }
 
+test "input editor uses history only from explicit empty state" {
+    var editor = InputEditor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    switch (try editor.feed("anterior\r")) {
+        .submitted => |line| std.testing.allocator.free(line),
+        else => return error.ExpectedSubmit,
+    }
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("rascunho"));
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[A"));
+    try std.testing.expectEqualStrings("rascunho", editor.buffer.items);
+
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x01\x7f\x1b[A"));
+    try std.testing.expectEqualStrings("anterior", editor.buffer.items);
+}
+
 test "input editor clears history" {
     var editor = InputEditor.init(std.testing.allocator);
     defer editor.deinit();
@@ -1326,6 +1521,83 @@ test "input editor preserves multiline keyboard input until plain enter" {
         },
         else => return error.ExpectedSubmit,
     }
+}
+
+test "input editor navigates multiline rows and preserves desired column" {
+    var editor = InputEditor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[200~abcde\nxy\n12345\x1b[201~"));
+    try std.testing.expectEqual(@as(usize, 14), editor.cursor);
+
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[A"));
+    try std.testing.expectEqual(@as(usize, 8), editor.cursor);
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[A"));
+    try std.testing.expectEqual(@as(usize, 5), editor.cursor);
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[B"));
+    try std.testing.expectEqual(@as(usize, 8), editor.cursor);
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[B"));
+    try std.testing.expectEqual(@as(usize, 14), editor.cursor);
+
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[D\x1b[A"));
+    try std.testing.expectEqual(@as(usize, 8), editor.cursor);
+}
+
+test "input editor navigates soft wrapped visual rows" {
+    var editor = InputEditor.init(std.testing.allocator);
+    defer editor.deinit();
+    editor.navigation_width = 5;
+
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("abcdefghijkl"));
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[A"));
+    try std.testing.expectEqual(@as(usize, 7), editor.cursor);
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[A"));
+    try std.testing.expectEqual(@as(usize, 2), editor.cursor);
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[B"));
+    try std.testing.expectEqual(@as(usize, 7), editor.cursor);
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("X"));
+    try std.testing.expectEqualStrings("abcdefgXhijkl", editor.buffer.items);
+}
+
+test "input editor arrow navigation edits multiline text at cursor" {
+    var editor = InputEditor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[200~um\ndois\ntrês\x1b[201~"));
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[A\x1b[D"));
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("!"));
+    try std.testing.expectEqualStrings("um\ndoi!s\ntrês", editor.buffer.items);
+}
+
+test "input editor accepts fragmented CSI and SS3 arrows" {
+    var editor = InputEditor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[200~abcde\nxy\n12345\x1b[201~"));
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b"));
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("[A"));
+    try std.testing.expectEqual(@as(usize, 8), editor.cursor);
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1bO"));
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("A"));
+    try std.testing.expectEqual(@as(usize, 5), editor.cursor);
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[1;1D"));
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("X"));
+    try std.testing.expectEqualStrings("abcdXe\nxy\n12345", editor.buffer.items);
+}
+
+test "input editor ctrl a selection deletes or replaces all text" {
+    var editor = InputEditor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("\x1b[200~primeira\nsegunda\x1b[201~\x01"));
+    try std.testing.expect(editor.select_all);
+    try std.testing.expectEqual(InputEvent.none, try editor.feed(&.{0x7f}));
+    try std.testing.expectEqualStrings("", editor.buffer.items);
+    try std.testing.expectEqual(@as(usize, 0), editor.cursor);
+
+    try std.testing.expectEqual(InputEvent.none, try editor.feed("antigo\x01novo"));
+    try std.testing.expectEqualStrings("novo", editor.buffer.items);
+    try std.testing.expect(!editor.select_all);
 }
 
 test "input editor preserves thousand line bracketed paste" {
@@ -1378,6 +1650,23 @@ test "bottom bar snapshot matches prompt and status surface" {
         "                 \r\n" ++
         "                 ";
     try std.testing.expectEqualStrings(expected, buffer.items);
+}
+
+test "every full prompt line preserves one trailing column" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+
+    _ = try renderBottomBar(writer, .{
+        .color = false,
+        .cols = 10,
+        .prompt = "123456\nabcdef",
+        .cursor = 13,
+        .show_prompt = true,
+        .prompt_line_limit = 2,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "> 123456 \r\n  abcdef ") != null);
 }
 
 test "status bar formats real token usage without accumulating" {
@@ -1516,19 +1805,19 @@ test "prompt view wraps and keeps cursor in visible window" {
     var view = try computePromptView(std.testing.allocator, "abcdefghi", 9, 6, 10);
     defer view.deinit();
     try std.testing.expectEqual(@as(usize, 3), view.line_count);
-    try std.testing.expectEqualStrings("abcd", view.storage[0]);
-    try std.testing.expectEqualStrings("efgh", view.storage[1]);
-    try std.testing.expectEqualStrings("i", view.storage[2]);
+    try std.testing.expectEqualStrings("abc", view.storage[0]);
+    try std.testing.expectEqualStrings("def", view.storage[1]);
+    try std.testing.expectEqualStrings("ghi", view.storage[2]);
     try std.testing.expectEqual(@as(usize, 2), view.cursor_row);
-    try std.testing.expectEqual(@as(usize, 1), view.cursor_col);
+    try std.testing.expectEqual(@as(usize, 3), view.cursor_col);
 }
 
 test "prompt view honors small terminal line limit" {
     var view = try computePromptViewLimited(std.testing.allocator, "abcdefghijkl", 12, 6, 2);
     defer view.deinit();
     try std.testing.expectEqual(@as(usize, 2), view.line_count);
-    try std.testing.expectEqualStrings("efgh", view.storage[0]);
-    try std.testing.expectEqualStrings("ijkl", view.storage[1]);
+    try std.testing.expectEqualStrings("ghi", view.storage[0]);
+    try std.testing.expectEqualStrings("jkl", view.storage[1]);
 }
 
 test "prompt view has no hidden 256 line truncation" {
