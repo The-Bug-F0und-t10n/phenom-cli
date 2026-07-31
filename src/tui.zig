@@ -1031,18 +1031,8 @@ pub fn TerminalUi(comptime Writer: type) type {
             defer view.deinit();
             const active_prompt_lines = if (opts.show_prompt) view.line_count else 1;
             const rows = @min(bottomBarRows(active_prompt_lines), max_footer_rows);
-            const size_changed = size.rows != self.terminal_rows or size.cols != self.terminal_cols;
-            if (rows != self.bottom_rows or size_changed) {
-                const old_start = @max(@as(usize, 1), (size.rows -| self.bottom_rows) + 1);
-                const new_start = @max(@as(usize, 1), (size.rows -| rows) + 1);
-                const clear_start = @min(old_start, new_start);
-                try self.writer.print("\x1b[r\x1b[{};1H\x1b[J", .{clear_start});
-                self.prompt_rows = view.line_count;
-                self.bottom_rows = rows;
-                self.terminal_rows = size.rows;
-                self.terminal_cols = size.cols;
-                try self.resyncScrollRegionFor(size);
-            }
+            const size_changed = try self.syncLayout(size, rows);
+            self.prompt_rows = view.line_count;
 
             const status_row = @max(@as(usize, 1), (size.rows -| self.bottom_rows) + 1);
             var out = std.ArrayList(u8).empty;
@@ -1063,7 +1053,7 @@ pub fn TerminalUi(comptime Writer: type) type {
                     }
                 }
             }
-            if (opts.preserve_cursor) try bw.writeAll("\x1b7");
+            if (opts.preserve_cursor and !size_changed) try bw.writeAll("\x1b7");
             try bw.print("\x1b[{};1H", .{status_row});
             _ = try renderBottomBar(bw, .{
                 .color = self.color,
@@ -1079,8 +1069,11 @@ pub fn TerminalUi(comptime Writer: type) type {
                 .show_prompt = opts.show_prompt,
                 .prompt_line_limit = active_prompt_lines,
             });
-            if (opts.preserve_cursor) {
+            if (opts.preserve_cursor and !size_changed) {
                 try bw.writeAll("\x1b8");
+            } else if (opts.preserve_cursor) {
+                const content_row = @max(@as(usize, 1), size.rows -| self.bottom_rows);
+                try bw.print("\x1b[{};1H", .{content_row});
             } else if (opts.show_prompt) {
                 const prompt_first_row = status_row + 3;
                 const screen_col = @min(size.cols, @as(usize, 3) + view.cursor_col);
@@ -1088,6 +1081,24 @@ pub fn TerminalUi(comptime Writer: type) type {
                 try bw.print("\x1b[{};{}H", .{ screen_row, screen_col });
             }
             try self.writer.writeAll(out.items);
+        }
+
+        fn syncLayout(self: *Self, size: TerminalSize, rows: usize) !bool {
+            const size_changed = size.rows != self.terminal_rows or size.cols != self.terminal_cols;
+            if (!size_changed and rows == self.bottom_rows) return false;
+
+            const new_start = @max(@as(usize, 1), (size.rows -| rows) + 1);
+            if (size_changed) {
+                try self.writer.print("\x1b[r\x1b[{};1H\x1b[J", .{new_start});
+            } else {
+                const old_start = @max(@as(usize, 1), (size.rows -| self.bottom_rows) + 1);
+                try self.writer.print("\x1b[r\x1b[{};1H\x1b[J", .{@min(old_start, new_start)});
+            }
+            self.bottom_rows = rows;
+            self.terminal_rows = size.rows;
+            self.terminal_cols = size.cols;
+            try self.resyncScrollRegionFor(size);
+            return size_changed;
         }
 
         fn formatStatus(self: *Self, status: []const u8, buf: *[192]u8) []const u8 {
@@ -1885,4 +1896,20 @@ test "mini visualizer resizes without stale width" {
     var buf: [256]u8 = undefined;
     const frame = try visualizer.render(&buf, monotonicMs());
     try std.testing.expectEqual(@as(usize, 12), utf8Columns(frame));
+}
+
+test "terminal resize clears only the new bottom bar and invalidates saved cursor" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var ui = TerminalUi(@TypeOf(writer)).init(std.testing.allocator, writer, false);
+    defer ui.editor.deinit();
+    ui.attached = true;
+    ui.terminal_rows = 24;
+    ui.terminal_cols = 80;
+    ui.bottom_rows = 6;
+
+    try std.testing.expect(try ui.syncLayout(.{ .rows = 18, .cols = 24 }, 6));
+    try std.testing.expectEqualStrings("\x1b[r\x1b[13;1H\x1b[J\x1b7\x1b[1;12r\x1b8", buffer.items);
 }
