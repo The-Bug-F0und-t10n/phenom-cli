@@ -878,7 +878,16 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             try sink.flushDeferredVisible();
         }
         if (sink.completion_stop_reason == .length and sink.visible_bytes > 0) {
-            try repairLengthStoppedVisibleAnswerUntilStop(allocator, effective_config, prompt, &client, &events, &db, ui_ptr, &sink);
+            _ = try repairLengthStoppedVisibleAnswerUntilStop(allocator, effective_config, prompt, &client, &events, &db, ui_ptr, &sink);
+        }
+        if (sink.completion_stop_reason != .length) {
+            if (sink.length_repair_context) |context| {
+                if (std.mem.indexOf(u8, context, "[WEB_DOSSIER v1]") != null and webAnswerMissingCollectedSource(sink.visible.items, context)) {
+                    const sources = try appendCollectedWebSources(allocator, "", context);
+                    defer allocator.free(sources);
+                    try sink.emitVisibleText(sources);
+                }
+            }
         }
         if (sink.visible_bytes == 0 and rawVisibleContainsToolCall(sink.raw_visible.items)) {
             sink.discardDeferredVisible();
@@ -922,9 +931,13 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             defer allocator.free(message);
             try db.recordEvent(config.session, "model_stop", message);
         }
-        const final_status = "ok";
+        const final_status = finalTurnStatus(sink.completion_stop_reason);
         try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, final_status, prompt, sink.visible.items);
     }
+}
+
+fn finalTurnStatus(stop_reason: http.StopReason) []const u8 {
+    return if (stop_reason == .length) "incomplete_length" else "ok";
 }
 
 fn shouldUseSessionContext(config: cli.Config) bool {
@@ -932,10 +945,12 @@ fn shouldUseSessionContext(config: cli.Config) bool {
 }
 
 fn expectationSatisfied(visible: []const u8, expected: []const u8) bool {
-    if (std.mem.indexOf(u8, visible, expected) == null) return false;
+    const marker_start = std.mem.indexOf(u8, visible, expected) orelse return false;
     if (!isSyntheticExpectationMarker(expected)) return true;
     const line = lastNonEmptyLine(visible) orelse return false;
-    return std.mem.eql(u8, line, expected);
+    if (std.mem.eql(u8, line, expected)) return true;
+    const suffix = std.mem.trim(u8, visible[marker_start + expected.len ..], " \t\r\n");
+    return std.mem.startsWith(u8, suffix, "Sources:\n");
 }
 
 fn isSyntheticExpectationMarker(expected: []const u8) bool {
@@ -5197,10 +5212,11 @@ fn repairLengthStoppedVisibleAnswer(
     db: *audit.AuditDb,
     ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
     aggregate_sink: *StreamSink,
+    attempt: usize,
 ) !bool {
     try db.recordEvent(config.session, "answer_repair", "server length stop with partial visible answer");
 
-    const partial = try compactOperationalText(allocator, aggregate_sink.visible.items, 4096);
+    const partial = try visibleContinuationTail(allocator, aggregate_sink.visible.items, 4096);
     defer allocator.free(partial);
     const session_blocks = [_]model_context.SessionBlock{.{ .text = partial }};
     const repair_evidence_text = if (aggregate_sink.length_repair_context) |context|
@@ -5214,6 +5230,8 @@ fn repairLengthStoppedVisibleAnswer(
         evidence_block_storage[0] = .{ .text = text };
         evidence_blocks = evidence_block_storage[0..1];
     }
+    const next_action = try std.fmt.allocPrint(allocator, "Continue after the exact final byte of SESSION_CONTEXT and complete the answer. Continuation attempt {}.", .{attempt});
+    defer allocator.free(next_action);
     const repair_context = try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
         .mode = "finalization_repair",
@@ -5225,7 +5243,7 @@ fn repairLengthStoppedVisibleAnswer(
         .session = &session_blocks,
         .obligations = &.{
             "Previous visible answer stopped because the server reached the generation length limit.",
-            "SESSION_CONTEXT is the partial visible answer already shown to the user.",
+            "SESSION_CONTEXT is the verbatim tail of the partial visible answer already shown to the user; preserve its structure and continue after its final byte.",
             "If EVIDENCE is present, keep using it for sources and grounding while continuing.",
             "Continue from the exact stopping point; do not repeat earlier paragraphs, headings, or calculations.",
             "Do not mention truncation, token limits, tool calls, or protocol details.",
@@ -5233,7 +5251,7 @@ fn repairLengthStoppedVisibleAnswer(
         .grounding = groundingRules(),
         .next_action_v1 = .{
             .kind = .answer_directly,
-            .text = "Continue and complete the visible answer now.",
+            .text = next_action,
         },
     });
     defer allocator.free(repair_context);
@@ -5259,11 +5277,12 @@ fn repairLengthStoppedVisibleAnswer(
     client.thinking = .off;
     defer client.thinking = previous_thinking;
 
+    const repair_max_tokens = continuationMaxTokens(config.max_tokens, attempt);
     const repair_input = http.InferenceInput{
         .user_prompt = prompt,
         .system_prompt = config.system_prompt,
         .model_context = repair_context,
-        .max_tokens = config.max_tokens,
+        .max_tokens = repair_max_tokens,
     };
     const context_usage = recordModelContextBudget(allocator, db, config.session, repair_context, client, repair_input) catch |err| {
         try db.recordEvent(config.session, "answer_repair_failed", @errorName(err));
@@ -5280,7 +5299,7 @@ fn repairLengthStoppedVisibleAnswer(
         return err;
     };
     try repair_sink.flush();
-    repair_sink.promoteTokenLimitStop(config.max_tokens);
+    repair_sink.promoteTokenLimitStop(repair_max_tokens);
 
     const repair_stop_reason = repair_sink.completion_stop_reason;
     aggregate_sink.mergeGenerationStop(repair_sink);
@@ -5294,11 +5313,13 @@ fn repairLengthStoppedVisibleAnswer(
         defer allocator.free(detail);
         try db.recordEvent(config.session, "answer_repair_failed", detail);
         try db.recordTurnError(config.session, .model_protocol, "length_stop_continuation", detail);
+        aggregate_sink.completion_stop_reason = .length;
         return false;
     }
     const reconciled = continuationVisibleSuffix(aggregate_sink.visible.items, repair_visible);
     if (reconciled.len == 0) {
         try db.recordEvent(config.session, "answer_repair_failed", "length stop continuation repeated already visible answer");
+        aggregate_sink.completion_stop_reason = .length;
         return false;
     }
     try aggregate_sink.emitVisibleText(reconciled);
@@ -5306,6 +5327,19 @@ fn repairLengthStoppedVisibleAnswer(
     repair_sink.raw_visible.clearRetainingCapacity();
     try db.recordEvent(config.session, "answer_repair_done", "server length continuation emitted visible answer");
     return true;
+}
+
+fn continuationMaxTokens(base: u16, attempt: usize) u16 {
+    var result: u32 = base;
+    for (0..attempt) |_| result = @min(result * 2, std.math.maxInt(u16));
+    return @intCast(result);
+}
+
+fn visibleContinuationTail(allocator: std.mem.Allocator, visible: []const u8, max_bytes: usize) ![]u8 {
+    if (visible.len <= max_bytes) return allocator.dupe(u8, visible);
+    var start = visible.len - max_bytes;
+    while (start < visible.len and (visible[start] & 0xc0) == 0x80) : (start += 1) {}
+    return allocator.dupe(u8, visible[start..]);
 }
 
 fn continuationVisibleSuffix(previous: []const u8, continuation: []const u8) []const u8 {
@@ -5317,7 +5351,67 @@ fn continuationVisibleSuffix(previous: []const u8, continuation: []const u8) []c
     const common = commonPrefixUtf8Bytes(previous[previous_start..], continuation[continuation_start..]);
     const shorter = @min(previous.len - previous_start, continuation.len - continuation_start);
     if (common >= 128 and common * 2 >= shorter) return continuation[continuation_start + common ..];
+    if (repeatedLineSuffixEnd(previous[previous_start..], continuation[continuation_start..])) |end| {
+        return continuation[continuation_start + end ..];
+    }
     return continuation;
+}
+
+fn repeatedLineSuffixEnd(previous: []const u8, continuation: []const u8) ?usize {
+    var previous_start: usize = 0;
+    while (previous_start < previous.len) : (previous_start = nextLineOffset(previous, previous_start)) {
+        var continuation_start: usize = 0;
+        while (continuation_start < continuation.len) : (continuation_start = nextLineOffset(continuation, continuation_start)) {
+            if (matchingLineSuffixEnd(previous[previous_start..], continuation[continuation_start..])) |end| {
+                return continuation_start + end;
+            }
+        }
+    }
+    return null;
+}
+
+fn matchingLineSuffixEnd(previous: []const u8, continuation: []const u8) ?usize {
+    var previous_offset: usize = 0;
+    var continuation_offset: usize = 0;
+    var matched = false;
+    while (previous_offset < previous.len and continuation_offset < continuation.len) {
+        const previous_end = lineEndOffset(previous, previous_offset);
+        const continuation_end = lineEndOffset(continuation, continuation_offset);
+        const previous_line = normalizedContinuationLine(previous[previous_offset..previous_end]);
+        const continuation_line = normalizedContinuationLine(continuation[continuation_offset..continuation_end]);
+        const previous_is_last = previous_end == previous.len;
+        if (previous_is_last and std.mem.startsWith(u8, continuation_line, previous_line)) {
+            if (std.mem.eql(u8, previous_line, continuation_line)) return nextLineOffset(continuation, continuation_offset);
+            return continuation_offset + continuationContentOffset(continuation[continuation_offset..continuation_end]) + previous_line.len;
+        }
+        if (!std.mem.eql(u8, previous_line, continuation_line)) return null;
+        matched = true;
+        previous_offset = nextLineOffset(previous, previous_offset);
+        continuation_offset = nextLineOffset(continuation, continuation_offset);
+    }
+    return if (matched and previous_offset >= previous.len) continuation_offset else null;
+}
+
+fn lineEndOffset(text: []const u8, start: usize) usize {
+    return std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+}
+
+fn nextLineOffset(text: []const u8, start: usize) usize {
+    const end = lineEndOffset(text, start);
+    return if (end < text.len) end + 1 else text.len;
+}
+
+fn normalizedContinuationLine(line: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    const start = continuationContentOffset(trimmed);
+    return std.mem.trimStart(u8, trimmed[start..], " \t");
+}
+
+fn continuationContentOffset(line: []const u8) usize {
+    var start: usize = 0;
+    while (start < line.len and (line[start] == '*' or line[start] == '_' or line[start] == '`' or line[start] == '>' or line[start] == '#')) : (start += 1) {}
+    while (start < line.len and (line[start] == ' ' or line[start] == '\t')) : (start += 1) {}
+    return start;
 }
 
 fn longestSuffixPrefixOverlap(previous: []const u8, continuation: []const u8) ?usize {
@@ -5359,19 +5453,22 @@ fn repairLengthStoppedVisibleAnswerUntilStop(
     db: *audit.AuditDb,
     ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
     aggregate_sink: *StreamSink,
-) !void {
+) !bool {
     var iterations: usize = 0;
     while (aggregate_sink.completion_stop_reason == .length and aggregate_sink.visible_bytes > 0) {
         if (iterations >= max_tool_emergency_iterations) {
             try db.recordEvent(config.session, "answer_repair_blocked", "length continuation emergency limit reached");
             try db.recordTurnError(config.session, .model_protocol, "length_stop_continuation", "length continuation emergency limit reached");
-            return;
+            return false;
         }
         const before = aggregate_sink.visible_bytes;
         iterations += 1;
-        const repaired = try repairLengthStoppedVisibleAnswer(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink);
-        if (!repaired or aggregate_sink.visible_bytes <= before) return;
+        const repaired = try repairLengthStoppedVisibleAnswer(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, iterations);
+        if (!repaired or aggregate_sink.visible_bytes <= before) {
+            try db.recordEvent(config.session, "answer_repair_retry", "length continuation made no visible progress");
+        }
     }
+    return aggregate_sink.completion_stop_reason != .length;
 }
 
 fn parseSearchPlanTerms(allocator: std.mem.Allocator, visible: []const u8) !?[]u8 {
@@ -5414,7 +5511,8 @@ fn streamDeferredToolLoopTurnInternal(
     const answer_repair_mode = std.mem.indexOf(u8, follow_context, "[EMPTY_WEB_EVIDENCE_ANSWER_REPAIR]") != null;
     const required_tool_mode = required_tool_repair != null;
     const final_answer_mode = active_contract.name == .answer_only and finalization_state != null;
-    const stream_final_visible = final_answer_mode;
+    const web_answer_mode = std.mem.indexOf(u8, follow_context, "[WEB_DOSSIER v1]") != null;
+    const stream_final_visible = final_answer_mode and !web_answer_mode;
     const protocol_hidden_mode = required_tool_mode or answer_repair_mode or final_answer_mode or active_contract.name == .search_web;
     if (finalization_state != null and !required_tool_mode) try aggregate_sink.rememberLengthRepairContext(follow_context);
     const previous_thinking = client.thinking;
@@ -5664,7 +5762,7 @@ fn streamDeferredToolLoopTurnInternal(
                 follow_sink.raw_visible.clearRetainingCapacity();
                 return .final_answer;
             }
-            if (active_contract.name == .search_web and webEvidenceHasOnlyEmptyExcerpts(follow_context) and !answer_repair_mode) {
+            if (web_answer_mode and webEvidenceHasOnlyEmptyExcerpts(follow_context) and !answer_repair_mode) {
                 follow_sink.discardDeferredVisible();
                 try db.recordEvent(config.session, "answer_repair", "empty web evidence final answer blocked");
                 if (finalization_state) |state| {
@@ -5689,7 +5787,22 @@ fn streamDeferredToolLoopTurnInternal(
                     required_tool_missing_visible,
                 );
             }
-            if (active_contract.name == .search_web and searchWebFinalEndsWithQuestion(follow_sink.raw_visible.items)) {
+            if (web_answer_mode and webAnswerMissingCollectedSource(follow_sink.raw_visible.items, follow_context)) {
+                if (follow_sink.completion_stop_reason == .length) {
+                    aggregate_sink.mergeGenerationStop(follow_sink);
+                    try aggregate_sink.emitVisibleText(follow_sink.raw_visible.items);
+                    follow_sink.discardDeferredVisible();
+                    return .final_answer;
+                }
+                const sourced_answer = try appendCollectedWebSources(allocator, follow_sink.raw_visible.items, follow_context);
+                defer allocator.free(sourced_answer);
+                try db.recordEvent(config.session, "answer_repair", "controller appended collected web sources");
+                aggregate_sink.mergeGenerationStop(follow_sink);
+                try aggregate_sink.emitVisibleText(sourced_answer);
+                follow_sink.discardDeferredVisible();
+                return .final_answer;
+            }
+            if (web_answer_mode and searchWebFinalEndsWithQuestion(follow_sink.raw_visible.items)) {
                 if (finalization_state) |state| {
                     if (state.search_web_question_repairs < max_tool_repairs) {
                         state.search_web_question_repairs += 1;
@@ -5991,6 +6104,38 @@ fn renderEmptyWebEvidenceAnswerRepairContext(allocator: std.mem.Allocator, follo
         "{s}\n[EMPTY_WEB_EVIDENCE_ANSWER_REPAIR]\nPrevious visible answer was blocked because WEB_DOSSIER has no excerpt that directly supports the requested fact.\nAnswer visibly in the user's language from USER_TASK. State that web_search ran but returned no direct supporting evidence for the requested fact. Do not invent numbers, dates, versions, URLs, titles, or claims absent from WEB_DOSSIER. Do not emit tool calls, <think>, </think>, or protocol tags.\n",
         .{follow_context},
     );
+}
+
+fn webAnswerMissingCollectedSource(output: []const u8, context: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, context, '\n');
+    var has_source = false;
+    while (lines.next()) |line| {
+        const trimmed_line = std.mem.trimStart(u8, line, " \t");
+        if (!std.mem.startsWith(u8, trimmed_line, "source_url=")) continue;
+        const source = std.mem.trim(u8, trimmed_line["source_url=".len..], " \t\r");
+        if (source.len == 0) continue;
+        has_source = true;
+        if (std.mem.indexOf(u8, output, source) != null) return false;
+    }
+    return has_source;
+}
+
+fn appendCollectedWebSources(allocator: std.mem.Allocator, output: []const u8, context: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, std.mem.trimEnd(u8, output, " \t\r\n"));
+    try out.appendSlice(allocator, "\n\nSources:\n");
+    var lines = std.mem.splitScalar(u8, context, '\n');
+    while (lines.next()) |line| {
+        const trimmed_line = std.mem.trimStart(u8, line, " \t");
+        if (!std.mem.startsWith(u8, trimmed_line, "source_url=")) continue;
+        const source = std.mem.trim(u8, trimmed_line["source_url=".len..], " \t\r");
+        if (source.len == 0 or std.mem.indexOf(u8, out.items, source) != null) continue;
+        try out.appendSlice(allocator, "- ");
+        try out.appendSlice(allocator, source);
+        try out.append(allocator, '\n');
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn renderToolPhaseClosedAnswerRepairContext(allocator: std.mem.Allocator, follow_context: []const u8) ![]u8 {
@@ -8606,6 +8751,19 @@ test "final token usage at max tokens promotes unknown stop to length" {
     try std.testing.expectEqual(http.StopReason.unknown, tokenLimitStopReason(.unknown, 512, 0));
 }
 
+test "length stopped turn is never persisted as ok" {
+    try std.testing.expectEqualStrings("incomplete_length", finalTurnStatus(.length));
+    try std.testing.expectEqualStrings("ok", finalTurnStatus(.stop));
+    try std.testing.expectEqualStrings("ok", finalTurnStatus(.unknown));
+}
+
+test "length continuation increases generation budget deterministically" {
+    try std.testing.expectEqual(@as(u16, 512), continuationMaxTokens(512, 0));
+    try std.testing.expectEqual(@as(u16, 1024), continuationMaxTokens(512, 1));
+    try std.testing.expectEqual(@as(u16, 2048), continuationMaxTokens(512, 2));
+    try std.testing.expectEqual(std.math.maxInt(u16), continuationMaxTokens(32768, 2));
+}
+
 test "length continuation suffix removes exact overlap" {
     const previous = "abc resposta parcial no meio da frase longa com contexto suficiente para passar do limite minimo de sobreposicao";
     const continuation = "frase longa com contexto suficiente para passar do limite minimo de sobreposicao e termina corretamente";
@@ -8616,6 +8774,88 @@ test "length continuation suffix removes repeated rendered prefix" {
     const previous = "Com base nas especificacoes tecnicas oficiais, aqui esta a lista consolidada com processador memoria armazenamento tela conectividade bateria e fontes.";
     const continuation = "*Com base nas especificacoes tecnicas oficiais, aqui esta a lista consolidada com processador memoria armazenamento tela conectividade bateria e fontes. Continua apenas com a parte restante.";
     try std.testing.expectEqualStrings(" Continua apenas com a parte restante.", continuationVisibleSuffix(previous, continuation));
+}
+
+test "length continuation suffix removes repeated multiline answer" {
+    const previous =
+        \\Resumo tecnico:
+        \\### CPU
+        \\• Ryzen 5
+        \\### Memoria
+        \\• DDR4
+    ;
+    const continuation =
+        \\*Resumo tecnico:
+        \\### CPU
+        \\• Ryzen 5
+        \\### Memoria
+        \\• DDR4
+        \\### Fontes
+        \\• https://example.test/specs
+    ;
+    try std.testing.expectEqualStrings("### Fontes\n• https://example.test/specs", continuationVisibleSuffix(previous, continuation));
+}
+
+test "length continuation suffix aligns restart before visible section" {
+    const previous =
+        \\### Memoria RAM
+        \\• Tipo: DDR4-3200 MHz
+        \\### Armazenamento
+        \\• Tipo: M.2 NVMe
+        \\### Tela
+        \\• Touchscreen: disponivel, mas nao e
+    ;
+    const continuation =
+        \\Aqui esta a lista tecnica completa:
+        \\### Processador
+        \\• Ryzen 7
+        \\### Memoria RAM
+        \\• Tipo: DDR4-3200 MHz
+        \\### Armazenamento
+        \\• Tipo: M.2 NVMe
+        \\### Tela
+        \\• Touchscreen: disponivel, mas nao e padrao.
+        \\### Fontes
+        \\• https://example.test/specs
+    ;
+    const expected = " padrao.\n### Fontes\n• https://example.test/specs";
+    for (0..256) |_| try std.testing.expectEqualStrings(expected, continuationVisibleSuffix(previous, continuation));
+}
+
+test "length continuation tail preserves structure and utf8 boundary" {
+    const visible = "prefixo descartado\n### Conectividade\n• Bluetooth: versão estável\n### Fontes\n";
+    const tail = try visibleContinuationTail(std.testing.allocator, visible, 49);
+    defer std.testing.allocator.free(tail);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(tail));
+    try std.testing.expect(std.mem.endsWith(u8, tail, "• Bluetooth: versão estável\n### Fontes\n"));
+    try std.testing.expect(std.mem.indexOfScalar(u8, tail, '\n') != null);
+}
+
+test "web answer requires one collected source url" {
+    const context =
+        \\[WEB_DOSSIER v1]
+        \\  source_url=https://example.test/specs
+        \\  source_url=https://example.test/support
+    ;
+    try std.testing.expect(webAnswerMissingCollectedSource("Resposta sem referencias.", context));
+    try std.testing.expect(!webAnswerMissingCollectedSource("Fonte: https://example.test/specs", context));
+    try std.testing.expect(!webAnswerMissingCollectedSource("Resposta sem pesquisa.", "[EVIDENCE]\n- E1 local\n"));
+}
+
+test "web source fallback is stable and deduplicated" {
+    const context =
+        \\[WEB_DOSSIER v1]
+        \\source_url=https://example.test/specs
+        \\source_url=https://example.test/specs
+        \\source_url=https://example.test/support
+    ;
+    const first = try appendCollectedWebSources(std.testing.allocator, "Resposta completa.", context);
+    defer std.testing.allocator.free(first);
+    const second = try appendCollectedWebSources(std.testing.allocator, "Resposta completa.", context);
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(first, "https://example.test/specs"));
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(first, "https://example.test/support"));
 }
 
 test "initial context no longer forces protocol repair" {
