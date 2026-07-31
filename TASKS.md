@@ -12920,3 +12920,52 @@ Invariantes afetadas:
 Risco residual:
 
 - A reconciliação remove apenas sobreposição textual longa e literal no fluxo de reparo de `length`. Repetições semânticas não literais continuam sendo responsabilidade do modelo.
+
+## T347 - Inferencia nativa llama.cpp, streaming real e protecao do transcript
+
+Status: implemented-verified.
+
+Prioridade: urgente.
+
+Motivacao: testes reais no CLI mostraram quatro falhas relacionadas na fronteira entre backend e transcript: o llama.cpp era chamado pelo endpoint legado `/completion`, respostas curtas eram retidas e apareciam abruptamente, tags `<think>` podiam vazar no bloco visual de reasoning e `thinking=auto` classificava prompts por uma lista hardcoded de palavras. A statusbar tambem expunha o caminho absoluto de `$HOME` em capturas de tela.
+
+Decisoes de implementacao:
+
+1. Usar `/v1/chat/completions` e mensagens estruturadas para delegar o template ao GGUF/llama.cpp.
+2. Enviar `chat_template_kwargs.enable_thinking` somente para `on` ou `off`; `auto` deixa a politica nativa do backend sem classificar texto do usuario.
+3. Processar `reasoning_content`, uso de tokens e parada no stream OpenAI-compatible.
+4. Emitir texto normal imediatamente e reter somente prefixos estruturais ainda incompletos de protocolo.
+5. Filtrar `<think>`/`</think>` de forma stateful tanto em `content` quanto em `reasoning_content`, inclusive tags quebradas entre chunks.
+6. Exibir reasoning inicial no bloco thinking; manter ocultas somente fases internas explicitamente marcadas como reparo/protocolo.
+7. Preservar a lingua da mensagem mais recente do usuario por contrato do prompt, sem detector lexical de idioma.
+8. Mostrar o cwd da statusbar como `~/...` quando estiver dentro de `$HOME`, sem alterar o cwd real do processo.
+
+Implementacao:
+
+- `src/http.zig`: endpoint OpenAI-compatible, payload `messages`, thinking nativo, parsing de `reasoning_content` e token usage.
+- `src/main.zig`: streaming incremental protegido por framing estrutural, reasoning visivel e sanitizacao stateful de tags.
+- `src/reasoning_filter.zig`: texto comum deixa de esperar flush; tags fragmentadas continuam classificadas estruturalmente.
+- `src/system_prompt.md`, `src/system_prompt_strict.md`: contrato explicito de idioma e proibicao de expor classificacoes internas.
+- `src/tui.zig`: cwd sob `$HOME` abreviado para `~` na statusbar.
+- Fixtures locais atualizados para `/v1/chat/completions`; novos testes temporais cobrem stdout e PTY.
+
+Validacao executada:
+
+- `zig build test` -> passou.
+- `tools/check_cli_tty_streaming_flow.py` -> primeiro delta em aproximadamente `0.001s` antes de pausa simulada de `2s`; thinking visivel sem tags.
+- `tools/check_cli_streaming_flow.py` -> primeiro delta em aproximadamente `0.000s`.
+- `tools/check_think_only_finalization.sh` -> passou com framing real `<think>...</think>`.
+- `tools/check_simple_greeting_flow.sh` -> passou.
+- `zig-out/bin/phenom` e `~/.local/bin/phenom` sincronizados durante a validacao.
+
+Invariantes afetadas:
+
+- Controller nao decide thinking por palavras do prompt: reforcada; `auto` e politica nativa do backend.
+- Protocolo interno nao vaza no transcript: reforcada por parsing estrutural de tags e envelopes.
+- Resposta final do modelo nao e reescrita: preservada; apenas framing de protocolo e removido.
+- Idioma nao e inferido por tabela lexical: preservada; o contrato referencia diretamente a mensagem mais recente do usuario.
+- Capturas da TUI nao expõem o nome do usuario pelo cwd quando o projeto esta sob `$HOME`.
+
+Risco residual:
+
+- Backends que nao implementam o formato OpenAI-compatible exigem o backend Ollama existente ou adaptador explicito; nao ha fallback heuristico de endpoint.
