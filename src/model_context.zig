@@ -253,11 +253,24 @@ pub fn measureRenderedContextBytes(rendered: []const u8) ContextByteBuckets {
 
 fn appendTemporalContext(out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     var date_buf: [16]u8 = undefined;
-    const current_date = temporal.currentUtcDateText(&date_buf);
+    var time_buf: [16]u8 = undefined;
+    var zone_buf: [32]u8 = undefined;
+    var offset_buf: [8]u8 = undefined;
+    const clock = temporal.currentLocalClockText(&date_buf, &time_buf, &zone_buf, &offset_buf);
     try out.appendSlice(allocator, "\n[TEMPORAL_CONTEXT]\n");
     try out.appendSlice(allocator, "current_date=");
-    try out.appendSlice(allocator, current_date);
-    try out.appendSlice(allocator, "\ntimezone=UTC\nknowledge_cutoff=unknown\nfreshness_rule=model_decides\n");
+    try out.appendSlice(allocator, clock.date);
+    try out.appendSlice(allocator, "\ncurrent_time=");
+    try out.appendSlice(allocator, clock.time);
+    try out.appendSlice(allocator, "\ncurrent_weekday=");
+    try out.appendSlice(allocator, clock.weekday);
+    try out.appendSlice(allocator, "\niso_weekday=");
+    try out.append(allocator, '0' + clock.iso_weekday);
+    try out.appendSlice(allocator, "\ntimezone=");
+    try out.appendSlice(allocator, clock.zone);
+    try out.appendSlice(allocator, "\nutc_offset=");
+    try out.appendSlice(allocator, clock.utc_offset);
+    try out.appendSlice(allocator, "\nsource=system_clock\nauthority=authoritative_for_current_date_time_and_weekday\nweekday_rule=use_current_weekday_verbatim; do_not_recalculate\nknowledge_cutoff=unknown\nfreshness_rule=system_clock_for_date_time; tools_for_external_current_facts\n");
 }
 
 pub fn assertNoRawContextLeak(rendered: []const u8) !void {
@@ -395,8 +408,14 @@ test "model context omits absent memory skills and evidence blocks" {
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[TURN_CONTEXT v1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[TEMPORAL_CONTEXT]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "current_time=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "source=system_clock") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "current_weekday=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "iso_weekday=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "authority=authoritative_for_current_date_time_and_weekday") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "weekday_rule=use_current_weekday_verbatim; do_not_recalculate") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "knowledge_cutoff=unknown") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "freshness_rule=model_decides") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "freshness_rule=system_clock_for_date_time") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[CONTRACTS]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
