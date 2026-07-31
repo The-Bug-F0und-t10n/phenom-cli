@@ -32,11 +32,12 @@ test "default system prompt is loaded from template file" {
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "You are Phenom") == null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Model decides when contracts/tools are needed") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Do not roleplay identity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "language of the latest user message") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "MEMORY=verified project/workdir facts") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "SKILLS=user-confirmed durable rules/preferences/operational constraints") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "before a relevant memory lookup") != null);
-    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "promote a concise interpreted SKILLS rule") != null);
-    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "separate known, inferred, and unknown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "explicitly states a durable future-turn rule/preference") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "do not expose these labels or process") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "safe read-only context/search can verify") != null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Do not fill gaps") != null);
 }
