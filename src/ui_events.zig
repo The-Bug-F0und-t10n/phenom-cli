@@ -166,8 +166,14 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
         allocator: ?std.mem.Allocator = null,
         write_mutex: ?*std.atomic.Mutex = null,
         terminal_columns: ?*const fn () usize = null,
+        terminal_rows: ?*const fn () usize = null,
+        layout_ctx: ?*anyopaque = null,
+        content_row: ?*const fn (*anyopaque) usize = null,
+        prepare_redraw_ctx: ?*anyopaque = null,
+        prepare_redraw: ?*const fn (*anyopaque) anyerror!void = null,
         history: std.ArrayList(Event) = .empty,
         rendered_columns: usize = 0,
+        rendered_rows: usize = 0,
         assistant_started: bool = false,
         turn_started_ms: i64 = 0,
 
@@ -189,9 +195,42 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
                 lockTerminal(mutex);
                 defer mutex.unlock();
             }
+            try self.redrawIfNeededUnlocked();
+            try self.render(event);
+            if (self.allocator) |allocator| try self.history.append(allocator, try cloneEvent(allocator, event));
+        }
+
+        pub fn redrawIfNeeded(self: *Self) !void {
+            if (self.write_mutex) |mutex| {
+                lockTerminal(mutex);
+                defer mutex.unlock();
+            }
+            try self.redrawIfNeededUnlocked();
+        }
+
+        pub fn redrawIfNeededAssumeLocked(self: *Self) !void {
+            try self.redrawIfNeededUnlocked();
+        }
+
+        fn redrawIfNeededUnlocked(self: *Self) !void {
             const columns = if (self.terminal_columns) |current| current() else 0;
-            if (columns > 0 and self.rendered_columns > 0 and columns != self.rendered_columns and self.history.items.len > 0) {
-                try self.renderer.redrawStart(columns);
+            const rows = if (self.terminal_rows) |current| current() else 0;
+            const size_changed = (columns > 0 and self.rendered_columns > 0 and columns != self.rendered_columns) or
+                (rows > 0 and self.rendered_rows > 0 and rows != self.rendered_rows);
+            if (size_changed and self.history.items.len > 0) {
+                if (self.prepare_redraw_ctx) |ctx| {
+                    if (self.prepare_redraw) |prepare| {
+                        self.renderer.resetForRedraw(columns);
+                        try prepare(ctx);
+                    } else {
+                        try self.renderer.redrawStart(columns);
+                    }
+                } else {
+                    try self.renderer.redrawStart(columns);
+                    if (self.layout_ctx) |ctx| {
+                        if (self.content_row) |current| try self.renderer.positionAtRow(current(ctx));
+                    }
+                }
                 self.assistant_started = false;
                 self.turn_started_ms = 0;
                 for (self.history.items) |recorded| try self.render(recorded);
@@ -199,8 +238,7 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
                 self.renderer.setTerminalColumns(columns);
             }
             if (columns > 0) self.rendered_columns = columns;
-            try self.render(event);
-            if (self.allocator) |allocator| try self.history.append(allocator, try cloneEvent(allocator, event));
+            if (rows > 0) self.rendered_rows = rows;
         }
 
         fn render(self: *Self, event: Event) !void {
@@ -395,10 +433,72 @@ test "renderer sink replays responsive components after resize" {
     test_terminal_columns = 20;
     try sink.handle(.{ .progress_update = "redimensionado" });
 
-    const redraw = std.mem.lastIndexOf(u8, buffer.items, "\x1b[H\x1b[J") orelse return error.ExpectedRedraw;
-    const replay = buffer.items[redraw + "\x1b[H\x1b[J".len ..];
+    const redraw_sequence = "\x1b[3J\x1b[H\x1b[2J";
+    const redraw = std.mem.lastIndexOf(u8, buffer.items, redraw_sequence) orelse return error.ExpectedRedraw;
+    const replay = buffer.items[redraw + redraw_sequence.len ..];
     try std.testing.expect(std.mem.indexOf(u8, replay, "> [user] consulta") != null);
     try std.testing.expect(std.mem.indexOf(u8, replay, "│ Nome") != null);
     try std.testing.expect(std.mem.indexOf(u8, replay, "│      │ longo") != null);
     try std.testing.expect(std.mem.indexOf(u8, replay, "redimensionado") != null);
+}
+
+test "renderer sink reflows assistant text after horizontal resize" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = render.AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 40 });
+    var sink = RendererEventSink(@TypeOf(&renderer)){
+        .renderer = &renderer,
+        .allocator = std.testing.allocator,
+        .terminal_columns = testTerminalColumns,
+    };
+    defer sink.deinit();
+
+    test_terminal_columns = 40;
+    try sink.handle(.{ .user_message = "consulta" });
+    try sink.handle(.{ .message_chunk = "abcdefghijklmnopqrstuvwxyz" });
+    test_terminal_columns = 12;
+    try sink.redrawIfNeeded();
+
+    const redraw_sequence = "\x1b[3J\x1b[H\x1b[2J";
+    const redraw = std.mem.lastIndexOf(u8, buffer.items, redraw_sequence) orelse return error.ExpectedRedraw;
+    const replay = buffer.items[redraw + redraw_sequence.len ..];
+    try std.testing.expect(std.mem.indexOf(u8, replay, " abcdefghij\n klmnopqrst\n uvwxyz") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, " abcdefghijklmnopqrstuvwxyz") == null);
+}
+
+test "renderer sink uses prepared redraw without full screen clear" {
+    const State = struct {
+        buffer: *std.ArrayList(u8),
+
+        fn prepare(ctx: *anyopaque) !void {
+            const state: *@This() = @ptrCast(@alignCast(ctx));
+            try state.buffer.appendSlice(std.testing.allocator, "\x1b[1;1H\x1b[2K\x1b[9;1H");
+        }
+    };
+
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = render.AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 40 });
+    var state = State{ .buffer = &buffer };
+    var sink = RendererEventSink(@TypeOf(&renderer)){
+        .renderer = &renderer,
+        .allocator = std.testing.allocator,
+        .terminal_columns = testTerminalColumns,
+        .prepare_redraw_ctx = &state,
+        .prepare_redraw = State.prepare,
+    };
+    defer sink.deinit();
+
+    test_terminal_columns = 40;
+    try sink.handle(.{ .user_message = "consulta" });
+    try sink.handle(.{ .message_chunk = "resposta" });
+    test_terminal_columns = 20;
+    try sink.redrawIfNeeded();
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[2J") == null);
+    const prepared = std.mem.lastIndexOf(u8, buffer.items, "\x1b[9;1H") orelse return error.ExpectedPreparedRedraw;
+    const replay = std.mem.indexOfPos(u8, buffer.items, prepared, "> [user] consulta") orelse return error.ExpectedReplay;
+    try std.testing.expect(replay > prepared);
 }

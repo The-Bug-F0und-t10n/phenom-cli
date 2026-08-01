@@ -95,8 +95,19 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             const writer = self.writer;
             var options = self.options;
             options.terminal_columns = @max(@as(usize, 1), columns);
-            try writer.writeAll("\x1b[H\x1b[J");
+            try writer.writeAll("\x1b[3J\x1b[H\x1b[2J");
             self.* = Self.init(writer, options);
+        }
+
+        pub fn resetForRedraw(self: *Self, columns: usize) void {
+            const writer = self.writer;
+            var options = self.options;
+            options.terminal_columns = @max(@as(usize, 1), columns);
+            self.* = Self.init(writer, options);
+        }
+
+        pub fn positionAtRow(self: *Self, row: usize) !void {
+            try self.writer.print("\x1b[{};1H", .{@max(@as(usize, 1), row)});
         }
 
         pub fn user(self: *Self, text: []const u8) !void {

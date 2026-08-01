@@ -3,6 +3,10 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BIN=${1:-"$ROOT/zig-out/bin/phenom"}
+case "$BIN" in
+  /*) ;;
+  *) BIN="$ROOT/$BIN" ;;
+esac
 WORK=${PHENOM_MEMORY_SMOKE_DIR:-/tmp/phenom-memory-persistence-smoke}
 DB="$WORK/.phenom-zig/phenom.db"
 
@@ -10,11 +14,6 @@ command -v sqlite3 >/dev/null 2>&1 || {
   printf 'memory-persistence: sqlite3 CLI is required\n' >&2
   exit 1
 }
-command -v python3 >/dev/null 2>&1 || {
-  printf 'memory-persistence: python3 is required for interrupt smoke\n' >&2
-  exit 1
-}
-
 rm -rf "$WORK"
 mkdir -p "$WORK"
 
@@ -39,25 +38,7 @@ test "$(sql_count session_focus "$COMPLETED_SESSION" "user_intent = 'turn_checkp
 test "$(sql_count session_focus "$COMPLETED_SESSION" "user_intent = 'turn_memory' and useful_facts like '%source=turn_memory_v1%' and useful_facts like '%detail_available: assistant_delta event%'")" -ge 1 || { printf 'memory-persistence: completed turn missing structured memory focus\n' >&2; exit 1; }
 
 PORT_FILE="$WORK/port"
-python3 - "$PORT_FILE" <<'PY' &
-import socket
-import sys
-import time
-
-port_file = sys.argv[1]
-sock = socket.socket()
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-sock.bind(("127.0.0.1", 0))
-sock.listen(1)
-with open(port_file, "w", encoding="utf-8") as f:
-    f.write(str(sock.getsockname()[1]))
-conn, _ = sock.accept()
-try:
-    time.sleep(60)
-finally:
-    conn.close()
-    sock.close()
-PY
+"${ZIG:-zig}" run "$ROOT/tools/scripted_backend.zig" -lc -- memory_blocking "$PORT_FILE" &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 

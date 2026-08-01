@@ -34,6 +34,10 @@ const welcome = @import("welcome.zig");
 const web_rag = @import("web_rag.zig");
 const working_context = @import("working_context.zig");
 
+const InteractiveTranscriptWriter = fd_writer.NewlineWriter(fd_writer.FdWriter);
+const InteractiveRenderer = render.AppendOnlyRenderer(*InteractiveTranscriptWriter);
+const InteractiveRenderSink = ui_events.RendererEventSink(*InteractiveRenderer);
+
 const c = @cImport({
     @cInclude("sys/stat.h");
     @cInclude("errno.h");
@@ -203,7 +207,26 @@ fn recordModelStreamFailure(
 }
 
 fn currentTerminalColumns() usize {
-    return tui.terminalSize().cols;
+    return @max(@as(usize, 1), tui.terminalSize().cols -| 1);
+}
+
+fn currentTerminalRows() usize {
+    return tui.terminalSize().rows;
+}
+
+fn redrawInteractiveTranscriptAssumeLocked(ctx: *anyopaque) !void {
+    const sink: *InteractiveRenderSink = @ptrCast(@alignCast(ctx));
+    try sink.redrawIfNeededAssumeLocked();
+}
+
+fn interactiveContentRow(ctx: *anyopaque) usize {
+    const ui: *tui.TerminalUi(fd_writer.FdWriter) = @ptrCast(@alignCast(ctx));
+    return ui.contentRow();
+}
+
+fn prepareInteractiveTranscriptRedraw(ctx: *anyopaque) !void {
+    const ui: *tui.TerminalUi(fd_writer.FdWriter) = @ptrCast(@alignCast(ctx));
+    try ui.prepareTranscriptRedrawAssumeLocked();
 }
 
 fn runChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Config) !void {
@@ -252,10 +275,27 @@ fn runInteractiveChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Conf
     try makeDirIfMissing(".phenom-zig");
     var db = try audit.AuditDb.open(allocator, ".phenom-zig/phenom.db");
     defer db.close();
+
+    var transcript_writer = InteractiveTranscriptWriter{ .inner = stdout, .crlf = true };
+    var renderer = InteractiveRenderer.init(&transcript_writer, .{ .color = !config.no_color, .terminal_columns = currentTerminalColumns(), .user_label = userLabel() });
+    var render_sink = InteractiveRenderSink{
+        .renderer = &renderer,
+        .allocator = allocator,
+        .write_mutex = ui.mutex(),
+        .terminal_columns = currentTerminalColumns,
+        .terminal_rows = currentTerminalRows,
+        .layout_ctx = &ui,
+        .content_row = interactiveContentRow,
+        .prepare_redraw_ctx = &ui,
+        .prepare_redraw = prepareInteractiveTranscriptRedraw,
+    };
+    defer render_sink.deinit();
+    ui.setResizeHandler(&render_sink, redrawInteractiveTranscriptAssumeLocked);
+
     try loadHistoryFromDb(allocator, &db, &ui);
     try ui.positionContent();
     renderWelcome(config, stdout, &ui);
-    const restored = try renderRestoredSession(allocator, &db, config.session, stdout, !config.no_color, tui.terminalSize().cols, true, ui.mutex());
+    const restored = try renderRestoredSession(allocator, &db, config.session, stdout, !config.no_color, currentTerminalColumns(), true, ui.mutex(), &render_sink, InteractiveRenderSink.handleOpaque);
     if (restored > 0) try ui.showPrompt();
 
     while (true) {
@@ -311,13 +351,13 @@ fn runInteractiveChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Conf
 
         try ui.showStatus("Thinking");
         try ui.positionContent();
-        try runChatTurnWithUi(allocator, io, config, stdout, prompt, &ui);
+        try runChatTurnWithUi(allocator, io, config, stdout, prompt, &ui, &render_sink);
         try ui.showPrompt();
     }
 }
 
 fn runChatTurn(allocator: std.mem.Allocator, io: std.Io, config: cli.Config, stdout: fd_writer.FdWriter, prompt: []const u8) !void {
-    try runChatTurnWithUi(allocator, io, config, stdout, prompt, null);
+    try runChatTurnWithUi(allocator, io, config, stdout, prompt, null, null);
 }
 
 fn isCreateCustomPromptCommand(input: []const u8) bool {
@@ -638,7 +678,7 @@ fn cwdJoinAlloc(allocator: std.mem.Allocator, file_name: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, file_name });
 }
 
-fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Config, stdout: fd_writer.FdWriter, prompt: []const u8, ui: anytype) !void {
+fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Config, stdout: fd_writer.FdWriter, prompt: []const u8, ui: anytype, shared_render_sink: ?*InteractiveRenderSink) !void {
     var effective_config = config;
     const turn_project_prompt = if (config.system_prompt == null) try config_file.loadProjectPromptIfPresent(allocator) else null;
     defer if (turn_project_prompt) |value| allocator.free(value);
@@ -650,7 +690,8 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
     const size = tui.terminalSize();
     const ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter) = ui;
     var transcript_writer = fd_writer.NewlineWriter(fd_writer.FdWriter){ .inner = stdout, .crlf = ui_ptr != null };
-    var renderer = render.AppendOnlyRenderer(@TypeOf(&transcript_writer)).init(&transcript_writer, .{ .color = !config.no_color, .terminal_columns = size.cols, .user_label = userLabel() });
+    const terminal_columns = if (ui_ptr != null) @max(@as(usize, 1), size.cols -| 1) else size.cols;
+    var renderer = render.AppendOnlyRenderer(@TypeOf(&transcript_writer)).init(&transcript_writer, .{ .color = !config.no_color, .terminal_columns = terminal_columns, .user_label = userLabel() });
     var events = ui_events.EventBus.init(allocator);
     defer events.deinit();
     var render_sink = ui_events.RendererEventSink(@TypeOf(&renderer)){
@@ -658,9 +699,14 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         .allocator = allocator,
         .write_mutex = if (ui_ptr) |active_ui| active_ui.mutex() else null,
         .terminal_columns = if (ui_ptr != null) currentTerminalColumns else null,
+        .terminal_rows = if (ui_ptr != null) currentTerminalRows else null,
     };
     defer render_sink.deinit();
-    try events.on(&render_sink, @TypeOf(render_sink).handleOpaque);
+    if (shared_render_sink) |shared| {
+        try events.on(shared, InteractiveRenderSink.handleOpaque);
+    } else {
+        try events.on(&render_sink, @TypeOf(render_sink).handleOpaque);
+    }
 
     try makeDirIfMissing(".phenom-zig");
     var db = try audit.AuditDb.open(allocator, ".phenom-zig/phenom.db");
@@ -7002,6 +7048,8 @@ fn renderRestoredSession(
     columns: usize,
     crlf: bool,
     write_mutex: ?*std.atomic.Mutex,
+    shared_sink_ctx: ?*anyopaque,
+    shared_sink_call: ?*const fn (*anyopaque, ui_events.Event) anyerror!void,
 ) !usize {
     var events = try db.loadRecentSessionTurnEvents(allocator, session, max_restored_session_turns);
     defer audit.freeAuditEvents(allocator, &events);
@@ -7020,7 +7068,11 @@ fn renderRestoredSession(
         .write_mutex = write_mutex,
         .terminal_columns = if (write_mutex != null) currentTerminalColumns else null,
     };
-    try bus.on(&render_sink, @TypeOf(render_sink).handleOpaque);
+    if (shared_sink_ctx) |ctx| {
+        try bus.on(ctx, shared_sink_call orelse return error.MissingSharedSinkHandler);
+    } else {
+        try bus.on(&render_sink, @TypeOf(render_sink).handleOpaque);
+    }
 
     var restored_turn_open = false;
     var restored_turn_started_s: ?i64 = null;
@@ -7774,7 +7826,7 @@ test "restored sqlite session is rendered through styled transcript events" {
     defer buffer.deinit(std.testing.allocator);
     const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
 
-    const count = try renderRestoredSession(std.testing.allocator, &db, "restore", writer, false, 80, false, null);
+    const count = try renderRestoredSession(std.testing.allocator, &db, "restore", writer, false, 80, false, null, null, null);
     try std.testing.expectEqual(@as(usize, 7), count);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "> [") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "analise") != null);
@@ -7801,9 +7853,33 @@ test "restored sqlite session is rendered through styled transcript events" {
     defer tui_buffer.deinit(std.testing.allocator);
     const tui_writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &tui_buffer };
     var write_mutex: std.atomic.Mutex = .unlocked;
-    _ = try renderRestoredSession(std.testing.allocator, &db, "restore", tui_writer, false, 80, false, &write_mutex);
+    _ = try renderRestoredSession(std.testing.allocator, &db, "restore", tui_writer, false, 80, false, &write_mutex, null, null);
     try std.testing.expect(std.mem.indexOf(u8, tui_buffer.items, "resposta") != null);
     try std.testing.expect(std.mem.indexOf(u8, tui_buffer.items, "  ─ Worked for 1s") != null);
+
+    const SharedResize = struct {
+        var columns: usize = 80;
+        fn currentColumns() usize {
+            return columns;
+        }
+    };
+    var shared_buffer = std.ArrayList(u8).empty;
+    defer shared_buffer.deinit(std.testing.allocator);
+    const shared_writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &shared_buffer };
+    var shared_transcript_writer = fd_writer.NewlineWriter(@TypeOf(shared_writer)){ .inner = shared_writer, .crlf = false };
+    var shared_renderer = render.AppendOnlyRenderer(@TypeOf(&shared_transcript_writer)).init(&shared_transcript_writer, .{ .color = false, .terminal_columns = 80 });
+    var shared_sink = ui_events.RendererEventSink(@TypeOf(&shared_renderer)){
+        .renderer = &shared_renderer,
+        .allocator = std.testing.allocator,
+        .terminal_columns = SharedResize.currentColumns,
+    };
+    defer shared_sink.deinit();
+    _ = try renderRestoredSession(std.testing.allocator, &db, "restore", shared_writer, false, 80, false, null, &shared_sink, @TypeOf(shared_sink).handleOpaque);
+    SharedResize.columns = 30;
+    try shared_sink.redrawIfNeeded();
+    const redraw_sequence = "\x1b[3J\x1b[H\x1b[2J";
+    const redraw = std.mem.lastIndexOf(u8, shared_buffer.items, redraw_sequence) orelse return error.ExpectedRestoredResizeRedraw;
+    try std.testing.expect(std.mem.indexOf(u8, shared_buffer.items[redraw + redraw_sequence.len ..], "resposta") != null);
 
     var replay_events = try db.loadSessionEvents(std.testing.allocator, "restore", 40);
     defer audit.freeAuditEvents(std.testing.allocator, &replay_events);
