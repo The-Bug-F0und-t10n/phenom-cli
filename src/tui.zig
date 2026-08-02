@@ -324,14 +324,16 @@ pub fn computePromptViewLimited(allocator: std.mem.Allocator, prompt: []const u8
                 try wrapped.append(allocator, .{ .start = line_start, .end = line_start, .logical_row = logical_row, .col_start = 0 });
             } else {
                 var part_start: usize = 0;
+                var col_start: usize = 0;
                 while (part_start < line.len) {
-                    const take = @min(content_width, line.len - part_start);
+                    const take = utf8PrefixBytes(line[part_start..], content_width);
                     try wrapped.append(allocator, .{
                         .start = line_start + part_start,
                         .end = line_start + part_start + take,
                         .logical_row = logical_row,
-                        .col_start = part_start,
+                        .col_start = col_start,
                     });
+                    col_start += utf8Columns(line[part_start .. part_start + take]);
                     part_start += take;
                 }
             }
@@ -351,7 +353,7 @@ pub fn computePromptViewLimited(allocator: std.mem.Allocator, prompt: []const u8
             cursor_line_start = j + 1;
         }
     }
-    const cursor_col_in_line = safe_cursor - cursor_line_start;
+    const cursor_col_in_line = codepointCount(prompt[cursor_line_start..safe_cursor]);
     const cursor_line_end = logicalLineEnd(prompt, safe_cursor);
     const cursor_line_columns = codepointCount(prompt[cursor_line_start..cursor_line_end]);
     const cursor_wrap = visualRowIndex(cursor_col_in_line, cursor_line_columns, content_width);
@@ -868,7 +870,8 @@ pub fn TerminalUi(comptime Writer: type) type {
                         return error.StdinReadFailed;
                     }
                     if (poll_result == 0) {
-                        if (size.rows != self.terminal_rows or size.cols != self.terminal_cols) {
+                        const current_size = terminalSize();
+                        if (current_size.rows != self.terminal_rows or current_size.cols != self.terminal_cols) {
                             try self.draw(.{ .status = null, .show_prompt = true, .preserve_cursor = false });
                         }
                         continue;
@@ -902,9 +905,36 @@ pub fn TerminalUi(comptime Writer: type) type {
 
         pub fn prepareTranscriptRedrawAssumeLocked(self: *Self) !void {
             if (!self.attached) return;
-            const last = self.contentRow();
+            try self.writer.writeAll("\x1b[r\x1b[3J\x1b[H\x1b[2J");
             try self.resyncScrollRegionFor(.{ .rows = self.terminal_rows, .cols = self.terminal_cols });
+            try self.writer.writeAll("\x1b[1;1H");
+        }
+
+        pub fn drawTranscriptViewportAssumeLocked(self: *Self, transcript: []const u8) !void {
+            if (!self.attached) return;
+            const size = TerminalSize{
+                .rows = if (self.terminal_rows > 0) self.terminal_rows else terminalSize().rows,
+                .cols = if (self.terminal_cols > 0) self.terminal_cols else terminalSize().cols,
+            };
+            const last = @max(@as(usize, 1), size.rows -| self.bottom_rows);
+            const visible_transcript = trimTranscriptEnd(transcript);
+            const total_lines = transcriptLineCount(visible_transcript);
+            const skip = total_lines -| last;
+
+            try self.writer.writeAll("\x1b[r\x1b[3J\x1b[H\x1b[2J");
+            try self.resyncScrollRegionFor(size);
+
+            var cursor: usize = 0;
+            var line_index: usize = 0;
             var row: usize = 1;
+            while (nextTranscriptLine(visible_transcript, &cursor)) |line| : (line_index += 1) {
+                if (line_index < skip) continue;
+                if (row > last) break;
+                try self.writer.print("\x1b[{};1H\x1b[2K", .{row});
+                try self.writer.writeAll(line);
+                try self.writer.writeAll(reset);
+                row += 1;
+            }
             while (row <= last) : (row += 1) {
                 try self.writer.print("\x1b[{};1H\x1b[2K", .{row});
             }
@@ -1049,11 +1079,12 @@ pub fn TerminalUi(comptime Writer: type) type {
             const size = terminalSize();
             const paint_cols = @max(@as(usize, 1), size.cols -| 1);
             const max_footer_rows = @max(@as(usize, 1), size.rows -| 1);
+            const compact_bottom = max_footer_rows < bottomBarRows(1);
             const max_prompt_lines = @min(max_rendered_prompt_rows, @max(@as(usize, 1), max_footer_rows -| 5));
             var view = try computePromptView(self.allocator, self.editor.buffer.items, self.editor.cursor, paint_cols, max_prompt_lines);
             defer view.deinit();
-            const active_prompt_lines = if (opts.show_prompt) view.line_count else 1;
-            const rows = @min(bottomBarRows(active_prompt_lines), max_footer_rows);
+            const active_prompt_lines = if (opts.show_prompt and !compact_bottom) view.line_count else 1;
+            const rows = if (compact_bottom) @as(usize, 1) else bottomBarRows(active_prompt_lines);
             const size_changed = try self.syncLayout(size, rows);
             self.prompt_rows = view.line_count;
             if (size_changed) {
@@ -1083,20 +1114,24 @@ pub fn TerminalUi(comptime Writer: type) type {
             }
             if (opts.preserve_cursor and !size_changed) try bw.writeAll("\x1b7");
             try bw.print("\x1b[{};1H", .{status_row});
-            _ = try renderBottomBar(bw, .{
-                .color = self.color,
-                .cols = size.cols,
-                .status = status_text,
-                .status_right = null,
-                .footer = footer,
-                .visualizer = visualizer_text,
-                .visualizer_mode = null,
-                .visualizer_tick = self.visualizer_tick,
-                .prompt = self.editor.buffer.items,
-                .cursor = self.editor.cursor,
-                .show_prompt = opts.show_prompt,
-                .prompt_line_limit = active_prompt_lines,
-            });
+            if (compact_bottom) {
+                try self.renderCompactBottomBar(bw, size.cols, status_text, view, opts.show_prompt);
+            } else {
+                _ = try renderBottomBar(bw, .{
+                    .color = self.color,
+                    .cols = size.cols,
+                    .status = status_text,
+                    .status_right = null,
+                    .footer = footer,
+                    .visualizer = visualizer_text,
+                    .visualizer_mode = null,
+                    .visualizer_tick = self.visualizer_tick,
+                    .prompt = self.editor.buffer.items,
+                    .cursor = self.editor.cursor,
+                    .show_prompt = opts.show_prompt,
+                    .prompt_line_limit = active_prompt_lines,
+                });
+            }
             if (opts.preserve_cursor and !size_changed) {
                 try bw.writeAll("\x1b8");
             } else if (opts.preserve_cursor) {
@@ -1109,6 +1144,19 @@ pub fn TerminalUi(comptime Writer: type) type {
                 try bw.print("\x1b[{};{}H", .{ screen_row, screen_col });
             }
             try self.writer.writeAll(out.items);
+        }
+
+        fn renderCompactBottomBar(self: *Self, writer: anytype, cols: usize, status: ?[]const u8, view: PromptView, show_prompt: bool) !void {
+            const paint_cols = @max(@as(usize, 1), cols -| 1);
+            if (show_prompt) {
+                const row = @min(view.cursor_row, view.line_count - 1);
+                const prefix: []const u8 = if (view.first_visible + row == 0) "> " else "  ";
+                try paintInputRow(writer, self.color, prefix, view.storage[row], paint_cols);
+            } else if (status) |text| {
+                try writeStatus(writer, self.color, text, null, null, paint_cols);
+            } else {
+                try writeSpaces(writer, paint_cols);
+            }
         }
 
         fn syncLayout(self: *Self, size: TerminalSize, rows: usize) !bool {
@@ -1351,8 +1399,8 @@ fn formatByteCount(buf: *[24]u8, value: usize) []const u8 {
 fn paintInputRow(writer: anytype, color: bool, prefix: []const u8, content: []const u8, width: usize) !void {
     if (color) try writer.writeAll(user_bg ++ user_fg);
     const prefix_len = @min(prefix.len, width);
-    const content_len = @min(content.len, (width - prefix_len) -| 1);
-    const used = prefix_len + content_len;
+    const content_len = utf8PrefixBytes(content, (width - prefix_len) -| 1);
+    const used = prefix_len + utf8Columns(content[0..content_len]);
     try writer.writeAll(prefix[0..prefix_len]);
     try writer.writeAll(content[0..content_len]);
     if (used < width) try writeSpaces(writer, width - used);
@@ -1372,6 +1420,85 @@ fn paintInputBlank(writer: anytype, color: bool, width: usize) !void {
 fn writeSpaces(writer: anytype, count: usize) !void {
     var i: usize = 0;
     while (i < count) : (i += 1) try writer.writeAll(" ");
+}
+
+fn transcriptLineCount(bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
+    var cursor: usize = 0;
+    var count: usize = 0;
+    while (nextTranscriptLine(bytes, &cursor) != null) count += 1;
+    return count;
+}
+
+fn trimTranscriptEnd(bytes: []const u8) []const u8 {
+    var start: usize = 0;
+    var last_content_end: usize = 0;
+    while (start <= bytes.len) {
+        const newline = std.mem.indexOfScalarPos(u8, bytes, start, '\n') orelse bytes.len;
+        const raw_line = bytes[start..newline];
+        const line = stripTrailingCr(raw_line);
+        if (transcriptLineHasVisibleContent(line)) last_content_end = start + line.len;
+        if (newline == bytes.len) break;
+        start = newline + 1;
+    }
+    return bytes[0..last_content_end];
+}
+
+fn nextTranscriptLine(bytes: []const u8, cursor: *usize) ?[]const u8 {
+    if (bytes.len == 0 or cursor.* > bytes.len) return null;
+    if (cursor.* == bytes.len) {
+        cursor.* += 1;
+        return "";
+    }
+    const start = cursor.*;
+    const newline = std.mem.indexOfScalarPos(u8, bytes, start, '\n') orelse {
+        cursor.* = bytes.len + 1;
+        return stripTrailingCr(bytes[start..]);
+    };
+    cursor.* = newline + 1;
+    return stripTrailingCr(bytes[start..newline]);
+}
+
+fn stripTrailingCr(bytes: []const u8) []const u8 {
+    if (bytes.len > 0 and bytes[bytes.len - 1] == '\r') return bytes[0 .. bytes.len - 1];
+    return bytes;
+}
+
+fn transcriptLineHasVisibleContent(bytes: []const u8) bool {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const byte = bytes[i];
+        if (byte == 0x1b) {
+            i += ansiEscapeLen(bytes[i..]);
+            continue;
+        }
+        if (byte == ' ' or byte == '\t' or byte == '\r') {
+            i += 1;
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn ansiEscapeLen(bytes: []const u8) usize {
+    if (bytes.len < 2) return 1;
+    if (bytes[1] == '[') {
+        var i: usize = 2;
+        while (i < bytes.len) : (i += 1) {
+            if (bytes[i] >= 0x40 and bytes[i] <= 0x7e) return i + 1;
+        }
+        return bytes.len;
+    }
+    if (bytes[1] == ']') {
+        var i: usize = 2;
+        while (i < bytes.len) : (i += 1) {
+            if (bytes[i] == 0x07) return i + 1;
+            if (bytes[i] == 0x1b and i + 1 < bytes.len and bytes[i + 1] == '\\') return i + 2;
+        }
+        return bytes.len;
+    }
+    return 2;
 }
 
 fn prevCodepointStart(bytes: []const u8, cursor: usize) usize {
@@ -1854,6 +1981,17 @@ test "prompt view wraps and keeps cursor in visible window" {
     try std.testing.expectEqual(@as(usize, 3), view.cursor_col);
 }
 
+test "prompt view wraps utf8 by columns instead of bytes" {
+    var view = try computePromptViewLimited(std.testing.allocator, "áéíó", "áéíó".len, 6, 3);
+    defer view.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), view.line_count);
+    try std.testing.expectEqualStrings("áéí", view.storage[0]);
+    try std.testing.expectEqualStrings("ó", view.storage[1]);
+    try std.testing.expectEqual(@as(usize, 1), view.cursor_row);
+    try std.testing.expectEqual(@as(usize, 1), view.cursor_col);
+}
+
 test "prompt view honors small terminal line limit" {
     var view = try computePromptViewLimited(std.testing.allocator, "abcdefghijkl", 12, 6, 2);
     defer view.deinit();
@@ -1977,4 +2115,104 @@ test "content row uses synchronized layout rows" {
     ui.bottom_rows = 7;
 
     try std.testing.expectEqual(@as(usize, 23), ui.contentRow());
+}
+
+test "prepared transcript redraw clears scrollback before responsive replay" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var ui = TerminalUi(@TypeOf(writer)).init(std.testing.allocator, writer, false);
+    defer ui.editor.deinit();
+    ui.attached = true;
+    ui.terminal_rows = 24;
+    ui.terminal_cols = 80;
+    ui.bottom_rows = 6;
+
+    try ui.prepareTranscriptRedrawAssumeLocked();
+
+    try std.testing.expect(std.mem.startsWith(u8, buffer.items, "\x1b[r\x1b[3J\x1b[H\x1b[2J"));
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[1;18r") != null);
+    try std.testing.expect(std.mem.endsWith(u8, buffer.items, "\x1b[1;1H"));
+}
+
+test "transcript viewport redraw paints last rendered rows only" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var ui = TerminalUi(@TypeOf(writer)).init(std.testing.allocator, writer, false);
+    defer ui.editor.deinit();
+    ui.attached = true;
+    ui.terminal_rows = 4;
+    ui.terminal_cols = 20;
+    ui.bottom_rows = 2;
+
+    try ui.drawTranscriptViewportAssumeLocked("old\r\nvisible-1\r\nvisible-2\r\n");
+
+    try std.testing.expect(std.mem.startsWith(u8, buffer.items, "\x1b[r\x1b[3J\x1b[H\x1b[2J"));
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "old") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[1;1H\x1b[2Kvisible-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[2;1H\x1b[2Kvisible-2") != null);
+    try std.testing.expect(std.mem.endsWith(u8, buffer.items, "\x1b[2;1H"));
+}
+
+test "transcript viewport keeps short output fixed at top" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var ui = TerminalUi(@TypeOf(writer)).init(std.testing.allocator, writer, false);
+    defer ui.editor.deinit();
+    ui.attached = true;
+    ui.terminal_rows = 8;
+    ui.terminal_cols = 20;
+    ui.bottom_rows = 3;
+
+    try ui.drawTranscriptViewportAssumeLocked("fixed\r\n");
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[1;1H\x1b[2Kfixed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[5;1H\x1b[2Kfixed") == null);
+    try std.testing.expect(std.mem.endsWith(u8, buffer.items, "\x1b[5;1H"));
+}
+
+test "transcript trim removes trailing visual blanks" {
+    try std.testing.expectEqualStrings("fixed", trimTranscriptEnd("fixed\r\n   \r\n"));
+    try std.testing.expectEqualStrings("fixed", trimTranscriptEnd("fixed\r\n" ++ user_bg ++ user_fg ++ "   " ++ reset ++ "\r\n"));
+}
+
+test "transcript viewport ignores trailing styled blank rows" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var ui = TerminalUi(@TypeOf(writer)).init(std.testing.allocator, writer, false);
+    defer ui.editor.deinit();
+    ui.attached = true;
+    ui.terminal_rows = 8;
+    ui.terminal_cols = 20;
+    ui.bottom_rows = 3;
+
+    try ui.drawTranscriptViewportAssumeLocked("fixed\r\n" ++ user_bg ++ user_fg ++ "   " ++ reset ++ "\r\n\r\n");
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[1;1H\x1b[2Kfixed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, user_bg) == null);
+    try std.testing.expect(std.mem.endsWith(u8, buffer.items, "\x1b[5;1H"));
+}
+
+test "compact bottom bar writes only one utf8-safe prompt row" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var ui = TerminalUi(@TypeOf(writer)).init(std.testing.allocator, writer, false);
+    defer ui.editor.deinit();
+    var view = try computePromptViewLimited(std.testing.allocator, "olá", "olá".len, 9, 1);
+    defer view.deinit();
+
+    try ui.renderCompactBottomBar(writer, 10, null, view, true);
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\r\n") == null);
+    try std.testing.expect(utf8Columns(buffer.items) <= 9);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "olá") != null);
 }

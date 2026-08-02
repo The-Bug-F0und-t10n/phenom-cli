@@ -44,12 +44,14 @@ pub fn NewlineWriter(comptime Inner: type) type {
         inner: Inner,
         crlf: bool = false,
         prev_cr: bool = false,
+        capture: ?BufferWriter = null,
 
         const Self = @This();
 
         pub fn writeAll(self: *Self, bytes: []const u8) !void {
+            const out = if (self.capture) |writer| writer else null;
             if (!self.crlf) {
-                try self.inner.writeAll(bytes);
+                if (out) |writer| try writer.writeAll(bytes) else try self.inner.writeAll(bytes);
                 if (bytes.len > 0) self.prev_cr = bytes[bytes.len - 1] == '\r';
                 return;
             }
@@ -58,15 +60,19 @@ pub fn NewlineWriter(comptime Inner: type) type {
             var i: usize = 0;
             while (i < bytes.len) : (i += 1) {
                 if (bytes[i] != '\n') continue;
-                if (i > start) try self.inner.writeAll(bytes[start..i]);
+                if (i > start) {
+                    if (out) |writer| try writer.writeAll(bytes[start..i]) else try self.inner.writeAll(bytes[start..i]);
+                }
                 const has_cr = if (i > 0) bytes[i - 1] == '\r' else self.prev_cr;
-                if (!has_cr) try self.inner.writeAll("\r");
-                try self.inner.writeAll("\n");
+                if (!has_cr) {
+                    if (out) |writer| try writer.writeAll("\r") else try self.inner.writeAll("\r");
+                }
+                if (out) |writer| try writer.writeAll("\n") else try self.inner.writeAll("\n");
                 self.prev_cr = false;
                 start = i + 1;
             }
             if (start < bytes.len) {
-                try self.inner.writeAll(bytes[start..]);
+                if (out) |writer| try writer.writeAll(bytes[start..]) else try self.inner.writeAll(bytes[start..]);
                 self.prev_cr = bytes[bytes.len - 1] == '\r';
             }
         }
@@ -75,6 +81,16 @@ pub fn NewlineWriter(comptime Inner: type) type {
             var buf: [4096]u8 = undefined;
             const text = try std.fmt.bufPrint(&buf, fmt, args);
             try self.writeAll(text);
+        }
+
+        pub fn startCapture(self: *Self, writer: BufferWriter) void {
+            self.capture = writer;
+            self.prev_cr = false;
+        }
+
+        pub fn stopCapture(self: *Self) void {
+            self.capture = null;
+            self.prev_cr = false;
         }
     };
 }
@@ -89,4 +105,21 @@ test "newline writer translates lf for raw terminal transcript" {
     try writer.writeAll("\r\nc\n");
 
     try std.testing.expectEqualStrings("a\r\nb\r\nc\r\n", buffer.items);
+}
+
+test "newline writer can capture redraw without writing inner stream" {
+    var terminal = std.ArrayList(u8).empty;
+    defer terminal.deinit(std.testing.allocator);
+    var capture = std.ArrayList(u8).empty;
+    defer capture.deinit(std.testing.allocator);
+
+    const inner = BufferWriter{ .allocator = std.testing.allocator, .list = &terminal };
+    var writer = NewlineWriter(@TypeOf(inner)){ .inner = inner, .crlf = true };
+    writer.startCapture(.{ .allocator = std.testing.allocator, .list = &capture });
+    try writer.writeAll("a\nb");
+    writer.stopCapture();
+    try writer.writeAll("c\n");
+
+    try std.testing.expectEqualStrings("a\r\nb", capture.items);
+    try std.testing.expectEqualStrings("c\r\n", terminal.items);
 }

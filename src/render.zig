@@ -339,7 +339,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 const line = text[logical_start..logical_end];
 
                 const active_prefix = if (first_logical) prefix else "";
-                const virtual_len = active_prefix.len + line.len;
+                const virtual_len = utf8Columns(active_prefix) + utf8Columns(line);
                 var pos: usize = 0;
                 var wrote_chunk = false;
                 while (pos < virtual_len or !wrote_chunk) {
@@ -361,32 +361,32 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         fn writeUserBlankLine(self: *Self) !void {
             try self.writeContentGutter();
             if (self.options.color) try self.writer.writeAll(user_bg ++ user_fg);
-            try self.writeSpaces(self.userInnerWidth() + 1);
+            try self.writeSpaces(self.contentWrapWidth());
             if (self.options.color) try self.writer.writeAll(reset);
         }
 
         fn writeUserVirtualLine(self: *Self, prefix: []const u8, text: []const u8, pos: usize, take: usize) !void {
-            const width = self.userInnerWidth();
+            const fill_width = self.contentWrapWidth();
             if (self.options.color) {
                 try self.writer.writeAll(user_bg ++ user_fg);
             }
             try self.writeVirtualSegment(prefix, text, pos, take);
-            if (take < width) try self.writeSpaces(width - take);
-            try self.writer.writeAll(" ");
+            if (take < fill_width) try self.writeSpaces(fill_width - take);
             if (self.options.color) try self.writer.writeAll(reset);
         }
 
         fn writeVirtualSegment(self: *Self, prefix: []const u8, text: []const u8, pos: usize, take: usize) !void {
             if (take == 0) return;
             const end = pos + take;
-            if (pos < prefix.len) {
-                const prefix_end = @min(prefix.len, end);
-                try self.writer.writeAll(prefix[pos..prefix_end]);
+            const prefix_cols = utf8Columns(prefix);
+            if (pos < prefix_cols) {
+                const prefix_take = @min(take, prefix_cols - pos);
+                try self.writer.writeAll(utf8ColumnSlice(prefix, pos, prefix_take));
             }
-            if (end > prefix.len) {
-                const text_start = if (pos > prefix.len) pos - prefix.len else 0;
-                const text_end = @min(text.len, end - prefix.len);
-                if (text_start < text_end) try self.writer.writeAll(text[text_start..text_end]);
+            if (end > prefix_cols) {
+                const text_start = if (pos > prefix_cols) pos - prefix_cols else 0;
+                const text_take = end - @max(pos, prefix_cols);
+                if (text_take > 0) try self.writer.writeAll(utf8ColumnSlice(text, text_start, text_take));
             }
         }
 
@@ -1238,7 +1238,7 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         }
 
         fn userInnerWidth(self: *Self) usize {
-            return @max(@as(usize, 8), @max(@as(usize, 12), self.contentWrapWidth()) - 1);
+            return @max(@as(usize, 1), self.contentWrapWidth() -| 1);
         }
 
         fn paintInputRow(self: *Self, prefix: []const u8, content: []const u8, cols: usize) !void {
@@ -1355,6 +1355,16 @@ fn utf8PrefixBytes(bytes: []const u8, max_cols: usize) usize {
         index = @min(bytes.len, index + utf8ByteLen(bytes[index]));
     }
     return index;
+}
+
+fn utf8ColumnSlice(bytes: []const u8, start_col: usize, max_cols: usize) []const u8 {
+    var start: usize = 0;
+    var columns: usize = 0;
+    while (start < bytes.len and columns < start_col) : (columns += 1) {
+        start = @min(bytes.len, start + utf8ByteLen(bytes[start]));
+    }
+    const take = utf8PrefixBytes(bytes[start..], max_cols);
+    return bytes[start .. start + take];
 }
 
 fn toolLabel(name: []const u8) []const u8 {
@@ -1888,6 +1898,23 @@ test "append only snapshot matches phenom cli ts plain surface" {
 
     const expected = "\n                 \n > [user] ola    \n                 \n\n ok\n\n  ─ Worked for 0s\n";
     try std.testing.expectEqualStrings(expected, buffer.items);
+}
+
+test "user block fits narrow utf8 input without terminal soft wrap" {
+    const columns: usize = 10;
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = columns });
+    try renderer.user("olá mundo");
+
+    var start: usize = 0;
+    while (nextLine(buffer.items, &start)) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(visibleTextWidth(line) <= columns - 1);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "olá") != null);
 }
 
 test "status after assistant delta starts on separate block" {

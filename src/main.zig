@@ -224,9 +224,27 @@ fn interactiveContentRow(ctx: *anyopaque) usize {
     return ui.contentRow();
 }
 
+const InteractiveRedrawContext = struct {
+    allocator: std.mem.Allocator,
+    ui: *tui.TerminalUi(fd_writer.FdWriter),
+    writer: *InteractiveTranscriptWriter,
+    buffer: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *InteractiveRedrawContext) void {
+        self.buffer.deinit(self.allocator);
+    }
+};
+
 fn prepareInteractiveTranscriptRedraw(ctx: *anyopaque) !void {
-    const ui: *tui.TerminalUi(fd_writer.FdWriter) = @ptrCast(@alignCast(ctx));
-    try ui.prepareTranscriptRedrawAssumeLocked();
+    const redraw: *InteractiveRedrawContext = @ptrCast(@alignCast(ctx));
+    redraw.buffer.clearRetainingCapacity();
+    redraw.writer.startCapture(.{ .allocator = redraw.allocator, .list = &redraw.buffer });
+}
+
+fn finishInteractiveTranscriptRedraw(ctx: *anyopaque) !void {
+    const redraw: *InteractiveRedrawContext = @ptrCast(@alignCast(ctx));
+    redraw.writer.stopCapture();
+    try redraw.ui.drawTranscriptViewportAssumeLocked(redraw.buffer.items);
 }
 
 fn runChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Config) !void {
@@ -278,6 +296,12 @@ fn runInteractiveChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Conf
 
     var transcript_writer = InteractiveTranscriptWriter{ .inner = stdout, .crlf = true };
     var renderer = InteractiveRenderer.init(&transcript_writer, .{ .color = !config.no_color, .terminal_columns = currentTerminalColumns(), .user_label = userLabel() });
+    var redraw_ctx = InteractiveRedrawContext{
+        .allocator = allocator,
+        .ui = &ui,
+        .writer = &transcript_writer,
+    };
+    defer redraw_ctx.deinit();
     var render_sink = InteractiveRenderSink{
         .renderer = &renderer,
         .allocator = allocator,
@@ -286,8 +310,10 @@ fn runInteractiveChat(allocator: std.mem.Allocator, io: std.Io, config: cli.Conf
         .terminal_rows = currentTerminalRows,
         .layout_ctx = &ui,
         .content_row = interactiveContentRow,
-        .prepare_redraw_ctx = &ui,
+        .prepare_redraw_ctx = &redraw_ctx,
         .prepare_redraw = prepareInteractiveTranscriptRedraw,
+        .finish_redraw_ctx = &redraw_ctx,
+        .finish_redraw = finishInteractiveTranscriptRedraw,
     };
     defer render_sink.deinit();
     ui.setResizeHandler(&render_sink, redrawInteractiveTranscriptAssumeLocked);
@@ -2369,15 +2395,16 @@ fn renderCollectEvidenceSearchIntentRepairContext(
 }
 
 fn collectEvidenceSearchIntentRepairSchema() []const u8 {
-    return
-    \\[TOOLS v1]
-    \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol, stage=minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
-    \\Only collect_evidence is active for this repair. The previous collect_evidence call was malformed; correct it with path, or with intent+terms.
-    \\A pathless collect_evidence call must include <parameter=intent>what source-code evidence you want</parameter> and <parameter=terms>concrete code retrieval keys for that intent</parameter>.
-    \\The controller does not infer search terms from the user prompt. The model must choose the search intent and keys before evidence collection.
-    \\For function/type/file identity, prefer stage=candidates with strategy=symbol, then expand the best C# candidate.
-    \\<tool_call><function=collect_evidence><parameter=intent>find concrete source definition</parameter><parameter=strategy>symbol</parameter><parameter=stage>candidates</parameter><parameter=terms>ConcreteSymbolOrPathTerms</parameter></function></tool_call>
+    const schema =
+        \\[TOOLS v1]
+        \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol, stage=minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
+        \\Only collect_evidence is active for this repair. The previous collect_evidence call was malformed; correct it with path, or with intent+terms.
+        \\A pathless collect_evidence call must include <parameter=intent>what source-code evidence you want</parameter> and <parameter=terms>concrete code retrieval keys for that intent</parameter>.
+        \\The controller does not infer search terms from the user prompt. The model must choose the search intent and keys before evidence collection.
+        \\For function/type/file identity, prefer stage=candidates with strategy=symbol, then expand the best C# candidate.
+        \\<tool_call><function=collect_evidence><parameter=intent>find concrete source definition</parameter><parameter=strategy>symbol</parameter><parameter=stage>candidates</parameter><parameter=terms>ConcreteSymbolOrPathTerms</parameter></function></tool_call>
     ;
+    return schema;
 }
 
 fn collectEvidenceRepairContract() contracts.ActiveContract {
@@ -2402,12 +2429,13 @@ fn applyPatchOnlyRepairContract() contracts.ActiveContract {
 }
 
 fn applyPatchOnlyRepairSchema() []const u8 {
-    return
-    \\[TOOLS v1]
-    \\apply_patch(operation=edit|create|delete|rename, path, destinationPath?, content?, contextId?, repeated search/replace?)
-    \\Only apply_patch is active for this repair. Evidence and MICRO_CONTEXT are already present; do not call collect_evidence again.
-    \\<tool_call><function=apply_patch><parameter=operation>edit</parameter><parameter=path>relative/path</parameter><parameter=contextId>ctx_...</parameter><parameter=search>exact old text</parameter><parameter=replace>exact new text</parameter></function></tool_call>
+    const schema =
+        \\[TOOLS v1]
+        \\apply_patch(operation=edit|create|delete|rename, path, destinationPath?, content?, contextId?, repeated search/replace?)
+        \\Only apply_patch is active for this repair. Evidence and MICRO_CONTEXT are already present; do not call collect_evidence again.
+        \\<tool_call><function=apply_patch><parameter=operation>edit</parameter><parameter=path>relative/path</parameter><parameter=contextId>ctx_...</parameter><parameter=search>exact old text</parameter><parameter=replace>exact new text</parameter></function></tool_call>
     ;
+    return schema;
 }
 
 fn validateSyntaxOnlyRepairContract() contracts.ActiveContract {
@@ -2419,12 +2447,13 @@ fn validateSyntaxOnlyRepairContract() contracts.ActiveContract {
 }
 
 fn validateSyntaxOnlyRepairSchema() []const u8 {
-    return
-    \\[TOOLS v1]
-    \\validate_syntax(path)
-    \\Only validate_syntax is active for this repair. Patch was already applied; do not call collect_evidence.
-    \\<tool_call><function=validate_syntax><parameter=path>relative/path.zig</parameter></function></tool_call>
+    const schema =
+        \\[TOOLS v1]
+        \\validate_syntax(path)
+        \\Only validate_syntax is active for this repair. Patch was already applied; do not call collect_evidence.
+        \\<tool_call><function=validate_syntax><parameter=path>relative/path.zig</parameter></function></tool_call>
     ;
+    return schema;
 }
 
 fn repairMutationRequiresPatch(
