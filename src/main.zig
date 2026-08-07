@@ -6970,10 +6970,11 @@ fn webAnswerMissingCollectedSource(output: []const u8, context: []const u8) bool
     while (lines.next()) |line| {
         const trimmed_line = std.mem.trimStart(u8, line, " \t");
         if (!std.mem.startsWith(u8, trimmed_line, "source_url=")) continue;
-        const source = std.mem.trim(u8, trimmed_line["source_url=".len..], " \t\r");
-        if (source.len == 0) continue;
+        var source_buf: [2048]u8 = undefined;
+        const source = normalizeCollectedSourceUrl(&source_buf, trimmed_line["source_url=".len..]) orelse continue;
+        if (sourceUrlIsDuckDuckGoSearchPage(source)) continue;
         has_source = true;
-        if (std.mem.indexOf(u8, output, source) != null) return false;
+        if (outputContainsCollectedSourceUrl(output, source)) return false;
     }
     return has_source;
 }
@@ -7059,18 +7060,76 @@ fn appendCollectedWebSources(allocator: std.mem.Allocator, output: []const u8, c
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, std.mem.trimEnd(u8, output, " \t\r\n"));
-    try out.appendSlice(allocator, "\n\nSources:\n");
+
+    var sources = std.ArrayList(u8).empty;
+    defer sources.deinit(allocator);
     var lines = std.mem.splitScalar(u8, context, '\n');
     while (lines.next()) |line| {
         const trimmed_line = std.mem.trimStart(u8, line, " \t");
         if (!std.mem.startsWith(u8, trimmed_line, "source_url=")) continue;
-        const source = std.mem.trim(u8, trimmed_line["source_url=".len..], " \t\r");
-        if (source.len == 0 or std.mem.indexOf(u8, out.items, source) != null) continue;
-        try out.appendSlice(allocator, "- ");
-        try out.appendSlice(allocator, source);
-        try out.append(allocator, '\n');
+        var source_buf: [2048]u8 = undefined;
+        const source = normalizeCollectedSourceUrl(&source_buf, trimmed_line["source_url=".len..]) orelse continue;
+        if (sourceUrlIsDuckDuckGoSearchPage(source) or std.mem.indexOf(u8, sources.items, source) != null) continue;
+        try sources.appendSlice(allocator, "- ");
+        try sources.appendSlice(allocator, source);
+        try sources.append(allocator, '\n');
+    }
+    if (sources.items.len > 0) {
+        try out.appendSlice(allocator, "\n\nSources:\n");
+        try out.appendSlice(allocator, sources.items);
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn normalizeCollectedSourceUrl(buf: []u8, raw: []const u8) ?[]const u8 {
+    const trimmed = trimSourceUrlBoundary(raw);
+    var len: usize = 0;
+    for (trimmed) |byte| {
+        if (std.ascii.isWhitespace(byte) or byte == '`') continue;
+        if (len == buf.len) return null;
+        buf[len] = byte;
+        len += 1;
+    }
+    const normalized = trimSourceUrlBoundary(buf[0..len]);
+    if (!web_rag.isHttpTarget(normalized)) return null;
+    return normalized;
+}
+
+fn trimSourceUrlBoundary(raw: []const u8) []const u8 {
+    var text = std.mem.trim(u8, raw, " \t\r\n`'\"<>()[]{}");
+    while (text.len > 0 and isTrailingSourceUrlPunctuation(text[text.len - 1])) {
+        text = text[0 .. text.len - 1];
+    }
+    return text;
+}
+
+fn isTrailingSourceUrlPunctuation(byte: u8) bool {
+    return byte == '.' or byte == ',' or byte == ';' or byte == ':' or byte == ')' or byte == ']' or byte == '}';
+}
+
+fn sourceUrlIsDuckDuckGoSearchPage(source: []const u8) bool {
+    return std.mem.indexOf(u8, source, "://html.duckduckgo.com/html/") != null;
+}
+
+fn outputContainsCollectedSourceUrl(output: []const u8, source: []const u8) bool {
+    if (std.mem.indexOf(u8, output, source) != null) return true;
+    var cursor: usize = 0;
+    while (cursor < output.len) : (cursor += 1) {
+        var output_idx = cursor;
+        var source_idx: usize = 0;
+        while (output_idx < output.len and source_idx < source.len) {
+            const byte = output[output_idx];
+            if (std.ascii.isWhitespace(byte) or byte == '`') {
+                output_idx += 1;
+                continue;
+            }
+            if (byte != source[source_idx]) break;
+            output_idx += 1;
+            source_idx += 1;
+        }
+        if (source_idx == source.len) return true;
+    }
+    return false;
 }
 
 fn renderToolPhaseClosedAnswerRepairContext(allocator: std.mem.Allocator, follow_context: []const u8) ![]u8 {
@@ -10124,6 +10183,7 @@ test "web answer requires one collected source url" {
     ;
     try std.testing.expect(webAnswerMissingCollectedSource("Resposta sem referencias.", context));
     try std.testing.expect(!webAnswerMissingCollectedSource("Fonte: https://example.test/specs", context));
+    try std.testing.expect(!webAnswerMissingCollectedSource("Fonte: `https://example.test/sp\necs`.", context));
     try std.testing.expect(!webAnswerMissingCollectedSource("Resposta sem pesquisa.", "[EVIDENCE]\n- E1 local\n"));
 }
 
@@ -10163,6 +10223,21 @@ test "web source fallback is stable and deduplicated" {
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expectEqual(@as(usize, 1), countNeedle(first, "https://example.test/specs"));
     try std.testing.expectEqual(@as(usize, 1), countNeedle(first, "https://example.test/support"));
+}
+
+test "web source fallback normalizes urls and skips search pages" {
+    const context =
+        \\[WEB_DOSSIER v1]
+        \\source_url=https://html.duckduckgo.com/html/?q=presidente%20do%20brasil%202026
+        \\source_url=`https://pt.wikipedia.org/wiki/Campanha_presidencial_de_Fl%C3%A1vio_Bolsonaro_em_2026`,
+        \\source_url=https://pt.wikipedia.org/wiki/Campanha_presidencial_de_Fl%C3%A1vio_Bolsonaro_em_2026
+    ;
+    const sourced = try appendCollectedWebSources(std.testing.allocator, "Resposta completa.", context);
+    defer std.testing.allocator.free(sourced);
+
+    try std.testing.expect(std.mem.indexOf(u8, sourced, "html.duckduckgo.com/html") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sourced, "`") == null);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(sourced, "https://pt.wikipedia.org/wiki/Campanha_presidencial_de_Fl%C3%A1vio_Bolsonaro_em_2026"));
 }
 
 test "initial context no longer forces protocol repair" {

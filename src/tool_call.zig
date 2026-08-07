@@ -197,6 +197,7 @@ fn firstJsonToolMarker(output: []const u8) ?usize {
         "\"tool_call\"",
         "\"tool_calls\"",
         "\"function_call\"",
+        "\"contract\"",
         "\"web_search\"",
         "\"search_web\"",
         "\"rag_web\"",
@@ -239,6 +240,10 @@ fn parseJsonToolCallObject(allocator: std.mem.Allocator, root: std.json.ObjectMa
     }
     if (jsonStringField(root, "name") != null or jsonStringField(root, "function") != null) {
         return try buildJsonToolCall(allocator, root);
+    }
+    if (jsonStringField(root, "contract")) |raw_contract| {
+        if (parseContractName(raw_contract) == null) return null;
+        return try buildJsonContractToolCall(allocator, root);
     }
     return null;
 }
@@ -331,6 +336,30 @@ fn buildJsonToolCall(allocator: std.mem.Allocator, raw_tool: std.json.ObjectMap)
         .start_line = jsonUsizeField(args, "start_line") orelse 1,
         .max_lines = jsonUsizeField(args, "max_lines") orelse 12,
         .compact = jsonBoolField(args, "compact") orelse false,
+        .requires_inspection = jsonBoolField(args, "requiresInspection"),
+        .requires_mutation = jsonBoolField(args, "requiresMutation"),
+        .requires_runtime_validation = jsonBoolField(args, "requiresRuntimeValidation"),
+        .requires_browser_diagnostics = jsonBoolField(args, "requiresBrowserDiagnostics"),
+        .requires_memory_promotion = jsonBoolField(args, "requiresMemoryPromotion"),
+        .reason = if (reason) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
+fn buildJsonContractToolCall(allocator: std.mem.Allocator, args: std.json.ObjectMap) !ToolCall {
+    const raw_contract = jsonStringField(args, "contract") orelse return error.InvalidToolCallJson;
+    const contract = parseContractName(raw_contract) orelse return error.InvalidContract;
+    const intent = normalizeOptionalText(jsonStringField(args, "intent"));
+    const terms = normalizeOptionalText(jsonStringField(args, "terms") orelse jsonStringField(args, "query"));
+    const target = normalizeOptionalText(jsonStringField(args, "target") orelse jsonStringField(args, "url"));
+    const reason = normalizeOptionalText(jsonStringField(args, "reason"));
+
+    return .{
+        .name = try allocator.dupe(u8, "set_operational_contract"),
+        .intent = if (intent) |value| try allocator.dupe(u8, value) else null,
+        .terms = if (terms) |value| try allocator.dupe(u8, value) else null,
+        .target = if (target) |value| try allocator.dupe(u8, value) else null,
+        .contract = contract,
+        .budget_bytes = jsonUsizeField(args, "budget_bytes") orelse jsonUsizeField(args, "max_bytes"),
         .requires_inspection = jsonBoolField(args, "requiresInspection"),
         .requires_mutation = jsonBoolField(args, "requiresMutation"),
         .requires_runtime_validation = jsonBoolField(args, "requiresRuntimeValidation"),
@@ -1185,6 +1214,28 @@ test "parses compact set operational contract from fenced shell prose" {
     try std.testing.expectEqual(@as(?usize, 2000), call.budget_bytes);
 }
 
+test "parses bare json contract as operational contract switch" {
+    const output =
+        \\# search_web
+        \\
+        \\```json
+        \\{
+        \\  "contract": "search_web",
+        \\  "query": "presidente do brasil 2026",
+        \\  "intent": "external factual verification of current Brazilian president"
+        \\}
+        \\```
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("set_operational_contract", call.name);
+    try std.testing.expectEqual(contracts.ContractName.search_web, call.contract.?);
+    try std.testing.expectEqualStrings("presidente do brasil 2026", call.terms.?);
+    try std.testing.expectEqualStrings("external factual verification of current Brazilian president", call.intent.?);
+    try std.testing.expect(containsJsonToolCallSignature(output));
+}
+
 test "parses compact web search alias" {
     const output = "```bash\nsearch_web(query=\"R36S RK3326 RAM specs\", budget_bytes=4096)\n```";
     const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
@@ -1325,6 +1376,7 @@ test "openai tool calls json with string arguments parses web search" {
 
 test "json without tool_call is not a tool" {
     try std.testing.expect((try parseFirst(std.testing.allocator, "{\"answer\":\"ok\"}")) == null);
+    try std.testing.expect((try parseFirst(std.testing.allocator, "{\"contract\":\"rental\",\"answer\":\"ok\"}")) == null);
 }
 
 test "collect evidence parses explicit http search toggle" {

@@ -240,6 +240,23 @@ test "initial router accepts compact explicit web contract switch" {
     try std.testing.expectEqualStrings("Retroflag R36S especificações", envelope.call.?.terms.?);
 }
 
+test "initial router accepts bare json web contract switch" {
+    const active = contracts.activeContract(.workflow) orelse return error.MissingContract;
+    const output =
+        \\# search_web
+        \\
+        \\```json
+        \\{"contract":"search_web","query":"presidente do brasil 2026","intent":"verify current Brazilian president"}
+        \\```
+    ;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.accepted, envelope.state);
+    try std.testing.expectEqualStrings("set_operational_contract", envelope.raw_name);
+    try std.testing.expectEqual(contracts.ContractName.search_web, envelope.call.?.contract.?);
+    try std.testing.expectEqualStrings("presidente do brasil 2026", envelope.call.?.terms.?);
+}
+
 test "active web contract accepts legacy search_web alias" {
     const active = contracts.activeContract(.search_web) orelse return error.MissingContract;
     const output =
