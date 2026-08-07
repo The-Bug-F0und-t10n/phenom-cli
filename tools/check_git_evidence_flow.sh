@@ -38,7 +38,7 @@ mkdir -p "$WORK"
 
 PORT_FILE="$WORK/port"
 PROMPTS_FILE="$WORK/prompts.log"
-"${ZIG:-zig}" run "$ROOT/tools/scripted_backend.zig" -lc -- git_evidence "$PORT_FILE" "$PROMPTS_FILE" "$EXPECT" &
+sh "$ROOT/tools/start_scripted_backend.sh" git_evidence "$PORT_FILE" "$PROMPTS_FILE" "$EXPECT" &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 

@@ -917,6 +917,7 @@ pub fn TerminalUi(comptime Writer: type) type {
                 .cols = if (self.terminal_cols > 0) self.terminal_cols else terminalSize().cols,
             };
             const last = @max(@as(usize, 1), size.rows -| self.bottom_rows);
+            const paint_cols = @max(@as(usize, 1), size.cols -| 1);
             const visible_transcript = trimTranscriptEnd(transcript);
             const total_lines = transcriptLineCount(visible_transcript);
             const skip = total_lines -| last;
@@ -931,7 +932,7 @@ pub fn TerminalUi(comptime Writer: type) type {
                 if (line_index < skip) continue;
                 if (row > last) break;
                 try self.writer.print("\x1b[{};1H\x1b[2K", .{row});
-                try self.writer.writeAll(line);
+                try writeVisibleColumns(self.writer, line, paint_cols);
                 try self.writer.writeAll(reset);
                 row += 1;
             }
@@ -1481,6 +1482,23 @@ fn transcriptLineHasVisibleContent(bytes: []const u8) bool {
     return false;
 }
 
+fn writeVisibleColumns(writer: anytype, bytes: []const u8, max_cols: usize) !void {
+    var cols: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len and cols < max_cols) {
+        if (bytes[i] == 0x1b) {
+            const len = ansiEscapeLen(bytes[i..]);
+            try writer.writeAll(bytes[i .. i + len]);
+            i += len;
+            continue;
+        }
+        const end = nextCodepointStart(bytes, i);
+        try writer.writeAll(bytes[i..end]);
+        i = end;
+        cols += 1;
+    }
+}
+
 fn ansiEscapeLen(bytes: []const u8) usize {
     if (bytes.len < 2) return 1;
     if (bytes[1] == '[') {
@@ -1836,6 +1854,31 @@ test "every full prompt line preserves one trailing column" {
     });
 
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "> 123456 \r\n  abcdef ") != null);
+}
+
+test "bottom bar status lines fit tiny terminal widths" {
+    const widths = [_]usize{ 1, 2, 3, 4, 5, 8, 12, 20 };
+    for (widths) |cols| {
+        var buffer = std.ArrayList(u8).empty;
+        defer buffer.deinit(std.testing.allocator);
+        const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+
+        _ = try renderBottomBar(writer, .{
+            .color = false,
+            .cols = cols,
+            .status = "Thinking (6s · ↓ 2.2k in · ↑ 128 out · esc to interrupt)",
+            .visualizer_mode = .thinking,
+            .prompt = "olá mundo",
+            .cursor = "olá mundo".len,
+            .show_prompt = true,
+        });
+
+        const paint_cols = @max(@as(usize, 1), cols -| 1);
+        var cursor: usize = 0;
+        while (nextTranscriptLine(buffer.items, &cursor)) |line| {
+            try std.testing.expect(utf8Columns(line) <= paint_cols);
+        }
+    }
 }
 
 test "status bar formats real token usage without accumulating" {
@@ -2198,6 +2241,24 @@ test "transcript viewport ignores trailing styled blank rows" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[1;1H\x1b[2Kfixed") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, user_bg) == null);
     try std.testing.expect(std.mem.endsWith(u8, buffer.items, "\x1b[5;1H"));
+}
+
+test "transcript viewport clips redraw lines to narrow terminal width" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var ui = TerminalUi(@TypeOf(writer)).init(std.testing.allocator, writer, false);
+    defer ui.editor.deinit();
+    ui.attached = true;
+    ui.terminal_rows = 6;
+    ui.terminal_cols = 10;
+    ui.bottom_rows = 2;
+
+    try ui.drawTranscriptViewportAssumeLocked("0123456789abcdef\r\nshort\r\n");
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[1;1H\x1b[2K012345678") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[1;1H\x1b[2K0123456789") == null);
 }
 
 test "compact bottom bar writes only one utf8-safe prompt row" {

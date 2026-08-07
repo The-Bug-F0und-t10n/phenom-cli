@@ -92,13 +92,11 @@ pub fn codeEvidenceSchema() []const u8 {
 pub fn initialRouterSchema() []const u8 {
     return
     \\[TOOLS v1]
-    \\set_operational_contract(contract=answer_only|collect_evidence|mutate_file|validate_work|inspect_runtime|search_web|rag_web|memory, strategyId?, query?, intent?, terms?, target?, budget_bytes?, requiresInspection?, requiresMutation?, requiresRuntimeValidation?, requiresBrowserDiagnostics?, requiresMemoryPromotion?, reason?)
+    \\set_operational_contract(contract=answer_only|collect_evidence|mutate_file|validate_work|inspect_runtime|search_web|rag_web|memory, query?, intent?, terms?, target?, budget_bytes?, requiresInspection?, requiresMutation?, requiresRuntimeValidation?, requiresBrowserDiagnostics?, requiresMemoryPromotion?, reason?)
     \\search_session(intent?, terms, scope=current|all, session?)
-    \\Initial router. Answer directly when enough; otherwise emit one contract declaration or one search_session call. Controller never infers intent from prompt keywords.
-    \\Use model-selected query/terms only: exact external fact/entity for search_web/rag_web, concrete workspace keys for collect_evidence, concrete prior-session keys for search_session, concise durable rule text for memory promotion.
+    \\Initial router. Answer directly when enough; otherwise emit one contract declaration or one search_session. Controller never infers intent from prompt keywords.
+    \\Use model-selected query/terms only: exact external fact or entity for search_web/rag_web, workspace keys for collect_evidence, prior-session keys for search_session, durable rule text for memory.
     \\Declare before executors. Full executor schema appears only after the selected contract is active.
-    \\<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>exact external fact or entity</parameter></function></tool_call>
-    \\<tool_call><function=search_session><parameter=intent>recover prior decision</parameter><parameter=terms>TopicName EntityName DecisionKey</parameter><parameter=scope>current</parameter></function></tool_call>
     ;
 }
 
@@ -158,7 +156,7 @@ pub fn mutateFileSchema() []const u8 {
     \\search_session(intent?, terms, scope=current|all, session?)
     \\apply_patch(operation=edit|create|delete|rename, path, destinationPath?, content?, contextId?, repeated search/replace?)
     \\set_operational_contract(contract=answer_only|collect_evidence|validate_work|inspect_runtime|search_web|memory, query?, reason?)
-    \\Mutation contract active. Use collect_evidence first when editing/deleting/renaming. Use strategy=diff to inspect existing Git changes. edit accepts repeated contextId/search/replace hunks; every search must be exact and unique in the original file. create requires content and refuses overwrite. delete/rename require fresh contextId. The controller rejects missing or stale patch context. Use set_operational_contract only for an explicit switch to a different contract.
+    \\Mutation contract active. For a new file from current dialogue content, call apply_patch operation=create with relative path and full content; do not collect_evidence. If prior dialogue content is needed and not visible, call search_session with concrete artifact terms. Use collect_evidence first only when editing/deleting/renaming existing workspace files. Use strategy=diff to inspect existing Git changes. edit accepts repeated contextId/search/replace hunks; every search must be exact and unique in the original file. create requires content and refuses overwrite. delete/rename require fresh contextId. The controller rejects missing or stale patch context. Use set_operational_contract only for an explicit switch to a different contract.
     \\<tool_call><function=apply_patch><parameter=operation>edit</parameter><parameter=path>relative/path</parameter><parameter=contextId>ctx_...</parameter><parameter=search>exact old text</parameter><parameter=replace>exact new text</parameter></function></tool_call>
     ;
 }
@@ -201,10 +199,15 @@ pub fn memorySchema() []const u8 {
     \\[TOOLS v1]
     \\search_persistent_context(target=memory|skills|both, terms, intent?, budget_bytes?)
     \\promote_context(target=memory|skills, text)
+    \\search_personal_memory(terms, kind=preference|profile|project|decision|constraint|correction|goal?, budget_bytes?)
+    \\promote_personal_memory(kind=preference|profile|project|decision|constraint|correction|goal, key, value, confidence=confirmed|inferred|uncertain?)
+    \\forget_personal_memory(id?, terms?)
     \\set_operational_contract(contract=answer_only|collect_evidence|mutate_file|validate_work|inspect_runtime|search_web, query?, reason?)
-    \\Memory contract active. Search MEMORY/SKILLS by model-selected terms before applying existing local durable facts/rules. Retrieved SKILLS are active response rules when relevant. If the user asks for a local rule/preference/protocol, answer only from directly retrieved MEMORY/SKILLS entries; do not add adjacent advice, generic best practices, or inferred extras. Promote explicit user-confirmed future-turn rules/preferences/operational constraints to skills as one concise interpreted imperative. Promote verified reusable project/workdir facts to memory. Never promote raw tool output, E#/S# blocks, logs, patches, unverified model guesses, or one-off task instructions. If the user wording is not durable enough to persist, ask/answer without promotion. Use set_operational_contract only for an explicit switch to a different contract.
+    \\Memory contract active. PERSONAL_MEMORY is about the private owner of this local agent: preferences, profile, recurring projects, corrections, constraints, goals, and decisions. MEMORY is distilled local project/task context: facts, decisions, active work, visible outcomes, and verified insights that keep the model centered. SKILLS are local operating rules. Retrieved SKILLS are active response rules when relevant. Search PERSONAL_MEMORY before answering questions about the owner or applying durable owner preferences. Search MEMORY/SKILLS before applying existing local project rules. If the user asks for a local rule/preference/protocol, answer only from directly retrieved MEMORY/SKILLS entries or PERSONAL_MEMORY entries; do not add adjacent advice, generic best practices, or inferred extras. Promote explicit user-confirmed owner preferences/profile/corrections to PERSONAL_MEMORY. Promote explicit user-confirmed future-turn rules/preferences/operational constraints to skills as one concise interpreted imperative. Promote explicit workspace facts/rules to MEMORY/SKILLS. Never promote raw tool output, E#/S# blocks, logs, patches, hidden reasoning, unverified model guesses, or one-off task instructions. Use forget_personal_memory only when the user asks to forget/remove a stored owner memory.
     \\<tool_call><function=search_persistent_context><parameter=target>both</parameter><parameter=terms>specific local rule preference protocol fact</parameter></function></tool_call>
     \\<tool_call><function=promote_context><parameter=target>skills</parameter><parameter=text>Prefer concise final answers.</parameter></function></tool_call>
+    \\<tool_call><function=search_personal_memory><parameter=terms>response style language preference</parameter></function></tool_call>
+    \\<tool_call><function=promote_personal_memory><parameter=kind>preference</parameter><parameter=key>response_style</parameter><parameter=value>Prefer concise Portuguese answers.</parameter><parameter=confidence>confirmed</parameter></function></tool_call>
     ;
 }
 
@@ -310,6 +313,8 @@ test "contract schemas expose executor families only after contract selection" {
 
     const mutation = activeContractSchemaFor(.mutate_file);
     try std.testing.expect(std.mem.indexOf(u8, mutation, "apply_patch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mutation, "operation=create") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mutation, "do not collect_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, mutation, "contextId") != null);
     try std.testing.expect(std.mem.indexOf(u8, mutation, "delete/rename require fresh contextId") != null);
     try std.testing.expect(std.mem.indexOf(u8, mutation, "refuses overwrite") != null);
@@ -328,9 +333,10 @@ test "contract schemas expose executor families only after contract selection" {
 
     const memory = activeContractSchemaFor(.memory);
     try std.testing.expect(std.mem.indexOf(u8, memory, "promote_context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "promote_personal_memory") != null);
     try std.testing.expect(std.mem.indexOf(u8, memory, "Never promote raw tool output") != null);
     try std.testing.expect(std.mem.indexOf(u8, memory, "<parameter=target>skills</parameter>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, memory, "interpreted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "PERSONAL_MEMORY") != null);
     try std.testing.expect(std.mem.indexOf(u8, memory, "inferred extras") != null);
     try std.testing.expect(std.mem.indexOf(u8, memory, "apply_patch") == null);
 

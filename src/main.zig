@@ -16,6 +16,7 @@ const gate = @import("gate.zig");
 const http = @import("http.zig");
 const micro_context = @import("micro_context.zig");
 const model_context = @import("model_context.zig");
+const personal_memory = @import("personal_memory.zig");
 const persistent_context = @import("persistent_context.zig");
 const product_guardrails = @import("product_guardrails.zig");
 const reasoning_filter = @import("reasoning_filter.zig");
@@ -23,6 +24,7 @@ const render = @import("render.zig");
 const session_context = @import("session_context.zig");
 const strategy_registry = @import("strategy_registry.zig");
 const system_prompt = @import("system_prompt.zig");
+const text_match = @import("text_match.zig");
 const tool_call = @import("tool_call.zig");
 const tool_envelope = @import("tool_envelope.zig");
 const tool_event = @import("tool_event.zig");
@@ -752,7 +754,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         .help => {
             const visible = interactive_help_text;
             try events.emit(.{ .message_chunk = visible });
-            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
+            try recordAndEmitTurnDone(allocator, io, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
             return;
         },
         .reset => {
@@ -760,20 +762,20 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             const visible = try std.fmt.allocPrint(allocator, "Session reset: session '{s}' and input history cleared.", .{config.session});
             defer allocator.free(visible);
             try events.emit(.{ .message_chunk = visible });
-            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
+            try recordAndEmitTurnDone(allocator, io, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
             return;
         },
         .exit => {
             const visible = "Session saved. Use phenom chat to continue.";
             try events.emit(.{ .message_chunk = visible });
-            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
+            try recordAndEmitTurnDone(allocator, io, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
             return;
         },
         .create_custom_prompt => {
             const visible = try runCreateCustomPromptCommand(allocator, io, effective_config, &events, &db, ui_ptr);
             defer allocator.free(visible);
             try events.emit(.{ .message_chunk = visible });
-            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
+            try recordAndEmitTurnDone(allocator, io, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
             return;
         },
         .unknown => |name| {
@@ -781,10 +783,12 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             defer allocator.free(visible);
             try db.recordEvent(config.session, "local_command_unknown", name);
             try events.emit(.{ .message_chunk = visible });
-            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
+            try recordAndEmitTurnDone(allocator, io, &db, config.session, &events, turn_started_ms, "ok", prompt, visible);
             return;
         },
     }
+
+    if (try tryHandleArtifactSaveCommand(allocator, io, effective_config, &events, &db, prompt, turn_started_ms)) return;
 
     try events.emit(.{ .think_start = "Thinking" });
 
@@ -814,7 +818,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
         const response = offlineStubResponse();
         try events.emit(.{ .message_chunk = response });
         try db.recordEvent(config.session, "assistant_offline_stub", response);
-        try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "ok", prompt, response);
+        try recordAndEmitTurnDone(allocator, io, &db, config.session, &events, turn_started_ms, "ok", prompt, response);
     } else {
         var client = http.LocalModelClient{
             .allocator = allocator,
@@ -832,6 +836,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             .db = &db,
             .session = config.session,
             .ui = ui_ptr,
+            .context_limit_tokens = client.context_window,
             .filter = reasoning_filter.ReasoningFilter.init(allocator, false),
             .visible = std.ArrayList(u8).empty,
             .visible_bytes = 0,
@@ -877,7 +882,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
                 try events.emit(.{ .progress_update = message });
                 try db.recordEvent(config.session, "model_error", @errorName(err));
                 try db.recordTurnError(config.session, .model_protocol, "model_context", @errorName(err));
-                try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "model_context_error", prompt, sink.visible.items);
+                try recordAndEmitTurnDone(allocator, io, &db, config.session, &events, turn_started_ms, "model_context_error", prompt, sink.visible.items);
                 if (config.fail_on_model_error) return err;
                 return;
             };
@@ -888,7 +893,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
                 try events.emit(.{ .inference_cancel = "cancelled by user" });
                 try db.recordEvent(config.session, "inference_cancel", "cancelled by user");
                 try sink.flush();
-                try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "cancelled", prompt, sink.visible.items);
+                try recordAndEmitTurnDone(allocator, io, &db, config.session, &events, turn_started_ms, "cancelled", prompt, sink.visible.items);
                 return;
             }
             const endpoint = client.endpointSummary(allocator) catch "unknown-endpoint";
@@ -912,7 +917,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             try events.emit(.{ .progress_update = message });
             try db.recordEvent(config.session, "model_error", @errorName(err));
             try recordModelStreamFailure(&db, config.session, "streamInference", @errorName(err), failure_kind, failure_detail);
-            try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "model_error", prompt, sink.visible.items);
+            try recordAndEmitTurnDone(allocator, io, &db, config.session, &events, turn_started_ms, "model_error", prompt, sink.visible.items);
             if (config.fail_on_model_error) return err;
             return;
         };
@@ -923,13 +928,17 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             sink.raw_visible.clearRetainingCapacity();
             repaired_think_only_before_tool_loop = try repairThinkOnlyFinalAnswer(allocator, effective_config, prompt, &client, &events, &db, ui_ptr, &sink);
         }
-        if (enable_tool_loop and !repaired_think_only_before_tool_loop) {
+        const answered_from_personal_memory = if (enable_tool_loop)
+            try answerDirectPersonalMemoryRecall(allocator, &db, config.session, prompt, &sink)
+        else
+            false;
+        if (enable_tool_loop and !repaired_think_only_before_tool_loop and !answered_from_personal_memory) {
             const handled_by_tool_loop = runToolLoopIterations(allocator, io, effective_config, prompt, sink.raw_model.items, sink.raw_visible.items, model_context_text, &client, &events, &db, ui_ptr, &sink) catch |err| blk: {
                 if (err == error.Cancelled) {
                     try events.emit(.{ .inference_cancel = "cancelled by user" });
                     try db.recordEvent(config.session, "inference_cancel", "cancelled by user");
                     try sink.flush();
-                    try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "cancelled", prompt, sink.visible.items);
+                    try recordAndEmitTurnDone(allocator, io, &db, config.session, &events, turn_started_ms, "cancelled", prompt, sink.visible.items);
                     return;
                 }
                 const message = try std.fmt.allocPrint(allocator, "tool loop failed: {s}", .{@errorName(err)});
@@ -986,7 +995,7 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
                 try events.emit(.{ .progress_update = message });
                 try db.recordEvent(config.session, "expectation_failed", expected);
                 try db.recordTurnError(config.session, .validation_failed, "expect_contains", expected);
-                try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, "expectation_failed", prompt, sink.visible.items);
+                try recordAndEmitTurnDone(allocator, io, &db, config.session, &events, turn_started_ms, "expectation_failed", prompt, sink.visible.items);
                 return error.ExpectedVisibleOutputMissing;
             }
             try db.recordEvent(config.session, "expectation_passed", expected);
@@ -1005,8 +1014,19 @@ fn runChatTurnWithUi(allocator: std.mem.Allocator, io: std.Io, config: cli.Confi
             defer allocator.free(message);
             try db.recordEvent(config.session, "model_stop", message);
         }
-        const final_status = finalTurnStatus(sink.completion_stop_reason);
-        try recordAndEmitTurnDone(allocator, &db, config.session, &events, turn_started_ms, final_status, prompt, sink.visible.items);
+        var final_status = finalTurnStatus(sink.completion_stop_reason);
+        if (std.mem.eql(u8, final_status, "ok") and finalAnswerContradictsLoadedPersistentContext(sink.visible.items, model_context_text)) {
+            try db.recordEvent(config.session, "answer_repair_blocked", "loaded persistent context contradiction");
+            try db.recordTurnError(config.session, .model_protocol, "persistent_context", "final answer contradicted loaded MEMORY/SKILLS");
+            final_status = "model_protocol_error";
+        }
+        const used_personal_memory_context = if (model_context_text) |text| std.mem.indexOf(u8, text, "[PERSONAL_MEMORY]") != null else false;
+        if (std.mem.eql(u8, final_status, "ok") and !used_personal_memory_context) {
+            extractPersonalMemoryWithModel(allocator, &db, config.session, prompt, &client) catch |err| {
+                db.recordEvent(config.session, "personal_memory_extraction_error", @errorName(err)) catch {};
+            };
+        }
+        try recordAndEmitTurnDone(allocator, io, &db, config.session, &events, turn_started_ms, final_status, prompt, sink.visible.items);
     }
 }
 
@@ -1016,6 +1036,248 @@ fn finalTurnStatus(stop_reason: http.StopReason) []const u8 {
 
 fn shouldUseSessionContext(config: cli.Config) bool {
     return !config.prompt_provided or config.session_provided;
+}
+
+fn tryHandleArtifactSaveCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: cli.Config,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    prompt: []const u8,
+    turn_started_ms: i64,
+) !bool {
+    if (!isArtifactSaveRequest(prompt)) return false;
+    var maybe_artifact = try db.loadLatestArtifact(allocator, config.session);
+    if (maybe_artifact == null) {
+        try recordArtifactsFromVisible(allocator, db, config.session, prompt);
+        maybe_artifact = try db.loadLatestArtifact(allocator, config.session);
+    }
+    var artifact = maybe_artifact orelse {
+        const visible = "Nao encontrei um artefato de codigo anterior nesta sessao para salvar.";
+        try events.emit(.{ .message_chunk = visible });
+        try db.recordEvent(config.session, "artifact_save_missing", "latest artifact not found");
+        try recordAndEmitTurnDone(allocator, io, db, config.session, events, turn_started_ms, "ok", prompt, visible);
+        return true;
+    };
+    defer artifact.deinit(allocator);
+
+    const explicit_path = try singleStructuredPathFromPrompt(allocator, prompt);
+    defer if (explicit_path) |path| allocator.free(path);
+    const fallback_path = if (artifact.path_hint.len > 0)
+        artifact.path_hint
+    else
+        defaultArtifactPath(artifact.language);
+    const path = explicit_path orelse fallback_path;
+
+    var context = working_context.WorkingContext.init(allocator);
+    defer context.deinit();
+    try db.recordEvent(config.session, "contract_selected", "contract=mutate_file requestedContract=artifact_create requiresInspection=false requiresMutation=true requiresRuntimeValidation=false requiresBrowserDiagnostics=false allowed_tools=apply_patch source=controller reason=save generated artifact");
+    try db.recordTurnPhase(config.session, .mutation, "artifact_create");
+    const tool_start = try std.fmt.allocPrint(allocator, "apply_patch operation=create path={s} artifact_id={} bytes={}", .{ path, artifact.id, artifact.content.len });
+    defer allocator.free(tool_start);
+    try db.recordEvent(config.session, "tool_start", tool_start);
+    try events.emit(.{ .tool_start = .{ .name = "apply_patch", .detail = path } });
+
+    const result = apply_patch_tool.execute(allocator, io, .{
+        .operation = .create,
+        .path = path,
+        .content = artifact.content,
+    }, &context) catch |err| {
+        try db.recordEvent(config.session, "tool_error", @errorName(err));
+        try db.recordTurnError(config.session, .tool_runtime, "apply_patch", @errorName(err));
+        try events.emit(.{ .tool_result = .{ .name = "apply_patch", .output = @errorName(err) } });
+        const visible = try std.fmt.allocPrint(allocator, "Nao salvei `{s}`: {s}.", .{ path, @errorName(err) });
+        defer allocator.free(visible);
+        try events.emit(.{ .message_chunk = visible });
+        recordDirectExpectations(allocator, db, config.session, events, config, visible) catch |expect_err| {
+            try recordAndEmitTurnDone(allocator, io, db, config.session, events, turn_started_ms, "expectation_failed", prompt, visible);
+            return expect_err;
+        };
+        try recordAndEmitTurnDone(allocator, io, db, config.session, events, turn_started_ms, "ok", prompt, visible);
+        return true;
+    };
+    defer result.deinit(allocator);
+
+    try db.recordEvent(config.session, "tool_event", result.audit_text);
+    try db.recordEvent(config.session, "patch_result", result.text);
+    const save_body = try std.fmt.allocPrint(allocator, "artifact_id={} path={s} bytes={} hash={s}", .{ artifact.id, path, artifact.content.len, artifact.hash });
+    defer allocator.free(save_body);
+    try db.recordEvent(config.session, "artifact_saved", save_body);
+    try events.emit(.{ .tool_result = .{ .name = "apply_patch", .output = result.text } });
+    const visible = try std.fmt.allocPrint(allocator, "Salvo em `{s}`.", .{path});
+    defer allocator.free(visible);
+    try events.emit(.{ .message_chunk = visible });
+    recordDirectExpectations(allocator, db, config.session, events, config, visible) catch |expect_err| {
+        try recordAndEmitTurnDone(allocator, io, db, config.session, events, turn_started_ms, "expectation_failed", prompt, visible);
+        return expect_err;
+    };
+    try recordAndEmitTurnDone(allocator, io, db, config.session, events, turn_started_ms, "ok", prompt, visible);
+    return true;
+}
+
+fn recordDirectExpectations(
+    allocator: std.mem.Allocator,
+    db: *audit.AuditDb,
+    session: []const u8,
+    events: *ui_events.EventBus,
+    config: cli.Config,
+    visible: []const u8,
+) !void {
+    for (0..config.expect_contains_count) |expect_idx| {
+        const expected = config.expect_contains_all[expect_idx] orelse continue;
+        if (!expectationSatisfied(visible, expected)) {
+            try db.recordEvent(session, "expectation_failed", expected);
+            try db.recordTurnError(session, .validation_failed, "expect_contains", expected);
+            return error.ExpectedVisibleOutputMissing;
+        }
+        try db.recordEvent(session, "expectation_passed", expected);
+        if (config.show_expect_status) {
+            const message = try std.fmt.allocPrint(allocator, "success expected visible text found: {s}", .{expected});
+            defer allocator.free(message);
+            try events.emit(.{ .progress_update = message });
+        }
+    }
+}
+
+fn recordArtifactsFromVisible(allocator: std.mem.Allocator, db: *audit.AuditDb, session: []const u8, visible: []const u8) !void {
+    const path_hint = (try suggestedArtifactPathFromText(allocator, visible)) orelse try allocator.alloc(u8, 0);
+    defer allocator.free(path_hint);
+    var offset: usize = 0;
+    var stored: usize = 0;
+    while (stored < 8) {
+        const start_rel = std.mem.indexOf(u8, visible[offset..], "```") orelse break;
+        const fence_start = offset + start_rel;
+        const header_start = fence_start + 3;
+        const header_end_rel = std.mem.indexOfScalar(u8, visible[header_start..], '\n') orelse break;
+        const header_end = header_start + header_end_rel;
+        const content_start = header_end + 1;
+        const close_rel = std.mem.indexOf(u8, visible[content_start..], "\n```") orelse break;
+        const content_end = content_start + close_rel;
+        const content = visible[content_start..content_end];
+        const language = std.mem.trim(u8, visible[header_start..header_end], " \t\r\n");
+        if (content.len > 0) {
+            const hash = try artifactHashHex(allocator, content);
+            defer allocator.free(hash);
+            const id = try db.recordArtifact(session, path_hint, language, content, hash);
+            const body = try std.fmt.allocPrint(allocator, "id={} path_hint={s} language={s} bytes={} hash={s} content_lossless=true model_visible=false", .{ id, path_hint, language, content.len, hash });
+            defer allocator.free(body);
+            try db.recordEvent(session, "artifact", body);
+            stored += 1;
+        }
+        offset = content_end + "\n```".len;
+    }
+}
+
+fn answerDirectPersonalMemoryRecall(
+    allocator: std.mem.Allocator,
+    db: *audit.AuditDb,
+    session: []const u8,
+    prompt: []const u8,
+    sink: *StreamSink,
+) !bool {
+    if (!isDirectPersonalMemoryRecallRequest(prompt)) return false;
+    var rows = try db.searchPersonalMemory(allocator, prompt, null, 6);
+    if (rows.items.len == 0) {
+        audit.freePersonalMemory(allocator, &rows);
+        rows = try db.loadRecentPersonalMemory(allocator, 6);
+    }
+    defer audit.freePersonalMemory(allocator, &rows);
+    if (rows.items.len == 0) return false;
+
+    const value = std.mem.trim(u8, rows.items[0].value, " \t\r\n");
+    if (value.len == 0) return false;
+    if (std.mem.indexOf(u8, sink.visible.items, value) != null or std.mem.indexOf(u8, sink.raw_visible.items, value) != null) return false;
+
+    sink.discardDeferredVisible();
+    try db.recordEvent(session, "answer_repair", "personal_memory_direct_recall");
+    try sink.emitVisibleText(value);
+    return true;
+}
+
+fn isDirectPersonalMemoryRecallRequest(prompt: []const u8) bool {
+    if (text_match.containsFoldedIgnoreCase(prompt, "PERSONAL_MEMORY")) return true;
+    if (text_match.containsFoldedIgnoreCase(prompt, "memoria pessoal") or
+        text_match.containsFoldedIgnoreCase(prompt, "memória pessoal") or
+        text_match.containsFoldedIgnoreCase(prompt, "personal memory"))
+        return true;
+
+    const asks_value = text_match.containsFoldedIgnoreCase(prompt, "codigo") or
+        text_match.containsFoldedIgnoreCase(prompt, "código") or
+        text_match.containsFoldedIgnoreCase(prompt, "token") or
+        text_match.containsFoldedIgnoreCase(prompt, "identificador") or
+        text_match.containsFoldedIgnoreCase(prompt, "valor");
+    if (!asks_value) return false;
+
+    return text_match.containsFoldedIgnoreCase(prompt, "pessoal") or
+        text_match.containsFoldedIgnoreCase(prompt, "sobre mim") or
+        text_match.containsFoldedIgnoreCase(prompt, "meu ") or
+        text_match.containsFoldedIgnoreCase(prompt, "minha ") or
+        text_match.containsFoldedIgnoreCase(prompt, "salvo") or
+        text_match.containsFoldedIgnoreCase(prompt, "lembrar") or
+        text_match.containsFoldedIgnoreCase(prompt, "lembra");
+}
+
+fn artifactHashHex(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{x}", .{std.hash.Wyhash.hash(0, content)});
+}
+
+fn isArtifactSaveRequest(prompt: []const u8) bool {
+    if (text_match.containsFoldedIgnoreCase(prompt, "como salvar") or text_match.containsFoldedIgnoreCase(prompt, "how to save")) return false;
+    return (text_match.containsFoldedIgnoreCase(prompt, "salva") or
+        text_match.containsFoldedIgnoreCase(prompt, "salve") or
+        text_match.containsFoldedIgnoreCase(prompt, "salvar") or
+        text_match.containsFoldedIgnoreCase(prompt, "save")) and
+        (text_match.containsFoldedIgnoreCase(prompt, "codigo") or
+            text_match.containsFoldedIgnoreCase(prompt, "code") or
+            text_match.containsFoldedIgnoreCase(prompt, "arquivo") or
+            text_match.containsFoldedIgnoreCase(prompt, "file") or
+            text_match.containsFoldedIgnoreCase(prompt, "html"));
+}
+
+fn suggestedArtifactPathFromText(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    const markers = [_][]const u8{ "Save as", "save as", "Salvar como", "salvar como", "Salve como", "salve como", "Salva como", "salva como" };
+    for (markers) |marker| {
+        const idx = std.mem.indexOf(u8, text, marker) orelse continue;
+        if (try pathTokenAfter(allocator, text[idx + marker.len ..])) |path| return path;
+    }
+    return null;
+}
+
+fn pathTokenAfter(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    var start: usize = 0;
+    while (start < text.len and (std.ascii.isWhitespace(text[start]) or text[start] == ':' or text[start] == '`' or text[start] == '"' or text[start] == '\'')) : (start += 1) {}
+    var end = start;
+    while (end < text.len and isArtifactPathByte(text[end])) : (end += 1) {}
+    if (end == start) return null;
+    const raw = std.mem.trim(u8, text[start..end], ".;,`\"'");
+    if (!isSafeArtifactPath(raw)) return null;
+    return try allocator.dupe(u8, raw);
+}
+
+fn isArtifactPathByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '/' or byte == '_' or byte == '-' or byte == '.';
+}
+
+fn isSafeArtifactPath(path: []const u8) bool {
+    if (path.len == 0 or path.len > 240) return false;
+    if (std.fs.path.isAbsolute(path)) return false;
+    if (std.mem.indexOf(u8, path, "..") != null) return false;
+    if (std.mem.indexOfScalar(u8, path, '.') == null) return false;
+    var it = std.mem.tokenizeScalar(u8, path, '/');
+    while (it.next()) |part| {
+        if (part.len == 0) return false;
+        if (std.mem.startsWith(u8, part, ".")) return false;
+    }
+    return true;
+}
+
+fn defaultArtifactPath(language: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(language, "html")) return "artifact.html";
+    if (std.ascii.eqlIgnoreCase(language, "css")) return "artifact.css";
+    if (std.ascii.eqlIgnoreCase(language, "js") or std.ascii.eqlIgnoreCase(language, "javascript")) return "artifact.js";
+    if (std.ascii.eqlIgnoreCase(language, "zig")) return "artifact.zig";
+    return "artifact.txt";
 }
 
 fn expectationSatisfied(visible: []const u8, expected: []const u8) bool {
@@ -1047,6 +1309,7 @@ fn lastNonEmptyLine(text: []const u8) ?[]const u8 {
 
 fn recordAndEmitTurnDone(
     allocator: std.mem.Allocator,
+    io: std.Io,
     db: *audit.AuditDb,
     session: []const u8,
     events: *ui_events.EventBus,
@@ -1056,6 +1319,12 @@ fn recordAndEmitTurnDone(
     visible: []const u8,
 ) !void {
     const elapsed_ms = ui_events.elapsedMillisSince(turn_started_ms);
+    recordArtifactsFromVisible(allocator, db, session, visible) catch |err| {
+        db.recordEvent(session, "artifact_error", @errorName(err)) catch {};
+    };
+    recordDistilledProjectMemoryForTurn(allocator, io, db, session, status, prompt, visible) catch |err| {
+        db.recordEvent(session, "persistent_context_distillation_error", @errorName(err)) catch {};
+    };
     const quality = try buildTurnQuality(allocator, db, session, status, visible);
     defer quality.deinit(allocator);
     const body = try std.fmt.allocPrint(allocator, "status={s} elapsed_ms={} quality={s} flags={s}", .{ status, elapsed_ms, quality.quality, quality.flags });
@@ -1064,6 +1333,53 @@ fn recordAndEmitTurnDone(
     try db.recordEvent(session, "turn_done", body);
     try recordSessionFocusForTurn(allocator, db, session, prompt, visible, quality.quality, quality.flags);
     try events.emit(.{ .turn_done = .{ .elapsed_ms = elapsed_ms } });
+}
+
+fn recordDistilledProjectMemoryForTurn(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    db: *audit.AuditDb,
+    session: []const u8,
+    status: []const u8,
+    prompt: []const u8,
+    visible: []const u8,
+) !void {
+    if (!std.mem.eql(u8, status, "ok")) return;
+    if (std.mem.startsWith(u8, std.mem.trim(u8, prompt, " \t\r\n"), "/")) return;
+    if (std.mem.trim(u8, visible, " \t\r\n").len == 0) return;
+    if (visibleContainsInternalEvidenceProtocol(visible)) return;
+    if (std.mem.indexOf(u8, visible, "[MODEL_PROTOCOL_ERROR]") != null) return;
+
+    var turn_events = try db.loadLatestTurnEvents(allocator, session, 256);
+    defer audit.freeAuditEvents(allocator, &turn_events);
+    if (!turnWarrantsProjectMemoryDistillation(turn_events.items)) return;
+
+    const task = try compactOperationalText(allocator, prompt, 360);
+    defer allocator.free(task);
+    const outcome = try compactOperationalText(allocator, visible, 360);
+    defer allocator.free(outcome);
+    const result = try persistent_context.recordDistilledTurnFromCwd(allocator, io, .{
+        .task = task,
+        .outcome = outcome,
+    });
+    defer allocator.free(result);
+    try db.recordEvent(session, "persistent_context_distillation", result);
+}
+
+fn turnWarrantsProjectMemoryDistillation(events: []const audit.AuditEvent) bool {
+    for (events) |event| {
+        if (std.mem.eql(u8, event.kind, "artifact_saved")) return true;
+        if (std.mem.eql(u8, event.kind, "patch_result")) return true;
+        if (std.mem.eql(u8, event.kind, "persistent_promotion")) return true;
+        if (std.mem.eql(u8, event.kind, "persistent_context")) return true;
+        if (std.mem.eql(u8, event.kind, "tool_start")) {
+            if (std.mem.startsWith(u8, event.body, "search_personal_memory")) continue;
+            if (std.mem.startsWith(u8, event.body, "promote_personal_memory")) continue;
+            if (std.mem.startsWith(u8, event.body, "forget_personal_memory")) continue;
+            return true;
+        }
+    }
+    return false;
 }
 
 const TurnQuality = struct {
@@ -1147,6 +1463,100 @@ fn recordSessionFocusForTurn(
         facts,
         quality,
         flags,
+    );
+}
+
+fn recordPersonalMemoryCandidate(
+    allocator: std.mem.Allocator,
+    db: *audit.AuditDb,
+    session: []const u8,
+    candidate: *const personal_memory.Candidate,
+) !void {
+    const kind_name = @tagName(candidate.kind);
+    const entities = try personal_memory.extractEntities(allocator, candidate.key, candidate.value);
+    defer allocator.free(entities);
+    const hash = try personal_memory.hashHex(allocator, kind_name, candidate.key, candidate.value);
+    defer allocator.free(hash);
+    const inserted = try db.recordPersonalMemory(
+        kind_name,
+        candidate.key,
+        candidate.value,
+        entities,
+        candidate.confidence,
+        session,
+        null,
+        hash,
+    );
+    const body = try std.fmt.allocPrint(allocator, "kind={s} key={s} status={s} hash={s}", .{
+        kind_name,
+        candidate.key,
+        if (inserted) "promoted" else "duplicate",
+        hash,
+    });
+    defer allocator.free(body);
+    try db.recordEvent(session, "personal_memory", body);
+}
+
+fn extractPersonalMemoryWithModel(
+    allocator: std.mem.Allocator,
+    db: *audit.AuditDb,
+    session: []const u8,
+    prompt: []const u8,
+    client: *http.LocalModelClient,
+) !void {
+    const extractor_prompt = try renderPersonalMemoryExtractorPrompt(allocator, prompt);
+    defer allocator.free(extractor_prompt);
+    var sink = InternalCaptureSink{
+        .allocator = allocator,
+        .filter = reasoning_filter.ReasoningFilter.init(allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .thinking = std.ArrayList(u8).empty,
+    };
+    defer sink.deinit();
+    const previous_thinking = client.thinking;
+    client.thinking = .off;
+    defer client.thinking = previous_thinking;
+    try client.streamInference(.{
+        .user_prompt = extractor_prompt,
+        .system_prompt = personal_memory_extractor_system_prompt,
+        .max_tokens = 192,
+    }, &sink);
+    try sink.flush();
+    var candidate = (try personal_memory.parseModelCandidate(allocator, sink.visible.items)) orelse {
+        try db.recordEvent(session, "personal_memory_extraction", "status=none");
+        return;
+    };
+    defer candidate.deinit(allocator);
+    try recordPersonalMemoryCandidate(allocator, db, session, &candidate);
+}
+
+const personal_memory_extractor_system_prompt =
+    \\You are a private local memory extractor for one personal owner.
+    \\Return exactly one JSON object and no prose.
+    \\Schema when no durable owner memory is present:
+    \\{"remember":false}
+    \\Schema when durable owner memory is explicitly present:
+    \\{"remember":true,"kind":"preference|profile|project|decision|constraint|correction|goal","key":"short_snake_case_key","value":"concise fact","confidence":"confirmed|inferred|uncertain"}
+    \\Rules:
+    \\- Work across natural languages. Do not rely on language-specific trigger words.
+    \\- Store only durable facts about the owner: preferences, profile, recurring projects, corrections, constraints, goals, and decisions.
+    \\- The user message must explicitly support the memory. Do not infer private facts from a one-off task.
+    \\- Return at most one memory: the most explicit durable owner fact.
+    \\- Use kind "profile" for owner identifiers, names, roles, accounts, and personal profile facts. Use kind "constraint" only for limits, prohibitions, or non-negotiable behavior rules.
+    \\- Do not split identifiers, codes, tokens, names, or paths into smaller inferred facts.
+    \\- Do not store workspace/source-code facts, tool output, logs, patches, hidden reasoning, or assistant guesses.
+    \\- Use a short English snake_case key. Preserve the user meaning in value.
+;
+
+fn renderPersonalMemoryExtractorPrompt(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
+    const user_text = try compactOperationalText(allocator, prompt, 1200);
+    defer allocator.free(user_text);
+    return std.fmt.allocPrint(
+        allocator,
+        \\[USER_MESSAGE]
+        \\{s}
+    ,
+        .{user_text},
     );
 }
 
@@ -1254,14 +1664,12 @@ fn buildInitialModelContext(
     enable_tool_loop: bool,
     include_session_context: bool,
 ) !?[]u8 {
-    const include_persistent = modelContextEnabled();
+    const include_persistent = modelContextEnabled() or enable_tool_loop;
     if (!include_persistent and !enable_tool_loop) return null;
 
     var persistent = persistent_context.Loaded.init(allocator);
     defer persistent.deinit();
     if (include_persistent) persistent = try persistent_context.loadFromCwd(allocator, io);
-
-    if (!enable_tool_loop and persistent.memory.items.len == 0 and persistent.skills.items.len == 0) return null;
 
     var session_events = if (include_session_context)
         try db.loadRecentSessionEvents(allocator, session, 240)
@@ -1285,7 +1693,23 @@ fn buildInitialModelContext(
     const session_blocks = try session_context.toSessionBlocks(allocator, null);
     defer allocator.free(session_blocks);
 
-    if (enable_tool_loop and initialTurnContextStateIsEmpty(persistent.memory.items, persistent.skills.items, focus_blocks, dialogue_blocks, session_blocks)) {
+    var personal_rows = if (enable_tool_loop or include_persistent)
+        try db.searchPersonalMemory(allocator, prompt, null, 6)
+    else
+        std.ArrayList(personal_memory.Entry).empty;
+    if ((enable_tool_loop or include_persistent) and personal_rows.items.len == 0) {
+        audit.freePersonalMemory(allocator, &personal_rows);
+        personal_rows = try db.loadRecentPersonalMemory(allocator, 6);
+    }
+    defer audit.freePersonalMemory(allocator, &personal_rows);
+    const personal_text = try personal_memory.renderEntries(allocator, personal_rows.items, 2048);
+    defer if (personal_text) |text| allocator.free(text);
+    const personal_blocks = try toPersonalMemoryBlocks(allocator, personal_text);
+    defer allocator.free(personal_blocks);
+
+    if (!enable_tool_loop and persistent.memory.items.len == 0 and persistent.skills.items.len == 0 and personal_blocks.len == 0) return null;
+
+    if (enable_tool_loop and initialTurnContextStateIsEmpty(persistent.memory.items, persistent.skills.items, personal_blocks, focus_blocks, dialogue_blocks, session_blocks)) {
         return try model_context.renderModelTurnContext(allocator, .{
             .task = prompt,
             .mode = "micro_turn",
@@ -1304,12 +1728,20 @@ fn buildInitialModelContext(
         .focus = focus_blocks,
         .dialogue = dialogue_blocks,
         .session = session_blocks,
+        .personal_memory = personal_blocks,
         .memory = persistent.memory.items,
         .skills = persistent.skills.items,
         .grounding = groundingRules(),
         .next_action_v1 = if (enable_tool_loop) .{
             .kind = .collect_context,
-            .text = "Think first. If confidence is low and available read-only context, session, persistent memory, workspace evidence, or external search can verify the answer, emit the smallest useful exploratory tool call before asking the user. Ask only when exploration cannot safely reduce ambiguity.",
+            .text = if (personal_blocks.len > 0)
+                "Think first. If PERSONAL_MEMORY directly answers an owner fact/preference/request, answer from U# without search_session or workspace/source-code tools; otherwise use the smallest verifying read-only tool."
+            else if (persistent.skills.items.len > 0)
+                "Think first. Apply relevant [SKILLS] as active operating rules. Use MEMORY/SKILLS for local project/task context before generic answers; otherwise use the smallest verifying read-only tool."
+            else if (persistent.memory.items.len > 0)
+                "Think first. Use [MEMORY] as distilled local project/task context. Verify workspace/source-code claims with read-only tools when exact evidence is required."
+            else
+                "Think first. Use the smallest verifying read-only tool before low-confidence answers; ask only when exploration cannot reduce ambiguity.",
         } else .{
             .kind = .answer_directly,
             .text = "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
@@ -1320,11 +1752,19 @@ fn buildInitialModelContext(
 fn initialTurnContextStateIsEmpty(
     memory: []const []const u8,
     skills: []const []const u8,
+    personal: []const model_context.PersonalMemoryBlock,
     focus: []const model_context.FocusBlock,
     dialogue: []const model_context.DialogueBlock,
     session: []const model_context.SessionBlock,
 ) bool {
-    return memory.len == 0 and skills.len == 0 and focus.len == 0 and dialogue.len == 0 and session.len == 0;
+    return memory.len == 0 and skills.len == 0 and personal.len == 0 and focus.len == 0 and dialogue.len == 0 and session.len == 0;
+}
+
+fn toPersonalMemoryBlocks(allocator: std.mem.Allocator, rendered: ?[]const u8) ![]model_context.PersonalMemoryBlock {
+    const text = rendered orelse return allocator.alloc(model_context.PersonalMemoryBlock, 0);
+    const blocks = try allocator.alloc(model_context.PersonalMemoryBlock, 1);
+    blocks[0] = .{ .text = text };
+    return blocks;
 }
 
 fn loadMergedSessionFocus(
@@ -1353,7 +1793,7 @@ const max_duplicate_tool_repairs = 1;
 const max_required_tool_protocol_repairs = 2;
 const max_pathless_collect_budget: usize = 6 * 1024;
 const max_web_evidence_budget: usize = 8192;
-const web_cache_ttl_seconds: i64 = 6 * 60 * 60;
+const web_cache_ttl_seconds: i64 = 15 * 60;
 const max_model_context_send_bytes: usize = 24 * 1024;
 const weak_evidence_quality_score: i32 = 64;
 const required_tool_missing_answer = "[MODEL_FINALIZATION_BLOCKED] operational work was not completed; no final answer accepted.";
@@ -1372,7 +1812,9 @@ fn emitEmptyVisibleAnswer(sink: *StreamSink) !void {
 fn rawVisibleContainsToolCall(visible: []const u8) bool {
     return std.mem.indexOf(u8, visible, "<tool_call>") != null or
         std.mem.indexOf(u8, visible, "<function=") != null or
-        std.mem.indexOf(u8, visible, "\"tool_call\"") != null;
+        std.mem.indexOf(u8, visible, "\"tool_call\"") != null or
+        tool_call.containsJsonToolCallSignature(visible) or
+        tool_call.containsCompactToolCallSignature(visible);
 }
 
 fn visibleContainsInternalEvidenceProtocol(visible: []const u8) bool {
@@ -1381,7 +1823,8 @@ fn visibleContainsInternalEvidenceProtocol(visible: []const u8) bool {
 
 fn rawModelContainsToolEnvelope(raw: []const u8) bool {
     return std.mem.indexOf(u8, raw, "<tool_call>") != null or
-        std.mem.indexOf(u8, raw, "\"tool_call\"") != null;
+        std.mem.indexOf(u8, raw, "\"tool_call\"") != null or
+        tool_call.containsJsonToolCallSignature(raw);
 }
 
 fn renderEmptyVisibleAnswerMessage(allocator: std.mem.Allocator, sink: *const StreamSink) ![]u8 {
@@ -1974,7 +2417,7 @@ fn evidenceTextCoversQuery(text: []const u8, query: []const u8) bool {
         total_terms += 1;
         const is_anchor = queryTermLooksEntity(term);
         if (is_anchor) anchor_terms += 1;
-        if (!containsAsciiIgnoreCase(text, term)) continue;
+        if (!text_match.containsFoldedIgnoreCase(text, term)) continue;
         matched_terms += 1;
         if (is_anchor) {
             matched_anchors += 1;
@@ -2028,8 +2471,55 @@ fn webEvidenceExcerptOnlyRepeatsTitle(excerpt: []const u8, title: []const u8) bo
     if (normalized_excerpt.len == 0 or normalized_title.len == 0) return false;
     if (std.mem.eql(u8, normalized_excerpt, normalized_title)) return true;
     if (std.mem.startsWith(u8, normalized_title, normalized_excerpt)) return true;
+    if (webEvidenceLabeledExcerptOnlyRepeatsTitle(excerpt, title)) return true;
     if (!std.mem.startsWith(u8, normalized_excerpt, normalized_title)) return false;
     return titleEntityTokenMissingFromTail(title, normalized_excerpt[normalized_title.len..]);
+}
+
+fn webEvidenceLabeledExcerptOnlyRepeatsTitle(excerpt: []const u8, title: []const u8) bool {
+    if (!webDossierExcerptLooksMetadataOnly(excerpt)) return false;
+    var title_hits: usize = 0;
+    var it = std.mem.tokenizeAny(u8, excerpt, " \t\r\n");
+    while (it.next()) |raw| {
+        const token = metadataComparableToken(raw);
+        if (token.len < 4) continue;
+        if (metadataOnlyToken(token)) continue;
+        if (text_match.containsFoldedIgnoreCase(title, token)) {
+            title_hits += 1;
+            continue;
+        }
+        return false;
+    }
+    return title_hits > 0;
+}
+
+fn metadataComparableToken(raw: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, raw, '/') != null) return "";
+    var token = std.mem.trim(u8, raw, " \t\r\n\"'`()[]{}<>;,.");
+    if (std.mem.indexOfScalar(u8, token, '=')) |idx| token = token[idx + 1 ..];
+    if (std.mem.lastIndexOfScalar(u8, token, ':')) |idx| token = token[idx + 1 ..];
+    return std.mem.trim(u8, token, " \t\r\n\"'`()[]{}<>;,.");
+}
+
+fn metadataOnlyToken(token: []const u8) bool {
+    const values = [_][]const u8{
+        "page_title",
+        "meta",
+        "structured_data",
+        "table_row",
+        "breadcrumb",
+        "listitem",
+        "inicio",
+        "home",
+        "http",
+        "https",
+        "www",
+    };
+    for (values) |value| {
+        if (std.ascii.eqlIgnoreCase(token, value)) return true;
+        if (text_match.containsFoldedIgnoreCase(value, token) and text_match.containsFoldedIgnoreCase(token, value)) return true;
+    }
+    return false;
 }
 
 fn normalizeEvidenceTextAscii(buf: []u8, text: []const u8) []const u8 {
@@ -2135,11 +2625,51 @@ fn shouldRepairPersistentContextClaim(output: []const u8, context: ?[]const u8, 
     return outputClaimsPersistentContextWithoutRetrieval(output, context);
 }
 
+fn finalAnswerContradictsLoadedPersistentContext(output: []const u8, context: ?[]const u8) bool {
+    if (!contextHasSection(context, "[MEMORY]") and !contextHasSection(context, "[SKILLS]")) return false;
+    return outputDeniesPersistentContext(output);
+}
+
 fn outputContradictsRetrievedSkills(output: []const u8, state: ?*const ToolLoopState) bool {
     const loop_state = state orelse return false;
     if (loop_state.active_contract.name != .memory) return false;
     if (loop_state.retrieved_skills.items.len == 0) return false;
-    return outputIsShortUnansweredQuestion(output);
+    return outputIsShortUnansweredQuestion(output) or outputDeniesPersistentContext(output);
+}
+
+fn outputDeniesPersistentContext(output: []const u8) bool {
+    const trimmed = std.mem.trim(u8, output, " \t\r\n");
+    if (trimmed.len == 0 or trimmed.len > 900) return false;
+    const mentions_persistent =
+        containsAsciiIgnoreCase(trimmed, "regra") or
+        containsAsciiIgnoreCase(trimmed, "rule") or
+        containsAsciiIgnoreCase(trimmed, "skill") or
+        containsAsciiIgnoreCase(trimmed, "memory") or
+        containsAsciiIgnoreCase(trimmed, "memoria") or
+        containsAsciiIgnoreCase(trimmed, "memória") or
+        containsAsciiIgnoreCase(trimmed, "contexto persistente") or
+        containsAsciiIgnoreCase(trimmed, "persistent context") or
+        containsAsciiIgnoreCase(trimmed, "persistid") or
+        containsAsciiIgnoreCase(trimmed, "stored") or
+        containsAsciiIgnoreCase(trimmed, "local");
+    if (!mentions_persistent) return false;
+    return containsAsciiIgnoreCase(trimmed, "nao tenho") or
+        containsAsciiIgnoreCase(trimmed, "não tenho") or
+        containsAsciiIgnoreCase(trimmed, "nao ha") or
+        containsAsciiIgnoreCase(trimmed, "não há") or
+        containsAsciiIgnoreCase(trimmed, "nao encontrei") or
+        containsAsciiIgnoreCase(trimmed, "não encontrei") or
+        containsAsciiIgnoreCase(trimmed, "nenhuma") or
+        containsAsciiIgnoreCase(trimmed, "nenhum") or
+        containsAsciiIgnoreCase(trimmed, "sem regra") or
+        containsAsciiIgnoreCase(trimmed, "sem memoria") or
+        containsAsciiIgnoreCase(trimmed, "sem memória") or
+        containsAsciiIgnoreCase(trimmed, "no stored") or
+        containsAsciiIgnoreCase(trimmed, "no local") or
+        containsAsciiIgnoreCase(trimmed, "do not have") or
+        containsAsciiIgnoreCase(trimmed, "don't have") or
+        containsAsciiIgnoreCase(trimmed, "did not find") or
+        containsAsciiIgnoreCase(trimmed, "could not find");
 }
 
 fn firstMissingRetrievedSkillMarker(context: ?[]const u8, output: []const u8) ?[]const u8 {
@@ -2432,7 +2962,7 @@ fn applyPatchOnlyRepairSchema() []const u8 {
     const schema =
         \\[TOOLS v1]
         \\apply_patch(operation=edit|create|delete|rename, path, destinationPath?, content?, contextId?, repeated search/replace?)
-        \\Only apply_patch is active for this repair. Evidence and MICRO_CONTEXT are already present; do not call collect_evidence again.
+        \\Only apply_patch is active for this repair. For create, provide path and full content. For edit/delete/rename, evidence and MICRO_CONTEXT are already present; do not call collect_evidence again.
         \\<tool_call><function=apply_patch><parameter=operation>edit</parameter><parameter=path>relative/path</parameter><parameter=contextId>ctx_...</parameter><parameter=search>exact old text</parameter><parameter=replace>exact new text</parameter></function></tool_call>
     ;
     return schema;
@@ -2568,6 +3098,9 @@ fn runOneToolLoopStep(
     if (std.mem.eql(u8, call.name, "search_persistent_context")) {
         return try runSearchPersistentContextStep(allocator, io, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
     }
+    if (std.mem.eql(u8, call.name, "search_personal_memory")) {
+        return try runSearchPersonalMemoryStep(allocator, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
+    }
     if (std.mem.eql(u8, call.name, "apply_patch")) {
         return try runApplyPatchStep(allocator, io, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
     }
@@ -2582,6 +3115,12 @@ fn runOneToolLoopStep(
     }
     if (std.mem.eql(u8, call.name, "promote_context")) {
         return try runPromoteContextStep(allocator, io, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
+    }
+    if (std.mem.eql(u8, call.name, "promote_personal_memory")) {
+        return try runPromotePersonalMemoryStep(allocator, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
+    }
+    if (std.mem.eql(u8, call.name, "forget_personal_memory")) {
+        return try runForgetPersonalMemoryStep(allocator, config, prompt, call, client, events, db, ui_ptr, aggregate_sink, state, tool_iterations);
     }
     if (!std.mem.eql(u8, call.name, "collect_evidence")) {
         try db.recordEvent(config.session, "tool_rejected", call.name);
@@ -2651,6 +3190,41 @@ fn runOneToolLoopStep(
     const effective_source = if (call.strategy_id != null) descriptor.source else call_source;
     const strategy = if (call.strategy_id != null) descriptor.strategy else legacy_strategy;
     if (path == null and (strategy == .path or strategy == .diagnostic)) {
+        if (state.active_contract.name == .mutate_file and state.requirements.requires_mutation) {
+            if (repairs.* >= max_tool_repairs) {
+                try db.recordEvent(config.session, "tool_loop_stop", "mutation collect_evidence missing path after repair");
+                return .stopped;
+            }
+            repairs.* += 1;
+            try db.recordEvent(config.session, "tool_repair", "mutation collect_evidence missing path");
+            try events.emit(.{ .progress_update = "repairing mutation path: create uses apply_patch directly" });
+            const repair_context = try model_context.renderModelTurnContext(allocator, .{
+                .task = prompt,
+                .contracts = activeToolSchema(state),
+                .obligations = &.{
+                    "The previous collect_evidence call lacked a relative workspace path.",
+                    "Creating a new file from dialogue content does not need workspace evidence.",
+                    "Editing, deleting, or renaming an existing workspace file still needs collect_evidence with a relative path and fresh contextId.",
+                },
+                .grounding = groundingRules(),
+                .next_action = mutationToolNextAction(),
+            });
+            defer allocator.free(repair_context);
+            try db.recordEvent(config.session, "model_context", repair_context);
+            return try streamDeferredRequiredToolLoopTurn(
+                allocator,
+                config,
+                prompt,
+                repair_context,
+                "Output exactly one allowed mutation tool_call. For a new file, use apply_patch operation=create with relative path and full content. For prior dialogue content not visible, call search_session with concrete artifact terms. No prose.",
+                client,
+                events,
+                db,
+                ui_ptr,
+                aggregate_sink,
+                state.active_contract,
+            );
+        }
         if (repairs.* >= max_tool_repairs) {
             try db.recordEvent(config.session, "tool_loop_stop", "collect_evidence missing path after repair; answer with collected evidence");
             const answer_context = try renderCollectedEvidenceContext(
@@ -2823,15 +3397,28 @@ fn runOneToolLoopStep(
         try db.recordEvent(config.session, "tool_error", @errorName(err));
         try db.recordTurnError(config.session, .tool_runtime, "collect_evidence", @errorName(err));
         try events.emit(.{ .tool_result = .{ .name = "collect_evidence", .output = @errorName(err) } });
-        const follow_context = try renderCollectedEvidenceContext(
-            allocator,
-            prompt,
-            &state.context,
-            null,
-            null,
-            context_profile.toolSchema(.code_evidence, .after_collect_evidence),
-            "collect_evidence encountered an error. Answer the current user request directly.",
-        );
+        const follow_context = if (state.active_contract.name == .mutate_file and state.requirements.requires_mutation)
+            try model_context.renderModelTurnContext(allocator, .{
+                .task = prompt,
+                .contracts = activeToolSchema(state),
+                .obligations = &.{
+                    "collect_evidence failed inside a mutation contract.",
+                    "If the task is to create a new file from dialogue content, workspace evidence is not required.",
+                    "Use a relative path only. Absolute paths are rejected.",
+                },
+                .grounding = groundingRules(),
+                .next_action = mutationToolNextAction(),
+            })
+        else
+            try renderCollectedEvidenceContext(
+                allocator,
+                prompt,
+                &state.context,
+                null,
+                null,
+                context_profile.toolSchema(.code_evidence, .after_collect_evidence),
+                "collect_evidence encountered an error. Answer the current user request directly.",
+            );
         defer allocator.free(follow_context);
         try db.recordEvent(config.session, "model_context", follow_context);
         return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
@@ -2916,8 +3503,11 @@ fn phaseForTool(name: []const u8) audit.OperationalPhase {
     if (std.mem.eql(u8, name, "collect_evidence")) return .evidence;
     if (std.mem.eql(u8, name, "search_session")) return .evidence;
     if (std.mem.eql(u8, name, "search_persistent_context")) return .evidence;
+    if (std.mem.eql(u8, name, "search_personal_memory")) return .evidence;
     if (std.mem.eql(u8, name, "apply_patch")) return .mutation;
     if (std.mem.eql(u8, name, "promote_context")) return .mutation;
+    if (std.mem.eql(u8, name, "promote_personal_memory")) return .mutation;
+    if (std.mem.eql(u8, name, "forget_personal_memory")) return .mutation;
     if (std.mem.eql(u8, name, "validate_syntax")) return .validation;
     if (std.mem.eql(u8, name, "inspect_runtime")) return .validation;
     if (std.mem.eql(u8, name, "web_search")) return .evidence;
@@ -3520,7 +4110,7 @@ fn renderOperationalContractNextAction(
         return allocator.dupe(u8, "Proceed inside the active contract. Call collect_evidence with model-chosen strategyId/source/strategy and intent/terms/path.");
     }
     if (selected == .mutate_file) {
-        return allocator.dupe(u8, "Proceed inside the active contract. Collect evidence first when needed, then include contextId in apply_patch.");
+        return allocator.dupe(u8, mutationToolNextAction());
     }
     if (selected == .validate_work) {
         return allocator.dupe(u8, "Proceed inside the active contract. Call validate_syntax for the changed or requested Zig file.");
@@ -3528,9 +4118,9 @@ fn renderOperationalContractNextAction(
     if (selected == .memory) {
         const terms = call.terms orelse call.intent orelse call.reason orelse "";
         if (call.requires_memory_promotion == true) {
-            return allocator.dupe(u8, "Proceed inside the active memory contract. Promote the user-confirmed durable rule/preference/operational constraint with promote_context target=skills and concise interpreted text. Do not search first unless applying an existing rule is needed.");
+            return allocator.dupe(u8, "Proceed inside the active memory contract. Promote owner preferences/profile/corrections with promote_personal_memory. Promote durable project rules/facts with promote_context target=skills|memory. Do not store raw output.");
         }
-        return std.fmt.allocPrint(allocator, "Proceed inside the active memory contract. Search MEMORY/SKILLS with search_persistent_context target=both terms={s} before applying existing persistent context. If the current user turn establishes a new durable rule/preference, promote_context target=skills with concise interpreted text instead of searching.", .{terms});
+        return std.fmt.allocPrint(allocator, "Proceed inside the active memory contract. Search PERSONAL_MEMORY with search_personal_memory terms={s} for owner preferences/profile. Search MEMORY/SKILLS with search_persistent_context target=both terms={s} for project/task context and local rules. Promote only explicit durable content.", .{ terms, terms });
     }
     return allocator.dupe(u8, "Proceed inside the active contract. Call only advertised tools, or answer if no more tool-backed context is needed.");
 }
@@ -3579,7 +4169,7 @@ fn runSetOperationalContractStep(
     const effective_requires_runtime_validation = call.requires_runtime_validation orelse false;
     const request = contracts.OperationalContractRequest{
         .requested_contract = call.contract,
-        .requires_inspection = (call.requires_inspection orelse false) or effective_requires_mutation,
+        .requires_inspection = call.requires_inspection orelse false,
         .requires_mutation = effective_requires_mutation,
         .requires_runtime_validation = effective_requires_runtime_validation,
         .requires_browser_diagnostics = call.requires_browser_diagnostics orelse false,
@@ -4081,7 +4671,7 @@ fn optimizedQueryKeepsDeclaredCoverage(original_query: []const u8, optimized_que
         const term = std.mem.trim(u8, raw, " \t\r\n");
         if (term.len < 3) continue;
         original_terms += 1;
-        if (containsIgnoreCaseAscii(optimized_query, term)) covered_terms += 1;
+        if (text_match.containsFoldedIgnoreCase(optimized_query, term)) covered_terms += 1;
     }
     if (original_terms <= 1) return optimized_query.len >= original_query.len;
     return covered_terms * 2 >= original_terms;
@@ -4092,7 +4682,7 @@ fn optimizedQueryTermsAreGrounded(user_task: []const u8, original_query: []const
     while (it.next()) |raw| {
         const term = std.mem.trim(u8, raw, " \t\r\n");
         if (!significantQueryToken(term)) continue;
-        if (!containsIgnoreCaseAscii(original_query, term) and !containsIgnoreCaseAscii(user_task, term)) return false;
+        if (!text_match.containsFoldedIgnoreCase(original_query, term) and !text_match.containsFoldedIgnoreCase(user_task, term)) return false;
     }
     return true;
 }
@@ -4704,6 +5294,190 @@ fn renderPersistentSearchResult(allocator: std.mem.Allocator, memory: []const []
     return out.toOwnedSlice(allocator);
 }
 
+fn runSearchPersonalMemoryStep(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    call: *const tool_call.ToolCall,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    tool_iterations: *usize,
+) !ToolLoopNext {
+    if (tool_iterations.* >= max_tool_emergency_iterations) return .stopped;
+    tool_iterations.* += 1;
+
+    const terms = call.terms orelse call.intent orelse call.need orelse return try repairPersonalMemoryCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "search_personal_memory requires terms.");
+    const kind_name = if (call.kind) |raw| personalMemoryKindName(raw) orelse return try repairPersonalMemoryCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "search_personal_memory kind is invalid.") else null;
+    const budget_bytes = @min(call.budget_bytes orelse @as(usize, 2048), @as(usize, 8192));
+
+    try db.recordEvent(config.session, "tool_start", "search_personal_memory");
+    try events.emit(.{ .tool_start = .{ .name = "search_personal_memory", .detail = kind_name orelse "all" } });
+    var rows = try db.searchPersonalMemory(allocator, terms, kind_name, 6);
+    defer audit.freePersonalMemory(allocator, &rows);
+    const rendered = try renderPersonalMemoryToolResult(allocator, rows.items, budget_bytes);
+    defer allocator.free(rendered);
+    try db.recordEvent(config.session, "personal_memory_context", rendered);
+    try events.emit(.{ .tool_result = .{ .name = "search_personal_memory", .output = rendered } });
+    state.recordObservation();
+    state.recordPersonalMemorySearch();
+
+    const personal_text = try personal_memory.renderEntries(allocator, rows.items, budget_bytes);
+    defer if (personal_text) |text| allocator.free(text);
+    const personal_blocks = try toPersonalMemoryBlocks(allocator, personal_text);
+    defer allocator.free(personal_blocks);
+    const follow_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = activeToolSchema(state),
+        .personal_memory = personal_blocks,
+        .grounding = groundingRules(),
+        .next_action = "Apply directly relevant PERSONAL_MEMORY to owner preferences/profile only. If U# directly answers an owner fact or remembered personal value request, answer from U# without search_session or workspace/source-code tools. If no U# directly supports the requested owner memory, say personal memory did not contain it. Do not invent stored preferences.",
+    });
+    defer allocator.free(follow_context);
+    try db.recordEvent(config.session, "model_context", follow_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
+}
+
+fn runPromotePersonalMemoryStep(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    call: *const tool_call.ToolCall,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    tool_iterations: *usize,
+) !ToolLoopNext {
+    if (tool_iterations.* >= max_tool_emergency_iterations) return .stopped;
+    tool_iterations.* += 1;
+
+    const raw_kind = call.kind orelse return try repairPersonalMemoryCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "promote_personal_memory requires kind.");
+    const kind_name = personalMemoryKindName(raw_kind) orelse return try repairPersonalMemoryCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "promote_personal_memory kind is invalid.");
+    const raw_key = call.key orelse call.target orelse return try repairPersonalMemoryCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "promote_personal_memory requires key.");
+    const raw_value = call.value orelse call.text orelse return try repairPersonalMemoryCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "promote_personal_memory requires value.");
+    const confidence = call.confidence orelse "confirmed";
+    if (!personal_memory.confidenceIsValid(confidence)) {
+        return try repairPersonalMemoryCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "promote_personal_memory confidence must be confirmed, inferred, or uncertain.");
+    }
+
+    const key = try personal_memory.normalizeAlloc(allocator, raw_key, personal_memory.max_key_bytes);
+    defer allocator.free(key);
+    const value = try personal_memory.normalizeAlloc(allocator, raw_value, personal_memory.max_value_bytes);
+    defer allocator.free(value);
+    try personal_memory.validateText(key);
+    try personal_memory.validateText(value);
+    const entities = try personal_memory.extractEntities(allocator, key, value);
+    defer allocator.free(entities);
+    const hash = try personal_memory.hashHex(allocator, kind_name, key, value);
+    defer allocator.free(hash);
+
+    try db.recordEvent(config.session, "tool_start", "promote_personal_memory");
+    try events.emit(.{ .tool_start = .{ .name = "promote_personal_memory", .detail = kind_name } });
+    const inserted = try db.recordPersonalMemory(kind_name, key, value, entities, confidence, config.session, null, hash);
+    const body = try std.fmt.allocPrint(allocator, "kind={s} key={s} status={s} hash={s}", .{ kind_name, key, if (inserted) "promoted" else "duplicate", hash });
+    defer allocator.free(body);
+    try db.recordEvent(config.session, "personal_memory", body);
+    try events.emit(.{ .tool_result = .{ .name = "promote_personal_memory", .output = body } });
+    state.recordMemoryPromotion();
+
+    const follow_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .grounding = groundingRules(),
+        .next_action = "Answer that the explicit personal memory update was recorded. Do not claim raw tool output was stored.",
+    });
+    defer allocator.free(follow_context);
+    try db.recordEvent(config.session, "model_context", follow_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
+}
+
+fn runForgetPersonalMemoryStep(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    call: *const tool_call.ToolCall,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    tool_iterations: *usize,
+) !ToolLoopNext {
+    if (tool_iterations.* >= max_tool_emergency_iterations) return .stopped;
+    tool_iterations.* += 1;
+
+    try db.recordEvent(config.session, "tool_start", "forget_personal_memory");
+    try events.emit(.{ .tool_start = .{ .name = "forget_personal_memory", .detail = "personal" } });
+    const changed = if (call.id) |id|
+        try db.forgetPersonalMemoryById(id)
+    else if (call.terms orelse call.intent orelse call.need) |terms|
+        try db.forgetPersonalMemoryByTerms(allocator, terms, 6)
+    else
+        return try repairPersonalMemoryCall(allocator, config, prompt, client, events, db, ui_ptr, aggregate_sink, state, "forget_personal_memory requires id or terms.");
+    const body = try std.fmt.allocPrint(allocator, "status=forgotten count={}", .{changed});
+    defer allocator.free(body);
+    try db.recordEvent(config.session, "personal_memory_forget", body);
+    try events.emit(.{ .tool_result = .{ .name = "forget_personal_memory", .output = body } });
+
+    const follow_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .grounding = groundingRules(),
+        .next_action = "Answer with the personal memory forget result. Do not mention deleted raw data.",
+    });
+    defer allocator.free(follow_context);
+    try db.recordEvent(config.session, "model_context", follow_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
+}
+
+fn renderPersonalMemoryToolResult(allocator: std.mem.Allocator, rows: []const personal_memory.Entry, budget_bytes: usize) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "[PERSONAL_MEMORY]\n");
+    if (try personal_memory.renderEntries(allocator, rows, budget_bytes)) |rendered| {
+        defer allocator.free(rendered);
+        try out.appendSlice(allocator, rendered);
+    } else {
+        try out.appendSlice(allocator, "status=no_matches\n");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn repairPersonalMemoryCall(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    prompt: []const u8,
+    client: *http.LocalModelClient,
+    events: *ui_events.EventBus,
+    db: *audit.AuditDb,
+    ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter),
+    aggregate_sink: *StreamSink,
+    state: *ToolLoopState,
+    reason: []const u8,
+) !ToolLoopNext {
+    try db.recordEvent(config.session, "tool_repair", reason);
+    const repair_context = try model_context.renderModelTurnContext(allocator, .{
+        .task = prompt,
+        .contracts = activeToolSchema(state),
+        .obligations = &.{reason},
+        .grounding = groundingRules(),
+        .next_action = "Emit a corrected personal-memory tool call with concrete arguments, or answer without changing personal memory.",
+    });
+    defer allocator.free(repair_context);
+    try db.recordEvent(config.session, "model_context", repair_context);
+    return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
+}
+
+fn personalMemoryKindName(raw: []const u8) ?[]const u8 {
+    const kind = personal_memory.parseKind(raw) orelse return null;
+    return @tagName(kind);
+}
+
 fn appendListWithinBudget(out: *std.ArrayList(u8), allocator: std.mem.Allocator, entries: []const []const u8, budget_bytes: usize) !void {
     for (entries) |entry| {
         if (out.items.len >= budget_bytes) {
@@ -5102,6 +5876,7 @@ fn streamSearchPlanTurn(
         .db = db,
         .session = config.session,
         .ui = ui_ptr,
+        .context_limit_tokens = client.context_window,
         .filter = reasoning_filter.ReasoningFilter.init(allocator, false),
         .visible = std.ArrayList(u8).empty,
         .visible_bytes = 0,
@@ -5191,6 +5966,16 @@ fn repairThinkOnlyFinalAnswer(
     const hidden_draft = try compactOperationalText(allocator, aggregate_sink.raw_model.items, 4096);
     defer allocator.free(hidden_draft);
     const session_blocks = [_]model_context.SessionBlock{.{ .text = hidden_draft }};
+    var personal_rows = try db.searchPersonalMemory(allocator, prompt, null, 6);
+    if (personal_rows.items.len == 0) {
+        audit.freePersonalMemory(allocator, &personal_rows);
+        personal_rows = try db.loadRecentPersonalMemory(allocator, 6);
+    }
+    defer audit.freePersonalMemory(allocator, &personal_rows);
+    const personal_text = try personal_memory.renderEntries(allocator, personal_rows.items, 2048);
+    defer if (personal_text) |text| allocator.free(text);
+    const personal_blocks = try toPersonalMemoryBlocks(allocator, personal_text);
+    defer allocator.free(personal_blocks);
     const repair_context = try model_context.renderModelTurnContext(allocator, .{
         .task = prompt,
         .mode = "finalization_repair",
@@ -5198,10 +5983,12 @@ fn repairThinkOnlyFinalAnswer(
         \\[TOOLS v1]
         \\No tool schema is active for this repair.
         ,
+        .personal_memory = personal_blocks,
         .session = &session_blocks,
         .obligations = &.{
             "Previous generation ended inside hidden thinking and no visible final answer reached the user.",
             "SESSION_CONTEXT here is an internal draft, not evidence to cite.",
+            "If PERSONAL_MEMORY is present, keep using directly relevant U# owner memory.",
             "Do not emit <think>, </think>, tool calls, or protocol tags.",
             "Answer visibly and directly in the user's language.",
         },
@@ -5220,6 +6007,7 @@ fn repairThinkOnlyFinalAnswer(
         .db = db,
         .session = config.session,
         .ui = ui_ptr,
+        .context_limit_tokens = client.context_window,
         .filter = reasoning_filter.ReasoningFilter.init(allocator, false),
         .visible = std.ArrayList(u8).empty,
         .visible_bytes = 0,
@@ -5329,6 +6117,7 @@ fn repairLengthStoppedVisibleAnswer(
         .db = db,
         .session = config.session,
         .ui = ui_ptr,
+        .context_limit_tokens = client.context_window,
         .filter = reasoning_filter.ReasoningFilter.init(allocator, false),
         .visible = std.ArrayList(u8).empty,
         .visible_bytes = 0,
@@ -5590,6 +6379,7 @@ fn streamDeferredToolLoopTurnInternal(
         .db = db,
         .session = config.session,
         .ui = ui_ptr,
+        .context_limit_tokens = client.context_window,
         .filter = reasoning_filter.ReasoningFilter.init(allocator, false),
         .visible = std.ArrayList(u8).empty,
         .visible_bytes = 0,
@@ -5732,35 +6522,7 @@ fn streamDeferredToolLoopTurnInternal(
                 );
             }
             if (final_answer_mode and follow_sink.thinking_bytes > 0) {
-                follow_sink.discardDeferredVisible();
-                if (finalization_state) |state| {
-                    if (state.finalization_repairs >= max_tool_repairs) {
-                        try db.recordEvent(config.session, "answer_repair_blocked", "reasoning leaked after tool phase closed");
-                        try db.recordTurnError(config.session, .model_protocol, "final_answer_reasoning", "reasoning leaked after tool phase closed");
-                        try aggregate_sink.emitVisibleText("[MODEL_PROTOCOL_ERROR] final answer leaked reasoning after tool phase closed.");
-                        return .stopped;
-                    }
-                    state.finalization_repairs += 1;
-                }
-                try db.recordEvent(config.session, "answer_repair", "reasoning leaked after tool phase closed");
-                const repair_context = try renderToolPhaseClosedAnswerRepairContext(allocator, follow_context);
-                defer allocator.free(repair_context);
-                try db.recordEvent(config.session, "model_context", repair_context);
-                return streamDeferredToolLoopTurnInternal(
-                    allocator,
-                    config,
-                    prompt,
-                    repair_context,
-                    null,
-                    client,
-                    events,
-                    db,
-                    ui_ptr,
-                    aggregate_sink,
-                    active_contract,
-                    finalization_state,
-                    required_tool_missing_visible,
-                );
+                try db.recordEvent(config.session, "answer_repair_skipped", "suppressed hidden reasoning after tool phase closed");
             }
             if (shouldRepairPersistentContextClaim(follow_sink.raw_visible.items, follow_context, finalization_state)) {
                 follow_sink.discardDeferredVisible();
@@ -5835,6 +6597,28 @@ fn streamDeferredToolLoopTurnInternal(
                     state.finalization_repairs += 1;
                 }
                 const repair_context = try renderEmptyWebEvidenceAnswerRepairContext(allocator, follow_context);
+                defer allocator.free(repair_context);
+                try db.recordEvent(config.session, "model_context", repair_context);
+                return streamDeferredToolLoopTurnInternal(
+                    allocator,
+                    config,
+                    prompt,
+                    repair_context,
+                    null,
+                    client,
+                    events,
+                    db,
+                    ui_ptr,
+                    aggregate_sink,
+                    active_contract,
+                    finalization_state,
+                    required_tool_missing_visible,
+                );
+            }
+            if (web_answer_mode and webAnswerMissingDossierSupport(follow_sink.raw_visible.items, follow_context) and !answer_repair_mode) {
+                follow_sink.discardDeferredVisible();
+                try db.recordEvent(config.session, "answer_repair", "web answer lacked dossier support");
+                const repair_context = try renderUnsupportedWebAnswerRepairContext(allocator, follow_context);
                 defer allocator.free(repair_context);
                 try db.recordEvent(config.session, "model_context", repair_context);
                 return streamDeferredToolLoopTurnInternal(
@@ -6172,6 +6956,14 @@ fn renderEmptyWebEvidenceAnswerRepairContext(allocator: std.mem.Allocator, follo
     );
 }
 
+fn renderUnsupportedWebAnswerRepairContext(allocator: std.mem.Allocator, follow_context: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}\n[ANSWER_REPAIR]\nPrevious visible answer was blocked because it cited/used web context without reusing any substantial WEB_DOSSIER excerpt term.\nAnswer visibly in the user's language from USER_TASK using only source_url and excerpt lines in WEB_DOSSIER. If the excerpt does not directly support the requested claim, state that limitation. Do not emit tool calls, <think>, </think>, or protocol tags.\n",
+        .{follow_context},
+    );
+}
+
 fn webAnswerMissingCollectedSource(output: []const u8, context: []const u8) bool {
     var lines = std.mem.splitScalar(u8, context, '\n');
     var has_source = false;
@@ -6184,6 +6976,83 @@ fn webAnswerMissingCollectedSource(output: []const u8, context: []const u8) bool
         if (std.mem.indexOf(u8, output, source) != null) return false;
     }
     return has_source;
+}
+
+fn webAnswerMissingDossierSupport(output: []const u8, context: []const u8) bool {
+    if (std.mem.indexOf(u8, context, "[WEB_DOSSIER v1]") == null) return false;
+    if (std.mem.trim(u8, output, " \t\r\n").len == 0) return false;
+    return !webAnswerUsesDossierExcerpt(output, context);
+}
+
+fn webAnswerUsesDossierExcerpt(output: []const u8, context: []const u8) bool {
+    var matches: usize = 0;
+    var output_without_urls_buf: [8192]u8 = undefined;
+    const supported_output = webAnswerTextWithoutUrls(&output_without_urls_buf, output);
+    var lines = std.mem.splitScalar(u8, context, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (!std.mem.startsWith(u8, trimmed, "excerpt=")) continue;
+        const excerpt = std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n");
+        if (excerpt.len == 0) continue;
+        if (webDossierExcerptLooksMetadataOnly(excerpt)) continue;
+        var terms = std.mem.tokenizeAny(u8, excerpt, " \t\r\n\"'`()[]{}<>:;,./\\|+-=*");
+        while (terms.next()) |raw| {
+            const term = std.mem.trim(u8, raw, " \t\r\n\"'`()[]{}<>:;,./\\|+-=*");
+            if (!webDossierTermIsUseful(term)) continue;
+            if (!text_match.containsFoldedIgnoreCase(supported_output, term)) continue;
+            if (webDossierTermIsStrong(term)) return true;
+            matches += 1;
+            if (matches >= 2) return true;
+        }
+    }
+    return false;
+}
+
+fn webDossierExcerptLooksMetadataOnly(excerpt: []const u8) bool {
+    return std.mem.indexOf(u8, excerpt, "page_title=") != null or
+        std.mem.indexOf(u8, excerpt, "meta=page_title:") != null or
+        std.mem.indexOf(u8, excerpt, "structured_data=page_title:") != null or
+        std.mem.indexOf(u8, excerpt, "table_row=page_title:") != null;
+}
+
+fn webAnswerTextWithoutUrls(buf: []u8, text: []const u8) []const u8 {
+    var out_len: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < text.len and out_len < buf.len) {
+        if (std.mem.startsWith(u8, text[cursor..], "http://") or std.mem.startsWith(u8, text[cursor..], "https://")) {
+            while (cursor < text.len and !std.ascii.isWhitespace(text[cursor])) : (cursor += 1) {}
+            continue;
+        }
+        buf[out_len] = text[cursor];
+        out_len += 1;
+        cursor += 1;
+    }
+    return buf[0..out_len];
+}
+
+fn webDossierTermIsUseful(term: []const u8) bool {
+    if (std.mem.startsWith(u8, term, "http")) return false;
+    if (webDossierTermIsStrong(term)) return true;
+    if (term.len < 4) return false;
+    var useful = false;
+    for (term) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte >= 0x80 or byte == '_') {
+            useful = true;
+            break;
+        }
+    }
+    return useful;
+}
+
+fn webDossierTermIsStrong(term: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, term, '_') != null) return true;
+    var has_digit = false;
+    var has_alpha = false;
+    for (term) |byte| {
+        has_digit = has_digit or std.ascii.isDigit(byte);
+        has_alpha = has_alpha or std.ascii.isAlphabetic(byte);
+    }
+    return has_digit and has_alpha;
 }
 
 fn appendCollectedWebSources(allocator: std.mem.Allocator, output: []const u8, context: []const u8) ![]u8 {
@@ -6289,7 +7158,7 @@ fn hasTraversalComponent(path: []const u8) bool {
 }
 
 fn hasKnownTextExtension(path: []const u8) bool {
-    const exts = [_][]const u8{ ".zig", ".ts", ".js", ".md", ".json", ".toml", ".txt", ".lua", ".py", ".rs", ".c", ".h", ".cpp", ".hpp" };
+    const exts = [_][]const u8{ ".zig", ".ts", ".js", ".html", ".css", ".md", ".json", ".toml", ".txt", ".lua", ".py", ".rs", ".c", ".h", ".cpp", ".hpp" };
     for (exts) |ext| {
         if (std.mem.endsWith(u8, path, ext)) return true;
     }
@@ -6317,6 +7186,7 @@ const ToolLoopState = struct {
     browser_diagnostics: usize = 0,
     memory_promotions: usize = 0,
     persistent_context_searches: usize = 0,
+    personal_memory_searches: usize = 0,
     duplicate_repairs: usize = 0,
     contract_selected: bool = false,
     duplicate_contract_repairs: usize = 0,
@@ -6439,6 +7309,11 @@ const ToolLoopState = struct {
         self.finalization_repairs = 0;
     }
 
+    fn recordPersonalMemorySearch(self: *ToolLoopState) void {
+        self.personal_memory_searches += 1;
+        self.finalization_repairs = 0;
+    }
+
     fn rememberRetrievedSkills(self: *ToolLoopState, skills: []const []const u8) !void {
         for (skills) |skill| {
             const trimmed = std.mem.trim(u8, skill, " \t\r\n");
@@ -6460,12 +7335,12 @@ const ToolLoopState = struct {
     fn finalizationBlocker(self: *const ToolLoopState) ?[]const u8 {
         if (!self.contract_selected) return null;
         if (self.active_contract.name == .answer_only) return null;
-        if (self.requirements.requires_inspection and self.observations == 0) return "inspection evidence is required before finalization";
+        if (self.requirements.requires_inspection and self.observations == 0 and !(self.requirements.requires_mutation and self.mutations > 0)) return "inspection evidence is required before finalization";
         if (self.requirements.requires_mutation and self.mutations == 0) return "a successful mutation is required before finalization";
         if (self.requirements.requires_runtime_validation and self.runtime_validations == 0) return "runtime validation is required before finalization";
         if (self.requirements.requires_browser_diagnostics and self.browser_diagnostics == 0) return "browser/runtime diagnostics are required before finalization";
         if (self.requirements.requires_memory_promotion and self.memory_promotions == 0) return "memory or skills promotion is required before finalization";
-        if (self.active_contract.name == .memory and self.persistent_context_searches == 0 and self.memory_promotions == 0) return "persistent context search is required before finalization";
+        if (self.active_contract.name == .memory and self.persistent_context_searches == 0 and self.personal_memory_searches == 0 and self.memory_promotions == 0) return "memory context search is required before finalization";
         return null;
     }
 
@@ -6666,7 +7541,11 @@ fn stateNeedsValidationTool(state: *const ToolLoopState) bool {
 }
 
 fn mutationPatchNextAction() []const u8 {
-    return "Collected evidence contains the stale-checked MICRO_CONTEXT. Emit exactly one apply_patch tool_call now with operation=edit, path, fresh contextId, exact search text, and replacement text. Do not call collect_evidence again unless the exact old text or contextId is missing. No final prose before apply_patch.";
+    return "Emit exactly one apply_patch tool_call now. For create, use operation=create with relative path and full content; no contextId. For edit/delete/rename, use the stale-checked MICRO_CONTEXT: path, fresh contextId, exact search text, and replacement text. Do not call collect_evidence again unless old text or contextId is missing. No final prose before apply_patch.";
+}
+
+fn mutationToolNextAction() []const u8 {
+    return "Proceed inside the active mutation contract. For a new file from current dialogue content, call apply_patch operation=create with relative path and full content; do not collect_evidence. If the content was generated in prior dialogue but is not visible here, call search_session with concrete artifact terms. Use collect_evidence first only for editing, deleting, or renaming an existing workspace file.";
 }
 
 fn renderCollectedEvidenceContextInternal(
@@ -6872,7 +7751,7 @@ fn webDistillationExcerptGrounded(generated: []const u8, fallback: []const u8) b
         const token = std.mem.trim(u8, raw, ".,-_");
         if (!isGroundedEvidenceToken(token)) continue;
         checked += 1;
-        if (containsAsciiIgnoreCase(source_excerpt, token)) continue;
+        if (text_match.containsFoldedIgnoreCase(source_excerpt, token)) continue;
         if (containsLooseEvidenceLiteral(source_excerpt, token)) continue;
         return false;
     }
@@ -7035,27 +7914,30 @@ fn activeToolSchema(state: *const ToolLoopState) []const u8 {
 
 fn groundingRules() []const []const u8 {
     return &.{
-        "Workspace/source-code claims must cite E# from [EVIDENCE].",
+        "Workspace/source-code claims cite E#; owner memory U# is not workspace/source-code evidence.",
         "Quote only text present in E#/S#; explain outside quote/code blocks.",
         "[CONTRACTS], [GROUNDING], and tool schemas are instructions, not evidence.",
-        "Code identity claims need identifier/declaration/callsite in E#; refine with collect_evidence while budget remains.",
-        "[RECENT_DIALOGUE] gives continuity; [SESSION_FOCUS] routes only. Exact prior-session claims need S# from [SESSION_CONTEXT].",
+        "[PERSONAL_MEMORY] U# is sufficient evidence for owner preferences/profile/constraints; use remembered_personal_value or owner_<kind>.<key> for owner facts.",
+        "[MEMORY] is distilled project/task context and visible outcomes; use it to stay centered, but verify exact workspace/source-code claims with E#.",
+        "[SKILLS] are active local operating rules when relevant; do not contradict retrieved or loaded SKILLS.",
+        "Source-code identity claims need identifier/declaration/callsite in E#.",
+        "[RECENT_DIALOGUE] gives continuity; [SESSION_FOCUS] routes only. Exact prior-session claims need S#.",
         "S# entries are candidates; judge relevance and direct support before using them.",
-        "Near/partial matches are not evidence for exact entity/fact claims; refine retrieval or state not evidenced.",
-        "If E#/S# shows a tool already ran, do not claim the tool was unavailable; report the observed status/error/evidence instead.",
-        "Named/obscure entities, handles, public-record/existence claims, or current facts absent from current dialogue, MEMORY/SKILLS, SESSION_CONTEXT, E#, or stable knowledge need search_web/rag_web before saying unknown, fictional, no-records, or similar.",
+        "Near/partial matches are not evidenced exact entity/fact claims; refine retrieval or state not evidenced.",
+        "If E#/S# shows a tool ran, report observed status/error/evidence instead of unavailable.",
+        "Named/obscure entities/current/existence facts absent from dialogue, MEMORY/SKILLS, SESSION_CONTEXT, E#, or stable knowledge need search_web/rag_web before unknown/no-records.",
         "For vague workspace/code tasks, infer intent, split targets, and use collect_evidence terms as retrieval keys.",
         "If workspace/code context is required and collect_evidence is available, call it before saying context is unavailable.",
         "If web_search fails operationally, report status/error; do not invent a replacement URL.",
         "search_session intent says what to recover; terms are retrieval keys.",
         "If prior conversation context is required and search_session is available, call it before saying history is unavailable.",
         "If no E#/S# supports a workspace or exact prior-session claim, say it is not evidenced.",
-        "Answer in the user's language unless USER_TASK explicitly requests another language; translate or summarize evidence instead of switching to the source language.",
-        "When answering a local rule/preference/protocol from retrieved MEMORY/SKILLS, answer only the directly retrieved entry and do not add adjacent advice or generic best practices.",
-        "Low confidence is operational: when a read-only tool can verify or triangulate the answer, use it before generic clarification.",
-        "For external factual claims, uncertainty requires search_web/rag_web before answering; never convert plausibility, weak recall, or missing evidence into fact.",
-        "If external retrieval is unavailable, fails, or has no direct support, state that limitation and do not invent the missing fact.",
-        "Estimates must be explicitly requested or clearly labeled as estimates; never present them as verified facts.",
+        "Answer in user's language unless USER_TASK asks otherwise; translate or summarize evidence.",
+        "When answering a local rule/preference/protocol from retrieved MEMORY/SKILLS, use only directly retrieved entry; no generic best practices.",
+        "Low confidence: verify with available read-only tools before generic clarification.",
+        "External factual uncertainty needs search_web/rag_web; no plausibility as fact.",
+        "External retrieval unavailable/failed/no support: state limitation; do not invent.",
+        "Estimates need explicit request or estimate label; never as verified facts.",
     };
 }
 
@@ -7401,6 +8283,7 @@ const StreamSink = struct {
     db: *audit.AuditDb,
     session: []const u8,
     ui: ?*tui.TerminalUi(fd_writer.FdWriter),
+    context_limit_tokens: ?usize = null,
     filter: reasoning_filter.ReasoningFilter,
     visible: std.ArrayList(u8),
     raw_model: std.ArrayList(u8) = std.ArrayList(u8).empty,
@@ -7453,6 +8336,10 @@ const StreamSink = struct {
         } });
         if (ctx.ui) |ui| try ui.showTokenUsage(usage.input, usage.output, usage.total, usage.tokens_per_second);
         if (!usage.final) return;
+        if (ctx.context_limit_tokens) |limit| {
+            try ctx.events.emit(.{ .context_update = .{ .used_tokens = usage.input, .limit_tokens = limit } });
+            if (ctx.ui) |ui| try ui.showContextUsage(usage.input, limit);
+        }
         ctx.final_output_tokens = usage.output;
         const body = if (usage.tokens_per_second) |tps|
             try std.fmt.allocPrint(ctx.allocator, "input={} output={} total={} tokens_per_second={d:.2} exact=true final=true", .{ usage.input, usage.output, usage.total, tps })
@@ -7623,11 +8510,22 @@ fn finalStreamProtocolDetected(visible: []const u8) bool {
 fn finalStreamNeedsMoreProtocolBytes(visible: []const u8) bool {
     const prefix = std.mem.trim(u8, visible, " \t\r\n");
     if (prefix.len == 0) return true;
+    if (prefix[0] == '{' and prefix.len < 512 and std.mem.indexOfScalar(u8, prefix, '}') == null) return true;
     const markers = [_][]const u8{
         "<tool_call>",
         "<function=",
         "{\"tool_call\"",
+        "{\"tool_calls\"",
+        "{\"function_call\"",
+        "{\"name\"",
+        "{\"function\"",
         "[WEB_EVIDENCE",
+        "set_operational_contract(",
+        "web_search(",
+        "search_web(",
+        "rag_web(",
+        "search_session(",
+        "collect_evidence(",
     };
     for (markers) |marker| {
         const compared = @min(prefix.len, marker.len);
@@ -8144,8 +9042,8 @@ test "initial model context does not run prompt based session fts" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "renderer append-only deve manter terminal copiavel") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "turn_start: renderer append-only pergunta atual") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "fora da sessao") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[MEMORY]\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[SKILLS]\n") == null);
     try std.testing.expect(rendered.len < 7200);
 }
 
@@ -8300,8 +9198,8 @@ test "initial model context includes long session summary without failed or curr
     try std.testing.expect(std.mem.indexOf(u8, rendered, "topic: pedido atual ambiguo") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "user: pedido atual ambiguo") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "S1:") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[MEMORY]\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[SKILLS]\n") == null);
 }
 
 test "initial model context combines stored focus with legacy turn topics" {
@@ -8857,6 +9755,70 @@ test "final stream protocol guard blocks explicit tool protocol before render" {
     try std.testing.expect(sink.final_stream_blocked);
 }
 
+test "final stream protocol guard blocks compact tool signature before render" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var recorder = EventRecorder{};
+    try bus.on(&recorder, EventRecorder.handleOpaque);
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "final-stream-compact-protocol",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = false,
+        .final_stream_guard = true,
+    };
+    defer sink.deinit();
+
+    try sink.writeVisible("```bash\nset_operational_contract(contract=search_web, query=\"Retroflag R36S\")\n```");
+    try sink.flush();
+
+    try std.testing.expectEqual(@as(usize, 0), recorder.message_chunks);
+    try std.testing.expectEqual(@as(usize, 0), sink.visible_bytes);
+    try std.testing.expect(sink.final_stream_blocked);
+}
+
+test "final stream protocol guard blocks direct json tool call before render" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var recorder = EventRecorder{};
+    try bus.on(&recorder, EventRecorder.handleOpaque);
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "final-stream-direct-json-protocol",
+        .ui = null,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, false),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+        .defer_visible = false,
+        .final_stream_guard = true,
+    };
+    defer sink.deinit();
+
+    try sink.writeVisible("{\"name\":\"search_web\",\"arguments\":{\"query\":\"quem é o presidente do brasil\"}}");
+    try sink.flush();
+
+    try std.testing.expectEqual(@as(usize, 0), recorder.message_chunks);
+    try std.testing.expectEqual(@as(usize, 0), sink.visible_bytes);
+    try std.testing.expect(sink.final_stream_blocked);
+}
+
 test "native reasoning stream strips split think tags" {
     var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
     defer db.close();
@@ -8931,6 +9893,8 @@ test "raw visible tool call is not safe final prose" {
     try std.testing.expect(rawVisibleContainsToolCall("texto\n<tool_call><function=collect_evidence></function></tool_call>"));
     try std.testing.expect(rawVisibleContainsToolCall("texto\n<function=apply_patch>"));
     try std.testing.expect(rawVisibleContainsToolCall("```json\n{\"tool_call\":{\"name\":\"web_search\"}}\n```"));
+    try std.testing.expect(rawVisibleContainsToolCall("```json\n{\"name\":\"search_web\",\"arguments\":{\"query\":\"R36S\"}}\n```"));
+    try std.testing.expect(rawVisibleContainsToolCall("```bash\nset_operational_contract(contract=search_web, query=\"R36S\")\n```"));
     try std.testing.expect(visibleContainsInternalEvidenceProtocol("[WEB_EVIDENCE_EMPTY] web_search returned no direct supporting excerpt"));
     try std.testing.expect(!rawVisibleContainsToolCall("texto final sem chamada"));
     try std.testing.expect(!visibleContainsInternalEvidenceProtocol("A pesquisa web nao trouxe evidencia direta suficiente."));
@@ -9035,6 +9999,36 @@ test "server length stop reports server stop not protocol error" {
     try std.testing.expect(std.mem.indexOf(u8, message, "[MODEL_PROTOCOL_ERROR]") == null);
 }
 
+test "final token usage updates context usage when limit is known" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var bus = ui_events.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var recorder = EventRecorder{};
+    try bus.on(&recorder, EventRecorder.handleOpaque);
+
+    var sink = StreamSink{
+        .allocator = std.testing.allocator,
+        .events = &bus,
+        .db = &db,
+        .session = "ollama-context-usage",
+        .ui = null,
+        .context_limit_tokens = 8192,
+        .filter = reasoning_filter.ReasoningFilter.init(std.testing.allocator, true),
+        .visible = std.ArrayList(u8).empty,
+        .visible_bytes = 0,
+        .thinking_bytes = 0,
+    };
+    defer sink.deinit();
+
+    try sink.onTokenUsage(.{ .input = 2048, .output = 32, .total = 2080, .final = true });
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.context_updates);
+    try std.testing.expectEqual(@as(usize, 2048), recorder.context_used_tokens);
+    try std.testing.expectEqual(@as(usize, 8192), recorder.context_limit_tokens);
+}
+
 test "final token usage at max tokens promotes unknown stop to length" {
     try std.testing.expectEqual(http.StopReason.length, tokenLimitStopReason(.unknown, 512, 512));
     try std.testing.expectEqual(http.StopReason.unknown, tokenLimitStopReason(.unknown, 511, 512));
@@ -9131,6 +10125,28 @@ test "web answer requires one collected source url" {
     try std.testing.expect(webAnswerMissingCollectedSource("Resposta sem referencias.", context));
     try std.testing.expect(!webAnswerMissingCollectedSource("Fonte: https://example.test/specs", context));
     try std.testing.expect(!webAnswerMissingCollectedSource("Resposta sem pesquisa.", "[EVIDENCE]\n- E1 local\n"));
+}
+
+test "web answer must reuse dossier excerpt support" {
+    const context =
+        \\[WEB_DOSSIER v1]
+        \\W1:
+        \\source_url=https://example.test/r36s
+        \\excerpt=Console R36S usa RK3326 e 1GB RAM.
+    ;
+    try std.testing.expect(!webAnswerMissingDossierSupport("Fonte: https://example.test/r36s. O R36S usa RK3326.", context));
+    try std.testing.expect(!webAnswerMissingDossierSupport("Fonte: https://example.test/r36s. Console com 1GB RAM.", context));
+    try std.testing.expect(webAnswerMissingDossierSupport("Fonte: https://example.test/r36s. O PS5 tem Wi-Fi 6.", context));
+    const metadata_only =
+        \\[WEB_DOSSIER v1]
+        \\W1:
+        \\source_url=https://www.jota.info/eleicoes/eleicoes-2026/quem-sao-pre-candidatos-a-presidente-da-republica-do-brasil-eleicoes-de-2026-agosto
+        \\title=Quem são os pré-candidatos a presidente da República do Brasil nas eleições 2026
+        \\excerpt=page_title=Quem são os pré-candidatos a presidente da República do Brasil nas eleições 2026 meta=page_title: Quem são os pré-candidatos a presidente da República do Brasil nas eleições 2026.
+    ;
+    try std.testing.expect(webAnswerMissingDossierSupport("O presidente do Brasil é citado pela fonte.", metadata_only));
+    try std.testing.expect(webAnswerMissingDossierSupport("Fonte: https://example.test/empty. O resultado confirma.", "[WEB_DOSSIER v1]\nW1:\nsource_url=https://example.test/empty\n"));
+    try std.testing.expect(!webAnswerMissingDossierSupport("Resposta local.", "[EVIDENCE]\n- E1 local\n"));
 }
 
 test "web source fallback is stable and deduplicated" {
@@ -9298,7 +10314,7 @@ test "missing evidence citation requires repair before visible answer" {
     defer retrieved_skill_state.deinit();
     retrieved_skill_state.active_contract = contracts.activeContract(.memory) orelse return error.MissingContract;
     try retrieved_skill_state.rememberRetrievedSkills(&.{"Owner can invite members; members cannot alter billing."});
-    try std.testing.expect(!outputContradictsRetrievedSkills(
+    try std.testing.expect(outputContradictsRetrievedSkills(
         "I don't have a specific rule stored for that.",
         &retrieved_skill_state,
     ));
@@ -9309,6 +10325,14 @@ test "missing evidence citation requires repair before visible answer" {
     try std.testing.expect(!outputContradictsRetrievedSkills(
         "A regra recuperada e: Owner can invite members; members cannot alter billing.",
         &retrieved_skill_state,
+    ));
+    try std.testing.expect(finalAnswerContradictsLoadedPersistentContext(
+        "Nao tenho nenhuma regra local persistida sobre isso.",
+        "[TURN_CONTEXT v1]\n\n[SKILLS]\n- Nao commitar sem rodar testes\n",
+    ));
+    try std.testing.expect(!finalAnswerContradictsLoadedPersistentContext(
+        "A regra local e: nao commitar sem rodar testes.",
+        "[TURN_CONTEXT v1]\n\n[SKILLS]\n- Nao commitar sem rodar testes\n",
     ));
     const persistent_repair = try renderPersistentContextClaimRepairContext(
         std.testing.allocator,
@@ -9944,8 +10968,8 @@ test "candidate selection repair reuses temporary candidates only" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "select one candidate") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[EVIDENCE]\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "E1:") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[MEMORY]\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[SKILLS]\n") == null);
 }
 
 fn testingCandidate(allocator: std.mem.Allocator, id: []const u8, path: []const u8, source: []const u8) !collect_evidence.CandidateItem {
@@ -10137,8 +11161,8 @@ test "collected evidence context can require a follow-up collection" {
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "kind=collect_context action=Emit one refined collect_evidence call before answering.") != null);
     try std.testing.expect(!initialContextRequiresTool(rendered));
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[MEMORY]\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[SKILLS]\n") == null);
 }
 
 test "explicit git evidence can finalize without required follow-up repair" {
@@ -10416,6 +11440,11 @@ test "web distillation promotes grounded source excerpts structurally" {
     try std.testing.expect(webEvidenceCanCloseToolPhase(true, summary));
 }
 
+test "web evidence query coverage matches folded unicode terms" {
+    const summary = summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\nquery=MUNCHEN wetter\nsource_url=https://example.test/weather\nexcerpt=München Wetter aktuell stabil.\n");
+    try std.testing.expect(webEvidenceCanCloseToolPhase(true, summary));
+}
+
 test "web deterministic distillation promotes only query-covered source excerpts" {
     const grounded =
         \\[WEB_EVIDENCE]
@@ -10517,6 +11546,11 @@ test "successful web evidence closes tool phase structurally" {
     try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\ntitle=Ficha tecnica completa do Console Portatil R36S 64g Linux Tela IPS 3.5 Polegadas\nsource_url=https://example.test/r36s\nexcerpt=Ficha tecnica completa do Console Portatil R36S 64g Linux Tela IPS 3.5 Polegad\n")));
     try std.testing.expect(!webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\ntitle=Console Portatil R36S 64GB com o Melhor Preco\nsource_url=https://example.test/r36s\nexcerpt=Console Portatil R36S 64GB com o Melhor Preco Categorias Celulares iPhone 17 Samsung Galaxy\n")));
     try std.testing.expect(webEvidenceCanCloseToolPhase(true, summarizeWebEvidence("[WEB_EVIDENCE]\nstatus=200\ntitle=R36S Specs Hardware Details\nsource_url=https://example.test/r36s\nexcerpt=R36S Specs Hardware Details. R36S uses RK3326 and 1GB RAM.\n")));
+    const metadata_only = summarizeWebEvidence(
+        "[WEB_EVIDENCE]\nstatus=200\nquery=quem é o presidente do brasil\ntitle=Quem são os pré-candidatos a presidente da República do Brasil nas eleições 2026\nsource_url=https://www.jota.info/eleicoes/eleicoes-2026/quem-sao-pre-candidatos-a-presidente-da-republica-do-brasil-eleicoes-de-2026-agosto\nexcerpt=page_title=Quem são os pré-candidatos a presidente da República do Brasil nas eleições 2026 meta=page_title: Quem são os pré-candidatos a presidente da República do Brasil nas eleições 2026. info/eleicoes/eleicoes-2026/quem-sao-pre-candidatos-a-presidente-da-republica-do-brasil-eleicoes-de-2026-agosto ListItem Início\n",
+    );
+    try std.testing.expect(metadata_only.has_title_only_excerpt);
+    try std.testing.expect(!webEvidenceCanCloseToolPhase(true, metadata_only));
 
     state.closeToolPhase();
 
@@ -10785,9 +11819,9 @@ test "turn progress blocks finalization until selected contract is satisfied" {
         .requires_browser_diagnostics = false,
         .requires_memory_promotion = false,
     });
-    try std.testing.expectEqualStrings("persistent context search is required before finalization", state.finalizationBlocker().?);
+    try std.testing.expectEqualStrings("memory context search is required before finalization", state.finalizationBlocker().?);
     state.recordObservation();
-    try std.testing.expectEqualStrings("persistent context search is required before finalization", state.finalizationBlocker().?);
+    try std.testing.expectEqualStrings("memory context search is required before finalization", state.finalizationBlocker().?);
     state.recordPersistentContextSearch();
     try std.testing.expect(state.finalizationBlocker() == null);
 }
@@ -10819,13 +11853,14 @@ test "operational contract obligations come from model call fields" {
     defer mutation_call.deinit(std.testing.allocator);
     const mutation_request = contracts.OperationalContractRequest{
         .requested_contract = mutation_call.contract,
-        .requires_inspection = (mutation_call.requires_inspection orelse false) or (mutation_call.requires_mutation orelse false),
+        .requires_inspection = mutation_call.requires_inspection orelse false,
         .requires_mutation = mutation_call.requires_mutation orelse false,
         .requires_runtime_validation = mutation_call.requires_runtime_validation orelse false,
         .requires_browser_diagnostics = mutation_call.requires_browser_diagnostics orelse false,
         .requires_memory_promotion = mutation_call.requires_memory_promotion orelse false,
     };
     try std.testing.expectEqual(contracts.ContractName.mutate_file, contracts.selectOperationalContract(mutation_request));
+    try std.testing.expect(!mutation_request.requires_inspection);
 
     var direct_call = tool_call.ToolCall{
         .name = try std.testing.allocator.dupe(u8, "set_operational_contract"),
@@ -10844,6 +11879,62 @@ test "operational contract obligations come from model call fields" {
         .requires_memory_promotion = direct_call.requires_memory_promotion orelse false,
     };
     try std.testing.expectEqual(contracts.ContractName.answer_only, contracts.selectOperationalContract(direct_request));
+}
+
+test "successful mutation satisfies synthetic-free create finalization" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+
+    state.selectContract(contracts.activeContract(.mutate_file).?, .{
+        .requires_inspection = true,
+        .requires_mutation = true,
+        .requires_runtime_validation = false,
+        .requires_browser_diagnostics = false,
+        .requires_memory_promotion = false,
+    });
+    try std.testing.expectEqualStrings("inspection evidence is required before finalization", state.finalizationBlocker().?);
+    state.recordMutation();
+    try std.testing.expect(state.finalizationBlocker() == null);
+}
+
+test "fenced artifact is stored losslessly with suggested path" {
+    var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(std.testing.allocator);
+    try content.appendSlice(std.testing.allocator, "<!doctype html>\n");
+    for (0..120) |_| try content.appendSlice(std.testing.allocator, "<p>filler keeps this artifact beyond recent dialogue limits</p>\n");
+    try content.appendSlice(std.testing.allocator, "<main>PHENOM_ARTIFACT_TAIL</main>");
+
+    const visible = try std.fmt.allocPrint(std.testing.allocator, "```html\n{s}\n```\nSave as space.html.", .{content.items});
+    defer std.testing.allocator.free(visible);
+
+    try recordArtifactsFromVisible(std.testing.allocator, &db, "artifact-test", visible);
+    var artifact = (try db.loadLatestArtifact(std.testing.allocator, "artifact-test")) orelse return error.MissingArtifact;
+    defer artifact.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("space.html", artifact.path_hint);
+    try std.testing.expectEqualStrings("html", artifact.language);
+    try std.testing.expectEqualStrings(content.items, artifact.content);
+    try std.testing.expect(std.mem.indexOf(u8, artifact.content, "PHENOM_ARTIFACT_TAIL") != null);
+}
+
+test "artifact save request accepts accented Portuguese and html path" {
+    try std.testing.expect(isArtifactSaveRequest("salva o código em index.html"));
+    try std.testing.expect(!isArtifactSaveRequest("como salvar codigo html no navegador?"));
+
+    const path = (try singleStructuredPathFromPrompt(std.testing.allocator, "salva o código em index.html")) orelse return error.MissingPath;
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("index.html", path);
+}
+
+test "personal memory direct recall does not capture artifact save" {
+    try std.testing.expect(isDirectPersonalMemoryRecallRequest("Sem repetir explicacoes: o que esta salvo como meu codigo pessoal?"));
+    try std.testing.expect(isDirectPersonalMemoryRecallRequest("Use PERSONAL_MEMORY se existir. Qual e meu token salvo?"));
+    try std.testing.expect(isDirectPersonalMemoryRecallRequest("Qual codigo curto voce lembra sobre mim?"));
+    try std.testing.expect(!isDirectPersonalMemoryRecallRequest("salva o codigo em um arquivo"));
+    try std.testing.expect(!isDirectPersonalMemoryRecallRequest("corrija o codigo em src/main.zig"));
 }
 
 test "finalization repair context exposes only active contract tools" {
@@ -10904,8 +11995,8 @@ test "memory contract next action promotes durable user rule without forced sear
     const rendered = try renderOperationalContractNextAction(std.testing.allocator, .memory, &contract_call);
     defer std.testing.allocator.free(rendered);
 
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "promote_context target=skills") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Do not search first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "promote_personal_memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "promote_context target=skills|memory") != null);
 }
 
 test "plural selected candidates uses first candidate id" {
@@ -10932,8 +12023,8 @@ test "collected evidence context renders compact anchors without memory skills o
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[EVIDENCE_ANCHOR]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "old full text should disappear") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[MEMORY]\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[SKILLS]\n") == null);
 }
 
 test "collected context can include temporary session evidence without memory" {
@@ -10952,8 +12043,8 @@ test "collected context can include temporary session evidence without memory" {
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SESSION_CONTEXT]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "combinamos groundedness") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[MEMORY]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[MEMORY]\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[SKILLS]\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Exact prior-session claims need S#") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "S# entries are candidates") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "direct support") != null);
@@ -11009,11 +12100,19 @@ fn hasGroundingRule(rules: []const []const u8, a: []const u8, b: []const u8) boo
 
 const EventRecorder = struct {
     message_chunks: usize = 0,
+    context_updates: usize = 0,
+    context_used_tokens: usize = 0,
+    context_limit_tokens: usize = 0,
 
     fn handleOpaque(ctx: *anyopaque, event: ui_events.Event) !void {
         const self: *EventRecorder = @ptrCast(@alignCast(ctx));
         switch (event) {
             .message_chunk => self.message_chunks += 1,
+            .context_update => |update| {
+                self.context_updates += 1;
+                self.context_used_tokens = update.used_tokens;
+                self.context_limit_tokens = update.limit_tokens;
+            },
             else => {},
         }
     }

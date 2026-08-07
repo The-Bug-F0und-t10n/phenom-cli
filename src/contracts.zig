@@ -112,6 +112,9 @@ pub const all_tools = [_]ToolSpec{
     .{ .name = "set_operational_contract", .visibility = .model_visible },
     .{ .name = "promote_context", .visibility = .model_visible },
     .{ .name = "search_persistent_context", .visibility = .model_visible },
+    .{ .name = "search_personal_memory", .visibility = .model_visible },
+    .{ .name = "promote_personal_memory", .visibility = .model_visible },
+    .{ .name = "forget_personal_memory", .visibility = .model_visible },
     .{ .name = "build_task_context", .visibility = .internal_context },
     .{ .name = "get_context", .visibility = .internal_context },
     .{ .name = "get_minimal_context", .visibility = .internal_context },
@@ -187,7 +190,7 @@ pub const contract_specs = [_]ContractSpec{
     .{
         .name = .memory,
         .endpoint = "set_operational_contract",
-        .allowed_tools = &.{ "set_operational_contract", "search_persistent_context", "promote_context" },
+        .allowed_tools = &.{ "set_operational_contract", "search_persistent_context", "promote_context", "search_personal_memory", "promote_personal_memory", "forget_personal_memory" },
     },
 };
 
@@ -426,6 +429,9 @@ test "memory contract opens persistent lookup and promotion only" {
     const active = activeContract(selected) orelse return error.MissingContract;
     try std.testing.expect(active.allows("search_persistent_context"));
     try std.testing.expect(active.allows("promote_context"));
+    try std.testing.expect(active.allows("search_personal_memory"));
+    try std.testing.expect(active.allows("promote_personal_memory"));
+    try std.testing.expect(active.allows("forget_personal_memory"));
     try std.testing.expect(active.allows("set_operational_contract"));
     try std.testing.expect(!active.allows("collect_evidence"));
     try std.testing.expect(!active.allows("search_session"));

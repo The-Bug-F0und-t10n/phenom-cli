@@ -304,11 +304,42 @@ pub fn build(b: *std.Build) void {
     const memory_persistence_step = b.step("memory-persistence-smoke", "Offline e2e SQLite smoke for completed and interrupted conversation memory.");
     memory_persistence_step.dependOn(&memory_persistence_cmd.step);
 
+    const personal_memory_cmd = b.addSystemCommand(&.{
+        "sh",
+        "tools/check_personal_memory_flow.sh",
+    });
+    personal_memory_cmd.step.dependOn(&install_artifact.step);
+    personal_memory_cmd.addFileArg(exe.getEmittedBin());
+
+    const personal_memory_step = b.step("personal-memory-flow-smoke", "Offline e2e SQLite smoke for personal owner memory.");
+    personal_memory_step.dependOn(&personal_memory_cmd.step);
+
+    const personal_memory_ambiguity_100_cmd = b.addSystemCommand(&.{
+        "sh",
+        "tools/check_personal_memory_ambiguity_100.sh",
+    });
+    personal_memory_ambiguity_100_cmd.step.dependOn(&install_artifact.step);
+    personal_memory_ambiguity_100_cmd.addFileArg(exe.getEmittedBin());
+
+    const personal_memory_ambiguity_100_step = b.step("personal-memory-ambiguity-100-smoke", "100-turn SQLite smoke for ambiguous personal owner memory recall.");
+    personal_memory_ambiguity_100_step.dependOn(&personal_memory_ambiguity_100_cmd.step);
+
+    const real_personal_memory_100_cmd = b.addSystemCommand(&.{
+        "sh",
+        "tools/check_real_personal_memory_100.sh",
+    });
+    real_personal_memory_100_cmd.step.dependOn(&install_artifact.step);
+    real_personal_memory_100_cmd.addFileArg(exe.getEmittedBin());
+
+    const real_personal_memory_100_step = b.step("real-personal-memory-100-smoke", "Opt-in 100-turn real model smoke for personal owner memory recall. Requires active HOST:PORT.");
+    real_personal_memory_100_step.dependOn(&real_personal_memory_100_cmd.step);
+
     const user_rule_promotion_cmd = b.addSystemCommand(&.{
         "sh",
         "tools/check_user_rule_promotion_flow.sh",
     });
     user_rule_promotion_cmd.step.dependOn(&install_artifact.step);
+    user_rule_promotion_cmd.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     user_rule_promotion_cmd.addFileArg(exe.getEmittedBin());
 
     const user_rule_promotion_step = b.step("user-rule-promotion-flow-smoke", "Scripted-backend e2e smoke for model-driven SKILLS.md rule promotion and retrieval.");
@@ -323,6 +354,17 @@ pub fn build(b: *std.Build) void {
 
     const agent_patch_flow_step = b.step("agent-patch-flow-smoke", "Offline e2e scripted-backend agent smoke for collect evidence and apply_patch.");
     agent_patch_flow_step.dependOn(&agent_patch_flow_cmd.step);
+
+    const artifact_create_flow_cmd = b.addSystemCommand(&.{
+        "sh",
+        "tools/check_artifact_create_flow.sh",
+    });
+    artifact_create_flow_cmd.step.dependOn(&install_artifact.step);
+    artifact_create_flow_cmd.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+    artifact_create_flow_cmd.addFileArg(exe.getEmittedBin());
+
+    const artifact_create_flow_step = b.step("artifact-create-flow-smoke", "Offline e2e scripted-backend smoke for saving generated dialogue content as a new file.");
+    artifact_create_flow_step.dependOn(&artifact_create_flow_cmd.step);
 
     const required_tool_repair_cmd = b.addSystemCommand(&.{
         "sh",

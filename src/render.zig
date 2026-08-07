@@ -646,21 +646,34 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 return;
             }
             try self.writeCyanDim("│ ");
+            if (!isSyntaxHighlightLang(lang)) {
+                try self.writer.writeAll(line);
+                return;
+            }
             try self.writeHighlightedCode(line, lang);
         }
 
         fn writeMarkdownDiffLine(self: *Self, line: []const u8) !void {
+            const width = self.contentWrapWidth();
             if (parseUnifiedHunk(line)) |hunk| {
                 self.markdown_diff_old_line = hunk.old_start;
                 self.markdown_diff_new_line = hunk.new_start;
+                if (width <= 6) {
+                    try self.writeRgbWrapped(tone_fn, line, 0, "");
+                    return;
+                }
                 try self.writeCyan("    │ ");
-                try self.writeRgb(tone_fn, line);
+                try self.writeRgbWrapped(tone_fn, line, 6, "    │ ");
                 return;
             }
             if (std.mem.startsWith(u8, line, "+++") or std.mem.startsWith(u8, line, "---")) {
                 self.setMarkdownDiffCodeLang(line);
+                if (width <= 6) {
+                    try self.writeRgbWrapped(tone_preproc, line, 0, "");
+                    return;
+                }
                 try self.writeDim("    │ ");
-                try self.writeRgb(tone_preproc, line);
+                try self.writeRgbWrapped(tone_preproc, line, 6, "    │ ");
                 return;
             }
             if (std.mem.startsWith(u8, line, "+")) {
@@ -678,27 +691,39 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             const n = self.markdown_diff_new_line orelse self.markdown_diff_old_line orelse 1;
             if (self.markdown_diff_old_line) |old| self.markdown_diff_old_line = old + 1;
             if (self.markdown_diff_new_line) |new| self.markdown_diff_new_line = new + 1;
+            if (width <= 9) {
+                const text = if (std.mem.startsWith(u8, line, " ")) line[1..] else line;
+                const shown = try self.writeDimColumns(text, width);
+                if (shown < width) try self.writeSpaces(width - shown);
+                return;
+            }
             try self.writeDimLineNumber(n);
             try self.writeDim("   │ ");
-            try self.writeHighlightedDiffText(if (std.mem.startsWith(u8, line, " ")) line[1..] else line, null);
+            try self.writeHighlightedDiffTextWrapped(if (std.mem.startsWith(u8, line, " ")) line[1..] else line, null, 9, "       │ ");
         }
 
         fn writeMarkdownDiffEditLine(self: *Self, line_no: usize, marker: u8, text: []const u8, fg: Rgb, bg: Rgb) !void {
+            const width = self.contentWrapWidth();
+            if (width <= 9) {
+                var compact_buf = [_]u8{ marker, ' ' };
+                const compact = compact_buf[0..@min(compact_buf.len, width)];
+                try self.writeRgbMaybeBg(fg, bg, compact);
+                var used = utf8Columns(compact);
+                if (width > compact_buf.len) {
+                    const clipped = text[0..utf8PrefixBytes(text, width - compact_buf.len)];
+                    try self.writeHighlightedDiffText(clipped, bg);
+                    used += visibleTextWidth(clipped);
+                }
+                if (used < width) try self.writeRgbBgSpaces(bg, width - used);
+                return;
+            }
             try self.writeDiffLineNumber(line_no, fg, bg);
             const marker_text = [1]u8{marker};
             try self.writer.writeAll(" ");
             try self.writeRgbFgBg(fg, bg, &marker_text);
             try self.writer.writeAll(" ");
             try self.writeDim("│ ");
-            try self.writeHighlightedDiffText(text, bg);
-            try self.writeDiffLineFill(text, bg);
-        }
-
-        fn writeDiffLineFill(self: *Self, text: []const u8, bg: Rgb) !void {
-            const used = @as(usize, 9) + visibleTextWidth(text);
-            const width = self.contentWrapWidth();
-            if (used >= width) return;
-            try self.writeRgbBgSpaces(bg, width - used);
+            try self.writeHighlightedDiffTextWrapped(text, bg, 9, "       │ ");
         }
 
         fn setMarkdownDiffCodeLang(self: *Self, line: []const u8) void {
@@ -720,6 +745,32 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 return;
             }
             try self.writeHighlightedCodeBg(text, lang, bg);
+        }
+
+        fn writeHighlightedDiffTextWrapped(self: *Self, text: []const u8, bg: ?Rgb, first_prefix_cols: usize, continuation_prefix: []const u8) !void {
+            const width = self.contentWrapWidth();
+            var prefix_cols = first_prefix_cols;
+            var cursor: usize = 0;
+            while (cursor < text.len or (cursor == 0 and text.len == 0)) {
+                const available = @max(@as(usize, 1), width -| prefix_cols);
+                const take = utf8PrefixBytes(text[cursor..], available);
+                const slice = text[cursor .. cursor + take];
+                try self.writeHighlightedDiffText(slice, bg);
+                const used = prefix_cols + visibleTextWidth(slice);
+                if (used < width) {
+                    if (bg) |color| {
+                        try self.writeRgbBgSpaces(color, width - used);
+                    } else {
+                        try self.writeSpaces(width - used);
+                    }
+                }
+                cursor += take;
+                if (cursor >= text.len) break;
+                try self.writer.writeAll("\n");
+                try self.writeContentGutter();
+                try self.writeDim(continuation_prefix);
+                prefix_cols = utf8Columns(continuation_prefix);
+            }
         }
 
         fn writeDiffLineNumber(self: *Self, line_no: usize, fg: Rgb, bg: Rgb) !void {
@@ -1329,6 +1380,26 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         fn writeYellowBold(self: *Self, text: []const u8) !void {
             try self.writeAnsi("\x1b[33;1m", text);
         }
+
+        fn writeRgbWrapped(self: *Self, rgb: Rgb, text: []const u8, first_prefix_cols: usize, continuation_prefix: []const u8) !void {
+            const width = self.contentWrapWidth();
+            var prefix_cols = first_prefix_cols;
+            var cursor: usize = 0;
+            while (cursor < text.len or (cursor == 0 and text.len == 0)) {
+                const available = @max(@as(usize, 1), width -| prefix_cols);
+                const take = utf8PrefixBytes(text[cursor..], available);
+                const slice = text[cursor .. cursor + take];
+                try self.writeRgb(rgb, slice);
+                const used = prefix_cols + visibleTextWidth(slice);
+                if (used < width) try self.writeSpaces(width - used);
+                cursor += take;
+                if (cursor >= text.len) break;
+                try self.writer.writeAll("\n");
+                try self.writeContentGutter();
+                try self.writeDim(continuation_prefix);
+                prefix_cols = utf8Columns(continuation_prefix);
+            }
+        }
     };
 }
 
@@ -1451,6 +1522,19 @@ fn fenceLangStart(line: []const u8) usize {
 
 fn isDiffLang(lang: []const u8) bool {
     return std.ascii.eqlIgnoreCase(lang, "diff") or std.ascii.eqlIgnoreCase(lang, "patch");
+}
+
+fn isSyntaxHighlightLang(lang: []const u8) bool {
+    const known = [_][]const u8{
+        "zig",  "ts",    "tsx",   "typescript", "js",   "jsx",  "javascript",
+        "py",   "python", "sh",    "bash",       "zsh",  "shell",
+        "html", "xml",   "svg",   "css",        "scss", "sass", "less",
+        "lua",  "json",  "jsonc", "yaml",       "yml",  "sql",
+    };
+    for (known) |item| {
+        if (std.ascii.eqlIgnoreCase(lang, item)) return true;
+    }
+    return false;
 }
 
 const UnifiedHunk = struct {
@@ -2469,6 +2553,48 @@ test "assistant markdown code uses phenom cli ts 24 bit syntax palette" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;122;156;198mrun") != null);
 }
 
+test "assistant markdown plain code fence does not color capitalized prose as types" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = true });
+    try renderer.assistantStart();
+    try renderer.assistantDelta(
+        \\```
+        \\Mensagem Normal Sem Linguagem
+        \\```
+    );
+    try renderer.done();
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Mensagem Normal Sem Linguagem") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;127;178;201mMensagem") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;127;178;201mNormal") == null);
+}
+
+test "assistant markdown text fences do not color capitalized prose as types" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = true });
+    try renderer.assistantStart();
+    try renderer.assistantDelta(
+        \\```text
+        \\Mensagem Normal Sem Linguagem
+        \\```
+        \\```markdown
+        \\Outra Palavra Capitalizada
+        \\```
+    );
+    try renderer.done();
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Mensagem Normal Sem Linguagem") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Outra Palavra Capitalizada") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;127;178;201mMensagem") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;127;178;201mOutra") == null);
+}
+
 test "assistant markdown diff uses readable codex style foreground and background" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
@@ -2528,6 +2654,37 @@ test "assistant markdown diff text uses syntax highlight over subtle full line t
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;164;142;199;48;2;35;20;20mconst") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;127;169;143;48;2;35;20;20m\"old\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "\x1b[38;2;127;169;143;48;2;15;29;22mconst") == null);
+}
+
+test "assistant markdown diff lines fit narrow terminals" {
+    const widths = [_]usize{ 12, 16, 24, 32 };
+    for (widths) |columns| {
+        var buffer = std.ArrayList(u8).empty;
+        defer buffer.deinit(std.testing.allocator);
+
+        const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+        var renderer = AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = columns });
+        try renderer.assistantStart();
+        try renderer.assistantDelta(
+            \\```diff
+            \\diff --git a/tests/user.spec.js b/tests/user.spec.js
+            \\index 7a3c9e1..f8d2b4c 100644
+            \\--- a/tests/user.spec.js
+            \\+++ b/tests/user.spec.js
+            \\@@ -1,6 +1,7 @@
+            \\ import { describe, it, expect } from 'vitest';
+            \\-const user = createUser({ name: 'Joao', email: 'joao@email.com' });
+            \\+const user = createUser({ name: 'Joao', email: 'joao@email.com', active: true });
+            \\```
+        );
+        try renderer.done();
+
+        var start: usize = 0;
+        while (nextLine(buffer.items, &start)) |line| {
+            if (line.len == 0) continue;
+            try std.testing.expect(visibleTextWidth(line) <= columns - 1);
+        }
+    }
 }
 
 test "assistant markdown diff exposes line numbers and edit markers in plain mode" {

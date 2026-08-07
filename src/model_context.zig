@@ -25,6 +25,10 @@ pub const FocusBlock = struct {
     text: []const u8,
 };
 
+pub const PersonalMemoryBlock = struct {
+    text: []const u8,
+};
+
 pub const NextActionKind = enum {
     answer_directly,
     collect_context,
@@ -44,6 +48,7 @@ pub const ContextByteBuckets = struct {
     contracts: usize = 0,
     skills: usize = 0,
     memory: usize = 0,
+    personal_memory: usize = 0,
     candidates: usize = 0,
     evidence: usize = 0,
     focus: usize = 0,
@@ -65,6 +70,7 @@ pub const ModelTurnContext = struct {
     focus: []const FocusBlock = &.{},
     dialogue: []const DialogueBlock = &.{},
     session: []const SessionBlock = &.{},
+    personal_memory: []const PersonalMemoryBlock = &.{},
     memory: []const []const u8 = &.{},
     skills: []const []const u8 = &.{},
     obligations: []const []const u8 = &.{},
@@ -76,6 +82,7 @@ pub const ModelTurnContext = struct {
 const bucket_contracts_bytes: usize = 4096;
 const bucket_skills_bytes: usize = 2048;
 const bucket_memory_bytes: usize = 2048;
+const bucket_personal_memory_bytes: usize = 2048;
 const bucket_candidates_bytes: usize = 4096;
 const bucket_evidence_bytes: usize = 10 * 1024;
 const bucket_focus_bytes: usize = 2048;
@@ -114,6 +121,20 @@ pub fn renderModelTurnContext(allocator: std.mem.Allocator, ctx: ModelTurnContex
     if (ctx.memory.len > 0) {
         try out.appendSlice(allocator, "\n[MEMORY]\n");
         try appendListBudgeted(&out, allocator, ctx.memory, bucket_memory_bytes, "memory");
+    }
+
+    if (ctx.personal_memory.len > 0) {
+        try out.appendSlice(allocator, "\n[PERSONAL_MEMORY]\n");
+        try out.appendSlice(allocator, "U# entries are durable personal owner memory and sufficient evidence for owner preferences/profile/constraints. Use remembered_personal_value or owner_<kind>.<key> for owner facts. Do not treat U# as workspace, session, or web evidence.\n");
+        var remaining = bucket_personal_memory_bytes;
+        var truncated = false;
+        for (ctx.personal_memory, 0..) |entry, i| {
+            const label = try std.fmt.allocPrint(allocator, "U{}:\n", .{i + 1});
+            defer allocator.free(label);
+            try out.appendSlice(allocator, label);
+            truncated = (try appendEvidenceTextBudgeted(&out, allocator, entry.text, &remaining)) or truncated;
+        }
+        if (truncated) try out.appendSlice(allocator, "  [CONTEXT_BUCKET_TRUNCATED bucket=personal_memory]\n");
     }
 
     if (ctx.candidates.len > 0) {
@@ -225,6 +246,7 @@ pub fn measureRenderedContextBytes(rendered: []const u8) ContextByteBuckets {
         "\n[CONTRACTS]\n",
         "\n[SKILLS]\n",
         "\n[MEMORY]\n",
+        "\n[PERSONAL_MEMORY]\n",
         "\n[CANDIDATES_CONTEXT]\n",
         "\n[EVIDENCE]\n",
         "\n[SESSION_FOCUS]\n",
@@ -240,6 +262,7 @@ pub fn measureRenderedContextBytes(rendered: []const u8) ContextByteBuckets {
     buckets.contracts = sectionLen(rendered, "\n[CONTRACTS]\n", markers[0..]);
     buckets.skills = sectionLen(rendered, "\n[SKILLS]\n", markers[0..]);
     buckets.memory = sectionLen(rendered, "\n[MEMORY]\n", markers[0..]);
+    buckets.personal_memory = sectionLen(rendered, "\n[PERSONAL_MEMORY]\n", markers[0..]);
     buckets.candidates = sectionLen(rendered, "\n[CANDIDATES_CONTEXT]\n", markers[0..]);
     buckets.evidence = sectionLen(rendered, "\n[EVIDENCE]\n", markers[0..]);
     buckets.focus = sectionLen(rendered, "\n[SESSION_FOCUS]\n", markers[0..]);
@@ -550,6 +573,19 @@ test "model context includes memory and skills only when explicitly provided" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Projeto usa Zig 0.16.") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[SKILLS]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Nunca use any.") != null);
+}
+
+test "model context marks personal memory as durable owner memory" {
+    const personal = [_]PersonalMemoryBlock{.{ .text = "source=sqlite_personal_memory\n- U1 kind=preference value=PMEM100" }};
+    const rendered = try renderModelTurnContext(std.testing.allocator, .{
+        .task = "continuar",
+        .personal_memory = &personal,
+    });
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[PERSONAL_MEMORY]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "sufficient evidence for owner preferences") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "value=PMEM100") != null);
 }
 
 test "model context rejects raw markers" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const personal_memory = @import("personal_memory.zig");
 const tool_event = @import("tool_event.zig");
 
 const c = @cImport({
@@ -77,6 +78,22 @@ pub const WebCacheEntry = struct {
     }
 };
 
+pub const Artifact = struct {
+    id: i64,
+    path_hint: []u8,
+    language: []u8,
+    content: []u8,
+    hash: []u8,
+    created_at_unix_s: ?i64 = null,
+
+    pub fn deinit(self: *Artifact, allocator: std.mem.Allocator) void {
+        allocator.free(self.path_hint);
+        allocator.free(self.language);
+        allocator.free(self.content);
+        allocator.free(self.hash);
+    }
+};
+
 pub const AuditDb = struct {
     allocator: std.mem.Allocator,
     db: ?*c.sqlite3,
@@ -131,6 +148,24 @@ pub const AuditDb = struct {
             \\create index if not exists session_focus_session_id_idx on session_focus(session, id);
         );
         try audit.exec(
+            \\create table if not exists personal_memory (
+            \\  id integer primary key autoincrement,
+            \\  kind text not null,
+            \\  key text not null,
+            \\  value text not null,
+            \\  entities text not null default '',
+            \\  confidence text not null,
+            \\  source_session text not null,
+            \\  source_event_id integer,
+            \\  hash text not null unique,
+            \\  active integer not null default 1,
+            \\  expires_at text,
+            \\  created_at text not null default current_timestamp
+            \\);
+            \\create index if not exists personal_memory_active_id_idx on personal_memory(active, id);
+            \\create index if not exists personal_memory_kind_active_idx on personal_memory(kind, active, id);
+        );
+        try audit.exec(
             \\create table if not exists web_cache (
             \\  target text not null,
             \\  query text not null,
@@ -141,6 +176,19 @@ pub const AuditDb = struct {
             \\  primary key(target, query, budget_bytes)
             \\);
             \\create index if not exists web_cache_created_idx on web_cache(created_at);
+        );
+        try audit.exec(
+            \\create table if not exists artifacts (
+            \\  id integer primary key autoincrement,
+            \\  session text not null,
+            \\  path_hint text not null default '',
+            \\  language text not null default '',
+            \\  content text not null,
+            \\  hash text not null,
+            \\  created_at text not null default current_timestamp
+            \\);
+            \\create index if not exists artifacts_session_id_idx on artifacts(session, id);
+            \\create index if not exists artifacts_session_hash_idx on artifacts(session, hash);
         );
         try audit.ensureSessionFts();
         return audit;
@@ -191,6 +239,7 @@ pub const AuditDb = struct {
         errdefer self.exec("rollback;") catch {};
         try self.deleteSessionRows("events", session);
         try self.deleteSessionRows("session_focus", session);
+        try self.deleteSessionRows("artifacts", session);
         try self.exec("delete from input_history;");
         try self.exec("commit;");
     }
@@ -273,6 +322,64 @@ pub const AuditDb = struct {
         return null;
     }
 
+    pub fn recordArtifact(self: *AuditDb, session: []const u8, path_hint: []const u8, language: []const u8, content: []const u8, hash: []const u8) !i64 {
+        const sql =
+            \\insert into artifacts(session, path_hint, language, content, hash)
+            \\values (?1, ?2, ?3, ?4, ?5)
+        ;
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        try bindText(stmt, 1, session);
+        try bindText(stmt, 2, path_hint);
+        try bindText(stmt, 3, language);
+        try bindText(stmt, 4, content);
+        try bindText(stmt, 5, hash);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteStepFailed;
+        return c.sqlite3_last_insert_rowid(self.db);
+    }
+
+    pub fn loadLatestArtifact(self: *AuditDb, allocator: std.mem.Allocator, session: []const u8) !?Artifact {
+        const sql =
+            \\select id, path_hint, language, content, hash, cast(strftime('%s', created_at) as integer)
+            \\from artifacts
+            \\where session = ?1
+            \\order by id desc
+            \\limit 1
+        ;
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        try bindText(stmt, 1, session);
+
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return error.SqliteStepFailed;
+
+        const path_hint = try dupeColumnText(allocator, stmt, 1);
+        errdefer allocator.free(path_hint);
+        const language = try dupeColumnText(allocator, stmt, 2);
+        errdefer allocator.free(language);
+        const content = try dupeColumnText(allocator, stmt, 3);
+        errdefer allocator.free(content);
+        const hash = try dupeColumnText(allocator, stmt, 4);
+        errdefer allocator.free(hash);
+        return .{
+            .id = c.sqlite3_column_int64(stmt, 0),
+            .path_hint = path_hint,
+            .language = language,
+            .content = content,
+            .hash = hash,
+            .created_at_unix_s = if (c.sqlite3_column_type(stmt, 5) == c.SQLITE_NULL) null else @as(i64, @intCast(c.sqlite3_column_int64(stmt, 5))),
+        };
+    }
+
     fn ensureSessionFts(self: *AuditDb) !void {
         try self.exec(
             \\create table if not exists audit_meta (
@@ -302,10 +409,37 @@ pub const AuditDb = struct {
             \\  insert into events_fts(rowid, session, kind, body, created_at)
             \\  values (new.id, new.session, new.kind, new.body, new.created_at);
             \\end;
+            \\create virtual table if not exists personal_memory_fts using fts5(
+            \\  kind,
+            \\  key,
+            \\  value,
+            \\  entities,
+            \\  content='personal_memory',
+            \\  content_rowid='id',
+            \\  tokenize='unicode61'
+            \\);
+            \\create trigger if not exists personal_memory_ai after insert on personal_memory begin
+            \\  insert into personal_memory_fts(rowid, kind, key, value, entities)
+            \\  values (new.id, new.kind, new.key, new.value, new.entities);
+            \\end;
+            \\create trigger if not exists personal_memory_ad after delete on personal_memory begin
+            \\  insert into personal_memory_fts(personal_memory_fts, rowid, kind, key, value, entities)
+            \\  values('delete', old.id, old.kind, old.key, old.value, old.entities);
+            \\end;
+            \\create trigger if not exists personal_memory_au after update on personal_memory begin
+            \\  insert into personal_memory_fts(personal_memory_fts, rowid, kind, key, value, entities)
+            \\  values('delete', old.id, old.kind, old.key, old.value, old.entities);
+            \\  insert into personal_memory_fts(rowid, kind, key, value, entities)
+            \\  values (new.id, new.kind, new.key, new.value, new.entities);
+            \\end;
         );
         if (!try self.hasMeta("events_fts_rebuild_v1")) {
             self.exec("insert into events_fts(events_fts) values('rebuild');") catch {};
             try self.setMeta("events_fts_rebuild_v1", "done");
+        }
+        if (!try self.hasMeta("personal_memory_fts_rebuild_v1")) {
+            self.exec("insert into personal_memory_fts(personal_memory_fts) values('rebuild');") catch {};
+            try self.setMeta("personal_memory_fts_rebuild_v1", "done");
         }
     }
 
@@ -407,6 +541,126 @@ pub const AuditDb = struct {
         try bindText(stmt, 6, flags);
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteStepFailed;
+    }
+
+    pub fn recordPersonalMemory(
+        self: *AuditDb,
+        kind: []const u8,
+        key: []const u8,
+        value: []const u8,
+        entities: []const u8,
+        confidence: []const u8,
+        source_session: []const u8,
+        source_event_id: ?i64,
+        hash: []const u8,
+    ) !bool {
+        const sql =
+            \\insert or ignore into personal_memory(kind, key, value, entities, confidence, source_session, source_event_id, hash)
+            \\values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ;
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        try bindText(stmt, 1, kind);
+        try bindText(stmt, 2, key);
+        try bindText(stmt, 3, value);
+        try bindText(stmt, 4, entities);
+        try bindText(stmt, 5, confidence);
+        try bindText(stmt, 6, source_session);
+        if (source_event_id) |id| {
+            if (c.sqlite3_bind_int64(stmt, 7, id) != c.SQLITE_OK) return error.SqliteBindFailed;
+        } else if (c.sqlite3_bind_null(stmt, 7) != c.SQLITE_OK) return error.SqliteBindFailed;
+        try bindText(stmt, 8, hash);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteStepFailed;
+        return c.sqlite3_changes(self.db) > 0;
+    }
+
+    pub fn loadRecentPersonalMemory(self: *AuditDb, allocator: std.mem.Allocator, limit: usize) !std.ArrayList(personal_memory.Entry) {
+        if (limit > std.math.maxInt(c_int)) return error.EventLimitTooLarge;
+        const sql =
+            \\select id, kind, key, value, entities, confidence, cast(strftime('%s', created_at) as integer), 0.0
+            \\from personal_memory
+            \\where active = 1
+            \\  and (expires_at is null or datetime(expires_at) > datetime('now'))
+            \\order by id desc
+            \\limit ?1
+        ;
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_int(stmt, 1, @as(c_int, @intCast(limit))) != c.SQLITE_OK) return error.SqliteBindFailed;
+        return try loadPersonalMemoryRows(allocator, stmt);
+    }
+
+    pub fn searchPersonalMemory(
+        self: *AuditDb,
+        allocator: std.mem.Allocator,
+        terms: []const u8,
+        kind: ?[]const u8,
+        limit: usize,
+    ) !std.ArrayList(personal_memory.Entry) {
+        if (limit > std.math.maxInt(c_int)) return error.EventLimitTooLarge;
+        const query = try buildPersonalMemoryFtsQuery(allocator, terms);
+        defer allocator.free(query);
+        if (query.len == 0) return try self.loadRecentPersonalMemory(allocator, limit);
+
+        const sql =
+            \\select m.id, m.kind, m.key, m.value, m.entities, m.confidence,
+            \\  cast(strftime('%s', m.created_at) as integer),
+            \\  -bm25(personal_memory_fts)
+            \\    + case m.confidence when 'confirmed' then 3.0 when 'inferred' then 1.0 else 0.0 end
+            \\    + case m.kind when 'correction' then 2.0 else 0.0 end as score
+            \\from personal_memory_fts
+            \\join personal_memory m on m.id = personal_memory_fts.rowid
+            \\where personal_memory_fts match ?1
+            \\  and m.active = 1
+            \\  and (?2 is null or m.kind = ?2)
+            \\  and (m.expires_at is null or datetime(m.expires_at) > datetime('now'))
+            \\order by score desc, m.id desc
+            \\limit ?3
+        ;
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        try bindText(stmt, 1, query);
+        if (kind) |value| {
+            try bindText(stmt, 2, value);
+        } else if (c.sqlite3_bind_null(stmt, 2) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_int(stmt, 3, @as(c_int, @intCast(limit))) != c.SQLITE_OK) return error.SqliteBindFailed;
+        return try loadPersonalMemoryRows(allocator, stmt);
+    }
+
+    pub fn forgetPersonalMemoryById(self: *AuditDb, id: i64) !usize {
+        const sql = "update personal_memory set active = 0 where id = ?1 and active = 1";
+        const z_sql = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(z_sql);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, z_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_int64(stmt, 1, id) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteStepFailed;
+        return @intCast(c.sqlite3_changes(self.db));
+    }
+
+    pub fn forgetPersonalMemoryByTerms(self: *AuditDb, allocator: std.mem.Allocator, terms: []const u8, limit: usize) !usize {
+        var rows = try self.searchPersonalMemory(allocator, terms, null, limit);
+        defer freePersonalMemory(allocator, &rows);
+        var changed: usize = 0;
+        for (rows.items) |row| changed += try self.forgetPersonalMemoryById(row.id);
+        return changed;
     }
 
     pub fn loadRecentSessionFocus(self: *AuditDb, allocator: std.mem.Allocator, session: []const u8, limit: usize) !std.ArrayList(SessionFocus) {
@@ -892,6 +1146,11 @@ pub fn freeSessionFocus(allocator: std.mem.Allocator, rows: *std.ArrayList(Sessi
     rows.deinit(allocator);
 }
 
+pub fn freePersonalMemory(allocator: std.mem.Allocator, rows: *std.ArrayList(personal_memory.Entry)) void {
+    for (rows.items) |*row| row.deinit(allocator);
+    rows.deinit(allocator);
+}
+
 pub fn validPhaseTransition(from: ?OperationalPhase, to: OperationalPhase) bool {
     const prev = from orelse return to == .intent or to == .contract or to == .evidence;
     if (prev == to) return true;
@@ -976,6 +1235,61 @@ fn buildFtsQuery(allocator: std.mem.Allocator, terms: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+fn buildPersonalMemoryFtsQuery(allocator: std.mem.Allocator, terms: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var it = std.mem.tokenizeAny(u8, terms, " \t\r\n\"'`()[]{}<>:;,!?/\\|+=*&^%$#@~");
+    var first = true;
+    while (it.next()) |raw| {
+        const token = std.mem.trim(u8, raw, ".-_");
+        if (token.len < 2) continue;
+        if (!first) try out.appendSlice(allocator, " OR ");
+        first = false;
+        try out.append(allocator, '"');
+        for (token) |byte| {
+            if (byte == '"') try out.append(allocator, '"');
+            try out.append(allocator, byte);
+        }
+        try out.appendSlice(allocator, "\"*");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn loadPersonalMemoryRows(allocator: std.mem.Allocator, stmt: ?*c.sqlite3_stmt) !std.ArrayList(personal_memory.Entry) {
+    var rows = std.ArrayList(personal_memory.Entry).empty;
+    errdefer freePersonalMemory(allocator, &rows);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.SqliteStepFailed;
+
+        const id = c.sqlite3_column_int64(stmt, 0);
+        const kind = try dupeColumnText(allocator, stmt, 1);
+        errdefer allocator.free(kind);
+        const key = try dupeColumnText(allocator, stmt, 2);
+        errdefer allocator.free(key);
+        const value = try dupeColumnText(allocator, stmt, 3);
+        errdefer allocator.free(value);
+        const entities = try dupeColumnText(allocator, stmt, 4);
+        errdefer allocator.free(entities);
+        const confidence = try dupeColumnText(allocator, stmt, 5);
+        errdefer allocator.free(confidence);
+        const created_at_unix_s = if (c.sqlite3_column_type(stmt, 6) == c.SQLITE_NULL) null else @as(i64, @intCast(c.sqlite3_column_int64(stmt, 6)));
+        const score = c.sqlite3_column_double(stmt, 7);
+        try rows.append(allocator, .{
+            .id = id,
+            .kind = kind,
+            .key = key,
+            .value = value,
+            .entities = entities,
+            .confidence = confidence,
+            .created_at_unix_s = created_at_unix_s,
+            .score = score,
+        });
+    }
+    return rows;
+}
+
 fn dupeColumnText(allocator: std.mem.Allocator, stmt: ?*c.sqlite3_stmt, column: c_int) ![]u8 {
     const ptr = c.sqlite3_column_text(stmt, column) orelse return error.SqliteColumnFailed;
     const len_raw = c.sqlite3_column_bytes(stmt, column);
@@ -996,6 +1310,31 @@ test "audit db configures file database for concurrent sessions" {
     const journal = try pragmaText(std.testing.allocator, db.db, "pragma journal_mode;");
     defer std.testing.allocator.free(journal);
     try std.testing.expectEqualStrings("wal", journal);
+}
+
+test "audit db stores latest artifact losslessly" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    const content =
+        \\<!doctype html>
+        \\<title>Space</title>
+        \\<main>PHENOM_ARTIFACT_TAIL</main>
+    ;
+    _ = try db.recordArtifact("s1", "old.html", "html", "old", "oldhash");
+    const id = try db.recordArtifact("s1", "space.html", "html", content, "hash-space");
+    try std.testing.expect(id > 0);
+
+    var latest = (try db.loadLatestArtifact(std.testing.allocator, "s1")) orelse return error.MissingArtifact;
+    defer latest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(id, latest.id);
+    try std.testing.expectEqualStrings("space.html", latest.path_hint);
+    try std.testing.expectEqualStrings("html", latest.language);
+    try std.testing.expectEqualStrings(content, latest.content);
+    try std.testing.expectEqualStrings("hash-space", latest.hash);
+
+    try db.resetSession("s1");
+    try std.testing.expect((try db.loadLatestArtifact(std.testing.allocator, "s1")) == null);
 }
 
 fn pragmaText(allocator: std.mem.Allocator, db: ?*c.sqlite3, sql: []const u8) ![]u8 {
@@ -1154,6 +1493,47 @@ test "session focus stores compact operational turn summaries" {
     try std.testing.expectEqualStrings("Mateus 1 / matematica perfeita", rows.items[0].topic);
     try std.testing.expectEqualStrings("confirmed", rows.items[0].quality);
     try std.testing.expect(std.mem.indexOf(u8, rows.items[1].flags, "low_confidence=true") != null);
+}
+
+test "personal memory stores searches and forgets durable owner facts" {
+    var db = try AuditDb.open(std.testing.allocator, ":memory:");
+    defer db.close();
+
+    const hash = try personal_memory.hashHex(std.testing.allocator, "preference", "response_style", "respostas curtas em portugues");
+    defer std.testing.allocator.free(hash);
+    const inserted = try db.recordPersonalMemory(
+        "preference",
+        "response_style",
+        "respostas curtas em portugues",
+        "portugues",
+        "confirmed",
+        "s1",
+        null,
+        hash,
+    );
+    try std.testing.expect(inserted);
+    const duplicate = try db.recordPersonalMemory(
+        "preference",
+        "response_style",
+        "respostas curtas em portugues",
+        "portugues",
+        "confirmed",
+        "s1",
+        null,
+        hash,
+    );
+    try std.testing.expect(!duplicate);
+
+    var hits = try db.searchPersonalMemory(std.testing.allocator, "respostas portugues", null, 6);
+    defer freePersonalMemory(std.testing.allocator, &hits);
+    try std.testing.expectEqual(@as(usize, 1), hits.items.len);
+    try std.testing.expectEqualStrings("preference", hits.items[0].kind);
+    try std.testing.expectEqualStrings("respostas curtas em portugues", hits.items[0].value);
+
+    try std.testing.expectEqual(@as(usize, 1), try db.forgetPersonalMemoryById(hits.items[0].id));
+    var after_forget = try db.searchPersonalMemory(std.testing.allocator, "respostas portugues", null, 6);
+    defer freePersonalMemory(std.testing.allocator, &after_forget);
+    try std.testing.expectEqual(@as(usize, 0), after_forget.items.len);
 }
 
 test "tool event audit summary stores metadata without raw output" {

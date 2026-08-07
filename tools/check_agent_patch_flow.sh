@@ -26,7 +26,7 @@ ZIG
 
 PORT_FILE="$WORK/port"
 LOG_FILE="$WORK/backend.log"
-"${ZIG:-zig}" run "$ROOT/tools/scripted_backend.zig" -lc -- agent_patch "$PORT_FILE" "$LOG_FILE" &
+sh "$ROOT/tools/start_scripted_backend.sh" agent_patch "$PORT_FILE" "$LOG_FILE" &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 

@@ -5,6 +5,10 @@ const max_file_bytes = 32 * 1024;
 const default_max_entries = 24;
 const default_max_entry_bytes = 240;
 const max_promoted_entry_bytes = 240;
+const max_managed_context_entries = 12;
+const max_distilled_field_bytes = 220;
+const managed_memory_begin = "<!-- PHENOM_MEMORY_CONTEXT_BEGIN -->";
+const managed_memory_end = "<!-- PHENOM_MEMORY_CONTEXT_END -->";
 
 pub const PromotionTarget = enum {
     memory,
@@ -14,6 +18,11 @@ pub const PromotionTarget = enum {
 pub const Promotion = struct {
     target: PromotionTarget,
     text: []const u8,
+};
+
+pub const DistilledTurnContext = struct {
+    task: []const u8,
+    outcome: []const u8,
 };
 
 pub const SearchTarget = enum {
@@ -114,6 +123,7 @@ fn parseEntries(
         if (out.items.len >= max_entries) break;
         const normalized = normalizeLine(line);
         if (normalized.len == 0) continue;
+        if (isManagedMemoryMarker(normalized)) continue;
         const entry = try dupTruncated(allocator, normalized, max_entry_bytes);
         errdefer allocator.free(entry);
         try out.append(allocator, entry);
@@ -128,6 +138,10 @@ fn normalizeLine(line: []const u8) []const u8 {
     if (std.mem.startsWith(u8, trimmed, "- ")) trimmed = std.mem.trim(u8, trimmed[2..], " \t\r\n");
     if (std.mem.startsWith(u8, trimmed, "* ")) trimmed = std.mem.trim(u8, trimmed[2..], " \t\r\n");
     return trimmed;
+}
+
+fn isManagedMemoryMarker(line: []const u8) bool {
+    return std.mem.startsWith(u8, line, "<!-- PHENOM_MEMORY_CONTEXT_");
 }
 
 fn dupTruncated(allocator: std.mem.Allocator, text: []const u8, max_bytes: usize) ![]u8 {
@@ -145,8 +159,14 @@ fn containsRawMarker(content: []const u8) bool {
         "---BEGIN CONTENT---",
         "[READ_FILE]",
         "[TOOL_EVENT]",
+        "[EVIDENCE]",
+        "[SESSION_CONTEXT]",
+        "[RECENT_DIALOGUE]",
+        "<tool_call>",
         "rawOutput",
         "raw_output",
+        "assistant_delta",
+        "assistant_thinking_delta",
         "rg --json",
     };
     for (forbidden) |needle| {
@@ -179,6 +199,138 @@ pub fn searchFromDir(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, 
         if (loaded.skills_path) |path| result.skills_path = try allocator.dupe(u8, path);
     }
     return result;
+}
+
+pub fn recordDistilledTurnFromCwd(allocator: std.mem.Allocator, io: std.Io, context: DistilledTurnContext) ![]u8 {
+    return recordDistilledTurnFromDir(allocator, io, std.Io.Dir.cwd(), context);
+}
+
+pub fn recordDistilledTurnFromDir(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, context: DistilledTurnContext) ![]u8 {
+    const task = try normalizeDistilledField(allocator, context.task);
+    defer allocator.free(task);
+    const outcome = try normalizeDistilledField(allocator, context.outcome);
+    defer allocator.free(outcome);
+    if (task.len == 0 and outcome.len == 0) {
+        return allocator.dupe(u8, "target=memory path=MEMORY.md status=skipped reason=empty_distillation");
+    }
+
+    var entry = std.ArrayList(u8).empty;
+    defer entry.deinit(allocator);
+    try entry.appendSlice(allocator, "context:");
+    if (task.len > 0) {
+        try entry.appendSlice(allocator, " task=");
+        try entry.appendSlice(allocator, task);
+    }
+    if (outcome.len > 0) {
+        if (task.len > 0) try entry.appendSlice(allocator, ";");
+        try entry.appendSlice(allocator, " visible_outcome=");
+        try entry.appendSlice(allocator, outcome);
+    }
+    if (containsRawMarker(entry.items)) return error.RawContextPromotionDenied;
+
+    const existing = dir.readFileAlloc(io, "MEMORY.md", allocator, .limited(max_file_bytes)) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, ""),
+        else => return err,
+    };
+    defer allocator.free(existing);
+    if (containsRawMarker(existing)) return error.RawContextPromotionDenied;
+
+    var managed = std.ArrayList([]u8).empty;
+    defer {
+        for (managed.items) |line| allocator.free(line);
+        managed.deinit(allocator);
+    }
+    try appendUniqueManagedEntry(allocator, &managed, entry.items);
+    try appendExistingManagedEntries(allocator, existing, &managed);
+
+    const base = try stripManagedMemorySection(allocator, existing);
+    defer allocator.free(base);
+
+    var next = std.ArrayList(u8).empty;
+    defer next.deinit(allocator);
+    const base_trimmed = std.mem.trim(u8, base, " \t\r\n");
+    if (base_trimmed.len > 0) {
+        try next.appendSlice(allocator, base_trimmed);
+        try next.appendSlice(allocator, "\n\n");
+    }
+    try next.appendSlice(allocator, managed_memory_begin);
+    try next.append(allocator, '\n');
+    for (managed.items) |line| {
+        try next.appendSlice(allocator, "- ");
+        try next.appendSlice(allocator, line);
+        try next.append(allocator, '\n');
+    }
+    try next.appendSlice(allocator, managed_memory_end);
+    try next.append(allocator, '\n');
+
+    try dir.writeFile(io, .{ .sub_path = "MEMORY.md.tmp", .data = next.items });
+    try dir.rename("MEMORY.md.tmp", dir, "MEMORY.md", io);
+
+    return std.fmt.allocPrint(allocator, "target=memory path=MEMORY.md status=distilled_context bytes={} entries={}", .{ entry.items.len, managed.items.len });
+}
+
+fn normalizeDistilledField(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var last_space = false;
+    for (std.mem.trim(u8, text, " \t\r\n")) |byte| {
+        if (out.items.len >= max_distilled_field_bytes) break;
+        const normalized: u8 = switch (byte) {
+            '\n', '\r', '\t' => ' ',
+            else => byte,
+        };
+        if (normalized == ' ') {
+            if (last_space) continue;
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+        try out.append(allocator, normalized);
+    }
+    const normalized = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(normalized);
+    if (containsRawMarker(normalized)) return error.RawContextPromotionDenied;
+    return normalized;
+}
+
+fn appendExistingManagedEntries(allocator: std.mem.Allocator, content: []const u8, out: *std.ArrayList([]u8)) !void {
+    const begin = std.mem.indexOf(u8, content, managed_memory_begin) orelse return;
+    const body_start = begin + managed_memory_begin.len;
+    const end_rel = std.mem.indexOf(u8, content[body_start..], managed_memory_end) orelse return;
+    const body = content[body_start .. body_start + end_rel];
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| {
+        if (out.items.len >= max_managed_context_entries) return;
+        const normalized = normalizeLine(line);
+        if (normalized.len == 0 or isManagedMemoryMarker(normalized)) continue;
+        if (!std.mem.startsWith(u8, normalized, "context:")) continue;
+        try appendUniqueManagedEntry(allocator, out, normalized);
+    }
+}
+
+fn appendUniqueManagedEntry(allocator: std.mem.Allocator, out: *std.ArrayList([]u8), entry: []const u8) !void {
+    const normalized = normalizeLine(entry);
+    if (normalized.len == 0) return;
+    for (out.items) |existing| {
+        if (std.mem.eql(u8, existing, normalized)) return;
+    }
+    if (out.items.len >= max_managed_context_entries) return;
+    const owned = try allocator.dupe(u8, normalized);
+    errdefer allocator.free(owned);
+    try out.append(allocator, owned);
+}
+
+fn stripManagedMemorySection(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    const begin = std.mem.indexOf(u8, content, managed_memory_begin) orelse return allocator.dupe(u8, content);
+    const body_start = begin + managed_memory_begin.len;
+    const end_rel = std.mem.indexOf(u8, content[body_start..], managed_memory_end) orelse return allocator.dupe(u8, content);
+    var after_end = body_start + end_rel + managed_memory_end.len;
+    while (after_end < content.len and (content[after_end] == '\n' or content[after_end] == '\r')) : (after_end += 1) {}
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, content[0..begin]);
+    try out.appendSlice(allocator, content[after_end..]);
+    return out.toOwnedSlice(allocator);
 }
 
 fn appendRankedMatches(
@@ -433,4 +585,39 @@ test "persistent context search returns only relevant memory and skills" {
     try std.testing.expectEqual(@as(usize, 1), result.skills.items.len);
     try std.testing.expectEqualStrings("protocolo local usa MEM_REAL_826", result.memory.items[0]);
     try std.testing.expectEqualStrings("responder protocolo com SKILL_REAL_826", result.skills.items[0]);
+}
+
+test "distilled project context writes bounded managed memory section" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "MEMORY.md", .data = "- arquitetura existente\n" });
+
+    const first = try recordDistilledTurnFromDir(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .task = "implementar memoria segura",
+        .outcome = "criou resumo operacional",
+    });
+    defer std.testing.allocator.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "status=distilled_context") != null);
+
+    const duplicate = try recordDistilledTurnFromDir(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .task = "implementar memoria segura",
+        .outcome = "criou resumo operacional",
+    });
+    defer std.testing.allocator.free(duplicate);
+    try std.testing.expect(std.mem.indexOf(u8, duplicate, "entries=1") != null);
+
+    var loaded = try loadFromDir(std.testing.allocator, std.testing.io, tmp.dir);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded.memory.items.len);
+    try std.testing.expectEqualStrings("arquitetura existente", loaded.memory.items[0]);
+    try std.testing.expect(std.mem.indexOf(u8, loaded.memory.items[1], "context: task=implementar memoria segura") != null);
+}
+
+test "distilled project context rejects raw protocol" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(error.RawContextPromotionDenied, recordDistilledTurnFromDir(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .task = "analisar",
+        .outcome = "[EVIDENCE]\nraw",
+    }));
 }

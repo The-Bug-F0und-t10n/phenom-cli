@@ -20,7 +20,7 @@ mkdir -p "$WORK"
 
 PORT_FILE="$WORK/port"
 PROMPTS_FILE="$WORK/prompts.log"
-"${ZIG:-zig}" run "$ROOT/tools/scripted_backend.zig" -lc -- ambiguous_web "$PORT_FILE" "$PROMPTS_FILE" &
+sh "$ROOT/tools/start_scripted_backend.sh" ambiguous_web "$PORT_FILE" "$PROMPTS_FILE" &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
@@ -89,8 +89,8 @@ test "$(sql_count "kind = 'tool_envelope' and body like '%raw_name=web_search%'"
 test "$(sql_count "kind = 'tool_repair' and body like '%synthetic%'")" -eq 0 || { printf 'ambiguous-web-continuity-flow: synthetic repair was used\n' >&2; exit 1; }
 
 grep -q '\[RECENT_DIALOGUE\]' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: recent dialogue was not sent to model\n' >&2; exit 1; }
-grep -q '^current_date=' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: current_date missing from model context\n' >&2; exit 1; }
-grep -q '^current_weekday=' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: current_weekday missing from model context\n' >&2; exit 1; }
+grep -q 'current_date=' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: current_date missing from model context\n' >&2; exit 1; }
+grep -q 'current_weekday=' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: current_weekday missing from model context\n' >&2; exit 1; }
 ! grep -q 'TEMPORAL_CONTEXT_MISSING' "$WORK/all.out" || { printf 'ambiguous-web-continuity-flow: temporal context was unavailable\n' >&2; exit 1; }
 grep -q 'PHENOM_AMBIG_T1' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: turn 1 marker not present in later context\n' >&2; exit 1; }
 grep -q 'PHENOM_AMBIG_T2' "$PROMPTS_FILE" || { printf 'ambiguous-web-continuity-flow: turn 2 marker not present in later context\n' >&2; exit 1; }

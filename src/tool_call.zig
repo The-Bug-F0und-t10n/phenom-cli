@@ -26,6 +26,11 @@ pub const ToolCall = struct {
     content: ?[]const u8 = null,
     target: ?[]const u8 = null,
     text: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    value: ?[]const u8 = null,
+    confidence: ?[]const u8 = null,
+    id: ?i64 = null,
     contract: ?contracts.ContractName = null,
     budget_bytes: ?usize = null,
     http_search: ?bool = null,
@@ -65,13 +70,20 @@ pub const ToolCall = struct {
         if (self.content) |content| allocator.free(content);
         if (self.target) |target| allocator.free(target);
         if (self.text) |text| allocator.free(text);
+        if (self.kind) |kind| allocator.free(kind);
+        if (self.key) |key| allocator.free(key);
+        if (self.value) |value| allocator.free(value);
+        if (self.confidence) |confidence| allocator.free(confidence);
         if (self.strategy_id) |strategy_id| allocator.free(strategy_id);
         if (self.reason) |reason| allocator.free(reason);
     }
 };
 
 pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
-    const call_start = std.mem.indexOf(u8, output, "<tool_call>") orelse return try parseFirstJsonToolCall(allocator, output);
+    const call_start = std.mem.indexOf(u8, output, "<tool_call>") orelse {
+        if (try parseFirstJsonToolCall(allocator, output)) |call| return call;
+        return try parseFirstCompactToolCall(allocator, output);
+    };
     const call_end = std.mem.indexOf(u8, output[call_start..], "</tool_call>") orelse return null;
     const body = output[call_start + "<tool_call>".len .. call_start + call_end];
 
@@ -79,7 +91,7 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
     const fn_start = std.mem.indexOf(u8, body, fn_marker) orelse return null;
     const name_start = fn_start + fn_marker.len;
     const name_end = std.mem.indexOfScalar(u8, body[name_start..], '>') orelse return null;
-    const name = std.mem.trim(u8, body[name_start .. name_start + name_end], " \r\n\t");
+    const name = normalizeToolName(std.mem.trim(u8, body[name_start .. name_start + name_end], " \r\n\t"));
     const path = normalizeOptionalPath(parseParameter(body, "path"));
     const session = normalizeOptionalText(parseParameter(body, "session"));
     const scope = normalizeOptionalText(parseParameter(body, "scope"));
@@ -106,6 +118,10 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
     const content = normalizeOptionalContent(parseParameter(body, "content"));
     const target = normalizeOptionalText(parseParameter(body, "target") orelse parseParameter(body, "url"));
     const text = normalizeOptionalText(parseParameter(body, "text"));
+    const kind = normalizeOptionalText(parseParameter(body, "kind"));
+    const key = normalizeOptionalText(parseParameter(body, "key"));
+    const memory_value = normalizeOptionalText(parseParameter(body, "value"));
+    const confidence = normalizeOptionalText(parseParameter(body, "confidence"));
     const contract = try parseContractParameter(body);
     const reason = normalizeOptionalText(parseParameter(body, "reason"));
     const strategy_id = normalizeOptionalText(parseParameter(body, "strategyId") orelse parseParameter(body, "strategy_id"));
@@ -141,6 +157,11 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
         .content = if (content) |value| try allocator.dupe(u8, value) else null,
         .target = if (target) |value| try allocator.dupe(u8, value) else null,
         .text = if (text) |value| try allocator.dupe(u8, value) else null,
+        .kind = if (kind) |value| try allocator.dupe(u8, value) else null,
+        .key = if (key) |value| try allocator.dupe(u8, value) else null,
+        .value = if (memory_value) |item| try allocator.dupe(u8, item) else null,
+        .confidence = if (confidence) |value| try allocator.dupe(u8, value) else null,
+        .id = parseI64Parameter(body, "id"),
         .contract = contract,
         .budget_bytes = parseIntParameter(body, "budget_bytes") orelse parseIntParameter(body, "max_bytes"),
         .http_search = parseBoolParameter(body, "httpSearch") orelse parseBoolParameter(body, "http_search"),
@@ -159,8 +180,7 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
 }
 
 fn parseFirstJsonToolCall(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
-    const marker = "\"tool_call\"";
-    const marker_pos = std.mem.indexOf(u8, output, marker) orelse return null;
+    const marker_pos = firstJsonToolMarker(output) orelse return null;
     const start = jsonObjectStartBefore(output, marker_pos) orelse return null;
     const end = jsonObjectEnd(output, start) orelse return error.InvalidToolCallJson;
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, output[start..end], .{}) catch return error.InvalidToolCallJson;
@@ -169,20 +189,103 @@ fn parseFirstJsonToolCall(allocator: std.mem.Allocator, output: []const u8) !?To
         .object => |object| object,
         else => return null,
     };
-    const raw_tool = root.get("tool_call") orelse return null;
-    const tool = switch (raw_tool) {
-        .object => |object| object,
-        else => return error.InvalidToolCallJson,
+    return try parseJsonToolCallObject(allocator, root);
+}
+
+fn firstJsonToolMarker(output: []const u8) ?usize {
+    const markers = [_][]const u8{
+        "\"tool_call\"",
+        "\"tool_calls\"",
+        "\"function_call\"",
+        "\"web_search\"",
+        "\"search_web\"",
+        "\"rag_web\"",
+        "\"ragweb\"",
     };
+    var found: ?usize = null;
+    for (markers) |marker| {
+        const index = std.mem.indexOf(u8, output, marker) orelse continue;
+        if (found == null or index < found.?) found = index;
+    }
+    return found;
+}
+
+fn parseJsonToolCallObject(allocator: std.mem.Allocator, root: std.json.ObjectMap) !?ToolCall {
+    if (root.get("tool_call")) |raw_tool| {
+        const tool = switch (raw_tool) {
+            .object => |object| object,
+            else => return error.InvalidToolCallJson,
+        };
+        return try buildJsonToolCall(allocator, tool);
+    }
+    if (root.get("function_call")) |raw_tool| {
+        const tool = switch (raw_tool) {
+            .object => |object| object,
+            else => return error.InvalidToolCallJson,
+        };
+        return try buildJsonToolCall(allocator, tool);
+    }
+    if (root.get("tool_calls")) |raw_tools| {
+        const tools = switch (raw_tools) {
+            .array => |array| array,
+            else => return error.InvalidToolCallJson,
+        };
+        if (tools.items.len == 0) return error.InvalidToolCallJson;
+        const first = switch (tools.items[0]) {
+            .object => |object| object,
+            else => return error.InvalidToolCallJson,
+        };
+        return try buildJsonToolCall(allocator, first);
+    }
+    if (jsonStringField(root, "name") != null or jsonStringField(root, "function") != null) {
+        return try buildJsonToolCall(allocator, root);
+    }
+    return null;
+}
+
+const JsonArgsObject = struct {
+    object: std.json.ObjectMap,
+    parsed: ?std.json.Parsed(std.json.Value) = null,
+
+    fn deinit(self: *JsonArgsObject) void {
+        if (self.parsed) |*parsed| parsed.deinit();
+    }
+};
+
+fn nestedJsonFunctionObject(tool: std.json.ObjectMap) ?std.json.ObjectMap {
+    const raw_function = tool.get("function") orelse return null;
+    return switch (raw_function) {
+        .object => |object| object,
+        else => null,
+    };
+}
+
+fn jsonArgsObject(allocator: std.mem.Allocator, tool: std.json.ObjectMap) !JsonArgsObject {
+    const value = tool.get("arguments") orelse tool.get("parameters") orelse tool.get("args") orelse return .{ .object = tool };
+    return switch (value) {
+        .object => |object| .{ .object = object },
+        .string => |text| blk: {
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return error.InvalidToolCallJson;
+            const object = switch (parsed.value) {
+                .object => |object| object,
+                else => {
+                    parsed.deinit();
+                    return error.InvalidToolCallJson;
+                },
+            };
+            break :blk .{ .object = object, .parsed = parsed };
+        },
+        else => .{ .object = tool },
+    };
+}
+
+fn buildJsonToolCall(allocator: std.mem.Allocator, raw_tool: std.json.ObjectMap) !ToolCall {
+    const tool = nestedJsonFunctionObject(raw_tool) orelse raw_tool;
     const raw_name = jsonStringField(tool, "name") orelse jsonStringField(tool, "function") orelse return error.InvalidToolCallJson;
-    const name = normalizeJsonToolName(raw_name);
-    const args = if (tool.get("arguments")) |value| switch (value) {
-        .object => |object| object,
-        else => tool,
-    } else if (tool.get("parameters")) |value| switch (value) {
-        .object => |object| object,
-        else => tool,
-    } else tool;
+    const name = normalizeToolName(raw_name);
+    var args_view = try jsonArgsObject(allocator, tool);
+    defer args_view.deinit();
+    const args = args_view.object;
 
     const path = normalizeOptionalPath(jsonStringField(args, "path"));
     const session = normalizeOptionalText(jsonStringField(args, "session"));
@@ -191,9 +294,14 @@ fn parseFirstJsonToolCall(allocator: std.mem.Allocator, output: []const u8) !?To
     const need = normalizeOptionalText(jsonStringField(args, "need"));
     const terms = normalizeOptionalText(jsonStringField(args, "terms") orelse jsonStringField(args, "query"));
     const target = normalizeOptionalText(jsonStringField(args, "target") orelse jsonStringField(args, "url"));
+    const text = normalizeOptionalText(jsonStringField(args, "text"));
+    const kind = normalizeOptionalText(jsonStringField(args, "kind"));
+    const key = normalizeOptionalText(jsonStringField(args, "key"));
+    const memory_value = normalizeOptionalText(jsonStringField(args, "value"));
+    const confidence = normalizeOptionalText(jsonStringField(args, "confidence"));
     const reason = normalizeOptionalText(jsonStringField(args, "reason"));
     const strategy_id = normalizeOptionalText(jsonStringField(args, "strategyId") orelse jsonStringField(args, "strategy_id"));
-    const strategy = if (jsonStringField(args, "strategy")) |value| parseStrategyName(value) orelse return error.InvalidStrategy else null;
+    const strategy = if (jsonStringField(args, "strategy")) |raw_strategy| parseStrategyName(raw_strategy) orelse return error.InvalidStrategy else null;
     const strategy_id_as_strategy = if (strategy == null)
         if (strategy_id) |value| parseStrategyName(value) else null
     else
@@ -209,6 +317,12 @@ fn parseFirstJsonToolCall(allocator: std.mem.Allocator, output: []const u8) !?To
         .need = if (need) |value| try allocator.dupe(u8, value) else null,
         .terms = if (terms) |value| try allocator.dupe(u8, value) else null,
         .target = if (target) |value| try allocator.dupe(u8, value) else null,
+        .text = if (text) |value| try allocator.dupe(u8, value) else null,
+        .kind = if (kind) |value| try allocator.dupe(u8, value) else null,
+        .key = if (key) |value| try allocator.dupe(u8, value) else null,
+        .value = if (memory_value) |item| try allocator.dupe(u8, item) else null,
+        .confidence = if (confidence) |value| try allocator.dupe(u8, value) else null,
+        .id = jsonI64Field(args, "id"),
         .contract = if (jsonStringField(args, "contract")) |value| parseContractName(value) orelse return error.InvalidContract else null,
         .budget_bytes = jsonUsizeField(args, "budget_bytes") orelse jsonUsizeField(args, "max_bytes"),
         .http_search = jsonBoolField(args, "httpSearch") orelse jsonBoolField(args, "http_search"),
@@ -226,9 +340,292 @@ fn parseFirstJsonToolCall(allocator: std.mem.Allocator, output: []const u8) !?To
     };
 }
 
-fn normalizeJsonToolName(name: []const u8) []const u8 {
+fn normalizeToolName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "search_web") or std.mem.eql(u8, name, "rag_web") or std.mem.eql(u8, name, "ragweb")) return "web_search";
     return name;
+}
+
+const compact_tool_names = [_][]const u8{
+    "set_operational_contract",
+    "collect_evidence",
+    "search_session",
+    "web_search",
+    "search_web",
+    "rag_web",
+    "ragweb",
+    "apply_patch",
+    "validate_syntax",
+    "inspect_runtime",
+    "promote_context",
+    "search_persistent_context",
+    "search_personal_memory",
+    "promote_personal_memory",
+    "forget_personal_memory",
+};
+
+const CompactToolCallRange = struct {
+    name: []const u8,
+    args_start: usize,
+    args_end: usize,
+};
+
+const CompactParam = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+pub fn containsCompactToolCallSignature(text: []const u8) bool {
+    return findCompactToolCall(text) != null;
+}
+
+pub fn containsJsonToolCallSignature(text: []const u8) bool {
+    const marker_pos = firstJsonToolMarker(text) orelse return false;
+    return jsonObjectStartBefore(text, marker_pos) != null;
+}
+
+fn parseFirstCompactToolCall(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
+    const found = findCompactToolCall(output) orelse return null;
+    const body = output[found.args_start..found.args_end];
+    if (std.mem.indexOfScalar(u8, body, '=') == null) return null;
+
+    const raw_name = found.name;
+    const name = normalizeToolName(raw_name);
+    const path = normalizeOptionalPath(compactParamAny(body, &.{"path"}));
+    const session = normalizeOptionalText(compactParamAny(body, &.{"session"}));
+    const scope = normalizeOptionalText(compactParamAny(body, &.{"scope"}));
+    const intent = normalizeOptionalText(compactParamAny(body, &.{"intent"}));
+    const need = normalizeOptionalText(compactParamAny(body, &.{"need"}));
+    const terms = normalizeOptionalText(compactParamAny(body, &.{ "terms", "query" }));
+    const target_files = normalizeOptionalText(compactParamAny(body, &.{ "targetFiles", "target_files" }));
+    const scope_root = normalizeOptionalText(compactParamAny(body, &.{ "scopeRoot", "scope_root" }));
+    const source = try parseCompactSourceParameter(body);
+    const stage = normalizeOptionalText(compactParamAny(body, &.{"stage"}));
+    const selected_candidate = normalizeOptionalText(compactParamAny(body, &.{ "selectedCandidate", "selected_candidate" }));
+    const selected_candidates = normalizeOptionalText(compactParamAny(body, &.{ "selectedCandidates", "selected_candidates" }));
+    const operation = normalizeOptionalText(compactParamAny(body, &.{"operation"}));
+    const context_id = normalizeOptionalText(compactParamAny(body, &.{ "contextId", "context_id" }));
+    const search = normalizeOptionalText(compactParamAny(body, &.{"search"}));
+    const replace = normalizeOptionalReplace(compactParamAny(body, &.{"replace"}));
+    const destination_path = normalizeOptionalPath(compactParamAny(body, &.{ "destinationPath", "destination_path", "destPath", "dest" }));
+    const content = normalizeOptionalContent(compactParamAny(body, &.{"content"}));
+    const target = normalizeOptionalText(compactParamAny(body, &.{ "target", "url" }));
+    const text = normalizeOptionalText(compactParamAny(body, &.{"text"}));
+    const kind = normalizeOptionalText(compactParamAny(body, &.{"kind"}));
+    const key = normalizeOptionalText(compactParamAny(body, &.{"key"}));
+    const memory_value = normalizeOptionalText(compactParamAny(body, &.{"value"}));
+    const confidence = normalizeOptionalText(compactParamAny(body, &.{"confidence"}));
+    const contract = try parseCompactContractParameter(body);
+    const reason = normalizeOptionalText(compactParamAny(body, &.{"reason"}));
+    const strategy_id = normalizeOptionalText(compactParamAny(body, &.{ "strategyId", "strategy_id" }));
+    const strategy = try parseCompactStrategyParameter(body);
+    const strategy_id_as_strategy = if (strategy == null)
+        if (strategy_id) |value| parseStrategyName(value) else null
+    else
+        null;
+    const effective_strategy_id = if (strategy_id_as_strategy == null) strategy_id else null;
+
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .path = if (path) |value| try allocator.dupe(u8, value) else null,
+        .session = if (session) |value| try allocator.dupe(u8, value) else null,
+        .scope = if (scope) |value| try allocator.dupe(u8, value) else null,
+        .intent = if (intent) |value| try allocator.dupe(u8, value) else null,
+        .need = if (need) |value| try allocator.dupe(u8, value) else null,
+        .terms = if (terms) |value| try allocator.dupe(u8, value) else null,
+        .target_files = if (target_files) |value| try allocator.dupe(u8, value) else null,
+        .scope_root = if (scope_root) |value| try allocator.dupe(u8, value) else null,
+        .source = source,
+        .stage = if (stage) |value| try allocator.dupe(u8, value) else null,
+        .selected_candidate = if (selected_candidate) |value| try allocator.dupe(u8, value) else null,
+        .selected_candidates = if (selected_candidates) |value| try allocator.dupe(u8, value) else null,
+        .operation = if (operation) |value| try allocator.dupe(u8, value) else null,
+        .context_id = if (context_id) |value| try allocator.dupe(u8, value) else null,
+        .search = if (search) |value| try allocator.dupe(u8, value) else null,
+        .replace = if (replace) |value| try allocator.dupe(u8, value) else null,
+        .destination_path = if (destination_path) |value| try allocator.dupe(u8, value) else null,
+        .content = if (content) |value| try allocator.dupe(u8, value) else null,
+        .target = if (target) |value| try allocator.dupe(u8, value) else null,
+        .text = if (text) |value| try allocator.dupe(u8, value) else null,
+        .kind = if (kind) |value| try allocator.dupe(u8, value) else null,
+        .key = if (key) |value| try allocator.dupe(u8, value) else null,
+        .value = if (memory_value) |value| try allocator.dupe(u8, value) else null,
+        .confidence = if (confidence) |value| try allocator.dupe(u8, value) else null,
+        .id = compactI64Param(body, "id"),
+        .contract = contract,
+        .budget_bytes = compactUsizeParamAny(body, &.{ "budget_bytes", "max_bytes" }),
+        .http_search = compactBoolParamAny(body, &.{ "httpSearch", "http_search" }),
+        .strategy_id = if (effective_strategy_id) |value| try allocator.dupe(u8, value) else null,
+        .strategy = strategy orelse strategy_id_as_strategy,
+        .start_line = compactUsizeParamAny(body, &.{"start_line"}) orelse 1,
+        .max_lines = compactUsizeParamAny(body, &.{"max_lines"}) orelse 12,
+        .compact = compactBoolParamAny(body, &.{"compact"}) orelse false,
+        .requires_inspection = compactBoolParamAny(body, &.{"requiresInspection"}),
+        .requires_mutation = compactBoolParamAny(body, &.{"requiresMutation"}),
+        .requires_runtime_validation = compactBoolParamAny(body, &.{"requiresRuntimeValidation"}),
+        .requires_browser_diagnostics = compactBoolParamAny(body, &.{"requiresBrowserDiagnostics"}),
+        .requires_memory_promotion = compactBoolParamAny(body, &.{"requiresMemoryPromotion"}),
+        .reason = if (reason) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
+fn findCompactToolCall(text: []const u8) ?CompactToolCallRange {
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        for (compact_tool_names) |name| {
+            if (!startsWithAt(text, i, name)) continue;
+            if (i > 0 and isCompactIdent(text[i - 1])) continue;
+            var open = i + name.len;
+            while (open < text.len and (text[open] == ' ' or text[open] == '\t')) : (open += 1) {}
+            if (open >= text.len or text[open] != '(') continue;
+            const close = compactArgsEnd(text, open) orelse continue;
+            return .{ .name = name, .args_start = open + 1, .args_end = close };
+        }
+    }
+    return null;
+}
+
+fn compactArgsEnd(text: []const u8, open: usize) ?usize {
+    var depth: usize = 1;
+    var quote: ?u8 = null;
+    var escaped = false;
+    var i = open + 1;
+    while (i < text.len) : (i += 1) {
+        const ch = text[i];
+        if (quote) |mark| {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == mark) {
+                quote = null;
+            }
+            continue;
+        }
+        if (ch == '"' or ch == '\'') {
+            quote = ch;
+        } else if (ch == '(') {
+            depth += 1;
+        } else if (ch == ')') {
+            depth -= 1;
+            if (depth == 0) return i;
+        }
+    }
+    return null;
+}
+
+fn compactParamAny(body: []const u8, comptime names: []const []const u8) ?[]const u8 {
+    var cursor: usize = 0;
+    while (nextCompactParam(body, &cursor)) |param| {
+        for (names) |name| {
+            if (std.mem.eql(u8, param.key, name)) return param.value;
+        }
+    }
+    return null;
+}
+
+fn nextCompactParam(body: []const u8, cursor: *usize) ?CompactParam {
+    while (cursor.* < body.len) {
+        while (cursor.* < body.len and (body[cursor.*] == ',' or body[cursor.*] == ' ' or body[cursor.*] == '\t' or body[cursor.*] == '\r' or body[cursor.*] == '\n')) : (cursor.* += 1) {}
+        if (cursor.* >= body.len) return null;
+        const key_start = cursor.*;
+        while (cursor.* < body.len and body[cursor.*] != '=' and body[cursor.*] != ',') : (cursor.* += 1) {}
+        if (cursor.* >= body.len or body[cursor.*] != '=') {
+            while (cursor.* < body.len and body[cursor.*] != ',') : (cursor.* += 1) {}
+            continue;
+        }
+        const key = std.mem.trim(u8, body[key_start..cursor.*], " \t\r\n");
+        cursor.* += 1;
+        while (cursor.* < body.len and (body[cursor.*] == ' ' or body[cursor.*] == '\t')) : (cursor.* += 1) {}
+        const value = compactParamValue(body, cursor);
+        if (key.len == 0) continue;
+        return .{ .key = key, .value = value };
+    }
+    return null;
+}
+
+fn compactParamValue(body: []const u8, cursor: *usize) []const u8 {
+    if (cursor.* >= body.len) return "";
+    if (body[cursor.*] == '"' or body[cursor.*] == '\'') {
+        const quote = body[cursor.*];
+        cursor.* += 1;
+        const start = cursor.*;
+        var escaped = false;
+        while (cursor.* < body.len) : (cursor.* += 1) {
+            const ch = body[cursor.*];
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == quote) {
+                const end = cursor.*;
+                cursor.* += 1;
+                while (cursor.* < body.len and body[cursor.*] != ',') : (cursor.* += 1) {}
+                if (cursor.* < body.len and body[cursor.*] == ',') cursor.* += 1;
+                return body[start..end];
+            }
+        }
+        return body[start..];
+    }
+    const start = cursor.*;
+    while (cursor.* < body.len and body[cursor.*] != ',') : (cursor.* += 1) {}
+    const end = cursor.*;
+    if (cursor.* < body.len and body[cursor.*] == ',') cursor.* += 1;
+    return std.mem.trim(u8, body[start..end], " \t\r\n");
+}
+
+fn compactUsizeParamAny(body: []const u8, comptime names: []const []const u8) ?usize {
+    const value = compactParamAny(body, names) orelse return null;
+    return std.fmt.parseInt(usize, value, 10) catch null;
+}
+
+fn compactI64Param(body: []const u8, comptime name: []const u8) ?i64 {
+    const value = compactParamAny(body, &.{name}) orelse return null;
+    return std.fmt.parseInt(i64, value, 10) catch null;
+}
+
+fn compactBoolParamAny(body: []const u8, comptime names: []const []const u8) ?bool {
+    const value = compactParamAny(body, names) orelse return null;
+    if (std.ascii.eqlIgnoreCase(value, "true")) return true;
+    if (std.mem.eql(u8, value, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+    if (std.mem.eql(u8, value, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "no")) return false;
+    return null;
+}
+
+fn parseCompactContractParameter(body: []const u8) !?contracts.ContractName {
+    const value = compactParamAny(body, &.{"contract"}) orelse return null;
+    return parseContractName(value) orelse error.InvalidContract;
+}
+
+fn parseCompactStrategyParameter(body: []const u8) !?contracts.StrategyName {
+    const value = compactParamAny(body, &.{"strategy"}) orelse return null;
+    return parseStrategyName(value) orelse error.InvalidStrategy;
+}
+
+fn parseCompactSourceParameter(body: []const u8) !?contracts.SourceName {
+    const value = compactParamAny(body, &.{"source"}) orelse return null;
+    return parseSourceName(value) orelse error.InvalidSource;
+}
+
+fn parseSourceName(value: []const u8) ?contracts.SourceName {
+    if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
+    if (std.ascii.eqlIgnoreCase(value, "file")) return .file;
+    if (std.ascii.eqlIgnoreCase(value, "code")) return .code;
+    if (std.ascii.eqlIgnoreCase(value, "git")) return .git;
+    if (std.ascii.eqlIgnoreCase(value, "web")) return .web;
+    if (std.ascii.eqlIgnoreCase(value, "diagnostic")) return .diagnostic;
+    if (std.ascii.eqlIgnoreCase(value, "rag")) return .rag;
+    return null;
+}
+
+fn startsWithAt(text: []const u8, index: usize, needle: []const u8) bool {
+    return index <= text.len and text.len - index >= needle.len and std.mem.eql(u8, text[index .. index + needle.len], needle);
+}
+
+fn isCompactIdent(ch: u8) bool {
+    return (ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '_';
 }
 
 fn jsonObjectStartBefore(text: []const u8, marker_pos: usize) ?usize {
@@ -290,6 +687,14 @@ fn jsonUsizeField(object: std.json.ObjectMap, key: []const u8) ?usize {
     const value = object.get(key) orelse return null;
     return switch (value) {
         .integer => |number| if (number >= 0) @intCast(number) else null,
+        else => null,
+    };
+}
+
+fn jsonI64Field(object: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .integer => |number| @intCast(number),
         else => null,
     };
 }
@@ -368,6 +773,11 @@ fn parseIntParameter(body: []const u8, comptime name: []const u8) ?usize {
     return std.fmt.parseInt(usize, value, 10) catch null;
 }
 
+fn parseI64Parameter(body: []const u8, comptime name: []const u8) ?i64 {
+    const value = parseParameter(body, name) orelse return null;
+    return std.fmt.parseInt(i64, value, 10) catch null;
+}
+
 fn parseBoolParameter(body: []const u8, comptime name: []const u8) ?bool {
     const value = parseParameter(body, name) orelse return null;
     if (std.ascii.eqlIgnoreCase(value, "true")) return true;
@@ -422,14 +832,7 @@ fn parseContractName(value: []const u8) ?contracts.ContractName {
 
 fn parseSourceParameter(body: []const u8) !?contracts.SourceName {
     const value = parseParameter(body, "source") orelse return null;
-    if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "file")) return .file;
-    if (std.mem.eql(u8, value, "code")) return .code;
-    if (std.mem.eql(u8, value, "git")) return .git;
-    if (std.mem.eql(u8, value, "web")) return .web;
-    if (std.mem.eql(u8, value, "diagnostic")) return .diagnostic;
-    if (std.mem.eql(u8, value, "rag")) return .rag;
-    return error.InvalidSource;
+    return parseSourceName(value) orelse error.InvalidSource;
 }
 
 test "parses qwopus xml tool call" {
@@ -762,6 +1165,36 @@ test "parses set operational contract fields and owns reason" {
     try std.testing.expectEqualStrings("Need focused evidence before a patch.", call.reason.?);
 }
 
+test "parses compact set operational contract from fenced shell prose" {
+    var output = try std.testing.allocator.dupe(u8,
+        \\Vou buscar.
+        \\```bash
+        \\set_operational_contract(contract=search_web, query="Retroflag R36S especificações", terms="Retroflag R36S", intent=obter_especificacoes_acuradas, target=Retroflag R36S handheld, budget_bytes=2000, reason=informacao_incompleta_anterior)
+        \\```
+    );
+    defer std.testing.allocator.free(output);
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    output[80] = 'X';
+
+    try std.testing.expectEqualStrings("set_operational_contract", call.name);
+    try std.testing.expectEqual(contracts.ContractName.search_web, call.contract.?);
+    try std.testing.expectEqualStrings("Retroflag R36S especificações", call.terms.?);
+    try std.testing.expectEqualStrings("obter_especificacoes_acuradas", call.intent.?);
+    try std.testing.expectEqualStrings("Retroflag R36S handheld", call.target.?);
+    try std.testing.expectEqual(@as(?usize, 2000), call.budget_bytes);
+}
+
+test "parses compact web search alias" {
+    const output = "```bash\nsearch_web(query=\"R36S RK3326 RAM specs\", budget_bytes=4096)\n```";
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("web_search", call.name);
+    try std.testing.expectEqualStrings("R36S RK3326 RAM specs", call.terms.?);
+    try std.testing.expectEqual(@as(?usize, 4096), call.budget_bytes);
+}
+
 test "promote context parses target and text" {
     const output =
         \\<tool_call>
@@ -797,6 +1230,42 @@ test "web search parses url alias and byte budget" {
     try std.testing.expectEqual(@as(?usize, 4096), call.budget_bytes);
 }
 
+test "xml web search alias is normalized to executable web_search" {
+    const output =
+        \\<tool_call>
+        \\<function=search_web>
+        \\<parameter=query>quem é o presidente do brasil</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("web_search", call.name);
+    try std.testing.expectEqualStrings("quem é o presidente do brasil", call.terms.?);
+}
+
+test "personal memory promotion parses explicit fields" {
+    const output =
+        \\<tool_call>
+        \\<function=promote_personal_memory>
+        \\<parameter=kind>preference</parameter>
+        \\<parameter=key>response_style</parameter>
+        \\<parameter=value>Prefer concise Portuguese answers.</parameter>
+        \\<parameter=confidence>confirmed</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("promote_personal_memory", call.name);
+    try std.testing.expectEqualStrings("preference", call.kind.?);
+    try std.testing.expectEqualStrings("response_style", call.key.?);
+    try std.testing.expectEqualStrings("Prefer concise Portuguese answers.", call.value.?);
+    try std.testing.expectEqualStrings("confirmed", call.confidence.?);
+}
+
 test "json tool call is normalized to executable web_search" {
     const output =
         \\I'll search for that.
@@ -827,6 +1296,31 @@ test "inline json tool call is normalized to executable web_search" {
     defer call.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("web_search", call.name);
     try std.testing.expectEqualStrings("Londrina PR Brasil onde fica localização estado", call.terms.?);
+}
+
+test "direct json web search is normalized to executable web_search" {
+    const output =
+        \\```json
+        \\{"name":"search_web","arguments":{"query":"quem é o presidente do brasil","budget_bytes":4096}}
+        \\```
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("web_search", call.name);
+    try std.testing.expectEqualStrings("quem é o presidente do brasil", call.terms.?);
+    try std.testing.expectEqual(@as(?usize, 4096), call.budget_bytes);
+}
+
+test "openai tool calls json with string arguments parses web search" {
+    const output =
+        \\{"tool_calls":[{"type":"function","function":{"name":"search_web","arguments":"{\"query\":\"quem é o presidente do brasil\"}"}}]}
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("web_search", call.name);
+    try std.testing.expectEqualStrings("quem é o presidente do brasil", call.terms.?);
 }
 
 test "json without tool_call is not a tool" {

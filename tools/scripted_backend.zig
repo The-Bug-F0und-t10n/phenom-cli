@@ -25,6 +25,7 @@ const Mode = enum {
     rule_promotion,
     linear_web_workspace,
     required_tool_repair,
+    artifact_create,
     memory_blocking,
 };
 
@@ -126,6 +127,7 @@ fn maxCompletions(mode: Mode) usize {
         .rule_promotion => 7,
         .linear_web_workspace => 10,
         .required_tool_repair => 4,
+        .artifact_create => 1,
         .memory_blocking => 0,
     };
 }
@@ -244,6 +246,7 @@ fn writeFdAll(fd: c_int, data: []const u8) !void {
 }
 
 fn completionText(allocator: std.mem.Allocator, state: *State, body: []const u8) ![]const u8 {
+    if (contains(body, "private local memory extractor")) return "{\"remember\":false}";
     if (state.mode == .web_rag and contains(body, "[WEB_QUERY_OPTIMIZATION]")) return "Phenom Web RAG contrato";
     if (state.mode == .linear_web_workspace and contains(body, "[WEB_QUERY_OPTIMIZATION]")) {
         return if (contains(body, "alpha") or contains(body, "Alpha")) "Alpha Web RAG PHENOM_WEB_ALPHA_FACT" else "Beta Web RAG PHENOM_WEB_BETA_FACT";
@@ -272,6 +275,7 @@ fn completionText(allocator: std.mem.Allocator, state: *State, body: []const u8)
         .rule_promotion => rulePromotion(idx),
         .linear_web_workspace => try linearWebWorkspace(allocator, idx, state.port),
         .required_tool_repair => requiredToolRepair(idx),
+        .artifact_create => try artifactCreate(allocator, idx),
         .memory_blocking => unreachable,
     };
 }
@@ -350,6 +354,16 @@ fn requiredToolRepair(idx: usize) []const u8 {
         "segunda tentativa ainda falha como um modelo real desalinhado\n</think>\n\nNao consigo chamar a ferramenta agora.",
     };
     return responses[@min(idx, responses.len - 1)];
+}
+
+fn artifactCreate(allocator: std.mem.Allocator, idx: usize) ![]const u8 {
+    _ = idx;
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "gerar artefato html\n</think>\n\n```html\n<!doctype html>\n<title>Space</title>\n");
+    for (0..120) |_| try out.appendSlice(allocator, "<p>filler keeps this artifact beyond recent dialogue limits</p>\n");
+    try out.appendSlice(allocator, "<main>PHENOM_ARTIFACT_TAIL</main>\n```\nSave as space.html.");
+    return out.toOwnedSlice(allocator);
 }
 
 fn webRag(allocator: std.mem.Allocator, idx: usize, port: u16) ![]const u8 {

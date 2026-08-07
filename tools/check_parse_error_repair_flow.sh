@@ -19,7 +19,7 @@ command -v sqlite3 >/dev/null 2>&1 || {
 rm -rf "$WORK"
 mkdir -p "$WORK"
 PORT_FILE="$WORK/port"
-"${ZIG:-zig}" run "$ROOT/tools/scripted_backend.zig" -lc -- parse_error "$PORT_FILE" - "$EXPECT" &
+sh "$ROOT/tools/start_scripted_backend.sh" parse_error "$PORT_FILE" - "$EXPECT" &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 

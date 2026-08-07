@@ -2,6 +2,7 @@ const std = @import("std");
 
 const evidence = @import("evidence.zig");
 const http = @import("http.zig");
+const text_match = @import("text_match.zig");
 const temporal = @import("temporal.zig");
 
 const c = @cImport({
@@ -887,8 +888,19 @@ fn directHtmlStructuredText(allocator: std.mem.Allocator, raw: []const u8, plain
     try appendDirectJsonLdText(allocator, &out, raw, title_text);
     try appendDirectTagText(allocator, &out, raw, title_text, "tr", "table_row", 24, 900);
     try appendDirectTagText(allocator, &out, raw, title_text, "li", "list_item", 24, 700);
-    try appendDirectPageLine(allocator, &out, title_text, "page_text", plain_fallback);
+    const body_text = try directHtmlBodyText(allocator, raw, plain_fallback);
+    defer allocator.free(body_text);
+    try appendDirectPageLine(allocator, &out, title_text, "page_text", body_text);
     return out.toOwnedSlice(allocator);
+}
+
+fn directHtmlBodyText(allocator: std.mem.Allocator, raw: []const u8, plain_fallback: []const u8) ![]u8 {
+    const body_rel = indexOfIgnoreCase(raw, "<body") orelse return allocator.dupe(u8, plain_fallback);
+    const body_tag = body_rel;
+    const tag_end = std.mem.indexOfScalarPos(u8, raw, body_tag, '>') orelse return allocator.dupe(u8, plain_fallback);
+    const body_start = tag_end + 1;
+    const body_end = if (indexOfIgnoreCase(raw[body_start..], "</body>")) |rel| body_start + rel else raw.len;
+    return distillText(allocator, raw[body_start..body_end], plain_fallback.len);
 }
 
 fn appendDirectMetaText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), raw: []const u8, title: []const u8) !void {
@@ -960,9 +972,10 @@ fn appendDirectTagText(
 fn appendDirectPageLine(allocator: std.mem.Allocator, out: *std.ArrayList(u8), title: []const u8, label: []const u8, value: []const u8) !void {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (trimmed.len < 4 or isStyleLikeText(trimmed)) return;
+    if (!std.mem.eql(u8, label, "page_title") and directStructuredValueRepeatsTitle(trimmed, title)) return;
     if (std.mem.indexOf(u8, out.items, trimmed) != null) return;
     const capped = trimmed[0..@min(trimmed.len, 1600)];
-    if (title.len > 0 and !std.mem.eql(u8, label, "page_title")) {
+    if (title.len > 0 and shouldPrefixDirectLineWithTitle(label)) {
         const line = try std.fmt.allocPrint(allocator, "{s}=page_title: {s}. {s}\n", .{ label, title, capped });
         defer allocator.free(line);
         try out.appendSlice(allocator, line);
@@ -971,6 +984,25 @@ fn appendDirectPageLine(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t
         defer allocator.free(line);
         try out.appendSlice(allocator, line);
     }
+}
+
+fn shouldPrefixDirectLineWithTitle(label: []const u8) bool {
+    if (std.mem.eql(u8, label, "page_title")) return false;
+    if (std.mem.eql(u8, label, "meta")) return false;
+    if (std.mem.eql(u8, label, "structured_data")) return false;
+    return true;
+}
+
+fn directStructuredValueRepeatsTitle(value: []const u8, title: []const u8) bool {
+    const title_text = std.mem.trim(u8, title, " \t\r\n");
+    if (title_text.len == 0) return false;
+    var comparable = std.mem.trim(u8, value, " \t\r\n");
+    const label = "page_title:";
+    if (indexOfIgnoreCase(comparable, label)) |idx| {
+        comparable = std.mem.trim(u8, comparable[idx + label.len ..], " \t\r\n");
+    }
+    if (comparable.len == 0) return false;
+    return text_match.containsFoldedIgnoreCase(title_text, comparable) and text_match.containsFoldedIgnoreCase(comparable, title_text);
 }
 
 fn isDirectStructuredSummary(text: []const u8) bool {
@@ -1424,7 +1456,7 @@ fn queryCoverageScore(chunk: []const u8, query: []const u8) usize {
     while (it.next()) |raw| {
         const term = std.mem.trim(u8, raw, " \t\r\n");
         if (term.len < 3) continue;
-        if (containsIgnoreCase(chunk, term)) score += term.len;
+        if (text_match.containsFoldedIgnoreCase(chunk, term)) score += term.len;
     }
     return score;
 }
@@ -1441,7 +1473,7 @@ fn queryCoverageSufficient(chunk: []const u8, query: []const u8) bool {
         total_terms += 1;
         const is_anchor = queryTermLooksEntity(term);
         if (is_anchor) anchor_terms += 1;
-        if (!containsIgnoreCase(chunk, term)) continue;
+        if (!text_match.containsFoldedIgnoreCase(chunk, term)) continue;
         matched_terms += 1;
         if (is_anchor) matched_anchors += 1;
     }
@@ -1561,6 +1593,15 @@ test "query distillation keeps matching chunks and drops unrelated text" {
     try std.testing.expect(out.len <= 96);
 }
 
+test "query distillation matches folded unicode terms" {
+    const input = "Berlin irrelevante. München Wetter aktuell aparece nesta frase.";
+    const out = try distillTextForQuery(std.testing.allocator, input, "MUNCHEN wetter", 256);
+    defer std.testing.allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "München Wetter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Berlin") == null);
+}
+
 test "query distillation does not fall back to similar unrelated text" {
     const input = "Resultado sobre Wesley Silva, musico local. Outro resultado sobre Behemoth, banda polonesa.";
     const out = try distillTextForQuery(std.testing.allocator, input, "Wesley Beehmot biografia perfil", 256);
@@ -1674,10 +1715,29 @@ test "direct html structured metadata and tables become query evidence" {
     const excerpt = try distillTextForQuery(std.testing.allocator, text, "R36S especificacoes tecnicas RK3326 RAM tela", 900);
     defer std.testing.allocator.free(excerpt);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "structured_data=page_title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "structured_data=") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "table_row=page_title") != null);
     try std.testing.expect(std.mem.indexOf(u8, excerpt, "RK3326") != null);
     try std.testing.expect(std.mem.indexOf(u8, excerpt, "1GB RAM") != null);
+}
+
+test "direct html skips metadata that only repeats page title" {
+    const raw =
+        \\<html><head>
+        \\<title>Quem são os pré-candidatos a presidente da República do Brasil nas eleições 2026</title>
+        \\<meta name="title" content="Quem são os pré-candidatos a presidente da República do Brasil nas eleições 2026">
+        \\<meta name="description" content="Levantamento lista nomes cotados para a eleição presidencial.">
+        \\<script type="application/ld+json">{"headline":"page_title: Quem são os pré-candidatos a presidente da República do Brasil nas eleições 2026"}</script>
+        \\</head><body></body></html>
+    ;
+    const fallback = try distillText(std.testing.allocator, raw, raw.len);
+    defer std.testing.allocator.free(fallback);
+    const text = try structuredTextForDistillation(std.testing.allocator, "https://example.test/politica", raw, fallback);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "meta=page_title: Quem são os pré-candidatos") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "structured_data=page_title: Quem são os pré-candidatos") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Levantamento lista nomes cotados") != null);
 }
 
 test "web evidence annotates source quality without site allowlist" {

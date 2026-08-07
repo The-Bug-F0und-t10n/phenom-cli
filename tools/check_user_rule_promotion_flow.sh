@@ -19,12 +19,12 @@ command -v sqlite3 >/dev/null 2>&1 || {
 rm -rf "$WORK"
 mkdir -p "$WORK"
 
-"${ZIG:-zig}" run "$ROOT/tools/scripted_backend.zig" -lc -- rule_promotion "$PORT_FILE" "$PROMPTS_FILE" &
+sh "$ROOT/tools/start_scripted_backend.sh" rule_promotion "$PORT_FILE" "$PROMPTS_FILE" &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
 i=0
-while [ ! -s "$PORT_FILE" ] && [ "$i" -lt 50 ]; do
+while [ ! -s "$PORT_FILE" ] && [ "$i" -lt 200 ]; do
   i=$((i + 1))
   sleep 0.1
 done
@@ -39,6 +39,10 @@ SESSION=rule-promotion-flow
 
 grep -q 'Nao commitar sem rodar testes' "$WORK/SKILLS.md" || {
   printf 'rule-promotion-flow: SKILLS.md missing promoted interpreted rule\n' >&2
+  exit 1
+}
+grep -q 'PHENOM_MEMORY_CONTEXT_BEGIN' "$WORK/MEMORY.md" || {
+  printf 'rule-promotion-flow: MEMORY.md missing managed context section\n' >&2
   exit 1
 }
 
@@ -61,6 +65,10 @@ test "$(sql_count "kind = 'persistent_promotion' and body like '%target=skills%'
 }
 test "$(sql_count "kind = 'persistent_context' and body like '%Nao commitar sem rodar testes%'")" -ge 1 || {
   printf 'rule-promotion-flow: second turn did not retrieve SKILLS.md\n' >&2
+  exit 1
+}
+test "$(sql_count "kind = 'persistent_context_distillation' and body like '%status=distilled_context%'")" -ge 2 || {
+  printf 'rule-promotion-flow: missing MEMORY.md context distillation audit\n' >&2
   exit 1
 }
 test "$(sql_count "kind = 'answer_repair' and body = 'retrieved skills contradiction'")" -ge 1 || {

@@ -38,7 +38,7 @@ test "$(sql_count session_focus "$COMPLETED_SESSION" "user_intent = 'turn_checkp
 test "$(sql_count session_focus "$COMPLETED_SESSION" "user_intent = 'turn_memory' and useful_facts like '%source=turn_memory_v1%' and useful_facts like '%detail_available: assistant_delta event%'")" -ge 1 || { printf 'memory-persistence: completed turn missing structured memory focus\n' >&2; exit 1; }
 
 PORT_FILE="$WORK/port"
-"${ZIG:-zig}" run "$ROOT/tools/scripted_backend.zig" -lc -- memory_blocking "$PORT_FILE" &
+sh "$ROOT/tools/start_scripted_backend.sh" memory_blocking "$PORT_FILE" &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 

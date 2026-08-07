@@ -29,7 +29,7 @@ EOF
 
 PORT_FILE="$WORK/port"
 PROMPTS_FILE="$WORK/prompts.log"
-"${ZIG:-zig}" run "$ROOT/tools/scripted_backend.zig" -lc -- linear_web_workspace "$PORT_FILE" "$PROMPTS_FILE" &
+sh "$ROOT/tools/start_scripted_backend.sh" linear_web_workspace "$PORT_FILE" "$PROMPTS_FILE" &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 

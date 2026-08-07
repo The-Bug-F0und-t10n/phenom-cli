@@ -225,6 +225,37 @@ test "active contract accepts explicit contract switch" {
     try std.testing.expectEqual(contracts.ContractName.search_web, envelope.call.?.contract.?);
 }
 
+test "initial router accepts compact explicit web contract switch" {
+    const active = contracts.activeContract(.workflow) orelse return error.MissingContract;
+    const output =
+        \\```bash
+        \\set_operational_contract(contract=search_web, query="Retroflag R36S especificações", terms="Retroflag R36S", budget_bytes=2000)
+        \\```
+    ;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.accepted, envelope.state);
+    try std.testing.expectEqualStrings("set_operational_contract", envelope.raw_name);
+    try std.testing.expectEqual(contracts.ContractName.search_web, envelope.call.?.contract.?);
+    try std.testing.expectEqualStrings("Retroflag R36S especificações", envelope.call.?.terms.?);
+}
+
+test "active web contract accepts legacy search_web alias" {
+    const active = contracts.activeContract(.search_web) orelse return error.MissingContract;
+    const output =
+        \\<tool_call>
+        \\<function=search_web>
+        \\<parameter=query>quem é o presidente do brasil</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    var envelope = (try parseFirst(std.testing.allocator, output, active)) orelse return error.NoToolCall;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.accepted, envelope.state);
+    try std.testing.expectEqualStrings("web_search", envelope.raw_name);
+    try std.testing.expectEqualStrings("quem é o presidente do brasil", envelope.call.?.terms.?);
+}
+
 test "mutation executor is rejected before contract and accepted by mutation contract" {
     const initial = contracts.activeContract(.workflow) orelse return error.MissingContract;
     const output =
