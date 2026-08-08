@@ -1840,6 +1840,44 @@ fn runToolLoopIterations(
             maybe_envelope = normalized_envelope;
         }
     }
+    if (maybe_envelope == null and has_visible_output and state.active_contract.name == .workflow and state.active_contract.allows("set_operational_contract")) {
+        if (protocol_repair_policy.plaintextWebIntentNeedsRepair(visible_output)) {
+            first_sink.discardDeferredVisible();
+            try db.recordEvent(config.session, "tool_repair", protocol_repair_policy.plaintext_web_intent_repair_reason);
+            const repair_context = try model_context.renderModelTurnContext(allocator, .{
+                .task = prompt,
+                .contracts = activeToolSchema(&state),
+                .obligations = &.{
+                    "Previous visible output declared web search in prose but emitted no tool_call.",
+                    "The controller will not infer query/terms from that prose.",
+                },
+                .grounding = groundingRules(),
+                .next_action = "Emit exactly one set_operational_contract tool_call with contract=search_web and model-selected query/terms matching USER_TASK. No prose.",
+            });
+            defer allocator.free(repair_context);
+            try db.recordEvent(config.session, "model_context", repair_context);
+            const next = try streamDeferredRequiredToolLoopTurn(
+                allocator,
+                config,
+                prompt,
+                repair_context,
+                "Output exactly one set_operational_contract tool_call with contract=search_web and model-selected query/terms matching USER_TASK. No prose.",
+                client,
+                events,
+                db,
+                ui_ptr,
+                first_sink,
+                state.active_contract,
+            );
+            switch (next) {
+                .final_answer => return finishToolLoopRuntime(&state, .final_answer),
+                .stopped => return finishToolLoopRuntime(&state, .stopped),
+                .tool_call => |next_call| {
+                    maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
+                },
+            }
+        }
+    }
     const initial_decision = agent_state.decideInitialModelOutput(.{
         .has_tool_envelope = maybe_envelope != null,
         .has_visible_output = has_visible_output,

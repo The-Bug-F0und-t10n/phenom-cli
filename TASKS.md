@@ -103,6 +103,17 @@ Make `phenom-zig` operate as a reliable AI agent runtime with explicit states, c
   - Focused `src/main.zig` tests passed for plaintext session recovery and finalization contract-switch recovery.
   - `sh tools/check_plaintext_session_flow.sh ./zig-out/bin/phenom` passed with both `llamacpp` and `ollama` adapters.
   - Tool-flow smokes passed for parse-error repair, required-tool repair, agent patch, simple greeting, think-only finalization, web RAG, query web RAG, ambiguous web continuity, linear web/workspace conversation, git evidence, artifact create, `PHENOM.md` prompt, user-rule promotion, memory persistence, personal memory, and 100-turn personal-memory ambiguity.
+- Regression batch for plaintext web intent recovery:
+  - Root cause: initial workflow treated visible prose like `Preciso pesquisar na web para ...` as final visible output when the model declared an operational web intent but failed to emit `set_operational_contract` or `web_search`.
+  - Fix: `ProtocolRepairPolicy` treats plaintext web intent as a protocol-repair signal only. The controller discards the prose and asks the model to emit an explicit `set_operational_contract(contract=search_web, query|terms=...)`; it does not infer query/terms from the prose.
+  - `zig test src/protocol_repair_policy.zig` passed.
+  - `zig test tools/scripted_backend.zig -lc` passed.
+  - Focused `src/main.zig` plain-URL anti-synthesis test passed.
+  - `zig build` passed.
+  - `zig build test` passed.
+  - `git diff --check` passed.
+  - `sh tools/check_plaintext_web_intent_flow.sh ./zig-out/bin/phenom` passed with both `llamacpp` and `ollama` adapters using a neutral fixture prompt `quem e Aurora Vela?`.
+  - Regression smokes `sh tools/check_plaintext_session_flow.sh ./zig-out/bin/phenom` and `sh tools/check_query_web_rag_flow.sh ./zig-out/bin/phenom` passed.
 
 ## Design Rules
 

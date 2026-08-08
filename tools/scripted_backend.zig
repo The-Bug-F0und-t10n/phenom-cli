@@ -28,6 +28,7 @@ const Mode = enum {
     artifact_create,
     memory_blocking,
     plaintext_session,
+    plaintext_web,
 };
 
 const State = struct {
@@ -131,6 +132,7 @@ fn maxCompletions(mode: Mode) usize {
         .artifact_create => 1,
         .memory_blocking => 0,
         .plaintext_session => 3,
+        .plaintext_web => 3,
     };
 }
 
@@ -258,6 +260,7 @@ fn writeFdAll(fd: c_int, data: []const u8) !void {
 fn completionText(allocator: std.mem.Allocator, state: *State, body: []const u8) ![]const u8 {
     if (contains(body, "private local memory extractor")) return "{\"remember\":false}";
     if (state.mode == .web_rag and contains(body, "[WEB_QUERY_OPTIMIZATION]")) return "Phenom Web RAG contrato";
+    if (state.mode == .plaintext_web and contains(body, "[WEB_QUERY_OPTIMIZATION]")) return "identificar quem e Aurora Vela";
     if (state.mode == .linear_web_workspace and contains(body, "[WEB_QUERY_OPTIMIZATION]")) {
         return if (contains(body, "alpha") or contains(body, "Alpha")) "Alpha Web RAG PHENOM_WEB_ALPHA_FACT" else "Beta Web RAG PHENOM_WEB_BETA_FACT";
     }
@@ -269,6 +272,9 @@ fn completionText(allocator: std.mem.Allocator, state: *State, body: []const u8)
             try std.fmt.allocPrint(allocator, "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1:{}/doc-alpha.html\nstatus=200\nquery=Alpha Web RAG PHENOM_WEB_ALPHA_FACT\ntitle=Alpha RAG Doc\nexcerpt=Alpha Web RAG evidence says PHENOM_WEB_ALPHA_FACT and explains distilled external retrieval.", .{state.port})
         else
             try std.fmt.allocPrint(allocator, "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1:{}/doc-beta.html\nstatus=200\nquery=Beta Web RAG PHENOM_WEB_BETA_FACT\ntitle=Beta RAG Doc\nexcerpt=Beta Web RAG evidence says PHENOM_WEB_BETA_FACT and complements local config comparison.", .{state.port});
+    }
+    if (state.mode == .plaintext_web and contains(body, "[WEB_DISTILLATION_TASK]")) {
+        return try std.fmt.allocPrint(allocator, "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target=http://127.0.0.1:{}/search?q=identificar%20quem%20e%20Aurora%20Vela\nstatus=200\nquery=identificar quem e Aurora Vela\ntitle=Aurora Vela fixture\nexcerpt=Aurora Vela e uma pesquisadora ficticia do fixture local usada para validar busca web neutra. PHENOM_PLAINTEXT_WEB_FACT.", .{state.port});
     }
     const idx = state.completions;
     state.completions += 1;
@@ -288,6 +294,7 @@ fn completionText(allocator: std.mem.Allocator, state: *State, body: []const u8)
         .artifact_create => try artifactCreate(allocator, idx),
         .memory_blocking => unreachable,
         .plaintext_session => plaintextSession(idx),
+        .plaintext_web => try plaintextWeb(allocator, idx, state.port),
     };
 }
 
@@ -382,6 +389,12 @@ fn plaintextSession(idx: usize) []const u8 {
     return responses[@min(idx, responses.len - 1)];
 }
 
+fn plaintextWeb(allocator: std.mem.Allocator, idx: usize, port: u16) ![]const u8 {
+    if (idx == 0) return allocator.dupe(u8, "decidir ferramenta web em prosa\n</think>\n\nPreciso pesquisar na web para identificar quem e Aurora Vela.");
+    if (idx == 1) return allocator.dupe(u8, "corrigir protocolo com contrato web\n</think>\n\n<tool_call><function=set_operational_contract><parameter=contract>search_web</parameter><parameter=query>identificar quem e Aurora Vela</parameter><parameter=budget_bytes>4096</parameter><parameter=reason>corrigir prosa operacional com contrato explicito</parameter></function></tool_call>");
+    return std.fmt.allocPrint(allocator, "Segundo http://127.0.0.1:{}/search?q=identificar%20quem%20e%20Aurora%20Vela, Aurora Vela e uma pesquisadora ficticia do fixture local usada para validar busca web neutra. PHENOM_PLAINTEXT_WEB_FACT PHENOM_PLAINTEXT_WEB_OK", .{port});
+}
+
 fn artifactCreate(allocator: std.mem.Allocator, idx: usize) ![]const u8 {
     _ = idx;
     var out = std.ArrayList(u8).empty;
@@ -434,6 +447,10 @@ fn handleSearch(client: c_int, mode: Mode, path: []const u8) !void {
             if (contains(path, "dolar")) return send(client, "200 OK", "text/html", "<html><head><title>Busca dolar real</title></head><body><p>Resultado atual sintetizado: PHENOM_WEB_AMBIG_DOLAR_FACT.</p></body></html>");
             if (contains(path, "euro")) return send(client, "200 OK", "text/html", "<html><head><title>Busca euro real</title></head><body><p>Resultado atual sintetizado: PHENOM_WEB_DECL_EURO_FACT.</p></body></html>");
             return send(client, "400 Bad Request", "text/plain", "bad query");
+        },
+        .plaintext_web => {
+            if (!contains(path, "Aurora")) return send(client, "400 Bad Request", "text/plain", "bad query");
+            return send(client, "200 OK", "text/html", "<html><head><title>Aurora Vela fixture</title></head><body><p>Aurora Vela e uma pesquisadora ficticia do fixture local usada para validar busca web neutra. PHENOM_PLAINTEXT_WEB_FACT.</p><script>raw html should not persist</script></body></html>");
         },
         else => return send(client, "404 Not Found", "text/plain", "not found"),
     }

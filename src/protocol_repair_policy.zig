@@ -11,6 +11,7 @@ pub const InitialRejectedToolAction = enum {
 };
 
 pub const direct_web_search_normalization_reason = "initial router normalized direct web_search to search_web contract";
+pub const plaintext_web_intent_repair_reason = "initial router repaired plaintext web intent";
 
 pub fn classifyInitialRejectedTool(
     active_contract: contracts.ActiveContract,
@@ -49,6 +50,33 @@ pub fn searchWebContractCallFromDirect(allocator: std.mem.Allocator, direct_call
     if (direct_call.strategy_id) |strategy_id| call.strategy_id = try allocator.dupe(u8, strategy_id);
     call.reason = try allocator.dupe(u8, direct_web_search_normalization_reason);
     return call;
+}
+
+pub fn plaintextWebIntentNeedsRepair(visible: []const u8) bool {
+    const text = std.mem.trim(u8, visible, " \t\r\n");
+    if (text.len == 0) return false;
+    const has_search_verb =
+        containsIgnoreCase(text, "pesquis") or
+        containsIgnoreCase(text, "search");
+    const has_external_scope =
+        containsIgnoreCase(text, "web") or
+        containsIgnoreCase(text, "internet") or
+        containsIgnoreCase(text, "online");
+    return has_search_verb and has_external_scope;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    return indexOfIgnoreCase(haystack, needle) != null;
+}
+
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
 }
 
 test "initial workflow web_search rejection becomes contract normalization" {
@@ -97,4 +125,11 @@ test "direct web_search contract call preserves declared search data" {
     try std.testing.expectEqual(@as(usize, 2048), contract_call.budget_bytes.?);
     try std.testing.expectEqualStrings("document_summary", contract_call.strategy_id.?);
     try std.testing.expectEqualStrings(direct_web_search_normalization_reason, contract_call.reason.?);
+}
+
+test "plaintext web intent is a repair signal, not synthesized contract args" {
+    try std.testing.expect(plaintextWebIntentNeedsRepair("Preciso pesquisar na web para identificar quem e Aurora Vela."));
+    try std.testing.expect(plaintextWebIntentNeedsRepair("I need to search the web to identify Aurora Vela."));
+    try std.testing.expect(!plaintextWebIntentNeedsRepair("Veja https://example.com antes de responder."));
+    try std.testing.expect(!plaintextWebIntentNeedsRepair("Aurora Vela e uma pesquisadora ficticia."));
 }
