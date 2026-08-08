@@ -3,6 +3,10 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BIN=${1:-"$ROOT/zig-out/bin/phenom"}
+case "$BIN" in
+  /*) ;;
+  *) BIN="$ROOT/$BIN" ;;
+esac
 WORK=${PHENOM_LINEAR_WEB_WORKSPACE_SMOKE_DIR:-/tmp/phenom-linear-web-workspace-smoke}
 DB="$WORK/.phenom-zig/phenom.db"
 SESSION=linear-web-workspace-flow
@@ -47,6 +51,7 @@ run_turn() {
   marker=$1
   prompt=$2
   out=$3
+  expect_text=$4
   (
     cd "$WORK"
     "$BIN" chat \
@@ -57,16 +62,16 @@ run_turn() {
       --prompt "$prompt" \
       --max-tokens 512 \
       --thinking on \
-      --expect-contains "$marker" \
+      --expect-contains "$expect_text" \
       --fail-on-model-error \
       --no-color
   ) >"$WORK/$out.out" 2>"$WORK/$out.err"
 }
 
-run_turn PHENOM_LINEAR_T1 "Ola. Vamos manter conversa linear sobre RAG Web e evidencia local." turn1
-run_turn PHENOM_LINEAR_T2 "Agora use Web RAG para consultar $DOC1 e mantenha o assunto anterior." turn2
-run_turn PHENOM_LINEAR_T3 "Agora leia o README local e conecte com a evidencia web anterior." turn3
-run_turn PHENOM_LINEAR_FINAL "Agora consulte $DOC2, leia src/config.zig e compare tudo com o que ja conversamos." turn4
+run_turn PHENOM_LINEAR_T1 "Ola. Vamos manter conversa linear sobre RAG Web e evidencia local." turn1 "conversa linear sobre RAG Web"
+run_turn PHENOM_LINEAR_T2 "Agora use Web RAG para consultar $DOC1 e mantenha o assunto anterior." turn2 "evidencia web destilada"
+run_turn PHENOM_LINEAR_T3 "Agora leia o README local e conecte com a evidencia web anterior." turn3 "README local"
+run_turn PHENOM_LINEAR_FINAL "Agora consulte $DOC2, leia src/config.zig e compare tudo com o que ja conversamos." turn4 "evidencia web anterior registra"
 
 wait "$SERVER_PID" 2>/dev/null || true
 trap - EXIT

@@ -78,10 +78,28 @@ pub fn findDossierSupport(output: []const u8, context: []const u8) ?web_evidence
 }
 
 pub fn webDossierExcerptLooksMetadataOnly(excerpt: []const u8) bool {
+    if (webDossierPageTextHasContent(excerpt)) return false;
     return std.mem.indexOf(u8, excerpt, "page_title=") != null or
         std.mem.indexOf(u8, excerpt, "meta=page_title:") != null or
         std.mem.indexOf(u8, excerpt, "structured_data=page_title:") != null or
         std.mem.indexOf(u8, excerpt, "table_row=page_title:") != null;
+}
+
+fn webDossierPageTextHasContent(excerpt: []const u8) bool {
+    const marker = "page_text=";
+    const start = std.mem.indexOf(u8, excerpt, marker) orelse return false;
+    const page_text = excerpt[start + marker.len ..];
+    var useful_terms: usize = 0;
+    var terms = std.mem.tokenizeAny(u8, page_text, " \t\r\n\"'`()[]{}<>:;,./\\|+-=*");
+    while (terms.next()) |raw| {
+        const term = std.mem.trim(u8, raw, " \t\r\n\"'`()[]{}<>:;,./\\|+-=*");
+        if (std.ascii.eqlIgnoreCase(term, "page_title")) continue;
+        if (std.ascii.eqlIgnoreCase(term, "meta")) continue;
+        if (!webDossierTermIsUseful(term)) continue;
+        useful_terms += 1;
+        if (useful_terms >= 3) return true;
+    }
+    return false;
 }
 
 pub fn appendCollectedWebSources(allocator: std.mem.Allocator, output: []const u8, context: []const u8) ![]u8 {
@@ -265,4 +283,23 @@ test "web final verifier exposes claim support" {
     try support.validate();
     try std.testing.expectEqual(@as(usize, 2), support.evidence_index);
     try std.testing.expectEqualStrings("Console R36S usa RK3326 e 1GB RAM.", support.excerpt);
+}
+
+test "web final verifier accepts page text excerpts with page title metadata" {
+    const context =
+        \\[WEB_DOSSIER v1]
+        \\W1:
+        \\source_url=http://127.0.0.1/doc.html
+        \\excerpt=page_title=Phenom Web RAG page_text=page_title: Phenom Web RAG. Phenom Web RAG Contrato web_search fornece evidencia externa destilada para respostas e collect_evidence.
+    ;
+    const output = "Fonte: http://127.0.0.1/doc.html. Phenom Web RAG Contrato web_search fornece evidencia externa destilada para respostas.";
+    try std.testing.expectEqual(Decision.accept, verifyWebFinalAnswer(output, context).decision);
+
+    const metadata_only =
+        \\[WEB_DOSSIER v1]
+        \\W1:
+        \\source_url=https://example.test/meta
+        \\excerpt=page_title=Phenom Web RAG meta=page_title: Phenom Web RAG.
+    ;
+    try std.testing.expectEqual(Decision.repair_unsupported_claim, verifyWebFinalAnswer("Fonte: https://example.test/meta. Phenom Web RAG.", metadata_only).decision);
 }

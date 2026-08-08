@@ -11,6 +11,7 @@ WORK=${PHENOM_MD_PROMPT_SMOKE_DIR:-$(mktemp -d /tmp/phenom-md-prompt-flow.XXXXXX
 DB="$WORK/.phenom-zig/phenom.db"
 SESSION=phenom-md-prompt-flow
 EXPECT=PHENOM_MD_PROMPT_USED_OK
+EXPECT_TEXT="Phenom.md carregado no system prompt"
 
 command -v sqlite3 >/dev/null 2>&1 || {
   printf 'phenom-md-prompt-flow: sqlite3 CLI is required\n' >&2
@@ -58,7 +59,7 @@ EOF
     --prompt "ola" \
     --max-tokens 128 \
     --thinking off \
-    --expect-contains "$EXPECT" \
+    --expect-contains "$EXPECT_TEXT" \
     --fail-on-model-error \
     --no-color
 ) >"$WORK/out.txt" 2>"$WORK/err.txt"

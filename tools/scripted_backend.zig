@@ -27,6 +27,7 @@ const Mode = enum {
     required_tool_repair,
     artifact_create,
     memory_blocking,
+    plaintext_session,
 };
 
 const State = struct {
@@ -119,16 +120,17 @@ fn maxCompletions(mode: Mode) usize {
         .git_evidence => 3,
         .agent_patch => 4,
         .phenom_md => 2,
-        .web_rag => 7,
+        .web_rag => 6,
         .ambiguous_web => 12,
         .query_web => 3,
         .parse_error => 2,
         .think_only => 2,
         .rule_promotion => 7,
         .linear_web_workspace => 10,
-        .required_tool_repair => 4,
+        .required_tool_repair => 5,
         .artifact_create => 1,
         .memory_blocking => 0,
+        .plaintext_session => 3,
     };
 }
 
@@ -172,6 +174,14 @@ fn handleClient(allocator: std.mem.Allocator, state: *State, client: c_int) !voi
     if (std.mem.eql(u8, req.method, "GET") and state.mode == .linear_web_workspace) {
         if (std.mem.eql(u8, req.path, "/doc-alpha.html")) return send(client, "200 OK", "text/html", "<html><head><title>Alpha RAG Doc</title></head><body><p>Alpha Web RAG evidence says PHENOM_WEB_ALPHA_FACT and explains distilled external retrieval.</p><p>Raw filler should not be persisted as HTML.</p></body></html>");
         if (std.mem.eql(u8, req.path, "/doc-beta.html")) return send(client, "200 OK", "text/html", "<html><head><title>Beta RAG Doc</title></head><body><p>Beta Web RAG evidence says PHENOM_WEB_BETA_FACT and complements local config comparison.</p></body></html>");
+    }
+    if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/api/show")) {
+        return send(client, "200 OK", "application/json", "{\"model_info\":{\"llama.context_length\":8192},\"parameters\":\"num_ctx 8192\"}");
+    }
+    if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/api/chat")) {
+        if (state.log_file) |path| try appendPromptLog(allocator, path, state.completions + 1, req.body);
+        const text = try completionText(allocator, state, req.body);
+        return sendOllamaStream(client, text);
     }
     if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/chat/completions")) {
         if (state.log_file) |path| try appendPromptLog(allocator, path, state.completions + 1, req.body);
@@ -277,6 +287,7 @@ fn completionText(allocator: std.mem.Allocator, state: *State, body: []const u8)
         .required_tool_repair => requiredToolRepair(idx),
         .artifact_create => try artifactCreate(allocator, idx),
         .memory_blocking => unreachable,
+        .plaintext_session => plaintextSession(idx),
     };
 }
 
@@ -301,10 +312,16 @@ fn agentPatch(idx: usize) []const u8 {
 }
 
 fn agentPatchDynamic(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
-    const start = std.mem.indexOf(u8, body, "ctx_") orelse return error.MissingContextId;
+    const start = microContextIdStart(body) orelse return error.MissingContextId;
     var end = start;
     while (end < body.len and (std.ascii.isAlphanumeric(body[end]) or body[end] == '_')) : (end += 1) {}
     return std.fmt.allocPrint(allocator, "micro-contexto fresco encontrado\n</think>\n\n<tool_call><function=apply_patch><parameter=operation>edit</parameter><parameter=path>src/math.zig</parameter><parameter=contextId>{s}</parameter><parameter=search>return a - b;</parameter><parameter=replace>return a + b;</parameter></function></tool_call>", .{body[start..end]});
+}
+
+fn microContextIdStart(body: []const u8) ?usize {
+    const marker = "[MICRO_CONTEXT id=";
+    if (std.mem.lastIndexOf(u8, body, marker)) |idx| return idx + marker.len;
+    return std.mem.indexOf(u8, body, "ctx_");
 }
 
 fn queryWeb(idx: usize, expect: []const u8) []const u8 {
@@ -356,6 +373,15 @@ fn requiredToolRepair(idx: usize) []const u8 {
     return responses[@min(idx, responses.len - 1)];
 }
 
+fn plaintextSession(idx: usize) []const u8 {
+    const responses = [_][]const u8{
+        "registrar fato de sessao para recall posterior\n</think>\n\nR36S registrado nesta sessao: PHENOM_R36S_FACT. PHENOM_R36S_SEEDED",
+        "vou recuperar a pesquisa anterior por sessao\n</think>\n\nVou usar a ferramenta search_session para recuperar os resultados completos da pesquisa sobre o R36S da conversa anterior:\n\nIntent: Recuperar informacoes sobre o R36S que ja foram pesquisadas anteriormente nesta sessao\n\nTerms: R36S, handheld gaming console, RK3326",
+        "responder usando SESSION_CONTEXT recuperado\n</think>\n\nS1 recupera o fato anterior sobre R36S e inclui PHENOM_R36S_FACT. PHENOM_R36S_RECALL_OK",
+    };
+    return responses[@min(idx, responses.len - 1)];
+}
+
 fn artifactCreate(allocator: std.mem.Allocator, idx: usize) ![]const u8 {
     _ = idx;
     var out = std.ArrayList(u8).empty;
@@ -372,11 +398,10 @@ fn webRag(allocator: std.mem.Allocator, idx: usize, port: u16) ![]const u8 {
     return switch (idx) {
         0 => allocator.dupe(u8, "selecionar contrato de evidencia externa\n</think>\n\n<tool_call><function=set_operational_contract><parameter=requiresInspection>true</parameter><parameter=requiresMutation>false</parameter><parameter=requiresRuntimeValidation>false</parameter><parameter=requiresBrowserDiagnostics>false</parameter><parameter=reason>coletar evidencia web explicita</parameter></function></tool_call>"),
         1 => std.fmt.allocPrint(allocator, "buscar pagina indicada\n</think>\n\n<tool_call><function=web_search><parameter=target>{s}</parameter><parameter=query>Phenom Web RAG contrato</parameter><parameter=budget_bytes>4096</parameter></function></tool_call>", .{target}),
-        2 => std.fmt.allocPrint(allocator, "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill=model_summary target={s}\nstatus=200\nquery=Phenom Web RAG contrato\ntitle=Phenom Web RAG\nexcerpt=Phenom Web RAG fornece evidencia contratual externa destilada para respostas.", .{target}),
-        3 => allocator.dupe(u8, "E1 contem WEB_EVIDENCE da pagina explicitamente buscada e informa que Phenom Web RAG fornece evidencia contratual externa. PHENOM_WEB_RAG_OK"),
-        4 => allocator.dupe(u8, "selecionar contrato de evidencia por collect_evidence\n</think>\n\n<tool_call><function=set_operational_contract><parameter=requiresInspection>true</parameter><parameter=requiresMutation>false</parameter><parameter=requiresRuntimeValidation>false</parameter><parameter=requiresBrowserDiagnostics>false</parameter><parameter=reason>coletar URL pelo collect_evidence</parameter></function></tool_call>"),
-        5 => std.fmt.allocPrint(allocator, "coletar URL via collect_evidence\n</think>\n\n<tool_call><function=collect_evidence><parameter=httpSearch>true</parameter><parameter=target>{s}</parameter><parameter=query>Phenom Web RAG contrato</parameter><parameter=budget_bytes>4096</parameter></function></tool_call>", .{target}),
-        else => allocator.dupe(u8, "E1 informa que Phenom Web RAG fornece evidencia externa destilada para respostas. PHENOM_COLLECT_WEB_OK"),
+        2 => std.fmt.allocPrint(allocator, "A fonte {s} diz: Phenom Web RAG Contrato web_search fornece evidencia externa destilada para respostas e collect_evidence. PHENOM_WEB_RAG_OK", .{target}),
+        3 => allocator.dupe(u8, "selecionar contrato de evidencia por collect_evidence\n</think>\n\n<tool_call><function=set_operational_contract><parameter=requiresInspection>true</parameter><parameter=requiresMutation>false</parameter><parameter=requiresRuntimeValidation>false</parameter><parameter=requiresBrowserDiagnostics>false</parameter><parameter=reason>coletar URL pelo collect_evidence</parameter></function></tool_call>"),
+        4 => std.fmt.allocPrint(allocator, "coletar URL via collect_evidence\n</think>\n\n<tool_call><function=collect_evidence><parameter=httpSearch>true</parameter><parameter=target>{s}</parameter><parameter=query>Phenom Web RAG contrato</parameter><parameter=budget_bytes>4096</parameter></function></tool_call>", .{target}),
+        else => std.fmt.allocPrint(allocator, "A fonte {s} diz: Phenom Web RAG Contrato web_search fornece evidencia externa destilada para respostas e collect_evidence. PHENOM_COLLECT_WEB_OK", .{target}),
     };
 }
 
@@ -435,6 +460,16 @@ fn sendSse(client: c_int, text: []const u8) !void {
     try send(client, "200 OK", "text/event-stream", w.buffered());
 }
 
+fn sendOllamaStream(client: c_int, text: []const u8) !void {
+    var body_buf: [32768]u8 = undefined;
+    var w = std.Io.Writer.fixed(&body_buf);
+    try w.writeAll("{\"message\":{\"role\":\"assistant\",\"content\":\"");
+    try appendJson(&w, text);
+    try w.writeAll("\"},\"done\":false}\n");
+    try w.writeAll("{\"done\":true,\"prompt_eval_count\":8,\"eval_count\":16,\"eval_duration\":1000000000}\n");
+    try send(client, "200 OK", "application/x-ndjson", w.buffered());
+}
+
 fn appendJson(w: *std.Io.Writer, text: []const u8) !void {
     for (text) |ch| switch (ch) {
         '\\' => try w.writeAll("\\\\"),
@@ -460,4 +495,14 @@ fn sendAll(client: c_int, data: []const u8) !void {
         if (n <= 0) return error.SendFailed;
         offset += @intCast(n);
     }
+}
+
+test "agent patch fixture extracts real micro context id after schema example" {
+    const body =
+        "schema example contextId>ctx_...</parameter>\\n" ++
+        "[MICRO_CONTEXT id=ctx_real123abc path=src/math.zig lines=1-4]";
+    const start = microContextIdStart(body) orelse return error.MissingContextId;
+    var end = start;
+    while (end < body.len and (std.ascii.isAlphanumeric(body[end]) or body[end] == '_')) : (end += 1) {}
+    try std.testing.expectEqualStrings("ctx_real123abc", body[start..end]);
 }

@@ -11,6 +11,7 @@ WORK=${PHENOM_PARSE_ERROR_REPAIR_SMOKE_DIR:-/tmp/phenom-parse-error-repair-flow-
 DB="$WORK/.phenom-zig/phenom.db"
 SESSION=parse-error-repair-flow
 EXPECT=PHENOM_PARSE_ERROR_REPAIRED
+EXPECT_TEXT="Formato corrigido. Resposta direta final."
 
 command -v sqlite3 >/dev/null 2>&1 || {
   printf 'parse-error-repair-flow: sqlite3 CLI is required\n' >&2
@@ -41,7 +42,7 @@ PORT=$(cat "$PORT_FILE")
     --prompt "use uma ferramenta se precisar" \
     --max-tokens 128 \
     --thinking on \
-    --expect-contains "$EXPECT" \
+    --expect-contains "$EXPECT_TEXT" \
     --fail-on-model-error \
     --no-color
 ) >"$WORK/out.txt" 2>"$WORK/err.txt"

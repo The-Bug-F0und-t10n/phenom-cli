@@ -13,6 +13,8 @@ WEB_SESSION=web-rag-tool-flow
 COLLECT_SESSION=web-rag-collect-flow
 EXPECT_WEB=PHENOM_WEB_RAG_OK
 EXPECT_COLLECT=PHENOM_COLLECT_WEB_OK
+EXPECT_WEB_TEXT="Phenom Web RAG Contrato web_search fornece evidencia externa destilada"
+EXPECT_COLLECT_TEXT="Phenom Web RAG Contrato web_search fornece evidencia externa destilada"
 
 command -v sqlite3 >/dev/null 2>&1 || {
   printf 'web-rag-flow: sqlite3 CLI is required\n' >&2
@@ -46,7 +48,7 @@ TARGET="http://127.0.0.1:$PORT/doc.html"
     --prompt "Use evidencia web contratual para resumir $TARGET e responda contendo $EXPECT_WEB." \
     --max-tokens 512 \
     --thinking on \
-    --expect-contains "$EXPECT_WEB" \
+    --expect-contains "$EXPECT_WEB_TEXT" \
     --fail-on-model-error \
     --no-color
 ) >"$WORK/web.out" 2>"$WORK/web.err"
@@ -61,7 +63,7 @@ TARGET="http://127.0.0.1:$PORT/doc.html"
     --prompt "Use collect_evidence com target URL para coletar $TARGET e responda contendo $EXPECT_COLLECT." \
     --max-tokens 512 \
     --thinking on \
-    --expect-contains "$EXPECT_COLLECT" \
+    --expect-contains "$EXPECT_COLLECT_TEXT" \
     --fail-on-model-error \
     --no-color
 ) >"$WORK/collect.out" 2>"$WORK/collect.err"
@@ -85,8 +87,9 @@ test "$(sql_count "$WEB_SESSION" "kind = 'web_distillation' and body like '%succ
 test "$(sql_count "$WEB_SESSION" "kind = 'evidence' and body like '%[WEB_EVIDENCE]%' and body like '%Phenom Web RAG%' and body not like '%<html>%'")" -ge 1 || { printf 'web-rag-flow: missing distilled WEB_EVIDENCE\n' >&2; exit 1; }
 test "$(sql_count "$WEB_SESSION" "kind = 'turn_done' and body like 'status=ok%quality=confirmed%'")" -ge 1 || { printf 'web-rag-flow: web_search turn was not confirmed\n' >&2; exit 1; }
 
-test "$(sql_count "$COLLECT_SESSION" "kind = 'tool_start' and body like 'collect_evidence%' and body like '%$TARGET%'")" -ge 1 || { printf 'web-rag-flow: missing collect_evidence URL tool_start\n' >&2; exit 1; }
-test "$(sql_count "$COLLECT_SESSION" "kind = 'tool_event' and body like '%tool=web_search%' and body like '%status=200%'")" -ge 1 || { printf 'web-rag-flow: collect_evidence did not reuse web executor\n' >&2; exit 1; }
+test "$(sql_count "$COLLECT_SESSION" "kind = 'tool_start' and body like 'collect_evidence%'")" -ge 1 || { printf 'web-rag-flow: missing collect_evidence tool_start\n' >&2; exit 1; }
+test "$(sql_count "$COLLECT_SESSION" "kind = 'tool_arg_repair' and body like '%prompt_structured_path%'")" -ge 1 || { printf 'web-rag-flow: missing collect_evidence URL argument repair audit\n' >&2; exit 1; }
+test "$(sql_count "$COLLECT_SESSION" "kind = 'tool_event' and body like '%tool=web_search%' and body like '%status=200%' and body like '%$TARGET%'")" -ge 1 || { printf 'web-rag-flow: collect_evidence did not reuse web executor\n' >&2; exit 1; }
 test "$(sql_count "$COLLECT_SESSION" "kind = 'web_distillation' and body like '%success=true%' and body like '%output_bytes=%'")" -ge 1 || { printf 'web-rag-flow: missing collect_evidence model distillation audit\n' >&2; exit 1; }
 test "$(sql_count "$COLLECT_SESSION" "kind = 'evidence' and body like '%[WEB_EVIDENCE]%' and body like '%collect_evidence%' and body not like '%<html>%'")" -ge 1 || { printf 'web-rag-flow: collect_evidence URL evidence missing or raw\n' >&2; exit 1; }
 test "$(sql_count "$COLLECT_SESSION" "kind = 'turn_done' and body like 'status=ok%quality=confirmed%'")" -ge 1 || { printf 'web-rag-flow: collect_evidence turn was not confirmed\n' >&2; exit 1; }

@@ -1684,6 +1684,25 @@ fn buildInitialModelContext(
     });
 }
 
+fn buildInitialModelContextWithoutPersistent(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    db: *audit.AuditDb,
+    session: []const u8,
+    prompt: []const u8,
+    enable_tool_loop: bool,
+    include_session_context: bool,
+) !?[]u8 {
+    return initial_model_context.build(allocator, io, db, .{
+        .session = session,
+        .prompt = prompt,
+        .enable_tool_loop = enable_tool_loop,
+        .include_session_context = include_session_context,
+        .model_context_enabled = modelContextEnabled(),
+        .load_persistent_context = false,
+    });
+}
+
 fn initialTurnContextStateIsEmpty(
     memory: []const []const u8,
     skills: []const []const u8,
@@ -1809,6 +1828,18 @@ fn runToolLoopIterations(
     const has_visible_output = std.mem.trim(u8, visible_output, " \t\r\n").len > 0;
     var tool_iterations: usize = 0;
     var repairs: usize = 0;
+    if (maybe_envelope == null and has_visible_output and state.active_contract.allows("search_session")) {
+        if (try plaintextSearchSessionCallFromVisible(allocator, visible_output)) |session_call| {
+            var normalized_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, session_call);
+            const repair_reason = "plaintext search_session intent normalized";
+            db.recordEvent(config.session, "tool_repair", repair_reason) catch |err| {
+                normalized_envelope.deinit(allocator);
+                return err;
+            };
+            first_sink.discardDeferredVisible();
+            maybe_envelope = normalized_envelope;
+        }
+    }
     const initial_decision = agent_state.decideInitialModelOutput(.{
         .has_tool_envelope = maybe_envelope != null,
         .has_visible_output = has_visible_output,
@@ -2019,6 +2050,34 @@ fn syntheticInitialSessionSearchCall(allocator: std.mem.Allocator, prompt: []con
         .terms = terms,
         .scope = try allocator.dupe(u8, "current"),
     };
+}
+
+fn plaintextSearchSessionCallFromVisible(allocator: std.mem.Allocator, visible: []const u8) !?tool_call.ToolCall {
+    if (!containsIgnoreCaseAscii(visible, "search_session")) return null;
+    const terms = plaintextLabeledLineValue(visible, "terms") orelse return null;
+    if (terms.len == 0 or isSchemaPlaceholderText(terms)) return null;
+    const intent = plaintextLabeledLineValue(visible, "intent");
+    const scope = plaintextLabeledLineValue(visible, "scope");
+    const session = plaintextLabeledLineValue(visible, "session");
+    return .{
+        .name = try allocator.dupe(u8, "search_session"),
+        .intent = if (intent) |value| try allocator.dupe(u8, value) else null,
+        .terms = try allocator.dupe(u8, terms),
+        .scope = if (scope) |value| try allocator.dupe(u8, value) else null,
+        .session = if (session) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
+fn plaintextLabeledLineValue(text: []const u8, label: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n`>*-");
+        if (trimmed.len <= label.len or trimmed[label.len] != ':') continue;
+        if (!std.ascii.eqlIgnoreCase(trimmed[0..label.len], label)) continue;
+        const value = std.mem.trim(u8, trimmed[label.len + 1 ..], " \t\r\n`");
+        if (value.len > 0) return value;
+    }
+    return null;
 }
 
 fn syntheticSessionSearchTerms(allocator: std.mem.Allocator, prompt: []const u8, initial_context: []const u8) ![]u8 {
@@ -6267,6 +6326,17 @@ fn streamDeferredToolLoopTurnInternal(
 
     if (envelope.state == .rejected) {
         if (active_contract.name == .answer_only and finalization_state != null) {
+            if (envelope.rejection_reason == .tool_not_advertised and
+                std.mem.eql(u8, envelope.raw_name, "set_operational_contract") and
+                std.mem.indexOf(u8, follow_context, "[WEB_DOSSIER v1]") != null)
+            {
+                if (try recoverFinalizationContractSwitch(allocator, follow_sink.raw_visible.items, follow_sink.raw_model.items)) |call| {
+                    follow_sink.discardDeferredVisible();
+                    finalization_state.?.active_contract = contracts.activeContract(.workflow) orelse return error.MissingContract;
+                    try db.recordEvent(config.session, "contract_switch_after_web_evidence", "set_operational_contract");
+                    return .{ .tool_call = call };
+                }
+            }
             follow_sink.discardDeferredVisible();
             const state = finalization_state.?;
             if (state.finalization_repairs >= max_tool_repairs) {
@@ -6424,6 +6494,40 @@ fn parseToolCallFromVisibleOrRaw(
 ) !?tool_call.ToolCall {
     if (try tool_call.parseFirst(allocator, visible)) |call| return call;
     return try tool_call.parseFirst(allocator, raw_model);
+}
+
+fn recoverFinalizationContractSwitch(
+    allocator: std.mem.Allocator,
+    visible: []const u8,
+    raw_model: []const u8,
+) !?tool_call.ToolCall {
+    const workflow = contracts.activeContract(.workflow) orelse return error.MissingContract;
+    var envelope = (try parseToolEnvelopeFromVisibleOrRaw(allocator, visible, raw_model, workflow)) orelse return null;
+    defer envelope.deinit(allocator);
+    if (envelope.state != .accepted) return null;
+    if (!std.mem.eql(u8, envelope.raw_name, "set_operational_contract")) return null;
+    var call = envelope.takeCall() orelse return null;
+    errdefer call.deinit(allocator);
+    if (!finalizationContractSwitchAllowed(&call)) {
+        call.deinit(allocator);
+        return null;
+    }
+    return call;
+}
+
+fn finalizationContractSwitchAllowed(call: *const tool_call.ToolCall) bool {
+    const selected = contracts.selectOperationalContract(.{
+        .requested_contract = call.contract,
+        .requires_inspection = call.requires_inspection orelse false,
+        .requires_mutation = call.requires_mutation orelse false,
+        .requires_runtime_validation = call.requires_runtime_validation orelse false,
+        .requires_browser_diagnostics = call.requires_browser_diagnostics orelse false,
+        .requires_memory_promotion = call.requires_memory_promotion orelse false,
+    });
+    return switch (selected) {
+        .collect_evidence, .search_web, .session_context, .memory, .news, .inspect_runtime, .validate_work => true,
+        .workflow, .answer_only, .mutate_file => false,
+    };
 }
 
 fn renderFinalizationRepairContext(
@@ -7938,7 +8042,7 @@ test "tool loop schema is compact and offered without linguistic gating" {
     defer db.close();
     try db.recordEvent("schema-test", "turn_start", "falamos de groundedness");
     try db.recordEvent("schema-test", "assistant_delta", "resposta anterior");
-    const with_tools = (try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test", "ola tudo bem", true, true)) orelse return error.MissingContext;
+    const with_tools = (try buildInitialModelContextWithoutPersistent(std.testing.allocator, std.testing.io, &db, "schema-test", "ola tudo bem", true, true)) orelse return error.MissingContext;
     defer std.testing.allocator.free(with_tools);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "mode: code_evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "[SESSION_FOCUS]") != null);
@@ -7958,16 +8062,16 @@ test "tool loop schema is compact and offered without linguistic gating" {
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "stage=overview") == null);
     try std.testing.expect(with_tools.len < 5200);
 
-    try std.testing.expect((try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "schema-test-empty", "analise esse projeto", false, true)) == null);
+    try std.testing.expect((try buildInitialModelContextWithoutPersistent(std.testing.allocator, std.testing.io, &db, "schema-test-empty", "analise esse projeto", false, true)) == null);
 }
 
 test "empty initial turn uses structural micro context without prompt heuristics" {
     var db = try audit.AuditDb.open(std.testing.allocator, ":memory:");
     defer db.close();
 
-    const first = (try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "empty-a", "ola", true, true)) orelse return error.MissingContext;
+    const first = (try buildInitialModelContextWithoutPersistent(std.testing.allocator, std.testing.io, &db, "empty-a", "ola", true, true)) orelse return error.MissingContext;
     defer std.testing.allocator.free(first);
-    const second = (try buildInitialModelContext(std.testing.allocator, std.testing.io, &db, "empty-b", "pesquise na internet sobre Londrina", true, true)) orelse return error.MissingContext;
+    const second = (try buildInitialModelContextWithoutPersistent(std.testing.allocator, std.testing.io, &db, "empty-b", "pesquise na internet sobre Londrina", true, true)) orelse return error.MissingContext;
     defer std.testing.allocator.free(second);
 
     for ([_][]const u8{ first, second }) |rendered| {
@@ -7994,6 +8098,30 @@ test "search session scope is model selected without linguistic inference" {
     const audit_key = try renderSessionSearchAuditKey(std.testing.allocator, .all, "old-session", "recover prior layout decision", "w-90 bootstrap");
     defer std.testing.allocator.free(audit_key);
     try std.testing.expectEqualStrings("scope=all session=old-session intent=recover prior layout decision terms=w-90 bootstrap", audit_key);
+}
+
+test "plaintext search session announcement becomes executable tool call" {
+    const visible =
+        \\Vou usar a ferramenta search_session para recuperar os resultados completos da pesquisa sobre o R36S da conversa anterior:
+        \\
+        \\ Intent: Recuperar informações sobre o R36S que já foram pesquisadas anteriormente nesta sessão
+        \\
+        \\ Terms: R36S, handheld gaming console, RK3326
+    ;
+    const call = (try plaintextSearchSessionCallFromVisible(std.testing.allocator, visible)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("search_session", call.name);
+    try std.testing.expectEqualStrings("Recuperar informações sobre o R36S que já foram pesquisadas anteriormente nesta sessão", call.intent.?);
+    try std.testing.expectEqualStrings("R36S, handheld gaming console, RK3326", call.terms.?);
+    try std.testing.expect(call.scope == null);
+}
+
+test "plaintext search session announcement requires model selected terms" {
+    const visible =
+        \\Vou usar a ferramenta search_session para recuperar contexto.
+        \\ Intent: recuperar a conversa anterior
+    ;
+    try std.testing.expect((try plaintextSearchSessionCallFromVisible(std.testing.allocator, visible)) == null);
 }
 
 test "session recall missing search_session is turn quality without text heuristics" {
@@ -8109,7 +8237,7 @@ test "initial model context does not run prompt based session fts" {
     try db.recordEvent("long-session", "turn_start", "renderer append-only pergunta atual");
     try db.recordEvent("other-session", "assistant_delta", "renderer append-only fora da sessao");
 
-    const rendered = (try buildInitialModelContext(
+    const rendered = (try buildInitialModelContextWithoutPersistent(
         std.testing.allocator,
         std.testing.io,
         &db,
@@ -8145,7 +8273,7 @@ test "initial model context routes before prose without stale focus session sear
         "answered=true low_confidence=false",
     );
 
-    const rendered = (try buildInitialModelContext(
+    const rendered = (try buildInitialModelContextWithoutPersistent(
         std.testing.allocator,
         std.testing.io,
         &db,
@@ -8226,7 +8354,7 @@ test "initial model context for one-shot prompt omits implicit session context" 
         "answered=true low_confidence=false",
     );
 
-    const rendered = (try buildInitialModelContext(
+    const rendered = (try buildInitialModelContextWithoutPersistent(
         std.testing.allocator,
         std.testing.io,
         &db,
@@ -8264,7 +8392,7 @@ test "initial model context includes long session summary without failed or curr
     try db.recordEvent("long-summary", "turn_done", "status=ok low_confidence=true");
     try db.recordEvent("long-summary", "turn_start", "pedido atual ambiguo");
 
-    const rendered = (try buildInitialModelContext(
+    const rendered = (try buildInitialModelContextWithoutPersistent(
         std.testing.allocator,
         std.testing.io,
         &db,
@@ -9264,6 +9392,21 @@ test "web source fallback normalizes urls and skips search pages" {
     try std.testing.expect(std.mem.indexOf(u8, sourced, "html.duckduckgo.com/html") == null);
     try std.testing.expect(std.mem.indexOf(u8, sourced, "`") == null);
     try std.testing.expectEqual(@as(usize, 1), countNeedle(sourced, "https://pt.wikipedia.org/wiki/Campanha_presidencial_de_Fl%C3%A1vio_Bolsonaro_em_2026"));
+}
+
+test "finalization contract switch recovery accepts read only and rejects mutation" {
+    const collect_visible =
+        \\<tool_call><function=set_operational_contract><parameter=contract>collect_evidence</parameter><parameter=reason>read local file after web evidence</parameter></function></tool_call>
+    ;
+    var collect_call = (try recoverFinalizationContractSwitch(std.testing.allocator, collect_visible, "")) orelse return error.NoToolCall;
+    defer collect_call.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("set_operational_contract", collect_call.name);
+    try std.testing.expectEqual(contracts.ContractName.collect_evidence, collect_call.contract.?);
+
+    const mutate_visible =
+        \\<tool_call><function=set_operational_contract><parameter=contract>mutate_file</parameter><parameter=reason>write after web evidence</parameter></function></tool_call>
+    ;
+    try std.testing.expect((try recoverFinalizationContractSwitch(std.testing.allocator, mutate_visible, "")) == null);
 }
 
 test "initial context no longer forces protocol repair" {

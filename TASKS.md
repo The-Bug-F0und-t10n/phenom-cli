@@ -94,6 +94,15 @@ Make `phenom-zig` operate as a reliable AI agent runtime with explicit states, c
 - `sh tools/check_required_tool_repair_flow.sh ./zig-out/bin/phenom`
 - `sh tools/check_think_only_finalization.sh ./zig-out/bin/phenom`
 - `python3 tools/check_cli_streaming_flow.py ./zig-out/bin/phenom`
+- Regression batch for plaintext `search_session` recovery:
+  - `zig build`
+  - `zig build test` passed from repo cwd with local untracked `MEMORY.md` present.
+  - `zig test src/final_claim_verifier.zig`
+  - `zig test src/initial_model_context.zig -lc -lsqlite3`
+  - `zig test tools/scripted_backend.zig -lc`
+  - Focused `src/main.zig` tests passed for plaintext session recovery and finalization contract-switch recovery.
+  - `sh tools/check_plaintext_session_flow.sh ./zig-out/bin/phenom` passed with both `llamacpp` and `ollama` adapters.
+  - Tool-flow smokes passed for parse-error repair, required-tool repair, agent patch, simple greeting, think-only finalization, web RAG, query web RAG, ambiguous web continuity, linear web/workspace conversation, git evidence, artifact create, `PHENOM.md` prompt, user-rule promotion, memory persistence, personal memory, and 100-turn personal-memory ambiguity.
 
 ## Design Rules
 

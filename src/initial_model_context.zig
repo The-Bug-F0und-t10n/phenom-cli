@@ -13,6 +13,7 @@ pub const Options = struct {
     enable_tool_loop: bool,
     include_session_context: bool,
     model_context_enabled: bool,
+    load_persistent_context: bool = true,
 };
 
 pub fn build(
@@ -21,7 +22,7 @@ pub fn build(
     db: *audit.AuditDb,
     options: Options,
 ) !?[]u8 {
-    const include_persistent = options.model_context_enabled or options.enable_tool_loop;
+    const include_persistent = options.load_persistent_context and (options.model_context_enabled or options.enable_tool_loop);
     if (!include_persistent and !options.enable_tool_loop) return null;
 
     var persistent = persistent_context.Loaded.init(allocator);

@@ -11,6 +11,7 @@ WORK=${PHENOM_GIT_EVIDENCE_SMOKE_DIR:-/tmp/phenom-git-evidence-flow-smoke}
 DB="$WORK/.phenom-zig/phenom.db"
 SESSION=git-evidence-reflog-flow
 EXPECT=PHENOM_GIT_REFLOG_OK
+EXPECT_TEXT="deleted commit touching collect_evidence web_distillation"
 
 command -v git >/dev/null 2>&1 || {
   printf 'git-evidence-flow: git is required\n' >&2
@@ -60,7 +61,7 @@ PORT=$(cat "$PORT_FILE")
     --prompt "Use collect_evidence source=git strategy=reflog para recuperar o commit removido que tocou collect_evidence web_distillation e responda contendo $EXPECT." \
     --max-tokens 512 \
     --thinking on \
-    --expect-contains "$EXPECT" \
+    --expect-contains "$EXPECT_TEXT" \
     --fail-on-model-error \
     --no-color
 ) >"$WORK/out.txt" 2>"$WORK/err.txt"

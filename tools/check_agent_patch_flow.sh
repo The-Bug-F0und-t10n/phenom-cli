@@ -11,6 +11,7 @@ WORK=${PHENOM_AGENT_PATCH_SMOKE_DIR:-/tmp/phenom-agent-patch-flow-smoke}
 DB="$WORK/.phenom-zig/phenom.db"
 SESSION=agent-patch-flow
 EXPECT=PHENOM_AGENT_PATCH_OK
+EXPECT_TEXT="Patch aplicado em src/math.zig."
 
 command -v sqlite3 >/dev/null 2>&1 || {
   printf 'agent-patch-flow: sqlite3 CLI is required\n' >&2
@@ -46,7 +47,7 @@ PORT=$(cat "$PORT_FILE")
     --model scripted \
     --session "$SESSION" \
     --prompt "A soma esta errada. Corrija o bug no projeto." \
-    --expect-contains "$EXPECT" \
+    --expect-contains "$EXPECT_TEXT" \
     --show-expect-status \
     --fail-on-model-error \
     --no-color
@@ -57,6 +58,10 @@ trap - EXIT
 
 grep -q 'return a + b;' "$WORK/src/math.zig" || {
   printf 'agent-patch-flow: patch did not update src/math.zig\n' >&2
+  exit 1
+}
+grep -q "$EXPECT" "$WORK/agent.out" || {
+  printf 'agent-patch-flow: missing final marker\n' >&2
   exit 1
 }
 ! grep -q 'return a - b;' "$WORK/src/math.zig" || {
@@ -84,7 +89,7 @@ test "$(sql_count "kind = 'contract_selected' and body like '%contract=mutate_fi
 test "$(sql_count "kind = 'tool_start' and body like 'collect_evidence%'")" -ge 1 || { printf 'agent-patch-flow: missing collect_evidence tool_start\n' >&2; exit 1; }
 test "$(sql_count "kind = 'tool_start' and body like 'apply_patch%'")" -ge 1 || { printf 'agent-patch-flow: missing apply_patch tool_start\n' >&2; exit 1; }
 test "$(sql_count "kind = 'patch_result' and body like '%status=applied%'")" -ge 1 || { printf 'agent-patch-flow: missing applied patch result\n' >&2; exit 1; }
-test "$(sql_count "kind = 'expectation_passed' and body = '$EXPECT'")" -ge 1 || { printf 'agent-patch-flow: missing expectation_passed\n' >&2; exit 1; }
+test "$(sql_count "kind = 'expectation_passed' and body = '$EXPECT_TEXT'")" -ge 1 || { printf 'agent-patch-flow: missing expectation_passed\n' >&2; exit 1; }
 test "$(focus_count "user_intent = 'turn_memory' and useful_facts like '%source=turn_memory_v1%'")" -ge 1 || { printf 'agent-patch-flow: missing completed turn memory\n' >&2; exit 1; }
 test "$(sql_count "kind = 'turn_done' and body like 'status=ok%'")" -ge 1 || { printf 'agent-patch-flow: missing successful turn_done\n' >&2; exit 1; }
 test "$(sql_count "kind = 'turn_error' and body like '%class=model_protocol%'")" -eq 0 || { printf 'agent-patch-flow: unexpected model_protocol turn_error\n' >&2; exit 1; }
