@@ -2,6 +2,7 @@ const std = @import("std");
 
 const contracts = @import("contracts.zig");
 const model_context = @import("model_context.zig");
+const web_evidence_model = @import("web_evidence_model.zig");
 
 pub const default_model_budget_limit: usize = 18 * 1024;
 const min_remaining_budget: usize = 2200;
@@ -236,7 +237,7 @@ pub const WorkingContext = struct {
 };
 
 fn isWebEvidence(text: []const u8) bool {
-    return std.mem.indexOf(u8, text, "[WEB_EVIDENCE]") != null or
+    return web_evidence_model.hasEvidence(text) or
         std.mem.indexOf(u8, text, "[WEB_DOSSIER v1]") != null;
 }
 
@@ -268,6 +269,59 @@ fn appendWebDossierEntry(
     const label = try std.fmt.allocPrint(allocator, "W{}:\n", .{idx});
     defer allocator.free(label);
     try out.appendSlice(allocator, label);
+    if (web_evidence_model.parseFirst(text)) |web| {
+        try appendParsedWebDossierEntry(out, gaps, allocator, idx, entry, web);
+    } else {
+        try appendLegacyWebDossierEntry(out, gaps, allocator, idx, entry, text);
+    }
+}
+
+fn appendParsedWebDossierEntry(
+    out: *std.ArrayList(u8),
+    gaps: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    idx: usize,
+    entry: WorkingEvidence,
+    web: web_evidence_model.ParsedEvidenceEntry,
+) !void {
+    if (web.target.len > 0) {
+        try appendKV(out, allocator, "target", web.target, 360);
+    } else {
+        try appendKV(out, allocator, "target", entry.path, 360);
+    }
+    if (web.query.len > 0) {
+        try appendKV(out, allocator, "query", web.query, 240);
+    } else if (entry.terms.len > 0) {
+        try appendKV(out, allocator, "query", entry.terms, 240);
+    }
+    try appendIntKV(out, allocator, "quality", entry.quality_score);
+    if (web.status.len > 0) try appendKV(out, allocator, "status", web.status, 40);
+    if (web.source_domain.len > 0) try appendKV(out, allocator, "source_domain", web.source_domain, 120);
+    var sources = web.sourceIterator();
+    while (sources.next()) |source| {
+        try appendKV(out, allocator, "source_url", source.url, 360);
+    }
+    if (web.title.len > 0) try appendKV(out, allocator, "title", web.title, 240);
+    if (web.excerpt) |excerpt| {
+        const trimmed = std.mem.trim(u8, excerpt, " \t\r\n");
+        if (trimmed.len > 0) {
+            try appendKV(out, allocator, "excerpt", trimmed, 700);
+        } else {
+            try appendGap(gaps, allocator, idx, "empty_excerpt");
+        }
+    } else {
+        try appendGap(gaps, allocator, idx, "missing_excerpt");
+    }
+}
+
+fn appendLegacyWebDossierEntry(
+    out: *std.ArrayList(u8),
+    gaps: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    idx: usize,
+    entry: WorkingEvidence,
+    text: []const u8,
+) !void {
     if (webFieldValue(text, "target")) |target| {
         try appendKV(out, allocator, "target", target, 360);
     } else {

@@ -10,6 +10,7 @@ pub const EventType = enum {
     user_message,
     agent_message,
     message_chunk,
+    assistant_output,
     reasoning_chunk,
     tool_start,
     tool_result,
@@ -28,6 +29,23 @@ pub const EventType = enum {
 pub const ToolStart = struct {
     name: []const u8,
     detail: []const u8 = "",
+};
+
+pub const AssistantOutputClassification = enum {
+    streamed_answer,
+    final_answer,
+    protocol_diagnostic,
+};
+
+pub const AssistantOutputFormat = enum {
+    markdown,
+    plain_text,
+};
+
+pub const AssistantOutput = struct {
+    text: []const u8,
+    classification: AssistantOutputClassification = .streamed_answer,
+    format: AssistantOutputFormat = .markdown,
 };
 
 pub const ToolResult = struct {
@@ -68,6 +86,7 @@ pub const Event = union(EventType) {
     user_message: []const u8,
     agent_message: []const u8,
     message_chunk: []const u8,
+    assistant_output: AssistantOutput,
     reasoning_chunk: []const u8,
     tool_start: ToolStart,
     tool_result: ToolResult,
@@ -83,11 +102,20 @@ pub const Event = union(EventType) {
     progress_update: []const u8,
 };
 
+pub fn streamedAssistantOutput(text: []const u8) Event {
+    return .{ .assistant_output = .{ .text = text } };
+}
+
 fn cloneEvent(allocator: std.mem.Allocator, event: Event) !Event {
     return switch (event) {
         .user_message => |text| .{ .user_message = try allocator.dupe(u8, text) },
         .agent_message => |text| .{ .agent_message = try allocator.dupe(u8, text) },
         .message_chunk => |text| .{ .message_chunk = try allocator.dupe(u8, text) },
+        .assistant_output => |output| .{ .assistant_output = .{
+            .text = try allocator.dupe(u8, output.text),
+            .classification = output.classification,
+            .format = output.format,
+        } },
         .reasoning_chunk => |text| .{ .reasoning_chunk = try allocator.dupe(u8, text) },
         .tool_start => |tool| .{ .tool_start = .{ .name = try allocator.dupe(u8, tool.name), .detail = try allocator.dupe(u8, tool.detail) } },
         .tool_result => |result| .{ .tool_result = .{ .name = try allocator.dupe(u8, result.name), .output = try allocator.dupe(u8, result.output), .success = result.success } },
@@ -107,6 +135,7 @@ fn cloneEvent(allocator: std.mem.Allocator, event: Event) !Event {
 fn freeEvent(allocator: std.mem.Allocator, event: Event) void {
     switch (event) {
         .user_message, .agent_message, .message_chunk, .reasoning_chunk, .think_start, .inference_cancel, .progress_update => |text| allocator.free(text),
+        .assistant_output => |output| allocator.free(output.text),
         .tool_start => |tool| {
             allocator.free(tool.name);
             allocator.free(tool.detail);
@@ -266,6 +295,14 @@ pub fn RendererEventSink(comptime RendererPtr: type) type {
                 .message_chunk, .agent_message => |text| {
                     try self.ensureAssistantStarted();
                     try self.renderer.assistantDelta(text);
+                },
+                .assistant_output => |output| {
+                    _ = output.classification;
+                    try self.ensureAssistantStarted();
+                    switch (output.format) {
+                        .markdown => try self.renderer.assistantDelta(output.text),
+                        .plain_text => try self.renderer.assistantDeltaPlain(output.text),
+                    }
                 },
                 .reasoning_chunk => |text| try self.renderer.thinkingDelta(text),
                 .tool_start => |tool| try self.renderer.toolStart(tool.name, tool.detail),
@@ -430,6 +467,43 @@ test "renderer sink maps chat events to transcript" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "> [user] ola") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "resposta") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Worked for") != null);
+}
+
+test "renderer sink maps typed assistant output to transcript" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = render.AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 40 });
+    var sink = RendererEventSink(@TypeOf(&renderer)){
+        .renderer = &renderer,
+        .allocator = std.testing.allocator,
+        .terminal_columns = testTerminalColumns,
+    };
+    defer sink.deinit();
+
+    test_terminal_columns = 40;
+    try sink.handle(.{ .user_message = "ola" });
+    try sink.handle(streamedAssistantOutput("resposta tipada"));
+    test_terminal_columns = 20;
+    try sink.redrawIfNeeded();
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "resposta tipada") != null);
+}
+
+test "typed assistant output can bypass markdown rendering" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    const writer = fd_writer.BufferWriter{ .allocator = std.testing.allocator, .list = &buffer };
+    var renderer = render.AppendOnlyRenderer(@TypeOf(writer)).init(writer, .{ .color = false, .terminal_columns = 80 });
+    var sink = RendererEventSink(@TypeOf(&renderer)){ .renderer = &renderer };
+
+    try sink.handle(.{ .assistant_output = .{
+        .text = "| A | B |\n| --- | --- |\n| C | D |\n",
+        .format = .plain_text,
+    } });
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "| A | B |") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "│ A") == null);
 }
 
 test "renderer sink replays responsive components after resize" {

@@ -138,7 +138,11 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
         }
 
         pub fn assistantDelta(self: *Self, text: []const u8) !void {
-            try self.writeSanitizedAssistantDelta(text);
+            try self.writeSanitizedAssistantDelta(text, .markdown);
+        }
+
+        pub fn assistantDeltaPlain(self: *Self, text: []const u8) !void {
+            try self.writeSanitizedAssistantDelta(text, .plain_text);
         }
 
         pub fn thinkingDelta(self: *Self, text: []const u8) !void {
@@ -471,7 +475,12 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
             self.markdown_table_rows += 1;
         }
 
-        fn writeSanitizedAssistantDelta(self: *Self, text: []const u8) !void {
+        const AssistantDeltaFormat = enum {
+            markdown,
+            plain_text,
+        };
+
+        fn writeSanitizedAssistantDelta(self: *Self, text: []const u8, format: AssistantDeltaFormat) !void {
             var buf: [1024]u8 = undefined;
             var len: usize = 0;
             for (text) |byte| {
@@ -479,14 +488,24 @@ pub fn AppendOnlyRenderer(comptime Writer: type) type {
                 buf[len] = byte;
                 len += 1;
                 if (len == buf.len) {
-                    try self.writeMarkdownStream(buf[0..len]);
+                    try self.writeAssistantChunk(buf[0..len], format);
                     self.assistant_wrote_content = true;
                     len = 0;
                 }
             }
             if (len > 0) {
-                try self.writeMarkdownStream(buf[0..len]);
+                try self.writeAssistantChunk(buf[0..len], format);
                 self.assistant_wrote_content = true;
+            }
+        }
+
+        fn writeAssistantChunk(self: *Self, text: []const u8, format: AssistantDeltaFormat) !void {
+            switch (format) {
+                .markdown => try self.writeMarkdownStream(text),
+                .plain_text => {
+                    try self.flushMarkdown();
+                    try self.writeContentStream(text);
+                },
             }
         }
 

@@ -1,44 +1,55 @@
 const std = @import("std");
 
 const audit = @import("audit.zig");
+const agent_state = @import("agent_state.zig");
 const apply_patch_tool = @import("apply_patch_tool.zig");
 const build_options = @import("build_options");
 const cli = @import("cli.zig");
 const code_graph = @import("code_graph.zig");
 const collect_evidence = @import("collect_evidence.zig");
 const context_profile = @import("context_profile.zig");
+const context_budget = @import("context_budget.zig");
 const contracts = @import("contracts.zig");
 const config_file = @import("config_file.zig");
-const diagnostic_runner = @import("diagnostic_runner.zig");
 const evidence = @import("evidence.zig");
 const fd_writer = @import("fd_writer.zig");
+const final_claim_verifier = @import("final_claim_verifier.zig");
 const gate = @import("gate.zig");
 const http = @import("http.zig");
+const initial_model_context = @import("initial_model_context.zig");
 const micro_context = @import("micro_context.zig");
 const model_context = @import("model_context.zig");
 const personal_memory = @import("personal_memory.zig");
 const persistent_context = @import("persistent_context.zig");
 const product_guardrails = @import("product_guardrails.zig");
+const protocol_repair_policy = @import("protocol_repair_policy.zig");
 const reasoning_filter = @import("reasoning_filter.zig");
+const repair_contexts = @import("repair_context.zig");
 const render = @import("render.zig");
+const runtime_inspection = @import("runtime_inspection.zig");
 const session_context = @import("session_context.zig");
 const strategy_registry = @import("strategy_registry.zig");
 const system_prompt = @import("system_prompt.zig");
+const syntax_validation = @import("syntax_validation.zig");
 const text_match = @import("text_match.zig");
 const tool_call = @import("tool_call.zig");
 const tool_envelope = @import("tool_envelope.zig");
 const tool_event = @import("tool_event.zig");
 const tool_loop = @import("tool_loop.zig");
+const tool_loop_state = @import("tool_loop_state.zig");
+const tool_step_policy = @import("tool_step_policy.zig");
 const tools = @import("tools.zig");
 const tui = @import("tui.zig");
 const ui_events = @import("ui_events.zig");
 const welcome = @import("welcome.zig");
+const web_evidence_model = @import("web_evidence_model.zig");
 const web_rag = @import("web_rag.zig");
 const working_context = @import("working_context.zig");
 
 const InteractiveTranscriptWriter = fd_writer.NewlineWriter(fd_writer.FdWriter);
 const InteractiveRenderer = render.AppendOnlyRenderer(*InteractiveTranscriptWriter);
 const InteractiveRenderSink = ui_events.RendererEventSink(*InteractiveRenderer);
+const ToolLoopState = tool_loop_state.ToolLoopState;
 
 const c = @cImport({
     @cInclude("sys/stat.h");
@@ -1664,88 +1675,12 @@ fn buildInitialModelContext(
     enable_tool_loop: bool,
     include_session_context: bool,
 ) !?[]u8 {
-    const include_persistent = modelContextEnabled() or enable_tool_loop;
-    if (!include_persistent and !enable_tool_loop) return null;
-
-    var persistent = persistent_context.Loaded.init(allocator);
-    defer persistent.deinit();
-    if (include_persistent) persistent = try persistent_context.loadFromCwd(allocator, io);
-
-    var session_events = if (include_session_context)
-        try db.loadRecentSessionEvents(allocator, session, 240)
-    else
-        std.ArrayList(audit.AuditEvent).empty;
-    defer audit.freeAuditEvents(allocator, &session_events);
-
-    const focus_text = if (include_session_context)
-        try loadMergedSessionFocus(allocator, db, session, prompt, session_events.items)
-    else
-        null;
-    defer if (focus_text) |text| allocator.free(text);
-    const focus_blocks = try session_context.toFocusBlocks(allocator, focus_text);
-    defer allocator.free(focus_blocks);
-
-    const recent_dialogue = try session_context.renderRecentDialogue(allocator, session_events.items, prompt);
-    defer if (recent_dialogue) |text| allocator.free(text);
-    const dialogue_blocks = try session_context.toDialogueBlocks(allocator, recent_dialogue);
-    defer allocator.free(dialogue_blocks);
-
-    const session_blocks = try session_context.toSessionBlocks(allocator, null);
-    defer allocator.free(session_blocks);
-
-    var personal_rows = if (enable_tool_loop or include_persistent)
-        try db.searchPersonalMemory(allocator, prompt, null, 6)
-    else
-        std.ArrayList(personal_memory.Entry).empty;
-    if ((enable_tool_loop or include_persistent) and personal_rows.items.len == 0) {
-        audit.freePersonalMemory(allocator, &personal_rows);
-        personal_rows = try db.loadRecentPersonalMemory(allocator, 6);
-    }
-    defer audit.freePersonalMemory(allocator, &personal_rows);
-    const personal_text = try personal_memory.renderEntries(allocator, personal_rows.items, 2048);
-    defer if (personal_text) |text| allocator.free(text);
-    const personal_blocks = try toPersonalMemoryBlocks(allocator, personal_text);
-    defer allocator.free(personal_blocks);
-
-    if (!enable_tool_loop and persistent.memory.items.len == 0 and persistent.skills.items.len == 0 and personal_blocks.len == 0) return null;
-
-    if (enable_tool_loop and initialTurnContextStateIsEmpty(persistent.memory.items, persistent.skills.items, personal_blocks, focus_blocks, dialogue_blocks, session_blocks)) {
-        return try model_context.renderModelTurnContext(allocator, .{
-            .task = prompt,
-            .mode = "micro_turn",
-            .budget = "micro",
-        });
-    }
-
-    const profile = context_profile.select(.{
+    return initial_model_context.build(allocator, io, db, .{
+        .session = session,
+        .prompt = prompt,
         .enable_tool_loop = enable_tool_loop,
-    });
-    return try model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .mode = context_profile.modeName(profile),
-        .contracts = context_profile.toolSchema(profile, .initial),
-        .evidence = &[_]model_context.EvidenceBlock{},
-        .focus = focus_blocks,
-        .dialogue = dialogue_blocks,
-        .session = session_blocks,
-        .personal_memory = personal_blocks,
-        .memory = persistent.memory.items,
-        .skills = persistent.skills.items,
-        .grounding = groundingRules(),
-        .next_action_v1 = if (enable_tool_loop) .{
-            .kind = .collect_context,
-            .text = if (personal_blocks.len > 0)
-                "Think first. If PERSONAL_MEMORY directly answers an owner fact/preference/request, answer from U# without search_session or workspace/source-code tools; otherwise use the smallest verifying read-only tool."
-            else if (persistent.skills.items.len > 0)
-                "Think first. Apply relevant [SKILLS] as active operating rules. Use MEMORY/SKILLS for local project/task context before generic answers; otherwise use the smallest verifying read-only tool."
-            else if (persistent.memory.items.len > 0)
-                "Think first. Use [MEMORY] as distilled local project/task context. Verify workspace/source-code claims with read-only tools when exact evidence is required."
-            else
-                "Think first. Use the smallest verifying read-only tool before low-confidence answers; ask only when exploration cannot reduce ambiguity.",
-        } else .{
-            .kind = .answer_directly,
-            .text = "Apply persistent MEMORY/SKILLS only if relevant; answer the current user request directly.",
-        },
+        .include_session_context = include_session_context,
+        .model_context_enabled = modelContextEnabled(),
     });
 }
 
@@ -1757,14 +1692,11 @@ fn initialTurnContextStateIsEmpty(
     dialogue: []const model_context.DialogueBlock,
     session: []const model_context.SessionBlock,
 ) bool {
-    return memory.len == 0 and skills.len == 0 and personal.len == 0 and focus.len == 0 and dialogue.len == 0 and session.len == 0;
+    return initial_model_context.initialTurnContextStateIsEmpty(memory, skills, personal, focus, dialogue, session);
 }
 
 fn toPersonalMemoryBlocks(allocator: std.mem.Allocator, rendered: ?[]const u8) ![]model_context.PersonalMemoryBlock {
-    const text = rendered orelse return allocator.alloc(model_context.PersonalMemoryBlock, 0);
-    const blocks = try allocator.alloc(model_context.PersonalMemoryBlock, 1);
-    blocks[0] = .{ .text = text };
-    return blocks;
+    return initial_model_context.toPersonalMemoryBlocks(allocator, rendered);
 }
 
 fn loadMergedSessionFocus(
@@ -1774,27 +1706,17 @@ fn loadMergedSessionFocus(
     prompt: []const u8,
     session_events: []const audit.AuditEvent,
 ) !?[]u8 {
-    var focus_rows = try db.loadRecentSessionFocus(allocator, session, 16);
-    defer audit.freeSessionFocus(allocator, &focus_rows);
-    const stored_focus_text = try session_context.renderSessionFocusForPrompt(allocator, focus_rows.items, prompt);
-    defer if (stored_focus_text) |text| allocator.free(text);
-    const fallback_focus_text = try session_context.renderFallbackSessionFocusFromEvents(allocator, session_events, prompt);
-    defer if (fallback_focus_text) |text| allocator.free(text);
-    const long_summary_text = try session_context.renderLongSessionSummary(allocator, session_events, prompt);
-    defer if (long_summary_text) |text| allocator.free(text);
-    const fallback_context_text = try session_context.mergeSessionFocus(allocator, fallback_focus_text, long_summary_text);
-    defer if (fallback_context_text) |text| allocator.free(text);
-    return try session_context.mergeSessionFocus(allocator, stored_focus_text, fallback_context_text);
+    return initial_model_context.loadMergedSessionFocus(allocator, db, session, prompt, session_events);
 }
 
 const max_tool_emergency_iterations = 8;
 const max_tool_repairs = 1;
 const max_duplicate_tool_repairs = 1;
 const max_required_tool_protocol_repairs = 2;
-const max_pathless_collect_budget: usize = 6 * 1024;
+const max_pathless_collect_budget: usize = tool_step_policy.max_pathless_collect_budget;
 const max_web_evidence_budget: usize = 8192;
 const web_cache_ttl_seconds: i64 = 15 * 60;
-const max_model_context_send_bytes: usize = 24 * 1024;
+const max_model_context_send_bytes: usize = context_budget.max_model_context_send_bytes;
 const weak_evidence_quality_score: i32 = 64;
 const required_tool_missing_answer = "[MODEL_FINALIZATION_BLOCKED] operational work was not completed; no final answer accepted.";
 const required_work_missing_answer = "[MODEL_FINALIZATION_BLOCKED] required operational work was not completed; no final answer accepted.";
@@ -1882,82 +1804,92 @@ fn runToolLoopIterations(
     var maybe_envelope = parseToolEnvelopeFromVisibleOrRaw(allocator, visible_output, model_output, state.active_contract) catch |err| {
         try db.recordEvent(config.session, "tool_envelope_error", @errorName(err));
         try db.recordTurnError(config.session, .model_protocol, "tool_envelope", @errorName(err));
-        return true;
+        return finishToolLoopRuntime(&state, .stopped);
     };
     const has_visible_output = std.mem.trim(u8, visible_output, " \t\r\n").len > 0;
     var tool_iterations: usize = 0;
     var repairs: usize = 0;
-    if (maybe_envelope == null and has_visible_output and outputCitesMissingSessionEvidence(visible_output, initial_context)) {
-        first_sink.discardDeferredVisible();
-        try db.recordEvent(config.session, "tool_repair", "answer cited missing evidence");
-        const repair_context = try renderMissingCitationRepairContext(allocator, prompt);
-        defer allocator.free(repair_context);
-        try db.recordEvent(config.session, "model_context", repair_context);
-        const next = try streamDeferredRequiredToolLoopTurn(
-            allocator,
-            config,
-            prompt,
-            repair_context,
-            "Your previous answer cited E#/S#, but no matching evidence block exists. Output exactly one collect_evidence or search_session tool_call now. No prose.",
-            client,
-            events,
-            db,
-            ui_ptr,
-            first_sink,
-            state.active_contract,
-        );
-        switch (next) {
-            .final_answer => return true,
-            .stopped => return true,
-            .tool_call => |next_call| {
-                maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
-            },
-        }
+    const initial_decision = agent_state.decideInitialModelOutput(.{
+        .has_tool_envelope = maybe_envelope != null,
+        .has_visible_output = has_visible_output,
+        .cites_missing_session_evidence = has_visible_output and outputCitesMissingSessionEvidence(visible_output, initial_context),
+        .claims_persistent_context_without_retrieval = has_visible_output and shouldRepairPersistentContextClaim(visible_output, initial_context, &state),
+        .premature_clarification = has_visible_output and shouldSoftRepairPrematureClarification(visible_output, initial_context, &state),
+    });
+    switch (initial_decision) {
+        .process_tool_envelope => {},
+        .repair_missing_session_evidence => {
+            first_sink.discardDeferredVisible();
+            try db.recordEvent(config.session, "tool_repair", "answer cited missing evidence");
+            const repair_context = try renderMissingCitationRepairContext(allocator, prompt);
+            defer allocator.free(repair_context);
+            try db.recordEvent(config.session, "model_context", repair_context);
+            const next = try streamDeferredRequiredToolLoopTurn(
+                allocator,
+                config,
+                prompt,
+                repair_context,
+                "Your previous answer cited E#/S#, but no matching evidence block exists. Output exactly one collect_evidence or search_session tool_call now. No prose.",
+                client,
+                events,
+                db,
+                ui_ptr,
+                first_sink,
+                state.active_contract,
+            );
+            switch (next) {
+                .final_answer => return finishToolLoopRuntime(&state, .final_answer),
+                .stopped => return finishToolLoopRuntime(&state, .stopped),
+                .tool_call => |next_call| {
+                    maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
+                },
+            }
+        },
+        .repair_persistent_context_claim => {
+            first_sink.discardDeferredVisible();
+            try db.recordEvent(config.session, "answer_repair", "persistent context claim without retrieval");
+            const repair_context = try renderPersistentContextClaimRepairContext(allocator, prompt, state.active_contract);
+            defer allocator.free(repair_context);
+            try db.recordEvent(config.session, "model_context", repair_context);
+            const next = try streamDeferredRequiredToolLoopTurn(
+                allocator,
+                config,
+                prompt,
+                repair_context,
+                "Your previous answer made a MEMORY/SKILLS claim without retrieved persistent context. Output exactly one set_operational_contract tool_call with contract=memory and concrete terms from USER_TASK. No prose.",
+                client,
+                events,
+                db,
+                ui_ptr,
+                first_sink,
+                state.active_contract,
+            );
+            switch (next) {
+                .final_answer => return finishToolLoopRuntime(&state, .final_answer),
+                .stopped => return finishToolLoopRuntime(&state, .stopped),
+                .tool_call => |next_call| {
+                    maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
+                },
+            }
+        },
+        .repair_premature_clarification => {
+            state.clarification_soft_repairs += 1;
+            first_sink.discardDeferredVisible();
+            try db.recordEvent(config.session, "answer_repair", "clarification soft repair");
+            const repair_context = try renderClarificationSoftRepairContext(allocator, prompt, &state);
+            defer allocator.free(repair_context);
+            try db.recordEvent(config.session, "model_context", repair_context);
+            const next = try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, first_sink, &state);
+            switch (next) {
+                .final_answer => return finishToolLoopRuntime(&state, .final_answer),
+                .stopped => return finishToolLoopRuntime(&state, .stopped),
+                .tool_call => |next_call| {
+                    maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
+                },
+            }
+        },
+        .unhandled_model_output => return finishToolLoopRuntime(&state, .unhandled),
     }
-    if (maybe_envelope == null and has_visible_output and shouldRepairPersistentContextClaim(visible_output, initial_context, &state)) {
-        first_sink.discardDeferredVisible();
-        try db.recordEvent(config.session, "answer_repair", "persistent context claim without retrieval");
-        const repair_context = try renderPersistentContextClaimRepairContext(allocator, prompt, state.active_contract);
-        defer allocator.free(repair_context);
-        try db.recordEvent(config.session, "model_context", repair_context);
-        const next = try streamDeferredRequiredToolLoopTurn(
-            allocator,
-            config,
-            prompt,
-            repair_context,
-            "Your previous answer made a MEMORY/SKILLS claim without retrieved persistent context. Output exactly one set_operational_contract tool_call with contract=memory and concrete terms from USER_TASK. No prose.",
-            client,
-            events,
-            db,
-            ui_ptr,
-            first_sink,
-            state.active_contract,
-        );
-        switch (next) {
-            .final_answer => return true,
-            .stopped => return true,
-            .tool_call => |next_call| {
-                maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
-            },
-        }
-    }
-    if (maybe_envelope == null and has_visible_output and shouldSoftRepairPrematureClarification(visible_output, initial_context, &state)) {
-        state.clarification_soft_repairs += 1;
-        first_sink.discardDeferredVisible();
-        try db.recordEvent(config.session, "answer_repair", "clarification soft repair");
-        const repair_context = try renderClarificationSoftRepairContext(allocator, prompt, &state);
-        defer allocator.free(repair_context);
-        try db.recordEvent(config.session, "model_context", repair_context);
-        const next = try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, first_sink, &state);
-        switch (next) {
-            .final_answer => return true,
-            .stopped => return true,
-            .tool_call => |next_call| {
-                maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
-            },
-        }
-    }
-    if (maybe_envelope == null) return false;
 
     while (maybe_envelope) |envelope_value| {
         var envelope = envelope_value;
@@ -1975,8 +1907,8 @@ fn runToolLoopIterations(
                 try db.recordEvent(config.session, "model_context", repair_context);
                 const next = try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, first_sink, &state);
                 switch (next) {
-                    .final_answer => return true,
-                    .stopped => return true,
+                    .final_answer => return finishToolLoopRuntime(&state, .final_answer),
+                    .stopped => return finishToolLoopRuntime(&state, .stopped),
                     .tool_call => |next_call| {
                         maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
                         continue;
@@ -1985,27 +1917,22 @@ fn runToolLoopIterations(
             }
             const body = try std.fmt.allocPrint(allocator, "{s}\t{s}", .{ envelope.raw_name, envelope.auditText() });
             defer allocator.free(body);
-            if (state.active_contract.name == .workflow and envelope.rejection_reason == .tool_not_advertised and std.mem.eql(u8, envelope.raw_name, "web_search")) {
+            const initial_rejected_action = protocol_repair_policy.classifyInitialRejectedTool(
+                state.active_contract,
+                envelope.rejection_reason,
+                envelope.raw_name,
+            );
+            if (initial_rejected_action == .normalize_direct_web_search_to_contract) {
                 first_sink.discardDeferredVisible();
                 if (try parseToolCallFromVisibleOrRaw(allocator, visible_output, model_output)) |direct_web_call| {
                     defer direct_web_call.deinit(allocator);
-                    const direct_query = declaredWebQuery(&direct_web_call);
-                    var contract_call = tool_call.ToolCall{
-                        .name = try allocator.dupe(u8, "set_operational_contract"),
-                        .contract = .search_web,
-                        .target = if (direct_web_call.target) |target| try allocator.dupe(u8, target) else null,
-                        .terms = if (direct_query) |query| try allocator.dupe(u8, query) else null,
-                        .intent = if (direct_web_call.intent) |intent| try allocator.dupe(u8, intent) else null,
-                        .budget_bytes = direct_web_call.budget_bytes,
-                        .strategy_id = if (direct_web_call.strategy_id) |strategy_id| try allocator.dupe(u8, strategy_id) else null,
-                        .reason = try allocator.dupe(u8, "initial router normalized direct web_search to search_web contract"),
-                    };
+                    var contract_call = try protocol_repair_policy.searchWebContractCallFromDirect(allocator, &direct_web_call);
                     defer contract_call.deinit(allocator);
-                    try db.recordEvent(config.session, "tool_repair", "initial direct web_search normalized to search_web contract");
+                    try db.recordEvent(config.session, "tool_repair", protocol_repair_policy.direct_web_search_normalization_reason);
                     const next = try runSetOperationalContractStep(allocator, io, config, prompt, &contract_call, client, events, db, ui_ptr, first_sink, &state, &tool_iterations);
                     switch (next) {
-                        .final_answer => return true,
-                        .stopped => return true,
+                        .final_answer => return finishToolLoopRuntime(&state, .final_answer),
+                        .stopped => return finishToolLoopRuntime(&state, .stopped),
                         .tool_call => |next_call| {
                             maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
                             continue;
@@ -2015,15 +1942,15 @@ fn runToolLoopIterations(
             }
             try db.recordEvent(config.session, "tool_rejected", body);
             try db.recordTurnError(config.session, .tool_contract, "tool_envelope", body);
-            if (state.active_contract.name == .workflow and envelope.rejection_reason == .tool_not_advertised) {
+            if (initial_rejected_action == .request_initial_contract_selection) {
                 first_sink.discardDeferredVisible();
                 const repair_context = try renderInitialRejectedToolContext(allocator, prompt, envelope.raw_name);
                 defer allocator.free(repair_context);
                 try db.recordEvent(config.session, "model_context", repair_context);
                 const next = try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, first_sink, &state);
                 switch (next) {
-                    .final_answer => return true,
-                    .stopped => return true,
+                    .final_answer => return finishToolLoopRuntime(&state, .final_answer),
+                    .stopped => return finishToolLoopRuntime(&state, .stopped),
                     .tool_call => |next_call| {
                         maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
                         continue;
@@ -2031,13 +1958,13 @@ fn runToolLoopIterations(
                 }
             }
             try emitRejectedToolAnswer(allocator, first_sink, envelope.raw_name, envelope.auditText());
-            return true;
+            return finishToolLoopRuntime(&state, .stopped);
         }
 
         var call = envelope.takeCall() orelse {
             try db.recordEvent(config.session, "tool_rejected", "accepted envelope without call");
             try db.recordTurnError(config.session, .model_protocol, "tool_envelope", "accepted envelope without call");
-            return true;
+            return finishToolLoopRuntime(&state, .stopped);
         };
         defer call.deinit(allocator);
 
@@ -2057,15 +1984,20 @@ fn runToolLoopIterations(
             &repairs,
         );
         switch (next) {
-            .final_answer => return true,
-            .stopped => return true,
+            .final_answer => return finishToolLoopRuntime(&state, .final_answer),
+            .stopped => return finishToolLoopRuntime(&state, .stopped),
             .tool_call => |next_call| {
                 maybe_envelope = try tool_envelope.ToolCallEnvelope.fromAcceptedCall(allocator, state.active_contract, next_call);
                 continue;
             },
         }
     }
-    return true;
+    return finishToolLoopRuntime(&state, .final_answer);
+}
+
+fn finishToolLoopRuntime(state: *ToolLoopState, outcome: agent_state.RuntimeOutcome) bool {
+    state.applyRuntimeOutcome(outcome);
+    return agent_state.runtimeOutcomeHandled(outcome);
 }
 
 fn initialContextRequiresTool(context: ?[]const u8) bool {
@@ -2263,16 +2195,7 @@ fn renderClarificationSoftRepairContext(
     prompt: []const u8,
     state: *const ToolLoopState,
 ) ![]u8 {
-    return model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts = activeToolSchema(state),
-        .obligations = &.{
-            "Clarification is valid only when it resolves a real user decision.",
-            "Do not write files, patch files, run validation, or perform side-effecting actions for this repair.",
-        },
-        .grounding = groundingRules(),
-        .next_action = "The previous answer asked generic clarification before exploration. If an advertised read-only tool can verify, triangulate, or reduce uncertainty, emit exactly one exploratory tool_call. Otherwise answer with one specific clarification and why available context/tools cannot resolve it.",
-    });
+    return repair_contexts.clarificationSoft(allocator, prompt, activeToolSchema(state));
 }
 
 fn webEvidenceHasOnlyEmptyExcerpts(context: []const u8) bool {
@@ -2327,70 +2250,44 @@ const WebEvidenceSummary = struct {
 
 fn summarizeWebEvidence(text: []const u8) WebEvidenceSummary {
     var summary: WebEvidenceSummary = .{
-        .saw_block = std.mem.indexOf(u8, text, "[WEB_EVIDENCE]") != null,
+        .saw_block = web_evidence_model.hasEvidence(text),
     };
     if (!summary.saw_block) return summary;
     var saw_status_200 = false;
-    var title: ?[]const u8 = null;
-    var excerpt_value: ?[]const u8 = null;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
-        if (std.mem.startsWith(u8, trimmed, "status=")) {
-            const raw = std.mem.trim(u8, trimmed["status=".len..], " \t\r\n");
-            summary.status_code = std.fmt.parseInt(u16, raw, 10) catch null;
-            saw_status_200 = summary.status_code == 200;
+    var entries = web_evidence_model.iterator(text);
+    while (entries.next()) |entry| {
+        if (entry.status.len > 0) {
+            summary.status_code = std.fmt.parseInt(u16, entry.status, 10) catch null;
+            if (summary.status_code == 200) saw_status_200 = true;
         }
-        if (std.mem.startsWith(u8, trimmed, "query=")) {
-            const value = std.mem.trim(u8, trimmed["query=".len..], " \t\r\n");
-            if (value.len > 0) summary.query = value;
-        }
-        if (std.mem.startsWith(u8, trimmed, "source=") and std.mem.indexOf(u8, trimmed, "distill=source_excerpt") != null) {
+        if (entry.query.len > 0) summary.query = entry.query;
+        if (std.mem.eql(u8, entry.distill, "source_excerpt")) {
             summary.has_source_excerpt = true;
         }
-        if (std.mem.startsWith(u8, trimmed, "source=") and std.mem.indexOf(u8, trimmed, "distill=model_verified_excerpt") != null) {
+        if (std.mem.eql(u8, entry.distill, "model_verified_excerpt")) {
             summary.has_model_verified_excerpt = true;
         }
-        if (std.mem.startsWith(u8, trimmed, "source=") and std.mem.indexOf(u8, trimmed, "distill=deterministic_excerpt") != null) {
+        if (std.mem.eql(u8, entry.distill, "deterministic_excerpt")) {
             summary.has_deterministic_excerpt = true;
         }
-        if (std.mem.startsWith(u8, trimmed, "title=")) {
-            const value = std.mem.trim(u8, trimmed["title=".len..], " \t\r\n");
-            if (value.len > 0) title = value;
-        }
-        if (std.mem.startsWith(u8, trimmed, "excerpt=") and std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n").len > 0) {
-            const excerpt = std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n");
-            excerpt_value = excerpt;
-            summary.excerpt_text = excerpt;
+        if (entry.excerpt) |excerpt| {
             summary.saw_excerpt = true;
+            if (excerpt.len == 0) continue;
+            summary.excerpt_text = excerpt;
             summary.has_excerpt = true;
             if (std.mem.startsWith(u8, excerpt, "result=") or std.mem.indexOf(u8, excerpt, "\nresult=") != null) summary.has_search_result_excerpt = true;
             if (summary.preferred_result_index == null) summary.preferred_result_index = firstSearchResultIndex(excerpt);
-        } else if (std.mem.startsWith(u8, trimmed, "excerpt=")) {
-            summary.saw_excerpt = true;
+            if (entry.title.len > 0 and webEvidenceExcerptOnlyRepeatsTitle(excerpt, entry.title)) summary.has_title_only_excerpt = true;
         }
-        if (std.mem.startsWith(u8, trimmed, "source_url=") and std.mem.trim(u8, trimmed["source_url=".len..], " \t\r\n").len > 0) {
+        var sources = entry.sourceIterator();
+        while (sources.next()) |source| {
+            if (source.url.len == 0) continue;
             summary.has_source = true;
-            if (summary.first_source_url == null) summary.first_source_url = std.mem.trim(u8, trimmed["source_url=".len..], " \t\r\n");
+            if (summary.first_source_url == null) summary.first_source_url = source.url;
         }
-    }
-    if (title) |title_text| {
-        if (excerpt_value) |excerpt_text| summary.has_title_only_excerpt = webEvidenceExcerptOnlyRepeatsTitle(excerpt_text, title_text);
     }
     if (summary.preferred_result_index) |result_index| {
-        var source_index: usize = 0;
-        lines = std.mem.splitScalar(u8, text, '\n');
-        while (lines.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, " \t\r\n");
-            if (!std.mem.startsWith(u8, trimmed, "source_url=")) continue;
-            const source_url = std.mem.trim(u8, trimmed["source_url=".len..], " \t\r\n");
-            if (source_url.len == 0) continue;
-            source_index += 1;
-            if (source_index == result_index) {
-                summary.preferred_source_url = source_url;
-                break;
-            }
-        }
+        summary.preferred_source_url = web_evidence_model.sourceUrlAt(text, result_index);
     }
     if (saw_status_200) summary.status_code = 200;
     return summary;
@@ -2777,41 +2674,15 @@ fn evidenceRepairTermsFromOutput(
 }
 
 fn renderInitialToolCallRepairContext(allocator: std.mem.Allocator, initial_context: []const u8) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}\n[PROTOCOL_REPAIR]\nPrevious output was prose, but this turn requires one context tool call before prose. For broad workspace/project map, emit collect_evidence stage=overview strategy=auto with no terms. For focused collect_evidence/search_session, set intent+concrete terms. For code identity, emit collect_evidence stage=candidates before expanding a selected candidate.\n",
-        .{initial_context},
-    );
+    return repair_contexts.initialToolCall(allocator, initial_context);
 }
 
 fn renderInitialRejectedToolContext(allocator: std.mem.Allocator, prompt: []const u8, raw_tool: []const u8) ![]u8 {
-    const reason = try std.fmt.allocPrint(allocator, "The previous tool `{s}` is not active in the initial router contract.", .{raw_tool});
-    defer allocator.free(reason);
-    return model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts = context_profile.toolSchema(.code_evidence, .initial),
-        .obligations = &.{
-            reason,
-            "Initial router allows only set_operational_contract and search_session.",
-            "For local workspace/source-code claims, select contract=collect_evidence first. For external/current facts, select contract=search_web or contract=rag_web with a model-selected query. For general answers, answer directly.",
-        },
-        .grounding = groundingRules(),
-        .next_action = "Answer directly if no tool-backed context is needed, or emit one allowed set_operational_contract/search_session tool_call.",
-    });
+    return repair_contexts.initialRejectedTool(allocator, prompt, raw_tool);
 }
 
 fn renderMalformedToolCallRepairContext(allocator: std.mem.Allocator, prompt: []const u8, active_contract: contracts.ActiveContract) ![]u8 {
-    return model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts = context_profile.activeContractSchemaFor(active_contract.name),
-        .obligations = &.{
-            "Previous visible tool_call was malformed and was not executed.",
-            "If a tool is needed, emit one valid XML tool_call allowed by the active contract.",
-            "If no tool-backed context is needed, answer directly without a tool_call.",
-        },
-        .grounding = groundingRules(),
-        .next_action = "Answer directly, or emit exactly one valid active-contract tool_call. Do not mix prose around a tool_call.",
-    });
+    return repair_contexts.malformedToolCall(allocator, prompt, active_contract);
 }
 
 fn emitMalformedToolCallAnswer(allocator: std.mem.Allocator, sink: *StreamSink) !void {
@@ -2831,81 +2702,23 @@ fn emitRejectedToolAnswer(allocator: std.mem.Allocator, sink: *StreamSink, raw_t
 }
 
 fn renderMissingCitationRepairContext(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
-    return model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts = context_profile.toolSchema(.code_evidence, .initial),
-        .obligations = &.{
-            "E#/S# citations are valid only when matching [EVIDENCE] or [SESSION_CONTEXT] blocks are present.",
-            "The previous answer cited missing evidence. Collect evidence before citing, or answer without workspace/prior-session claims.",
-        },
-        .grounding = groundingRules(),
-        .next_action = "Emit exactly one collect_evidence or search_session tool_call now. No prose.",
-    });
+    return repair_contexts.missingCitation(allocator, prompt);
 }
 
 fn renderPersistentContextClaimRepairContext(allocator: std.mem.Allocator, prompt: []const u8, active_contract: contracts.ActiveContract) ![]u8 {
-    const memory_active = active_contract.name == .memory;
-    return model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts = if (memory_active)
-            context_profile.memorySchema()
-        else
-            context_profile.activeContractSchemaFor(active_contract.name),
-        .obligations = &.{
-            "The previous answer made a MEMORY/SKILLS claim without retrieved persistent context.",
-            "MEMORY/SKILLS availability/content/absence requires memory contract retrieval first.",
-        },
-        .grounding = groundingRules(),
-        .next_action = if (memory_active)
-            "Emit exactly one search_persistent_context target=both terms=<concrete terms from USER_TASK>. No prose."
-        else
-            "Emit exactly one set_operational_contract contract=memory terms=<concrete terms from USER_TASK>. No prose.",
-    });
+    return repair_contexts.persistentContextClaim(allocator, prompt, active_contract);
 }
 
 fn renderRetrievedSkillsAnswerRepairContext(allocator: std.mem.Allocator, prompt: []const u8, state: *const ToolLoopState) ![]u8 {
-    return model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts = activeToolSchema(state),
-        .skills = state.retrieved_skills.items,
-        .obligations = &.{
-            "The previous answer contradicted retrieved SKILLS.",
-            "Retrieved SKILLS directly govern this memory-contract turn.",
-            "Answer only from retrieved SKILLS. Do not ask clarification. Do not add generic advice.",
-        },
-        .grounding = groundingRules(),
-        .next_action = "Emit the final answer now, applying the retrieved SKILLS exactly. No tool_call.",
-    });
+    return repair_contexts.retrievedSkillsAnswer(allocator, prompt, activeToolSchema(state), state.retrieved_skills.items);
 }
 
 fn renderUnsupportedWorkspaceClaimRepairContext(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
-    return model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts =
-        \\[TOOLS v1]
-        \\collect_evidence(intent?, terms?, strategy=auto|lexical|symbol, stage=overview|candidates)
-        ,
-        .obligations = &.{
-            "The previous visible answer made a workspace/source-code claim without [EVIDENCE].",
-            "Broad workspace/project map uses stage=overview. Function/type/file identity uses stage=candidates, then expand one candidate.",
-        },
-        .grounding = groundingRules(),
-        .next_action = "Emit exactly one collect_evidence tool_call now. Use stage=overview for project map; stage=candidates for identity. No prose.",
-    });
+    return repair_contexts.unsupportedWorkspaceClaim(allocator, prompt);
 }
 
 fn renderWorkspaceClaimRouterRepairContext(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
-    return model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts = context_profile.toolSchema(.code_evidence, .initial),
-        .obligations = &.{
-            "The previous visible answer made a workspace/source-code claim before selecting an operational contract.",
-            "The initial router cannot execute collect_evidence directly.",
-            "Direct final answer remains valid only if it avoids local workspace/source-code claims.",
-        },
-        .grounding = groundingRules(),
-        .next_action = "Emit set_operational_contract with requiresInspection=true for workspace/source-code claims, or answer directly without those claims. No prose before a required tool call.",
-    });
+    return repair_contexts.workspaceClaimRouter(allocator, prompt);
 }
 
 fn renderCollectEvidenceSearchIntentRepairContext(
@@ -2925,16 +2738,7 @@ fn renderCollectEvidenceSearchIntentRepairContext(
 }
 
 fn collectEvidenceSearchIntentRepairSchema() []const u8 {
-    const schema =
-        \\[TOOLS v1]
-        \\collect_evidence(intent?, need?, path?, targetFiles?, scopeRoot?, terms?, strategy=auto|path|lexical|symbol, stage=minimum|candidates|expand?, selectedCandidate?, selectedCandidates?, start_line=1, max_lines=12, compact=false)
-        \\Only collect_evidence is active for this repair. The previous collect_evidence call was malformed; correct it with path, or with intent+terms.
-        \\A pathless collect_evidence call must include <parameter=intent>what source-code evidence you want</parameter> and <parameter=terms>concrete code retrieval keys for that intent</parameter>.
-        \\The controller does not infer search terms from the user prompt. The model must choose the search intent and keys before evidence collection.
-        \\For function/type/file identity, prefer stage=candidates with strategy=symbol, then expand the best C# candidate.
-        \\<tool_call><function=collect_evidence><parameter=intent>find concrete source definition</parameter><parameter=strategy>symbol</parameter><parameter=stage>candidates</parameter><parameter=terms>ConcreteSymbolOrPathTerms</parameter></function></tool_call>
-    ;
-    return schema;
+    return repair_contexts.collectEvidenceSearchIntentSchema();
 }
 
 fn collectEvidenceRepairContract() contracts.ActiveContract {
@@ -2948,42 +2752,6 @@ fn collectEvidenceRepairContract() contracts.ActiveContract {
 fn validationPathFromCollectOrPrompt(allocator: std.mem.Allocator, prompt: []const u8, call: *const tool_call.ToolCall) !?[]u8 {
     if (call.path) |path| return try allocator.dupe(u8, path);
     return try singleStructuredPathFromPrompt(allocator, prompt);
-}
-
-fn applyPatchOnlyRepairContract() contracts.ActiveContract {
-    return .{
-        .name = .mutate_file,
-        .version = contracts.manifest_version,
-        .allowed_tools = &.{"apply_patch"},
-    };
-}
-
-fn applyPatchOnlyRepairSchema() []const u8 {
-    const schema =
-        \\[TOOLS v1]
-        \\apply_patch(operation=edit|create|delete|rename, path, destinationPath?, content?, contextId?, repeated search/replace?)
-        \\Only apply_patch is active for this repair. For create, provide path and full content. For edit/delete/rename, evidence and MICRO_CONTEXT are already present; do not call collect_evidence again.
-        \\<tool_call><function=apply_patch><parameter=operation>edit</parameter><parameter=path>relative/path</parameter><parameter=contextId>ctx_...</parameter><parameter=search>exact old text</parameter><parameter=replace>exact new text</parameter></function></tool_call>
-    ;
-    return schema;
-}
-
-fn validateSyntaxOnlyRepairContract() contracts.ActiveContract {
-    return .{
-        .name = .validate_work,
-        .version = contracts.manifest_version,
-        .allowed_tools = &.{"validate_syntax"},
-    };
-}
-
-fn validateSyntaxOnlyRepairSchema() []const u8 {
-    const schema =
-        \\[TOOLS v1]
-        \\validate_syntax(path)
-        \\Only validate_syntax is active for this repair. Patch was already applied; do not call collect_evidence.
-        \\<tool_call><function=validate_syntax><parameter=path>relative/path.zig</parameter></function></tool_call>
-    ;
-    return schema;
 }
 
 fn repairMutationRequiresPatch(
@@ -3003,7 +2771,7 @@ fn repairMutationRequiresPatch(
         allocator,
         prompt,
         &state.context,
-        applyPatchOnlyRepairSchema(),
+        repair_contexts.applyPatchOnlySchema(),
         mutationPatchNextAction(),
     );
     defer allocator.free(repair_context);
@@ -3019,7 +2787,7 @@ fn repairMutationRequiresPatch(
         db,
         ui_ptr,
         aggregate_sink,
-        applyPatchOnlyRepairContract(),
+        repair_contexts.applyPatchOnlyContract(),
     );
 }
 
@@ -3037,20 +2805,7 @@ fn repairValidationRequiresSyntax(
     _ = state;
     try db.recordEvent(config.session, "tool_repair", "validation requires validate_syntax after patch");
     try events.emit(.{ .progress_update = "patch applied; repairing to validate_syntax" });
-    const repair_context = try model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts = validateSyntaxOnlyRepairSchema(),
-        .obligations = &.{
-            "Patch was already applied.",
-            "Validation is required before final answer.",
-            "Do not call collect_evidence for validation in this repair.",
-        },
-        .grounding = groundingRules(),
-        .next_action_v1 = .{
-            .kind = .validate_work,
-            .text = "Emit exactly one validate_syntax tool_call for the changed Zig file. No prose.",
-        },
-    });
+    const repair_context = try repair_contexts.validationRequiredAfterPatch(allocator, prompt);
     defer allocator.free(repair_context);
     try db.recordEvent(config.session, "model_context", repair_context);
     return try streamDeferredRequiredToolLoopTurn(
@@ -3064,7 +2819,7 @@ fn repairValidationRequiresSyntax(
         db,
         ui_ptr,
         aggregate_sink,
-        validateSyntaxOnlyRepairContract(),
+        repair_contexts.validateSyntaxOnlyContract(),
     );
 }
 
@@ -3499,76 +3254,39 @@ fn runOneToolLoopStep(
 }
 
 fn phaseForTool(name: []const u8) audit.OperationalPhase {
-    if (std.mem.eql(u8, name, "set_operational_contract")) return .contract;
-    if (std.mem.eql(u8, name, "collect_evidence")) return .evidence;
-    if (std.mem.eql(u8, name, "search_session")) return .evidence;
-    if (std.mem.eql(u8, name, "search_persistent_context")) return .evidence;
-    if (std.mem.eql(u8, name, "search_personal_memory")) return .evidence;
-    if (std.mem.eql(u8, name, "apply_patch")) return .mutation;
-    if (std.mem.eql(u8, name, "promote_context")) return .mutation;
-    if (std.mem.eql(u8, name, "promote_personal_memory")) return .mutation;
-    if (std.mem.eql(u8, name, "forget_personal_memory")) return .mutation;
-    if (std.mem.eql(u8, name, "validate_syntax")) return .validation;
-    if (std.mem.eql(u8, name, "inspect_runtime")) return .validation;
-    if (std.mem.eql(u8, name, "web_search")) return .evidence;
-    return .evidence;
+    return tool_step_policy.phaseForTool(name);
 }
 
 fn collectEvidenceHasSearchText(call: *const tool_call.ToolCall) bool {
-    return hasNonEmptyText(call.intent) or hasNonEmptyText(call.terms) or hasNonEmptyText(call.need) or hasNonEmptyText(call.target_files) or hasNonEmptyText(call.scope_root);
+    return tool_step_policy.collectEvidenceHasSearchText(call);
 }
 
 fn collectEvidenceSourceIs(call: *const tool_call.ToolCall, source: contracts.SourceName) bool {
-    return collectEvidenceCallSource(call) == source;
+    return tool_step_policy.collectEvidenceSourceIs(call, source);
 }
 
 fn collectEvidenceCallSource(call: *const tool_call.ToolCall) contracts.SourceName {
-    if (call.strategy_id) |strategy_id| {
-        if (strategy_registry.byId(strategy_id)) |descriptor| return descriptor.source;
-    }
-    return call.source orelse .auto;
+    return tool_step_policy.collectEvidenceCallSource(call);
 }
 
 fn collectEvidenceHasSearchPlaceholder(call: *const tool_call.ToolCall) bool {
-    if (call.intent) |value| if (isSchemaPlaceholderText(value)) return true;
-    if (call.terms) |value| if (isSchemaPlaceholderText(value)) return true;
-    if (call.need) |value| if (isSchemaPlaceholderText(value)) return true;
-    if (call.target_files) |value| if (isSchemaPlaceholderText(value)) return true;
-    if (call.scope_root) |value| if (isSchemaPlaceholderText(value)) return true;
-    return false;
+    return tool_step_policy.collectEvidenceHasSearchPlaceholder(call);
 }
 
 fn hasNonEmptyText(value: ?[]const u8) bool {
-    const text = std.mem.trim(u8, value orelse return false, " \t\r\n");
-    return text.len > 0;
+    return tool_step_policy.hasNonEmptyText(value);
 }
 
 fn isSchemaPlaceholderText(text: []const u8) bool {
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    const placeholders = [_][]const u8{
-        "specific retrieval keys",
-        "specific keys",
-        "evidence to recover",
-        "SymbolName FileName ErrorCode",
-        "TopicName EntityName DecisionKey",
-        "ConcreteSymbolOrPathTerms",
-        "target files",
-        "scope root",
-    };
-    for (placeholders) |placeholder| {
-        if (std.ascii.eqlIgnoreCase(trimmed, placeholder)) return true;
-    }
-    return false;
+    return tool_step_policy.isSchemaPlaceholderText(text);
 }
 
 fn collectEvidenceExecutionBudget(path: ?[]const u8, remaining_budget: usize) usize {
-    if (path != null) return remaining_budget;
-    return @min(remaining_budget, max_pathless_collect_budget);
+    return tool_step_policy.collectEvidenceExecutionBudget(path, remaining_budget);
 }
 
 fn isCollectEvidenceStage(call: *const tool_call.ToolCall, stage: []const u8) bool {
-    const raw = call.stage orelse return false;
-    return std.ascii.eqlIgnoreCase(raw, stage);
+    return tool_step_policy.isCollectEvidenceStage(call, stage);
 }
 
 fn runCollectEvidenceCandidatesStep(
@@ -4042,27 +3760,15 @@ fn runCollectEvidenceExpandStep(
 }
 
 fn expandedCandidateNextAction(allow_more_evidence: bool, weak_evidence: bool) []const u8 {
-    if (allow_more_evidence and weak_evidence) {
-        return "The expanded candidate evidence is weak or generic. Emit one more collect_evidence call with a different selectedCandidate or refined intent+terms before answering.";
-    }
-    if (allow_more_evidence) {
-        return "Answer only if cited E# directly covers the request. If the task is broad and this candidate covers only a fragment, emit one more collect_evidence call; do not ask permission. If naming a called/related function whose declaration is not in E#, collect it first.";
-    }
-    return "Answer using only cited E# evidence from the expanded candidate. If evidence is insufficient, say what is evidenced and what is not. Do not call tools again.";
+    return tool_step_policy.expandedCandidateNextAction(allow_more_evidence, weak_evidence);
 }
 
 fn candidateExpansionLineLimit(requested_max_lines: usize, candidate_start_line: usize, candidate_end_line: usize) usize {
-    const candidate_lines = candidate_end_line - candidate_start_line + 1;
-    const requested_lines = if (requested_max_lines == 12) @as(usize, 32) else requested_max_lines;
-    return @min(requested_lines, candidate_lines);
+    return tool_step_policy.candidateExpansionLineLimit(requested_max_lines, candidate_start_line, candidate_end_line);
 }
 
 fn firstSelectedCandidate(selected_candidates: ?[]const u8) ?[]const u8 {
-    var raw = selected_candidates orelse return null;
-    raw = std.mem.trim(u8, raw, " \t\r\n");
-    if (raw.len == 0) return null;
-    var it = std.mem.tokenizeAny(u8, raw, " ,;\t\r\n");
-    return it.next();
+    return tool_step_policy.firstSelectedCandidate(selected_candidates);
 }
 
 fn renderCandidateSelectionContext(
@@ -4298,16 +4004,7 @@ fn runApplyPatchStep(
         try db.recordEvent(config.session, "tool_error", @errorName(err));
         try db.recordTurnError(config.session, .tool_runtime, "apply_patch", @errorName(err));
         try events.emit(.{ .tool_result = .{ .name = "apply_patch", .output = @errorName(err) } });
-        const repair_context = try model_context.renderModelTurnContext(allocator, .{
-            .task = prompt,
-            .contracts = activeToolSchema(state),
-            .obligations = &.{
-                "Patch failed. If the context is stale, recollect evidence before another patch.",
-                "For edit, every search must be exact and unique in the original file. For delete/rename, include fresh contextId.",
-            },
-            .grounding = groundingRules(),
-            .next_action = "Emit one corrected apply_patch call, or collect_evidence again if context is stale.",
-        });
+        const repair_context = try repair_contexts.patchFailure(allocator, prompt, activeToolSchema(state));
         defer allocator.free(repair_context);
         try db.recordEvent(config.session, "model_context", repair_context);
         return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
@@ -4319,15 +4016,7 @@ fn runApplyPatchStep(
     try events.emit(.{ .tool_result = .{ .name = "apply_patch", .output = result.text } });
     state.recordMutation();
 
-    const follow_context = try model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts = context_profile.activeContractSchemaFor(.validate_work),
-        .obligations = &.{
-            "Patch has been applied. Validate changed code when possible before final answer.",
-        },
-        .grounding = groundingRules(),
-        .next_action = "Call validate_syntax for changed Zig files, or answer with the patch result if validation is not applicable.",
-    });
+    const follow_context = try repair_contexts.patchAppliedFollowup(allocator, prompt);
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
     state.active_contract = contracts.activeContract(.validate_work).?;
@@ -4347,25 +4036,14 @@ fn repairPatchCall(
     reason: []const u8,
 ) !ToolLoopNext {
     try db.recordEvent(config.session, "tool_repair", reason);
-    const repair_context = try model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts = activeToolSchema(state),
-        .obligations = &.{reason},
-        .grounding = groundingRules(),
-        .next_action = "Emit one corrected apply_patch call. For edit use path, contextId, repeated search/replace hunks. For create use operation=create and content. For delete/rename use fresh contextId.",
-    });
+    const repair_context = try repair_contexts.patchCallRepair(allocator, prompt, activeToolSchema(state), reason);
     defer allocator.free(repair_context);
     try db.recordEvent(config.session, "model_context", repair_context);
     return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
 }
 
 fn parsePatchOperation(value: ?[]const u8) !apply_patch_tool.Operation {
-    const operation = value orelse return .edit;
-    if (std.ascii.eqlIgnoreCase(operation, "edit")) return .edit;
-    if (std.ascii.eqlIgnoreCase(operation, "create")) return .create;
-    if (std.ascii.eqlIgnoreCase(operation, "delete")) return .delete;
-    if (std.ascii.eqlIgnoreCase(operation, "rename")) return .rename;
-    return error.InvalidPatchOperation;
+    return tool_step_policy.parsePatchOperation(value);
 }
 
 fn buildPatchArgs(
@@ -4374,56 +4052,7 @@ fn buildPatchArgs(
     path: []const u8,
     call: *const tool_call.ToolCall,
 ) !apply_patch_tool.Args {
-    return switch (operation) {
-        .edit => .{
-            .operation = .edit,
-            .path = path,
-            .hunks = try buildEditHunks(allocator, call),
-        },
-        .create => .{
-            .operation = .create,
-            .path = path,
-            .content = call.content orelse return error.MissingPatchContent,
-            .hunks = &.{},
-        },
-        .delete => .{
-            .operation = .delete,
-            .path = path,
-            .hunks = try buildContextOnlyHunk(allocator, call),
-        },
-        .rename => .{
-            .operation = .rename,
-            .path = path,
-            .destination_path = call.destination_path orelse return error.MissingPatchDestination,
-            .hunks = try buildContextOnlyHunk(allocator, call),
-        },
-    };
-}
-
-fn buildEditHunks(allocator: std.mem.Allocator, call: *const tool_call.ToolCall) ![]const apply_patch_tool.Hunk {
-    const searches = call.searches;
-    const replaces = call.replaces;
-    if (searches.len == 0) return error.MissingPatchSearch;
-    if (searches.len != replaces.len) return error.PatchHunkCountMismatch;
-    if (call.context_ids.len != 1 and call.context_ids.len != searches.len) return error.PatchContextCountMismatch;
-
-    const hunks = try allocator.alloc(apply_patch_tool.Hunk, searches.len);
-    errdefer allocator.free(hunks);
-    for (searches, 0..) |search, idx| {
-        hunks[idx] = .{
-            .search = search,
-            .replace = replaces[idx],
-            .context_id = if (call.context_ids.len == 1) call.context_ids[0] else call.context_ids[idx],
-        };
-    }
-    return hunks;
-}
-
-fn buildContextOnlyHunk(allocator: std.mem.Allocator, call: *const tool_call.ToolCall) ![]const apply_patch_tool.Hunk {
-    const context_id = if (call.context_ids.len > 0) call.context_ids[0] else return error.MissingPatchContextId;
-    const hunks = try allocator.alloc(apply_patch_tool.Hunk, 1);
-    hunks[0] = .{ .search = "", .replace = "", .context_id = context_id };
-    return hunks;
+    return tool_step_policy.buildPatchArgs(allocator, operation, path, call);
 }
 
 fn runValidateSyntaxStep(
@@ -4445,31 +4074,19 @@ fn runValidateSyntaxStep(
 
     try db.recordEvent(config.session, "tool_start", "validate_syntax");
     try events.emit(.{ .tool_start = .{ .name = "validate_syntax", .detail = path } });
-    const diagnostic = diagnostic_runner.run(allocator, path, state.remainingBudget()) catch |err| {
+    const validation = syntax_validation.execute(allocator, path, state.remainingBudget()) catch |err| {
         try db.recordEvent(config.session, "tool_error", @errorName(err));
         try db.recordTurnError(config.session, .validation_failed, "validate_syntax", @errorName(err));
         try events.emit(.{ .tool_result = .{ .name = "validate_syntax", .output = @errorName(err) } });
         return .stopped;
     };
-    defer diagnostic.deinit(allocator);
-
-    var packet = evidence.EvidencePacket.init(allocator);
-    defer packet.deinit();
-    try packet.add(try collect_evidence.cloneEvidenceEntry(allocator, diagnostic.entry));
-    const evidence_text = try packet.render(allocator);
-    defer allocator.free(evidence_text);
-    try db.recordEvent(config.session, "tool_event", diagnostic.audit_text);
-    try db.recordEvent(config.session, "validation", evidence_text);
-    try events.emit(.{ .tool_result = .{ .name = "validate_syntax", .output = evidence_text } });
+    defer validation.deinit(allocator);
+    try db.recordEvent(config.session, "tool_event", validation.audit_text);
+    try db.recordEvent(config.session, "validation", validation.evidence_text);
+    try events.emit(.{ .tool_result = .{ .name = "validate_syntax", .output = validation.evidence_text } });
     state.recordRuntimeValidation();
 
-    const validation_block = [_]model_context.EvidenceBlock{.{ .text = evidence_text }};
-    const follow_context = try model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .evidence = &validation_block,
-        .grounding = groundingRules(),
-        .next_action = "Answer with the patch and validation result. Cite validation evidence if it reports errors.",
-    });
+    const follow_context = try repair_contexts.validationFollowup(allocator, prompt, validation.evidence_text);
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
     return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
@@ -4487,12 +4104,7 @@ fn repairValidationCall(
     state: *ToolLoopState,
 ) !ToolLoopNext {
     try db.recordEvent(config.session, "tool_repair", "validate_syntax missing path");
-    const repair_context = try model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts = activeToolSchema(state),
-        .obligations = &.{"validate_syntax requires path."},
-        .next_action = "Emit validate_syntax with a relative Zig path, or answer if validation is not applicable.",
-    });
+    const repair_context = try repair_contexts.validationCallRepair(allocator, prompt, activeToolSchema(state));
     defer allocator.free(repair_context);
     try db.recordEvent(config.session, "model_context", repair_context);
     return try streamDeferredToolLoopTurn(allocator, config, prompt, repair_context, client, events, db, ui_ptr, aggregate_sink, state);
@@ -4513,55 +4125,21 @@ fn runInspectRuntimeStep(
 ) !ToolLoopNext {
     if (tool_iterations.* >= max_tool_emergency_iterations) return .stopped;
     tool_iterations.* += 1;
-    const owned_target = try runtimeInspectionTarget(allocator, config.host, call.target orelse call.path);
-    defer allocator.free(owned_target);
+    const inspection = try runtime_inspection.execute(allocator, config.host, call.target orelse call.path);
+    defer inspection.deinit(allocator);
     if (ui_ptr) |active_ui| try active_ui.showStatus("Inspecting");
-    const tool_start = try std.fmt.allocPrint(allocator, "inspect_runtime target={s}", .{owned_target});
+    const tool_start = try std.fmt.allocPrint(allocator, "inspect_runtime target={s}", .{inspection.target});
     defer allocator.free(tool_start);
     try db.recordEvent(config.session, "tool_start", tool_start);
-    try events.emit(.{ .tool_start = .{ .name = "inspect_runtime", .detail = owned_target } });
-
-    const inspected = http.inspectHttpGet(allocator, owned_target);
-    defer inspected.deinit(allocator);
-    const result = try renderRuntimeInspection(allocator, inspected);
-    defer allocator.free(result);
-    try db.recordEvent(config.session, "tool_event", result);
-    try db.recordEvent(config.session, "runtime_inspection", result);
-    try events.emit(.{ .tool_result = .{ .name = "inspect_runtime", .output = result } });
+    try events.emit(.{ .tool_start = .{ .name = "inspect_runtime", .detail = inspection.target } });
+    try db.recordEvent(config.session, "tool_event", inspection.evidence_text);
+    try db.recordEvent(config.session, "runtime_inspection", inspection.evidence_text);
+    try events.emit(.{ .tool_result = .{ .name = "inspect_runtime", .output = inspection.evidence_text } });
     state.recordBrowserDiagnostics();
-    const follow_context = try model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .evidence = &.{.{ .text = result }},
-        .obligations = &.{"Runtime inspection is bounded HTTP status/body evidence. Do not claim DOM/browser automation ran."},
-        .grounding = groundingRules(),
-        .next_action = "Answer using the HTTP runtime inspection evidence. State browser DOM automation was not executed.",
-    });
+    const follow_context = try repair_contexts.runtimeInspectionFollowup(allocator, prompt, inspection.evidence_text);
     defer allocator.free(follow_context);
     try db.recordEvent(config.session, "model_context", follow_context);
     return try streamDeferredToolLoopTurn(allocator, config, prompt, follow_context, client, events, db, ui_ptr, aggregate_sink, state);
-}
-
-fn runtimeInspectionTarget(allocator: std.mem.Allocator, backend_host: []const u8, requested: ?[]const u8) ![]u8 {
-    const raw = std.mem.trim(u8, requested orelse backend_host, " \t\r\n");
-    if (std.mem.startsWith(u8, raw, "http://") or std.mem.startsWith(u8, raw, "https://")) return allocator.dupe(u8, raw);
-    if (std.mem.startsWith(u8, raw, "/")) return std.fmt.allocPrint(allocator, "http://{s}{s}", .{ backend_host, raw });
-    return std.fmt.allocPrint(allocator, "http://{s}", .{raw});
-}
-
-fn renderRuntimeInspection(allocator: std.mem.Allocator, result: http.RuntimeHttpResult) ![]u8 {
-    const status = try optionalUsizeText(allocator, if (result.status) |value| @as(usize, @intCast(value)) else null);
-    defer allocator.free(status);
-    return std.fmt.allocPrint(
-        allocator,
-        "[RUNTIME_INSPECTION]\nsource=http_get raw_context_persisted=false target={s}\nstatus={s}\nserver={s}\nerror={s}\nbody_snippet={s}\n",
-        .{
-            result.target,
-            status,
-            result.server orelse "",
-            result.error_name orelse "",
-            result.body_snippet,
-        },
-    );
 }
 
 fn optimizeWebSearchQueryForFetch(
@@ -4997,20 +4575,6 @@ fn webEvidenceContextFollowupTarget(summary: WebEvidenceSummary, current_target:
     return null;
 }
 
-fn webEvidenceContainsTarget(text: []const u8, target: []const u8) bool {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
-        const idx = std.mem.indexOf(u8, trimmed, "target=") orelse continue;
-        const start = idx + "target=".len;
-        var end = start;
-        while (end < trimmed.len and !std.ascii.isWhitespace(trimmed[end])) : (end += 1) {}
-        const value = std.mem.trim(u8, trimmed[start..end], " \t\r\n");
-        if (std.mem.eql(u8, value, target)) return true;
-    }
-    return false;
-}
-
 fn stopWebSearchConfigurationError(
     allocator: std.mem.Allocator,
     config: cli.Config,
@@ -5037,15 +4601,7 @@ fn webEvidenceHasModelIntent(call: *const tool_call.ToolCall) bool {
 }
 
 fn declaredWebQuery(call: *const tool_call.ToolCall) ?[]const u8 {
-    if (call.terms) |terms| {
-        const trimmed = std.mem.trim(u8, terms, " \t\r\n");
-        if (trimmed.len > 0) return trimmed;
-    }
-    if (call.intent) |intent| {
-        const trimmed = std.mem.trim(u8, intent, " \t\r\n");
-        if (trimmed.len > 0) return trimmed;
-    }
-    return null;
+    return protocol_repair_policy.declaredWebQuery(call);
 }
 
 fn explicitHttpTargetFromCall(call: *const tool_call.ToolCall) ?[]const u8 {
@@ -5699,57 +5255,16 @@ fn recordModelContextBudget(
     client: *http.LocalModelClient,
     input: http.InferenceInput,
 ) !ModelContextUsage {
-    try model_context.assertNoRawContextLeak(rendered);
-    var buckets = model_context.measureRenderedContextBytes(rendered);
-    buckets.system = (input.system_prompt orelse system_prompt.default_system_prompt).len;
     const used_tokens = client.countInputTokens(input);
     const limit_tokens = client.context_window;
-    if (used_tokens) |used| {
-        if (limit_tokens) |limit| {
-            if (used > limit) return error.ModelContextBudgetExceeded;
-        }
-    } else if (limit_tokens == null and buckets.total_context > max_model_context_send_bytes) {
-        return error.ModelContextBudgetExceeded;
-    }
-    const used_text = try optionalUsizeText(allocator, used_tokens);
-    defer allocator.free(used_text);
-    const limit_text = try optionalUsizeText(allocator, limit_tokens);
-    defer allocator.free(limit_text);
-    const percent_text = try optionalPercentText(allocator, used_tokens, limit_tokens);
-    defer allocator.free(percent_text);
-    const budget_source: []const u8 = if (used_tokens != null and limit_tokens != null)
-        "backend_tokenizer"
-    else if (limit_tokens != null)
-        "backend_limit"
-    else
-        "unavailable";
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "pre_send=true tokenizer={s} token_estimate=false context_source={s} context_used_tokens={s} context_limit_tokens={s} context_used_percent={s} system_bytes={} header_bytes={} temporal_bytes={} contracts_bytes={} skills_bytes={} memory_bytes={} candidates_bytes={} evidence_bytes={} focus_bytes={} dialogue_bytes={} session_bytes={} obligations_bytes={} grounding_bytes={} next_action_bytes={} total_context_bytes={} fallback_context_limit_bytes={}",
-        .{
-            if (client.tokenizer_available) "backend" else "unavailable",
-            budget_source,
-            used_text,
-            limit_text,
-            percent_text,
-            buckets.system,
-            buckets.header,
-            buckets.temporal,
-            buckets.contracts,
-            buckets.skills,
-            buckets.memory,
-            buckets.candidates,
-            buckets.evidence,
-            buckets.focus,
-            buckets.dialogue,
-            buckets.session,
-            buckets.obligations,
-            buckets.grounding,
-            buckets.next_action,
-            buckets.total_context,
-            max_model_context_send_bytes,
-        },
-    );
+    const evaluation = try context_budget.evaluate(.{
+        .rendered = rendered,
+        .system_prompt_bytes = (input.system_prompt orelse system_prompt.default_system_prompt).len,
+        .used_tokens = used_tokens,
+        .limit_tokens = limit_tokens,
+        .tokenizer_available = client.tokenizer_available,
+    });
+    const body = try context_budget.renderAuditBody(allocator, evaluation);
     defer allocator.free(body);
     try db.recordEvent(session, "model_context_budget", body);
     return .{
@@ -5762,14 +5277,6 @@ const ModelContextUsage = struct {
     used_tokens: ?usize,
     limit_tokens: ?usize,
 };
-
-fn optionalPercentText(allocator: std.mem.Allocator, used_tokens: ?usize, limit_tokens: ?usize) ![]const u8 {
-    const used = used_tokens orelse return allocator.dupe(u8, "unknown");
-    const limit = limit_tokens orelse return allocator.dupe(u8, "unknown");
-    if (limit == 0) return allocator.dupe(u8, "unknown");
-    const pct = (@as(f64, @floatFromInt(used)) * 100.0) / @as(f64, @floatFromInt(limit));
-    return std.fmt.allocPrint(allocator, "{d:.1}", .{pct});
-}
 
 fn showModelContextUsage(usage: ModelContextUsage, events: *ui_events.EventBus, ui_ptr: ?*tui.TerminalUi(fd_writer.FdWriter)) !void {
     const used = usage.used_tokens orelse return;
@@ -6590,7 +6097,11 @@ fn streamDeferredToolLoopTurnInternal(
                 follow_sink.raw_visible.clearRetainingCapacity();
                 return .final_answer;
             }
-            if (web_answer_mode and webEvidenceHasOnlyEmptyExcerpts(follow_context) and !answer_repair_mode) {
+            const web_final_verdict = if (web_answer_mode)
+                final_claim_verifier.verifyWebFinalAnswer(follow_sink.raw_visible.items, follow_context)
+            else
+                final_claim_verifier.Verdict{ .decision = .accept };
+            if (web_final_verdict.decision == .repair_empty_evidence and !answer_repair_mode) {
                 follow_sink.discardDeferredVisible();
                 try db.recordEvent(config.session, "answer_repair", "empty web evidence final answer blocked");
                 if (finalization_state) |state| {
@@ -6615,7 +6126,7 @@ fn streamDeferredToolLoopTurnInternal(
                     required_tool_missing_visible,
                 );
             }
-            if (web_answer_mode and webAnswerMissingDossierSupport(follow_sink.raw_visible.items, follow_context) and !answer_repair_mode) {
+            if (web_final_verdict.decision == .repair_unsupported_claim and !answer_repair_mode) {
                 follow_sink.discardDeferredVisible();
                 try db.recordEvent(config.session, "answer_repair", "web answer lacked dossier support");
                 const repair_context = try renderUnsupportedWebAnswerRepairContext(allocator, follow_context);
@@ -6637,7 +6148,7 @@ fn streamDeferredToolLoopTurnInternal(
                     required_tool_missing_visible,
                 );
             }
-            if (web_answer_mode and webAnswerMissingCollectedSource(follow_sink.raw_visible.items, follow_context)) {
+            if (web_final_verdict.decision == .append_missing_source) {
                 if (follow_sink.completion_stop_reason == .length) {
                     aggregate_sink.mergeGenerationStop(follow_sink);
                     try aggregate_sink.emitVisibleText(follow_sink.raw_visible.items);
@@ -6921,223 +6432,48 @@ fn renderFinalizationRepairContext(
     state: *const ToolLoopState,
     blocker: []const u8,
 ) ![]u8 {
-    const operational_state = try std.fmt.allocPrint(
-        allocator,
-        "contract={s} observations={} mutations={} runtime_validations={} browser_diagnostics={} memory_promotions={} blocker={s}",
-        .{
-            @tagName(state.active_contract.name),
-            state.observations,
-            state.mutations,
-            state.runtime_validations,
-            state.browser_diagnostics,
-            state.memory_promotions,
-            blocker,
-        },
-    );
-    defer allocator.free(operational_state);
-    return model_context.renderModelTurnContext(allocator, .{
-        .task = prompt,
-        .contracts = activeToolSchema(state),
-        .obligations = &.{
-            operational_state,
-            "The previous visible answer was not accepted because the selected operational contract is not satisfied.",
-            "Choose the smallest allowed tool call that satisfies the blocker. Do not answer in prose before that tool result.",
-        },
-        .grounding = groundingRules(),
-        .next_action = "Emit exactly one allowed tool_call now. No prose.",
+    return repair_contexts.finalization(allocator, prompt, .{
+        .active_contract = state.active_contract,
+        .active_schema = activeToolSchema(state),
+        .observations = state.observations,
+        .mutations = state.mutations,
+        .runtime_validations = state.runtime_validations,
+        .browser_diagnostics = state.browser_diagnostics,
+        .memory_promotions = state.memory_promotions,
+        .blocker = blocker,
     });
 }
 
 fn renderEmptyWebEvidenceAnswerRepairContext(allocator: std.mem.Allocator, follow_context: []const u8) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}\n[EMPTY_WEB_EVIDENCE_ANSWER_REPAIR]\nPrevious visible answer was blocked because WEB_DOSSIER has no excerpt that directly supports the requested fact.\nAnswer visibly in the user's language from USER_TASK. State that web_search ran but returned no direct supporting evidence for the requested fact. Do not invent numbers, dates, versions, URLs, titles, or claims absent from WEB_DOSSIER. Do not emit tool calls, <think>, </think>, or protocol tags.\n",
-        .{follow_context},
-    );
+    return repair_contexts.emptyWebEvidenceAnswer(allocator, follow_context);
 }
 
 fn renderUnsupportedWebAnswerRepairContext(allocator: std.mem.Allocator, follow_context: []const u8) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}\n[ANSWER_REPAIR]\nPrevious visible answer was blocked because it cited/used web context without reusing any substantial WEB_DOSSIER excerpt term.\nAnswer visibly in the user's language from USER_TASK using only source_url and excerpt lines in WEB_DOSSIER. If the excerpt does not directly support the requested claim, state that limitation. Do not emit tool calls, <think>, </think>, or protocol tags.\n",
-        .{follow_context},
-    );
+    return repair_contexts.unsupportedWebAnswer(allocator, follow_context);
 }
 
 fn webAnswerMissingCollectedSource(output: []const u8, context: []const u8) bool {
-    var lines = std.mem.splitScalar(u8, context, '\n');
-    var has_source = false;
-    while (lines.next()) |line| {
-        const trimmed_line = std.mem.trimStart(u8, line, " \t");
-        if (!std.mem.startsWith(u8, trimmed_line, "source_url=")) continue;
-        var source_buf: [2048]u8 = undefined;
-        const source = normalizeCollectedSourceUrl(&source_buf, trimmed_line["source_url=".len..]) orelse continue;
-        if (sourceUrlIsDuckDuckGoSearchPage(source)) continue;
-        has_source = true;
-        if (outputContainsCollectedSourceUrl(output, source)) return false;
-    }
-    return has_source;
+    return final_claim_verifier.webAnswerMissingCollectedSource(output, context);
 }
 
 fn webAnswerMissingDossierSupport(output: []const u8, context: []const u8) bool {
-    if (std.mem.indexOf(u8, context, "[WEB_DOSSIER v1]") == null) return false;
-    if (std.mem.trim(u8, output, " \t\r\n").len == 0) return false;
-    return !webAnswerUsesDossierExcerpt(output, context);
+    return final_claim_verifier.webAnswerMissingDossierSupport(output, context);
 }
 
 fn webAnswerUsesDossierExcerpt(output: []const u8, context: []const u8) bool {
-    var matches: usize = 0;
-    var output_without_urls_buf: [8192]u8 = undefined;
-    const supported_output = webAnswerTextWithoutUrls(&output_without_urls_buf, output);
-    var lines = std.mem.splitScalar(u8, context, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
-        if (!std.mem.startsWith(u8, trimmed, "excerpt=")) continue;
-        const excerpt = std.mem.trim(u8, trimmed["excerpt=".len..], " \t\r\n");
-        if (excerpt.len == 0) continue;
-        if (webDossierExcerptLooksMetadataOnly(excerpt)) continue;
-        var terms = std.mem.tokenizeAny(u8, excerpt, " \t\r\n\"'`()[]{}<>:;,./\\|+-=*");
-        while (terms.next()) |raw| {
-            const term = std.mem.trim(u8, raw, " \t\r\n\"'`()[]{}<>:;,./\\|+-=*");
-            if (!webDossierTermIsUseful(term)) continue;
-            if (!text_match.containsFoldedIgnoreCase(supported_output, term)) continue;
-            if (webDossierTermIsStrong(term)) return true;
-            matches += 1;
-            if (matches >= 2) return true;
-        }
-    }
-    return false;
+    return final_claim_verifier.findDossierSupport(output, context) != null;
 }
 
 fn webDossierExcerptLooksMetadataOnly(excerpt: []const u8) bool {
-    return std.mem.indexOf(u8, excerpt, "page_title=") != null or
-        std.mem.indexOf(u8, excerpt, "meta=page_title:") != null or
-        std.mem.indexOf(u8, excerpt, "structured_data=page_title:") != null or
-        std.mem.indexOf(u8, excerpt, "table_row=page_title:") != null;
-}
-
-fn webAnswerTextWithoutUrls(buf: []u8, text: []const u8) []const u8 {
-    var out_len: usize = 0;
-    var cursor: usize = 0;
-    while (cursor < text.len and out_len < buf.len) {
-        if (std.mem.startsWith(u8, text[cursor..], "http://") or std.mem.startsWith(u8, text[cursor..], "https://")) {
-            while (cursor < text.len and !std.ascii.isWhitespace(text[cursor])) : (cursor += 1) {}
-            continue;
-        }
-        buf[out_len] = text[cursor];
-        out_len += 1;
-        cursor += 1;
-    }
-    return buf[0..out_len];
-}
-
-fn webDossierTermIsUseful(term: []const u8) bool {
-    if (std.mem.startsWith(u8, term, "http")) return false;
-    if (webDossierTermIsStrong(term)) return true;
-    if (term.len < 4) return false;
-    var useful = false;
-    for (term) |byte| {
-        if (std.ascii.isAlphanumeric(byte) or byte >= 0x80 or byte == '_') {
-            useful = true;
-            break;
-        }
-    }
-    return useful;
-}
-
-fn webDossierTermIsStrong(term: []const u8) bool {
-    if (std.mem.indexOfScalar(u8, term, '_') != null) return true;
-    var has_digit = false;
-    var has_alpha = false;
-    for (term) |byte| {
-        has_digit = has_digit or std.ascii.isDigit(byte);
-        has_alpha = has_alpha or std.ascii.isAlphabetic(byte);
-    }
-    return has_digit and has_alpha;
+    return final_claim_verifier.webDossierExcerptLooksMetadataOnly(excerpt);
 }
 
 fn appendCollectedWebSources(allocator: std.mem.Allocator, output: []const u8, context: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, std.mem.trimEnd(u8, output, " \t\r\n"));
-
-    var sources = std.ArrayList(u8).empty;
-    defer sources.deinit(allocator);
-    var lines = std.mem.splitScalar(u8, context, '\n');
-    while (lines.next()) |line| {
-        const trimmed_line = std.mem.trimStart(u8, line, " \t");
-        if (!std.mem.startsWith(u8, trimmed_line, "source_url=")) continue;
-        var source_buf: [2048]u8 = undefined;
-        const source = normalizeCollectedSourceUrl(&source_buf, trimmed_line["source_url=".len..]) orelse continue;
-        if (sourceUrlIsDuckDuckGoSearchPage(source) or std.mem.indexOf(u8, sources.items, source) != null) continue;
-        try sources.appendSlice(allocator, "- ");
-        try sources.appendSlice(allocator, source);
-        try sources.append(allocator, '\n');
-    }
-    if (sources.items.len > 0) {
-        try out.appendSlice(allocator, "\n\nSources:\n");
-        try out.appendSlice(allocator, sources.items);
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn normalizeCollectedSourceUrl(buf: []u8, raw: []const u8) ?[]const u8 {
-    const trimmed = trimSourceUrlBoundary(raw);
-    var len: usize = 0;
-    for (trimmed) |byte| {
-        if (std.ascii.isWhitespace(byte) or byte == '`') continue;
-        if (len == buf.len) return null;
-        buf[len] = byte;
-        len += 1;
-    }
-    const normalized = trimSourceUrlBoundary(buf[0..len]);
-    if (!web_rag.isHttpTarget(normalized)) return null;
-    return normalized;
-}
-
-fn trimSourceUrlBoundary(raw: []const u8) []const u8 {
-    var text = std.mem.trim(u8, raw, " \t\r\n`'\"<>()[]{}");
-    while (text.len > 0 and isTrailingSourceUrlPunctuation(text[text.len - 1])) {
-        text = text[0 .. text.len - 1];
-    }
-    return text;
-}
-
-fn isTrailingSourceUrlPunctuation(byte: u8) bool {
-    return byte == '.' or byte == ',' or byte == ';' or byte == ':' or byte == ')' or byte == ']' or byte == '}';
-}
-
-fn sourceUrlIsDuckDuckGoSearchPage(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "://html.duckduckgo.com/html/") != null;
-}
-
-fn outputContainsCollectedSourceUrl(output: []const u8, source: []const u8) bool {
-    if (std.mem.indexOf(u8, output, source) != null) return true;
-    var cursor: usize = 0;
-    while (cursor < output.len) : (cursor += 1) {
-        var output_idx = cursor;
-        var source_idx: usize = 0;
-        while (output_idx < output.len and source_idx < source.len) {
-            const byte = output[output_idx];
-            if (std.ascii.isWhitespace(byte) or byte == '`') {
-                output_idx += 1;
-                continue;
-            }
-            if (byte != source[source_idx]) break;
-            output_idx += 1;
-            source_idx += 1;
-        }
-        if (source_idx == source.len) return true;
-    }
-    return false;
+    return final_claim_verifier.appendCollectedWebSources(allocator, output, context);
 }
 
 fn renderToolPhaseClosedAnswerRepairContext(allocator: std.mem.Allocator, follow_context: []const u8) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}\n[ANSWER_REPAIR]\nThe previous visible output emitted a tool call after the tool phase was closed. Answer visibly in the user's language from USER_TASK using the collected evidence. Do not emit JSON, tool calls, <think>, </think>, or protocol tags.\n",
-        .{follow_context},
-    );
+    return repair_contexts.toolPhaseClosedAnswer(allocator, follow_context);
 }
 
 fn visibleCandidateSelectionToToolCall(allocator: std.mem.Allocator, visible: []const u8, follow_context: []const u8) !?tool_call.ToolCall {
@@ -7170,10 +6506,6 @@ fn isCandidateId(text: []const u8) bool {
         if (!std.ascii.isDigit(byte)) return false;
     }
     return true;
-}
-
-fn currentActiveContract() contracts.ActiveContract {
-    return contracts.activeContract(.workflow).?;
 }
 
 fn singleStructuredPathFromPrompt(allocator: std.mem.Allocator, prompt: []const u8) !?[]u8 {
@@ -7222,287 +6554,6 @@ fn hasKnownTextExtension(path: []const u8) bool {
         if (std.mem.endsWith(u8, path, ext)) return true;
     }
     return false;
-}
-
-const ToolLoopState = struct {
-    context: working_context.WorkingContext,
-    session_searches: std.ArrayList([]u8),
-    retrieved_skills: std.ArrayList([]u8),
-    candidates: std.ArrayList(collect_evidence.CandidateItem),
-    last_candidate_context: ?[]u8 = null,
-    last_session_context: ?[]u8 = null,
-    active_contract: contracts.ActiveContract,
-    requirements: contracts.OperationalContractRequest = .{
-        .requires_inspection = false,
-        .requires_mutation = false,
-        .requires_runtime_validation = false,
-        .requires_browser_diagnostics = false,
-        .requires_memory_promotion = false,
-    },
-    observations: usize = 0,
-    mutations: usize = 0,
-    runtime_validations: usize = 0,
-    browser_diagnostics: usize = 0,
-    memory_promotions: usize = 0,
-    persistent_context_searches: usize = 0,
-    personal_memory_searches: usize = 0,
-    duplicate_repairs: usize = 0,
-    contract_selected: bool = false,
-    duplicate_contract_repairs: usize = 0,
-    finalization_repairs: usize = 0,
-    retrieved_skill_answer_repairs: usize = 0,
-    search_web_question_repairs: usize = 0,
-    clarification_soft_repairs: usize = 0,
-    forced_exploratory_refinements: usize = 0,
-
-    fn init(allocator: std.mem.Allocator) ToolLoopState {
-        return .{
-            .context = working_context.WorkingContext.init(allocator),
-            .session_searches = std.ArrayList([]u8).empty,
-            .retrieved_skills = std.ArrayList([]u8).empty,
-            .candidates = std.ArrayList(collect_evidence.CandidateItem).empty,
-            .active_contract = currentActiveContract(),
-        };
-    }
-
-    fn deinit(self: *ToolLoopState) void {
-        for (self.session_searches.items) |terms| self.context.allocator.free(terms);
-        self.session_searches.deinit(self.context.allocator);
-        for (self.retrieved_skills.items) |skill| self.context.allocator.free(skill);
-        self.retrieved_skills.deinit(self.context.allocator);
-        for (self.candidates.items) |candidate| candidate.deinit(self.context.allocator);
-        self.candidates.deinit(self.context.allocator);
-        if (self.last_candidate_context) |text| self.context.allocator.free(text);
-        if (self.last_session_context) |text| self.context.allocator.free(text);
-        self.context.deinit();
-    }
-
-    fn hasExecutedArgs(self: ToolLoopState, path: ?[]const u8, terms: ?[]const u8, strategy: contracts.StrategyName, start_line: usize, max_lines: usize) bool {
-        return self.context.hasDuplicate(.{
-            .path = path,
-            .terms = terms,
-            .strategy = strategy,
-            .start_line = start_line,
-            .max_lines = max_lines,
-            .evidence_text = "",
-            .model_bytes = 0,
-            .quality_score = 0,
-        });
-    }
-
-    fn hasExecutedWebTarget(self: ToolLoopState, target: []const u8, strategy: contracts.StrategyName) bool {
-        for (self.context.entries.items) |entry| {
-            if (entry.strategy == strategy and entry.start_line == 1 and entry.max_lines == 1 and std.mem.eql(u8, entry.path, target)) return true;
-        }
-        return false;
-    }
-
-    fn hasFetchedWebEvidenceTarget(self: ToolLoopState, target: []const u8) bool {
-        for (self.context.entries.items) |entry| {
-            if (webEvidenceContainsTarget(entry.evidence_text, target)) return true;
-        }
-        return false;
-    }
-
-    fn rememberExecutedArgs(self: *ToolLoopState, path: ?[]const u8, terms: ?[]const u8, strategy: contracts.StrategyName, start_line: usize, max_lines: usize, context_id: ?[]const u8, evidence_text: []const u8, model_bytes: usize, quality_score: i32) !void {
-        self.context.remember(.{
-            .path = path,
-            .terms = terms,
-            .strategy = strategy,
-            .start_line = start_line,
-            .max_lines = max_lines,
-            .context_id = context_id,
-            .evidence_text = evidence_text,
-            .model_bytes = model_bytes,
-            .quality_score = quality_score,
-        }) catch |err| switch (err) {
-            error.DuplicateWorkingEvidence => return,
-            else => return err,
-        };
-    }
-
-    fn selectContract(self: *ToolLoopState, selected: contracts.ActiveContract, request: contracts.OperationalContractRequest) void {
-        self.active_contract = selected;
-        self.contract_selected = true;
-        self.requirements = request;
-        self.finalization_repairs = 0;
-        self.retrieved_skill_answer_repairs = 0;
-        self.search_web_question_repairs = 0;
-        self.duplicate_contract_repairs = 0;
-    }
-
-    fn recordObservation(self: *ToolLoopState) void {
-        self.observations += 1;
-        self.finalization_repairs = 0;
-        self.search_web_question_repairs = 0;
-    }
-
-    fn closeToolPhase(self: *ToolLoopState) void {
-        self.active_contract = contracts.activeContract(.answer_only).?;
-        self.finalization_repairs = 0;
-        self.search_web_question_repairs = 0;
-    }
-
-    fn recordMutation(self: *ToolLoopState) void {
-        self.mutations += 1;
-        self.finalization_repairs = 0;
-    }
-
-    fn recordRuntimeValidation(self: *ToolLoopState) void {
-        self.runtime_validations += 1;
-        self.finalization_repairs = 0;
-    }
-
-    fn recordBrowserDiagnostics(self: *ToolLoopState) void {
-        self.browser_diagnostics += 1;
-        self.finalization_repairs = 0;
-    }
-
-    fn recordMemoryPromotion(self: *ToolLoopState) void {
-        self.memory_promotions += 1;
-        self.finalization_repairs = 0;
-    }
-
-    fn recordPersistentContextSearch(self: *ToolLoopState) void {
-        self.persistent_context_searches += 1;
-        self.finalization_repairs = 0;
-    }
-
-    fn recordPersonalMemorySearch(self: *ToolLoopState) void {
-        self.personal_memory_searches += 1;
-        self.finalization_repairs = 0;
-    }
-
-    fn rememberRetrievedSkills(self: *ToolLoopState, skills: []const []const u8) !void {
-        for (skills) |skill| {
-            const trimmed = std.mem.trim(u8, skill, " \t\r\n");
-            if (trimmed.len == 0) continue;
-            var exists = false;
-            for (self.retrieved_skills.items) |existing| {
-                if (std.mem.eql(u8, existing, trimmed)) {
-                    exists = true;
-                    break;
-                }
-            }
-            if (exists) continue;
-            const owned = try self.context.allocator.dupe(u8, trimmed);
-            errdefer self.context.allocator.free(owned);
-            try self.retrieved_skills.append(self.context.allocator, owned);
-        }
-    }
-
-    fn finalizationBlocker(self: *const ToolLoopState) ?[]const u8 {
-        if (!self.contract_selected) return null;
-        if (self.active_contract.name == .answer_only) return null;
-        if (self.requirements.requires_inspection and self.observations == 0 and !(self.requirements.requires_mutation and self.mutations > 0)) return "inspection evidence is required before finalization";
-        if (self.requirements.requires_mutation and self.mutations == 0) return "a successful mutation is required before finalization";
-        if (self.requirements.requires_runtime_validation and self.runtime_validations == 0) return "runtime validation is required before finalization";
-        if (self.requirements.requires_browser_diagnostics and self.browser_diagnostics == 0) return "browser/runtime diagnostics are required before finalization";
-        if (self.requirements.requires_memory_promotion and self.memory_promotions == 0) return "memory or skills promotion is required before finalization";
-        if (self.active_contract.name == .memory and self.persistent_context_searches == 0 and self.personal_memory_searches == 0 and self.memory_promotions == 0) return "memory context search is required before finalization";
-        return null;
-    }
-
-    fn hasBudgetForMoreEvidence(self: ToolLoopState) bool {
-        return self.context.hasBudgetForMoreEvidence();
-    }
-
-    fn remainingBudget(self: ToolLoopState) usize {
-        return self.context.remainingBudget();
-    }
-
-    fn shouldAllowMoreEvidence(self: ToolLoopState) bool {
-        return self.context.shouldAllowMoreEvidence();
-    }
-
-    fn shouldRequireExploratoryRefinement(self: ToolLoopState, call: *const tool_call.ToolCall, path: ?[]const u8, strategy: contracts.StrategyName) bool {
-        if (path != null or !self.shouldAllowMoreEvidence() or self.forced_exploratory_refinements != 0) return false;
-        return switch (call.source orelse .auto) {
-            .git, .web, .diagnostic, .file => false,
-            .auto, .code, .rag => switch (strategy) {
-                .diff, .history, .show, .reflog, .@"unreachable", .diagnostic => false,
-                else => true,
-            },
-        };
-    }
-
-    fn hasSessionSearch(self: ToolLoopState, terms: []const u8) bool {
-        for (self.session_searches.items) |existing| {
-            if (std.ascii.eqlIgnoreCase(existing, terms)) return true;
-        }
-        return false;
-    }
-
-    fn rememberSessionSearch(self: *ToolLoopState, terms: []const u8) !void {
-        if (self.hasSessionSearch(terms)) return error.DuplicateSessionSearch;
-        const owned = try self.context.allocator.dupe(u8, terms);
-        errdefer self.context.allocator.free(owned);
-        try self.session_searches.append(self.context.allocator, owned);
-    }
-
-    fn rememberSessionContext(self: *ToolLoopState, text: []const u8) !void {
-        const owned = try self.context.allocator.dupe(u8, text);
-        errdefer self.context.allocator.free(owned);
-        if (self.last_session_context) |old| self.context.allocator.free(old);
-        self.last_session_context = owned;
-    }
-
-    fn rememberCandidates(self: *ToolLoopState, result: *const collect_evidence.CandidateResult) !void {
-        var next = std.ArrayList(collect_evidence.CandidateItem).empty;
-        var committed = false;
-        errdefer if (!committed) {
-            for (next.items) |candidate| candidate.deinit(self.context.allocator);
-            next.deinit(self.context.allocator);
-        };
-
-        for (result.candidates.items) |candidate| {
-            {
-                var cloned = try cloneCandidateItem(self.context.allocator, candidate);
-                errdefer cloned.deinit(self.context.allocator);
-                try next.append(self.context.allocator, cloned);
-            }
-        }
-        const owned = try self.context.allocator.dupe(u8, result.text);
-        errdefer self.context.allocator.free(owned);
-
-        for (self.candidates.items) |candidate| candidate.deinit(self.context.allocator);
-        self.candidates.deinit(self.context.allocator);
-        self.candidates = next;
-        committed = true;
-
-        if (self.last_candidate_context) |old| self.context.allocator.free(old);
-        self.last_candidate_context = owned;
-    }
-
-    fn findCandidate(self: ToolLoopState, id: []const u8) ?collect_evidence.CandidateItem {
-        for (self.candidates.items) |candidate| {
-            if (std.ascii.eqlIgnoreCase(candidate.id, id)) return candidate;
-        }
-        return null;
-    }
-};
-
-fn cloneCandidateItem(allocator: std.mem.Allocator, candidate: collect_evidence.CandidateItem) !collect_evidence.CandidateItem {
-    const id = try allocator.dupe(u8, candidate.id);
-    errdefer allocator.free(id);
-    const path = try allocator.dupe(u8, candidate.path);
-    errdefer allocator.free(path);
-    const source = try allocator.dupe(u8, candidate.source);
-    errdefer allocator.free(source);
-    const signature = try allocator.dupe(u8, candidate.signature);
-    errdefer allocator.free(signature);
-    const preview = try allocator.dupe(u8, candidate.preview);
-    errdefer allocator.free(preview);
-    return .{
-        .id = id,
-        .path = path,
-        .start_line = candidate.start_line,
-        .end_line = candidate.end_line,
-        .score = candidate.score,
-        .source = source,
-        .signature = signature,
-        .preview = preview,
-    };
 }
 
 fn renderCollectedEvidenceContext(
@@ -7972,32 +7023,7 @@ fn activeToolSchema(state: *const ToolLoopState) []const u8 {
 }
 
 fn groundingRules() []const []const u8 {
-    return &.{
-        "Workspace/source-code claims cite E#; owner memory U# is not workspace/source-code evidence.",
-        "Quote only text present in E#/S#; explain outside quote/code blocks.",
-        "[CONTRACTS], [GROUNDING], and tool schemas are instructions, not evidence.",
-        "[PERSONAL_MEMORY] U# is sufficient evidence for owner preferences/profile/constraints; use remembered_personal_value or owner_<kind>.<key> for owner facts.",
-        "[MEMORY] is distilled project/task context and visible outcomes; use it to stay centered, but verify exact workspace/source-code claims with E#.",
-        "[SKILLS] are active local operating rules when relevant; do not contradict retrieved or loaded SKILLS.",
-        "Source-code identity claims need identifier/declaration/callsite in E#.",
-        "[RECENT_DIALOGUE] gives continuity; [SESSION_FOCUS] routes only. Exact prior-session claims need S#.",
-        "S# entries are candidates; judge relevance and direct support before using them.",
-        "Near/partial matches are not evidenced exact entity/fact claims; refine retrieval or state not evidenced.",
-        "If E#/S# shows a tool ran, report observed status/error/evidence instead of unavailable.",
-        "Named/obscure entities/current/existence facts absent from dialogue, MEMORY/SKILLS, SESSION_CONTEXT, E#, or stable knowledge need search_web/rag_web before unknown/no-records.",
-        "For vague workspace/code tasks, infer intent, split targets, and use collect_evidence terms as retrieval keys.",
-        "If workspace/code context is required and collect_evidence is available, call it before saying context is unavailable.",
-        "If web_search fails operationally, report status/error; do not invent a replacement URL.",
-        "search_session intent says what to recover; terms are retrieval keys.",
-        "If prior conversation context is required and search_session is available, call it before saying history is unavailable.",
-        "If no E#/S# supports a workspace or exact prior-session claim, say it is not evidenced.",
-        "Answer in user's language unless USER_TASK asks otherwise; translate or summarize evidence.",
-        "When answering a local rule/preference/protocol from retrieved MEMORY/SKILLS, use only directly retrieved entry; no generic best practices.",
-        "Low confidence: verify with available read-only tools before generic clarification.",
-        "External factual uncertainty needs search_web/rag_web; no plausibility as fact.",
-        "External retrieval unavailable/failed/no support: state limitation; do not invent.",
-        "Estimates need explicit request or estimate label; never as verified facts.",
-    };
+    return initial_model_context.groundingRules();
 }
 
 fn modelContextEnabled() bool {
@@ -8500,7 +7526,7 @@ const StreamSink = struct {
         ctx.visible_bytes += text.len;
         try ctx.visible.appendSlice(ctx.allocator, text);
         if (ctx.ui) |ui| try ui.showStatus("Responding");
-        try ctx.events.emit(.{ .message_chunk = text });
+        try ctx.events.emit(ui_events.streamedAssistantOutput(text));
         if (ctx.ui) |ui| try ui.pulseStatus();
         try ctx.db.recordEvent(ctx.session, "assistant_delta", text);
     }
@@ -11834,11 +10860,28 @@ test "workflow starts without synthetic inspection fallback" {
     var state = ToolLoopState.init(std.testing.allocator);
     defer state.deinit();
 
+    try std.testing.expectEqual(agent_state.State.turn_started, state.phase);
     try std.testing.expectEqual(contracts.ContractName.workflow, state.active_contract.name);
     try std.testing.expect(!state.contract_selected);
     try std.testing.expect(state.active_contract.allows("set_operational_contract"));
     try std.testing.expect(!state.active_contract.allows("collect_evidence"));
     try std.testing.expect(!state.active_contract.allows("web_search"));
+}
+
+test "tool loop runtime outcome updates state phase" {
+    var state = ToolLoopState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try std.testing.expect(!finishToolLoopRuntime(&state, .unhandled));
+    try std.testing.expectEqual(agent_state.State.turn_started, state.phase);
+    try std.testing.expect(finishToolLoopRuntime(&state, .final_answer));
+    try std.testing.expectEqual(agent_state.State.completed, state.phase);
+
+    var failed_state = ToolLoopState.init(std.testing.allocator);
+    defer failed_state.deinit();
+    failed_state.recordMutation();
+    try std.testing.expect(finishToolLoopRuntime(&failed_state, .stopped));
+    try std.testing.expectEqual(agent_state.State.failed, failed_state.phase);
 }
 
 test "turn progress blocks finalization until selected contract is satisfied" {
@@ -11852,6 +10895,7 @@ test "turn progress blocks finalization until selected contract is satisfied" {
         .requires_browser_diagnostics = false,
         .requires_memory_promotion = false,
     });
+    try std.testing.expectEqual(agent_state.State.contract_selected, state.phase);
     try std.testing.expect(state.finalizationBlocker() == null);
 
     state.selectContract(contracts.activeContract(.collect_evidence).?, .{
@@ -11863,6 +10907,7 @@ test "turn progress blocks finalization until selected contract is satisfied" {
     });
     try std.testing.expectEqualStrings("inspection evidence is required before finalization", state.finalizationBlocker().?);
     state.recordObservation();
+    try std.testing.expectEqual(agent_state.State.evidence_recorded, state.phase);
     try std.testing.expect(state.finalizationBlocker() == null);
 
     state.selectContract(contracts.activeContract(.mutate_file).?, .{
@@ -12182,7 +11227,7 @@ const EventRecorder = struct {
     fn handleOpaque(ctx: *anyopaque, event: ui_events.Event) !void {
         const self: *EventRecorder = @ptrCast(@alignCast(ctx));
         switch (event) {
-            .message_chunk => self.message_chunks += 1,
+            .message_chunk, .assistant_output => self.message_chunks += 1,
             .context_update => |update| {
                 self.context_updates += 1;
                 self.context_used_tokens = update.used_tokens;

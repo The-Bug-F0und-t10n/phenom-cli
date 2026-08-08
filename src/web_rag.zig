@@ -4,6 +4,7 @@ const evidence = @import("evidence.zig");
 const http = @import("http.zig");
 const text_match = @import("text_match.zig");
 const temporal = @import("temporal.zig");
+const web_evidence_model = @import("web_evidence_model.zig");
 
 const c = @cImport({
     @cInclude("stdlib.h");
@@ -598,26 +599,21 @@ fn renderWebEvidenceBlock(
     defer allocator.free(status_text);
     var retrieved_buf: [16]u8 = undefined;
     const retrieved_at = temporal.currentUtcDateText(&retrieved_buf);
-    return std.fmt.allocPrint(
-        allocator,
-        "[WEB_EVIDENCE]\nsource=http_get raw_context_persisted=false distill={s} target={s}\nretrieved_at={s}\ntimezone=UTC\nstatus={s}\nserver={s}\nerror={s}\nquery={s}\ntitle={s}\nsource_domain={s}\nsource_quality_score={}\nsource_quality_reason={s}\n{s}excerpt_budget_bytes={}\nexcerpt={s}\n",
-        .{
-            distill,
-            inspected.target,
-            retrieved_at,
-            status_text,
-            inspected.server orelse "",
-            inspected.error_name orelse "",
-            query orelse "",
-            title,
-            source_quality.domain,
-            source_quality.score,
-            source_quality.reason,
-            source_urls,
-            budget_bytes,
-            excerpt,
-        },
-    );
+    const sources = try web_evidence_model.sourceRefsFromLines(allocator, source_urls, "", source_quality.domain, source_quality.score, source_quality.reason);
+    defer allocator.free(sources);
+    return web_evidence_model.renderEvidenceBlock(allocator, .{
+        .distill = distill,
+        .target = inspected.target,
+        .retrieved_at = retrieved_at,
+        .status = status_text,
+        .server = inspected.server orelse "",
+        .@"error" = inspected.error_name orelse "",
+        .query = query orelse "",
+        .title = title,
+        .sources = sources,
+        .excerpt_budget_bytes = budget_bytes,
+        .excerpt = excerpt,
+    });
 }
 
 const SourceQuality = struct {

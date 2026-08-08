@@ -1,5 +1,6 @@
 const std = @import("std");
 const cli = @import("cli.zig");
+const model_gateway = @import("model_gateway.zig");
 const system_prompt = @import("system_prompt.zig");
 
 const c = @cImport({
@@ -68,7 +69,12 @@ pub const LocalModelClient = struct {
             .off => "<think>\n\n</think>\n\n",
             .auto => "",
         };
-        const chat_prompt = self.buildLlamaCppPrompt(stable_input, generation_prefix) catch return null;
+        const chat_prompt = model_gateway.buildLlamaCppPrompt(self.allocator, requestInputFromInference(.{
+            .model = self.model,
+            .system_prompt = stable_input.system_prompt orelse system_prompt.default_system_prompt,
+            .input = stable_input,
+            .thinking = self.thinking,
+        }), generation_prefix) catch return null;
         defer self.allocator.free(chat_prompt);
         return self.countTextTokens(chat_prompt);
     }
@@ -139,13 +145,13 @@ pub const LocalModelClient = struct {
 
             if (data.len == 0) continue;
             if (chunked) {
-                if (try feedChunked(self.allocator, &chunk_buffer, data, &line_buffer, sink)) break;
+                if (try feedChunked(self.allocator, &chunk_buffer, data, &line_buffer, self.backend, sink)) break;
             } else {
-                if (try feedLines(self.allocator, &line_buffer, data, sink)) break;
+                if (try feedLinesForBackend(self.allocator, &line_buffer, data, self.backend, sink)) break;
             }
         }
 
-        _ = try flushLine(self.allocator, &line_buffer, sink);
+        _ = try flushLineForBackend(self.allocator, &line_buffer, self.backend, sink);
     }
 
     fn buildBody(self: *LocalModelClient, prompt: []const u8) ![]u8 {
@@ -195,118 +201,17 @@ pub const LocalModelClient = struct {
     }
 
     fn buildBodyForInput(self: *LocalModelClient, input: InferenceInput) ![]u8 {
-        const escaped_prompt = try jsonEscape(self.allocator, input.user_prompt);
-        defer self.allocator.free(escaped_prompt);
         const selected_system_prompt = input.system_prompt orelse system_prompt.default_system_prompt;
-        const escaped_system_prompt = try jsonEscape(self.allocator, selected_system_prompt);
-        defer self.allocator.free(escaped_system_prompt);
         const stable_context = if (input.model_context) |context| try stripVolatileTurnContextForPrompt(self.allocator, context) else null;
         defer if (stable_context) |context| self.allocator.free(context);
         var stable_input = input;
         stable_input.model_context = stable_context;
-        const escaped_context = if (stable_context) |context| try jsonEscape(self.allocator, context) else null;
-        defer if (escaped_context) |context| self.allocator.free(context);
-        const escaped_model = try jsonEscape(self.allocator, self.model);
-        defer self.allocator.free(escaped_model);
-
-        return switch (self.backend) {
-            .ollama => try self.buildOllamaBody(escaped_model, escaped_system_prompt, escaped_context, escaped_prompt, input.dialogue, input.max_tokens),
-            .llamacpp => try self.buildLlamaCppBody(
-                escaped_model,
-                escaped_system_prompt,
-                escaped_context,
-                escaped_prompt,
-                input.dialogue,
-                input.max_tokens,
-                self.thinking,
-            ),
-        };
-    }
-
-    fn buildLlamaCppBody(
-        self: *LocalModelClient,
-        escaped_model: []const u8,
-        escaped_system_prompt: []const u8,
-        escaped_context: ?[]const u8,
-        escaped_prompt: []const u8,
-        dialogue: []const ChatMessage,
-        max_tokens: u16,
-        thinking: cli.ThinkingMode,
-    ) ![]u8 {
-        var messages = std.ArrayList(u8).empty;
-        defer messages.deinit(self.allocator);
-        try appendJsonMessages(self.allocator, &messages, escaped_system_prompt, escaped_context, escaped_prompt, dialogue);
-        const token_limit = if (max_tokens == 0)
-            ""
-        else
-            try std.fmt.allocPrint(self.allocator, ",\"max_tokens\":{}", .{max_tokens});
-        defer if (max_tokens != 0) self.allocator.free(token_limit);
-        const thinking_option = switch (thinking) {
-            .auto => "",
-            .on => ",\"chat_template_kwargs\":{\"enable_thinking\":true}",
-            .off => ",\"chat_template_kwargs\":{\"enable_thinking\":false}",
-        };
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"model\":\"{s}\",\"stream\":true,\"messages\":[{s}]{s},\"reasoning_format\":\"none\",\"stream_options\":{{\"include_usage\":true}}{s}}}",
-            .{ escaped_model, messages.items, thinking_option, token_limit },
-        );
-    }
-
-    fn buildOllamaBody(self: *LocalModelClient, escaped_model: []const u8, escaped_system_prompt: []const u8, escaped_context: ?[]const u8, escaped_prompt: []const u8, dialogue: []const ChatMessage, max_tokens: u16) ![]u8 {
-        var messages = std.ArrayList(u8).empty;
-        defer messages.deinit(self.allocator);
-        try appendJsonMessages(self.allocator, &messages, escaped_system_prompt, escaped_context, escaped_prompt, dialogue);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"model\":\"{s}\",\"stream\":true,\"messages\":[{s}],\"options\":{{\"temperature\":0.2,\"num_predict\":{}}}}}",
-            .{ escaped_model, messages.items, generationTokenLimit(max_tokens) },
-        );
-    }
-
-    fn appendJsonMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(u8), escaped_system_prompt: []const u8, escaped_context: ?[]const u8, escaped_prompt: []const u8, dialogue: []const ChatMessage) !void {
-        try messages.appendSlice(allocator, "{\"role\":\"system\",\"content\":\"");
-        try messages.appendSlice(allocator, escaped_system_prompt);
-        if (escaped_context) |context| {
-            try messages.appendSlice(allocator, "\\n\\n");
-            try messages.appendSlice(allocator, context);
-        }
-        try messages.appendSlice(allocator, "\"}");
-        for (dialogue) |message| {
-            const escaped = try jsonEscape(allocator, message.content);
-            defer allocator.free(escaped);
-            try messages.appendSlice(allocator, ",{\"role\":\"");
-            try messages.appendSlice(allocator, chatRoleName(message.role));
-            try messages.appendSlice(allocator, "\",\"content\":\"");
-            try messages.appendSlice(allocator, escaped);
-            try messages.appendSlice(allocator, "\"}");
-        }
-        try messages.appendSlice(allocator, ",{\"role\":\"user\",\"content\":\"");
-        try messages.appendSlice(allocator, escaped_prompt);
-        try messages.appendSlice(allocator, "\"}");
-    }
-
-    fn generationTokenLimit(max_tokens: u16) i32 {
-        return if (max_tokens == 0) -1 else @intCast(max_tokens);
-    }
-
-    fn buildLlamaCppPrompt(self: *LocalModelClient, input: InferenceInput, generation_prefix: []const u8) ![]u8 {
-        var out = std.ArrayList(u8).empty;
-        errdefer out.deinit(self.allocator);
-        try out.appendSlice(self.allocator, "<|im_start|>system\n");
-        try out.appendSlice(self.allocator, input.system_prompt orelse system_prompt.default_system_prompt);
-        if (input.model_context) |context| {
-            try out.appendSlice(self.allocator, "\n\n");
-            try out.appendSlice(self.allocator, context);
-        }
-        try out.appendSlice(self.allocator, "<|im_end|>\n");
-        for (input.dialogue) |message| {
-            try appendChatMessage(&out, self.allocator, message.role, message.content);
-        }
-        try appendChatMessage(&out, self.allocator, .user, input.user_prompt);
-        try out.appendSlice(self.allocator, "<|im_start|>assistant\n");
-        try out.appendSlice(self.allocator, generation_prefix);
-        return out.toOwnedSlice(self.allocator);
+        return model_gateway.buildRequestBody(self.allocator, self.backend, requestInputFromInference(.{
+            .model = self.model,
+            .system_prompt = selected_system_prompt,
+            .input = stable_input,
+            .thinking = self.thinking,
+        }));
     }
 };
 
@@ -433,15 +338,8 @@ fn removeTurnContextSection(allocator: std.mem.Allocator, context: []const u8, m
     return out.toOwnedSlice(allocator);
 }
 
-pub const ChatRole = enum {
-    user,
-    assistant,
-};
-
-pub const ChatMessage = struct {
-    role: ChatRole,
-    content: []const u8,
-};
+pub const ChatRole = model_gateway.ChatRole;
+pub const ChatMessage = model_gateway.ChatMessage;
 
 pub const InferenceInput = struct {
     user_prompt: []const u8,
@@ -453,23 +351,28 @@ pub const InferenceInput = struct {
     cancel_fd: ?c_int = null,
 };
 
-pub const TokenUsage = struct {
-    input: usize,
-    output: usize,
-    total: usize,
-    tokens_per_second: ?f64 = null,
-    final: bool = false,
+pub const TokenUsage = model_gateway.TokenUsage;
+pub const StopReason = model_gateway.StopReason;
+pub const CompletionStop = model_gateway.CompletionStop;
+
+const RequestInputParts = struct {
+    model: []const u8,
+    system_prompt: []const u8,
+    input: InferenceInput,
+    thinking: cli.ThinkingMode,
 };
 
-pub const StopReason = enum {
-    stop,
-    length,
-    unknown,
-};
-
-pub const CompletionStop = struct {
-    reason: StopReason = .unknown,
-};
+fn requestInputFromInference(parts: RequestInputParts) model_gateway.RequestInput {
+    return .{
+        .model = parts.model,
+        .system_prompt = parts.system_prompt,
+        .model_context = parts.input.model_context,
+        .user_prompt = parts.input.user_prompt,
+        .dialogue = parts.input.dialogue,
+        .max_tokens = parts.input.max_tokens,
+        .thinking = parts.thinking,
+    };
+}
 
 pub const ProbeResult = struct {
     endpoint: []const u8,
@@ -653,21 +556,6 @@ fn probePathForBackend(backend: cli.Backend) []const u8 {
 
 pub fn resolveThinking(mode: cli.ThinkingMode) cli.ThinkingMode {
     return mode;
-}
-
-fn appendChatMessage(out: *std.ArrayList(u8), allocator: std.mem.Allocator, role: ChatRole, content: []const u8) !void {
-    try out.appendSlice(allocator, "<|im_start|>");
-    try out.appendSlice(allocator, chatRoleName(role));
-    try out.append(allocator, '\n');
-    try out.appendSlice(allocator, content);
-    try out.appendSlice(allocator, "<|im_end|>\n");
-}
-
-fn chatRoleName(role: ChatRole) []const u8 {
-    return switch (role) {
-        .user => "user",
-        .assistant => "assistant",
-    };
 }
 
 const ParsedHost = struct {
@@ -1166,6 +1054,7 @@ fn feedChunked(
     chunk_buffer: *std.ArrayList(u8),
     data: []const u8,
     line_buffer: *std.ArrayList(u8),
+    backend: cli.Backend,
     sink: anytype,
 ) !bool {
     try chunk_buffer.appendSlice(allocator, data);
@@ -1178,7 +1067,7 @@ fn feedChunked(
         const start = line_end + 2;
         const end = start + size;
         if (chunk_buffer.items.len < end + 2) break;
-        if (try feedLines(allocator, line_buffer, chunk_buffer.items[start..end], sink)) return true;
+        if (try feedLinesForBackend(allocator, line_buffer, chunk_buffer.items[start..end], backend, sink)) return true;
         const consumed = end + 2;
         const remaining = chunk_buffer.items.len - consumed;
         std.mem.copyForwards(u8, chunk_buffer.items[0..remaining], chunk_buffer.items[consumed..]);
@@ -1193,9 +1082,37 @@ fn feedLines(
     data: []const u8,
     sink: anytype,
 ) !bool {
+    return feedLinesAnyBackend(allocator, line_buffer, data, sink);
+}
+
+fn feedLinesForBackend(
+    allocator: std.mem.Allocator,
+    line_buffer: *std.ArrayList(u8),
+    data: []const u8,
+    backend: cli.Backend,
+    sink: anytype,
+) !bool {
     try line_buffer.appendSlice(allocator, data);
     while (std.mem.indexOfScalar(u8, line_buffer.items, '\n')) |idx| {
-        const done = try processModelLine(allocator, line_buffer.items[0..idx], sink);
+        const done = try processModelLineForBackend(allocator, line_buffer.items[0..idx], backend, sink);
+        const consumed = idx + 1;
+        const remaining = line_buffer.items.len - consumed;
+        std.mem.copyForwards(u8, line_buffer.items[0..remaining], line_buffer.items[consumed..]);
+        line_buffer.shrinkRetainingCapacity(remaining);
+        if (done) return true;
+    }
+    return false;
+}
+
+fn feedLinesAnyBackend(
+    allocator: std.mem.Allocator,
+    line_buffer: *std.ArrayList(u8),
+    data: []const u8,
+    sink: anytype,
+) !bool {
+    try line_buffer.appendSlice(allocator, data);
+    while (std.mem.indexOfScalar(u8, line_buffer.items, '\n')) |idx| {
+        const done = try processModelLineAnyBackend(allocator, line_buffer.items[0..idx], sink);
         const consumed = idx + 1;
         const remaining = line_buffer.items.len - consumed;
         std.mem.copyForwards(u8, line_buffer.items[0..remaining], line_buffer.items[consumed..]);
@@ -1207,34 +1124,41 @@ fn feedLines(
 
 fn flushLine(allocator: std.mem.Allocator, line_buffer: *std.ArrayList(u8), sink: anytype) !bool {
     if (line_buffer.items.len == 0) return false;
-    const done = try processModelLine(allocator, line_buffer.items, sink);
+    const done = try processModelLineAnyBackend(allocator, line_buffer.items, sink);
     line_buffer.clearRetainingCapacity();
     return done;
 }
 
-fn processModelLine(allocator: std.mem.Allocator, raw_line: []const u8, sink: anytype) !bool {
-    const line = std.mem.trim(u8, raw_line, " \r\t");
-    if (line.len == 0) return false;
-    if (std.mem.eql(u8, line, "data: [DONE]")) return true;
-    const json_line = if (std.mem.startsWith(u8, line, "data:")) std.mem.trim(u8, line[5..], " \t") else line;
-    if (extractJsonStringField(json_line, "reasoning_content")) |reasoning| {
-        const decoded = try jsonUnescape(allocator, reasoning);
-        defer allocator.free(decoded);
-        try emitReasoningDelta(sink, decoded);
-    }
-    if (extractJsonStringField(json_line, "content")) |content| {
-        const decoded = try jsonUnescape(allocator, content);
-        defer allocator.free(decoded);
-        try sink.onDelta(decoded);
-    } else if (extractJsonStringField(json_line, "response")) |response| {
-        const decoded = try jsonUnescape(allocator, response);
-        defer allocator.free(decoded);
-        try sink.onDelta(decoded);
-    }
-    const done = jsonBoolTrueField(json_line, "stop") or jsonBoolTrueField(json_line, "done") or hasFinishReason(json_line);
-    if (done) try emitCompletionStop(sink, completionStopFromLine(json_line));
-    if (extractTokenUsage(json_line, done)) |usage| try emitTokenUsage(sink, usage);
+fn flushLineForBackend(
+    allocator: std.mem.Allocator,
+    line_buffer: *std.ArrayList(u8),
+    backend: cli.Backend,
+    sink: anytype,
+) !bool {
+    if (line_buffer.items.len == 0) return false;
+    const done = try processModelLineForBackend(allocator, line_buffer.items, backend, sink);
+    line_buffer.clearRetainingCapacity();
     return done;
+}
+
+fn processModelLineAnyBackend(allocator: std.mem.Allocator, raw_line: []const u8, sink: anytype) !bool {
+    var line = try model_gateway.parseAnyStreamLine(allocator, raw_line);
+    defer line.deinit(allocator);
+    return emitNormalizedStreamLine(&line, sink);
+}
+
+fn processModelLineForBackend(allocator: std.mem.Allocator, raw_line: []const u8, backend: cli.Backend, sink: anytype) !bool {
+    var line = try model_gateway.parseStreamLine(allocator, raw_line, backend);
+    defer line.deinit(allocator);
+    return emitNormalizedStreamLine(&line, sink);
+}
+
+fn emitNormalizedStreamLine(line: *const model_gateway.StreamLine, sink: anytype) !bool {
+    if (line.reasoning_delta) |delta| try emitReasoningDelta(sink, delta);
+    if (line.visible_delta) |delta| try sink.onDelta(delta);
+    if (line.completion_stop) |stop| try emitCompletionStop(sink, stop);
+    if (line.token_usage) |usage| try emitTokenUsage(sink, usage);
+    return line.done;
 }
 
 fn emitReasoningDelta(sink: anytype, reasoning: []const u8) !void {
@@ -1274,226 +1198,31 @@ fn emitTokenUsage(sink: anytype, usage: TokenUsage) !void {
 }
 
 fn extractTokenUsage(line: []const u8, final: bool) ?TokenUsage {
-    const input = extractJsonUsizeField(line, "prompt_eval_count") orelse
-        extractJsonUsizeField(line, "prompt_tokens") orelse
-        extractJsonUsizeField(line, "tokens_evaluated") orelse
-        extractJsonUsizeField(line, "n_prompt_tokens") orelse
-        extractJsonUsizeField(line, "prompt_n") orelse
-        return null;
-    const output = extractJsonUsizeField(line, "eval_count") orelse
-        extractJsonUsizeField(line, "completion_tokens") orelse
-        extractJsonUsizeField(line, "tokens_predicted") orelse
-        extractJsonUsizeField(line, "predicted_n") orelse
-        return null;
-    const total = std.math.add(usize, input, output) catch return null;
-    const tps = extractJsonF64Field(line, "predicted_per_second") orelse
-        tokensPerSecondFromEvalDuration(output, extractJsonU64Field(line, "eval_duration"));
-    return .{
-        .input = input,
-        .output = output,
-        .total = total,
-        .tokens_per_second = tps,
-        .final = final,
-    };
-}
-
-fn hasFinishReason(line: []const u8) bool {
-    const value = extractJsonStringField(line, "finish_reason") orelse return false;
-    return !std.mem.eql(u8, value, "null") and value.len > 0;
-}
-
-fn completionStopFromLine(line: []const u8) CompletionStop {
-    if (jsonBoolTrueField(line, "stopped_limit") or jsonBoolTrueField(line, "truncated")) return .{ .reason = .length };
-    if (extractJsonStringField(line, "stop_type")) |value| {
-        if (std.ascii.eqlIgnoreCase(value, "limit") or std.ascii.eqlIgnoreCase(value, "length")) return .{ .reason = .length };
-        if (std.ascii.eqlIgnoreCase(value, "eos") or std.ascii.eqlIgnoreCase(value, "word") or std.ascii.eqlIgnoreCase(value, "stop")) return .{ .reason = .stop };
-    }
-    if (extractJsonStringField(line, "done_reason")) |value| return .{ .reason = stopReasonFromText(value) };
-    if (extractJsonStringField(line, "finish_reason")) |value| return .{ .reason = stopReasonFromText(value) };
-    return .{};
-}
-
-fn stopReasonFromText(value: []const u8) StopReason {
-    if (std.ascii.eqlIgnoreCase(value, "length") or std.ascii.eqlIgnoreCase(value, "max_tokens") or std.ascii.eqlIgnoreCase(value, "limit")) return .length;
-    if (std.ascii.eqlIgnoreCase(value, "stop") or std.ascii.eqlIgnoreCase(value, "eos")) return .stop;
-    return .unknown;
-}
-
-fn tokensPerSecondFromEvalDuration(output: usize, duration_ns: ?u64) ?f64 {
-    const ns = duration_ns orelse return null;
-    if (output == 0 or ns == 0) return null;
-    const seconds = @as(f64, @floatFromInt(ns)) / 1_000_000_000.0;
-    if (seconds <= 0) return null;
-    return @as(f64, @floatFromInt(output)) / seconds;
+    return model_gateway.extractAnyTokenUsage(line, final);
 }
 
 fn extractJsonUsizeField(line: []const u8, field: []const u8) ?usize {
-    const value = extractJsonU64Field(line, field) orelse return null;
-    return std.math.cast(usize, value);
+    return model_gateway.extractJsonUsizeField(line, field);
 }
 
 fn extractJsonU64Field(line: []const u8, field: []const u8) ?u64 {
-    const number = extractJsonNumberSlice(line, field) orelse return null;
-    return std.fmt.parseInt(u64, number, 10) catch null;
-}
-
-fn extractJsonF64Field(line: []const u8, field: []const u8) ?f64 {
-    const number = extractJsonNumberSlice(line, field) orelse return null;
-    return std.fmt.parseFloat(f64, number) catch null;
-}
-
-fn extractJsonNumberSlice(line: []const u8, field: []const u8) ?[]const u8 {
-    var i = jsonFieldValueStart(line, field) orelse return null;
-    const value_start = i;
-    if (i < line.len and line[i] == '-') return null;
-    while (i < line.len) : (i += 1) {
-        const ch = line[i];
-        if (!std.ascii.isDigit(ch) and ch != '.') break;
-    }
-    if (i == value_start) return null;
-    return line[value_start..i];
+    return model_gateway.extractJsonU64Field(line, field);
 }
 
 fn extractJsonStringField(line: []const u8, field: []const u8) ?[]const u8 {
-    var i = jsonFieldValueStart(line, field) orelse return null;
-    if (i >= line.len or line[i] != '"') return null;
-    i += 1;
-    const value_start = i;
-    while (i < line.len) : (i += 1) {
-        if (line[i] == '"' and (i == value_start or line[i - 1] != '\\')) return line[value_start..i];
-    }
-    return null;
+    return model_gateway.extractJsonStringField(line, field);
 }
 
 fn jsonBoolTrueField(line: []const u8, field: []const u8) bool {
-    const i = jsonFieldValueStart(line, field) orelse return false;
-    return std.mem.startsWith(u8, line[i..], "true");
-}
-
-fn jsonFieldValueStart(line: []const u8, field: []const u8) ?usize {
-    var needle_buf: [64]u8 = undefined;
-    if (field.len + 2 > needle_buf.len) return null;
-    needle_buf[0] = '"';
-    @memcpy(needle_buf[1 .. 1 + field.len], field);
-    needle_buf[1 + field.len] = '"';
-    const needle = needle_buf[0 .. field.len + 2];
-
-    const start = std.mem.indexOf(u8, line, needle) orelse return null;
-    var i = start + needle.len;
-    while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\n' or line[i] == '\r')) : (i += 1) {}
-    if (i >= line.len or line[i] != ':') return null;
-    i += 1;
-    while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\n' or line[i] == '\r')) : (i += 1) {}
-    return i;
+    return model_gateway.jsonBoolTrueField(line, field);
 }
 
 fn jsonEscape(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    var i: usize = 0;
-    while (i < text.len) {
-        const ch = text[i];
-        if (ch < 0x20 and ch != '\n' and ch != '\r' and ch != '\t') {
-            try appendJsonByteEscape(allocator, &out, ch);
-            i += 1;
-            continue;
-        }
-        switch (ch) {
-            '\\' => {
-                try out.appendSlice(allocator, "\\\\");
-                i += 1;
-            },
-            '"' => {
-                try out.appendSlice(allocator, "\\\"");
-                i += 1;
-            },
-            '\n' => {
-                try out.appendSlice(allocator, "\\n");
-                i += 1;
-            },
-            '\r' => {
-                try out.appendSlice(allocator, "\\r");
-                i += 1;
-            },
-            '\t' => {
-                try out.appendSlice(allocator, "\\t");
-                i += 1;
-            },
-            0x80...0xff => {
-                const len = std.unicode.utf8ByteSequenceLength(ch) catch {
-                    try out.appendSlice(allocator, "\\uFFFD");
-                    i += 1;
-                    continue;
-                };
-                const end = i + len;
-                if (end > text.len) {
-                    try out.appendSlice(allocator, "\\uFFFD");
-                    i += 1;
-                    continue;
-                }
-                _ = std.unicode.utf8Decode(text[i..end]) catch {
-                    try out.appendSlice(allocator, "\\uFFFD");
-                    i += 1;
-                    continue;
-                };
-                try out.appendSlice(allocator, text[i..end]);
-                i = end;
-            },
-            else => {
-                try out.append(allocator, ch);
-                i += 1;
-            },
-        }
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn appendJsonByteEscape(allocator: std.mem.Allocator, out: *std.ArrayList(u8), byte: u8) !void {
-    const hex = "0123456789abcdef";
-    try out.appendSlice(allocator, "\\u00");
-    try out.append(allocator, hex[byte >> 4]);
-    try out.append(allocator, hex[byte & 0x0f]);
+    return model_gateway.jsonEscape(allocator, text);
 }
 
 fn jsonUnescape(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-
-    var i: usize = 0;
-    while (i < text.len) : (i += 1) {
-        if (text[i] != '\\') {
-            try out.append(allocator, text[i]);
-            continue;
-        }
-
-        i += 1;
-        if (i >= text.len) {
-            try out.append(allocator, '\\');
-            break;
-        }
-
-        switch (text[i]) {
-            '\\' => try out.append(allocator, '\\'),
-            '"' => try out.append(allocator, '"'),
-            '/' => try out.append(allocator, '/'),
-            'n' => try out.append(allocator, '\n'),
-            'r' => try out.append(allocator, '\r'),
-            't' => try out.append(allocator, '\t'),
-            'b' => try out.append(allocator, 0x08),
-            'f' => try out.append(allocator, 0x0c),
-            'u' => {
-                if (i + 4 >= text.len) return error.InvalidUnicodeEscape;
-                const code = try std.fmt.parseInt(u21, text[i + 1 .. i + 5], 16);
-                var buf: [4]u8 = undefined;
-                const len = try std.unicode.utf8Encode(code, &buf);
-                try out.appendSlice(allocator, buf[0..len]);
-                i += 4;
-            },
-            else => |ch| try out.append(allocator, ch),
-        }
-    }
-
-    return out.toOwnedSlice(allocator);
+    return model_gateway.jsonUnescape(allocator, text);
 }
 
 test "extract ollama content field" {
