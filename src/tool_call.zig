@@ -81,16 +81,23 @@ pub const ToolCall = struct {
 
 pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
     const call_start = std.mem.indexOf(u8, output, "<tool_call>") orelse {
-        if (try parseFirstJsonToolCall(allocator, output)) |call| return call;
-        return try parseFirstCompactToolCall(allocator, output);
+        return try parseFirstJsonOrCompactToolCall(allocator, output);
     };
-    const call_end = std.mem.indexOf(u8, output[call_start..], "</tool_call>") orelse return null;
+    const call_end = std.mem.indexOf(u8, output[call_start..], "</tool_call>") orelse {
+        return try parseFirstJsonOrCompactToolCall(allocator, output);
+    };
     const body = output[call_start + "<tool_call>".len .. call_start + call_end];
 
     const fn_marker = "<function=";
-    const fn_start = std.mem.indexOf(u8, body, fn_marker) orelse return null;
+    const fn_start = std.mem.indexOf(u8, body, fn_marker) orelse {
+        if (try parseFirstJsonOrCompactToolCall(allocator, body)) |call| return call;
+        return try parseFirstJsonOrCompactToolCall(allocator, output);
+    };
     const name_start = fn_start + fn_marker.len;
-    const name_end = std.mem.indexOfScalar(u8, body[name_start..], '>') orelse return null;
+    const name_end = std.mem.indexOfScalar(u8, body[name_start..], '>') orelse {
+        if (try parseFirstJsonOrCompactToolCall(allocator, body)) |call| return call;
+        return try parseFirstJsonOrCompactToolCall(allocator, output);
+    };
     const name = normalizeToolName(std.mem.trim(u8, body[name_start .. name_start + name_end], " \r\n\t"));
     const path = normalizeOptionalPath(parseParameter(body, "path"));
     const session = normalizeOptionalText(parseParameter(body, "session"));
@@ -177,6 +184,11 @@ pub fn parseFirst(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
         .requires_memory_promotion = parseBoolParameter(body, "requiresMemoryPromotion"),
         .reason = if (reason) |value| try allocator.dupe(u8, value) else null,
     };
+}
+
+fn parseFirstJsonOrCompactToolCall(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
+    if (try parseFirstJsonToolCall(allocator, output)) |call| return call;
+    return try parseFirstCompactToolCall(allocator, output);
 }
 
 fn parseFirstJsonToolCall(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
@@ -288,7 +300,10 @@ fn buildJsonToolCall(allocator: std.mem.Allocator, raw_tool: std.json.ObjectMap)
     const tool = nestedJsonFunctionObject(raw_tool) orelse raw_tool;
     const raw_name = jsonStringField(tool, "name") orelse jsonStringField(tool, "function") orelse return error.InvalidToolCallJson;
     const name = normalizeToolName(raw_name);
-    var args_view = try jsonArgsObject(allocator, tool);
+    var args_view = jsonArgsObject(allocator, tool) catch |err| {
+        if (try parseCompactJsonArgumentsToolCall(allocator, name, tool)) |call| return call;
+        return err;
+    };
     defer args_view.deinit();
     const args = args_view.object;
 
@@ -298,6 +313,18 @@ fn buildJsonToolCall(allocator: std.mem.Allocator, raw_tool: std.json.ObjectMap)
     const intent = normalizeOptionalText(jsonStringField(args, "intent"));
     const need = normalizeOptionalText(jsonStringField(args, "need"));
     const terms = normalizeOptionalText(jsonStringField(args, "terms") orelse jsonStringField(args, "query"));
+    const target_files = normalizeOptionalText(jsonStringField(args, "targetFiles") orelse jsonStringField(args, "target_files"));
+    const scope_root = normalizeOptionalText(jsonStringField(args, "scopeRoot") orelse jsonStringField(args, "scope_root"));
+    const source = if (jsonStringField(args, "source")) |raw_source| parseSourceName(raw_source) orelse return error.InvalidSource else null;
+    const stage = normalizeOptionalText(jsonStringField(args, "stage"));
+    const selected_candidate = normalizeOptionalText(jsonStringField(args, "selectedCandidate") orelse jsonStringField(args, "selected_candidate"));
+    const selected_candidates = normalizeOptionalText(jsonStringField(args, "selectedCandidates") orelse jsonStringField(args, "selected_candidates"));
+    const operation = normalizeOptionalText(jsonStringField(args, "operation"));
+    const context_id = normalizeOptionalText(jsonStringField(args, "contextId") orelse jsonStringField(args, "context_id"));
+    const search = normalizeOptionalText(jsonStringField(args, "search"));
+    const replace = normalizeOptionalReplace(jsonStringField(args, "replace"));
+    const destination_path = normalizeOptionalPath(jsonStringField(args, "destinationPath") orelse jsonStringField(args, "destination_path") orelse jsonStringField(args, "destPath") orelse jsonStringField(args, "dest"));
+    const content = normalizeOptionalContent(jsonStringField(args, "content"));
     const target = normalizeOptionalText(jsonStringField(args, "target") orelse jsonStringField(args, "url"));
     const text = normalizeOptionalText(jsonStringField(args, "text"));
     const kind = normalizeOptionalText(jsonStringField(args, "kind"));
@@ -321,6 +348,18 @@ fn buildJsonToolCall(allocator: std.mem.Allocator, raw_tool: std.json.ObjectMap)
         .intent = if (intent) |value| try allocator.dupe(u8, value) else null,
         .need = if (need) |value| try allocator.dupe(u8, value) else null,
         .terms = if (terms) |value| try allocator.dupe(u8, value) else null,
+        .target_files = if (target_files) |value| try allocator.dupe(u8, value) else null,
+        .scope_root = if (scope_root) |value| try allocator.dupe(u8, value) else null,
+        .source = source,
+        .stage = if (stage) |value| try allocator.dupe(u8, value) else null,
+        .selected_candidate = if (selected_candidate) |value| try allocator.dupe(u8, value) else null,
+        .selected_candidates = if (selected_candidates) |value| try allocator.dupe(u8, value) else null,
+        .operation = if (operation) |value| try allocator.dupe(u8, value) else null,
+        .context_id = if (context_id) |value| try allocator.dupe(u8, value) else null,
+        .search = if (search) |value| try allocator.dupe(u8, value) else null,
+        .replace = if (replace) |value| try allocator.dupe(u8, value) else null,
+        .destination_path = if (destination_path) |value| try allocator.dupe(u8, value) else null,
+        .content = if (content) |value| try allocator.dupe(u8, value) else null,
         .target = if (target) |value| try allocator.dupe(u8, value) else null,
         .text = if (text) |value| try allocator.dupe(u8, value) else null,
         .kind = if (kind) |value| try allocator.dupe(u8, value) else null,
@@ -343,6 +382,22 @@ fn buildJsonToolCall(allocator: std.mem.Allocator, raw_tool: std.json.ObjectMap)
         .requires_memory_promotion = jsonBoolField(args, "requiresMemoryPromotion"),
         .reason = if (reason) |value| try allocator.dupe(u8, value) else null,
     };
+}
+
+fn parseCompactJsonArgumentsToolCall(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    tool: std.json.ObjectMap,
+) !?ToolCall {
+    const raw_args = tool.get("arguments") orelse tool.get("parameters") orelse tool.get("args") orelse return null;
+    const text = switch (raw_args) {
+        .string => |value| value,
+        else => return null,
+    };
+    if (try parseFirstCompactToolCall(allocator, text)) |call| return call;
+    const wrapped = try std.fmt.allocPrint(allocator, "{s}({s})", .{ name, text });
+    defer allocator.free(wrapped);
+    return try parseFirstCompactToolCall(allocator, wrapped);
 }
 
 fn buildJsonContractToolCall(allocator: std.mem.Allocator, args: std.json.ObjectMap) !ToolCall {
@@ -415,10 +470,9 @@ pub fn containsJsonToolCallSignature(text: []const u8) bool {
 fn parseFirstCompactToolCall(allocator: std.mem.Allocator, output: []const u8) !?ToolCall {
     const found = findCompactToolCall(output) orelse return null;
     const body = output[found.args_start..found.args_end];
-    if (std.mem.indexOfScalar(u8, body, '=') == null) return null;
-
     const raw_name = found.name;
     const name = normalizeToolName(raw_name);
+    if (std.mem.indexOfScalar(u8, body, '=') == null) return try parsePositionalCompactToolCall(allocator, name, body);
     const path = normalizeOptionalPath(compactParamAny(body, &.{"path"}));
     const session = normalizeOptionalText(compactParamAny(body, &.{"session"}));
     const scope = normalizeOptionalText(compactParamAny(body, &.{"scope"}));
@@ -494,6 +548,16 @@ fn parseFirstCompactToolCall(allocator: std.mem.Allocator, output: []const u8) !
         .requires_browser_diagnostics = compactBoolParamAny(body, &.{"requiresBrowserDiagnostics"}),
         .requires_memory_promotion = compactBoolParamAny(body, &.{"requiresMemoryPromotion"}),
         .reason = if (reason) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
+fn parsePositionalCompactToolCall(allocator: std.mem.Allocator, name: []const u8, body: []const u8) !?ToolCall {
+    if (!std.mem.eql(u8, name, "collect_evidence") and !std.mem.eql(u8, name, "validate_syntax")) return null;
+    const path = normalizeOptionalPath(std.mem.trim(u8, body, " \t\r\n\"'`")) orelse return null;
+    if (std.mem.indexOfAny(u8, path, " \t\r\n,") != null) return null;
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .path = try allocator.dupe(u8, path),
     };
 }
 
@@ -1014,6 +1078,13 @@ test "collect evidence parses compact flag" {
     try std.testing.expect(call.compact);
 }
 
+test "collect evidence parses positional compact path" {
+    const call = (try parseFirst(std.testing.allocator, "```bash\ncollect_evidence(src/math.zig)\n```")) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("collect_evidence", call.name);
+    try std.testing.expectEqualStrings("src/math.zig", call.path.?);
+}
+
 test "collect evidence parses definition candidate stage fields" {
     const output =
         \\<tool_call>
@@ -1130,6 +1201,22 @@ test "apply patch parses context id search and replace" {
     try std.testing.expectEqualStrings("ctx_abcdef", call.context_id.?);
     try std.testing.expectEqualStrings("old text", call.search.?);
     try std.testing.expectEqualStrings("new text", call.replace.?);
+}
+
+test "apply patch parses compact call inside tool_call wrapper" {
+    const output =
+        \\<tool_call>
+        \\apply_patch(operation=edit, path=src/math.zig, contextId=ctx_x, search="return a - b;", replace="return a + b;")
+        \\</tool_call>
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("apply_patch", call.name);
+    try std.testing.expectEqualStrings("edit", call.operation.?);
+    try std.testing.expectEqualStrings("src/math.zig", call.path.?);
+    try std.testing.expectEqualStrings("ctx_x", call.context_id.?);
+    try std.testing.expectEqualStrings("return a - b;", call.search.?);
+    try std.testing.expectEqualStrings("return a + b;", call.replace.?);
 }
 
 test "apply patch parses operation repeated hunks destination and content" {
@@ -1372,6 +1459,48 @@ test "openai tool calls json with string arguments parses web search" {
 
     try std.testing.expectEqualStrings("web_search", call.name);
     try std.testing.expectEqualStrings("quem é o presidente do brasil", call.terms.?);
+}
+
+test "ollama tool calls json with object arguments parses web search" {
+    const output =
+        \\{"tool_calls":[{"function":{"name":"search_web","arguments":{"query":"quem é o presidente do brasil","budget_bytes":4096}}}]}
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("web_search", call.name);
+    try std.testing.expectEqualStrings("quem é o presidente do brasil", call.terms.?);
+    try std.testing.expectEqual(@as(?usize, 4096), call.budget_bytes);
+}
+
+test "ollama tool calls json with object arguments parses apply patch" {
+    const output =
+        \\{"tool_calls":[{"function":{"name":"apply_patch","arguments":{"operation":"edit","path":"src/math.zig","contextId":"ctx_x","search":"return a - b;","replace":"return a + b;"}}}]}
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("apply_patch", call.name);
+    try std.testing.expectEqualStrings("edit", call.operation.?);
+    try std.testing.expectEqualStrings("src/math.zig", call.path.?);
+    try std.testing.expectEqualStrings("ctx_x", call.context_id.?);
+    try std.testing.expectEqualStrings("return a - b;", call.search.?);
+    try std.testing.expectEqualStrings("return a + b;", call.replace.?);
+}
+
+test "tool calls json with compact string arguments parses apply patch" {
+    const output =
+        \\{"tool_calls":[{"function":{"name":"apply_patch","arguments":"operation=edit, path=src/math.zig, contextId=ctx_x, search=\"return a - b;\", replace=\"return a + b;\""}}]}
+    ;
+    const call = (try parseFirst(std.testing.allocator, output)) orelse return error.NoToolCall;
+    defer call.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("apply_patch", call.name);
+    try std.testing.expectEqualStrings("edit", call.operation.?);
+    try std.testing.expectEqualStrings("src/math.zig", call.path.?);
+    try std.testing.expectEqualStrings("ctx_x", call.context_id.?);
+    try std.testing.expectEqualStrings("return a - b;", call.search.?);
+    try std.testing.expectEqualStrings("return a + b;", call.replace.?);
 }
 
 test "json without tool_call is not a tool" {
