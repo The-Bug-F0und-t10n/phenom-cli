@@ -13,6 +13,14 @@ A tentativa de corrigir esses efeitos exigiria a introdução de novas abstraç�
 O projeto foi descontinuado após atingir esse trade-off.
 
 --- 
+## Desenvolvimento
+
+O Phenom foi desenvolvido utilizando **AI-assisted programming** como parte do processo de desenvolvimento.
+
+A IA foi utilizada principalmente para implementação, exploração de alternativas, refatoração e iteração sobre o código. As decisões de arquitetura, definição dos problemas, requisitos, direção técnica e validação do comportamento permaneceram sob responsabilidade do autor.
+
+O projeto também serviu como experimento prático para avaliar até onde uma estratégia agressiva de minimização de contexto poderia ser aplicada em agentes locais de coding.
+
 Phenom Zig e o binario Zig/C do projeto Phenom: um agente local de terminal com CLI/TUI, streaming para modelos locais, renderer markdown append-only, auditoria SQLite, memoria operacional de sessao e tool loop controlado por contratos.
 
 O projeto e voltado a uso local-first com backends como Ollama e llama.cpp. A proposta central e executar conversas, recuperacao de contexto e acoes de codigo com evidencia destilada, limites auditaveis e separacao explicita entre dialogo, memoria persistente, micro-contexto e outputs de ferramentas.
