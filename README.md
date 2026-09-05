@@ -1,5 +1,18 @@
 # Phenom Zig
+---
+# Status do Projeto
 
+Discontinuado.
+
+O Phenom explorou uma estratégia agressiva de minimização de contexto para agentes de coding locais: fornecer ao modelo a menor quantidade de evidência necessária para realizar uma operação de inferência.
+
+A exploração da abordagem foi bem-sucedida, porém sua implementação não se comportou como esperado. A redução agressiva de contexto aumentou significativamente a complexidade do backend e, em diversas tarefas, degradou o raciocínio do modelo, especialmente em fluxos como web_rag e na interpretação da intenção do usuário.
+
+A tentativa de corrigir esses efeitos exigiria a introdução de novas abstrações para compensar as limitações criadas pela própria estratégia de minimização, tornando a arquitetura progressivamente mais complexa e difícil de manter.
+
+O projeto foi descontinuado após atingir esse trade-off.
+
+--- 
 Phenom Zig e o binario Zig/C do projeto Phenom: um agente local de terminal com CLI/TUI, streaming para modelos locais, renderer markdown append-only, auditoria SQLite, memoria operacional de sessao e tool loop controlado por contratos.
 
 O projeto e voltado a uso local-first com backends como Ollama e llama.cpp. A proposta central e executar conversas, recuperacao de contexto e acoes de codigo com evidencia destilada, limites auditaveis e separacao explicita entre dialogo, memoria persistente, micro-contexto e outputs de ferramentas.
